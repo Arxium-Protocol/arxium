@@ -1,0 +1,46 @@
+[workspace]
+members = [
+    "circuits/account",
+    #
+    "core/primitives",
+    "core/storage",
+    "core/mempool",
+    #
+    "arxd/node",
+    "arxd/executor",
+    "arxd",
+    #
+    "scripts/send-tx",
+]
+resolver = "2"
+default-members = ["arxd"]
+
+
+[workspace.dependencies]
+# internal packages
+xc-primitives = { path = "core/primitives" }
+xc-storage = { path = "core/storage" }
+xc-mempool = { path = "core/mempool" }
+
+circuit-account = { path = "circuits/account" }
+xc-executor = { path = "arxd/executor" }
+
+# external packages
+clap = { version = "4.4", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+anyhow = "1.0"
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+rand = "0.9"
+dirs = "5.0"
+thiserror = "2.0.19"
+rocksdb = "0.24.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
+bech32 = "0.12.0"
+sha2 = "0.11"
+hex = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+axum = "0.8"
+subtle = "2.6.1"

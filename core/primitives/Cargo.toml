@@ -1,0 +1,13 @@
+[package]
+name = "xc-primitives"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+bech32 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+bincode = { workspace = true }

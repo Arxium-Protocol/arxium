@@ -1,0 +1,15 @@
+[package]
+name = "xc-executor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+circuit-account = { workspace = true }
+xc-primitives = { workspace = true }
+xc-storage = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }

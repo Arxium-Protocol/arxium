@@ -1,0 +1,10 @@
+# Example production deployment: Caddy terminates TLS (automatic cert via
+# Let's Encrypt) and reverse-proxies to arxd, which should be started with
+# its default `--rpc-bind 127.0.0.1` (loopback-only, not internet-facing).
+#
+#   arxd --base-path /var/lib/arxium --port 30333
+#   caddy run --config Caddyfile
+#
+arxium.example.com {
+    reverse_proxy 127.0.0.1:30333
+}
