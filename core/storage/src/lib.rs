@@ -54,12 +54,31 @@ impl ArxiumDb {
         Ok(self.get(b"meta:height")?.is_some())
     }
 
+    /// Get the chain name recorded at genesis.
+    pub fn get_chain_name(&self) -> Result<Option<String>, StorageError> {
+        match self.get(b"meta:chain_name")? {
+            Some(bytes) => {
+                String::from_utf8(bytes).map(Some).map_err(|_| StorageError::CorruptedMeta)
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Write any batch-writable item's entries atomically.
     pub fn write_batch(&self, item: &impl BatchWritable) -> Result<(), StorageError> {
-        let entries = item.batch_entries()?;
+        self.write_batches(&[item as &dyn BatchWritable])
+    }
+
+    /// Write several batch-writable items' entries as a single atomic write.
+    /// Use this when two items must land together or not at all — e.g. a
+    /// block record and the account changes it caused, so a crash can never
+    /// leave one committed without the other.
+    pub fn write_batches(&self, items: &[&dyn BatchWritable]) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
-        for (key, value) in entries {
-            batch.put(key, value);
+        for item in items {
+            for (key, value) in item.batch_entries()? {
+                batch.put(key, value);
+            }
         }
         self.db.write(batch)?;
         Ok(())

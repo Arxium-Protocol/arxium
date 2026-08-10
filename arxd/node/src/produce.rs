@@ -22,7 +22,7 @@ pub fn produce_block(
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height is set");
 
-    let applied = execute_actions(db, actions)?;
+    let (applied, account_updates) = execute_actions(db, actions)?;
 
     let mut new_block = Block {
         height: tip_height + 1,
@@ -35,7 +35,10 @@ pub fn produce_block(
     if let Some((address, key)) = proposer {
         new_block.sign(address.clone(), key);
     }
-    db.write_batch(&new_block)?;
+    // One atomic write for both the block record and the account changes it
+    // caused — a crash here must never leave the two disagreeing (e.g. nonces
+    // bumped with no block on record for it, or vice versa).
+    db.write_batches(&[&account_updates, &new_block])?;
 
     Ok(new_block)
 }
@@ -54,8 +57,8 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis = Block::genesis(0);
-        execute_actions(&db, genesis.actions.clone()).unwrap();
-        db.write_batch(&genesis).unwrap();
+        let (_, genesis_updates) = execute_actions(&db, genesis.actions.clone()).unwrap();
+        db.write_batches(&[&genesis_updates, &genesis]).unwrap();
 
         let alice_key = SigningKey::from_bytes(&[1u8; 32]);
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();

@@ -6,8 +6,9 @@ mod validator;
 
 use crate::produce::produce_block;
 use crate::rpc::spawn_http_ingest;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,9 +49,21 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
 
     if db.get_block(0)?.is_none() {
         let genesis_block = Block::genesis(now_secs());
-        execute_actions(&db, genesis_block.actions.clone())?;
-        db.write_batch(&genesis_block)?;
+        let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone())?;
+        db.write_batches(&[&genesis_updates, &genesis_block])?;
         info!("wrote genesis block: {:?}", genesis_block);
+    }
+
+    // Detect on-disk corruption/tampering before building on top of the tip:
+    // a signed block whose signature no longer verifies means something is
+    // wrong with this node's storage, not with the chain going forward.
+    let tip_height = db.get_tip_height()?.unwrap_or(0);
+    if let Some(tip_block) = db.get_block(tip_height)?
+        && tip_block.signature.is_some()
+    {
+        tip_block
+            .verify_proposer_signature()
+            .context("tip block signature failed verification — on-disk corruption or tampering")?;
     }
 
     Ok((db, snapshot))
@@ -87,9 +100,29 @@ pub fn run() -> Result<()> {
         config.rpc_token.clone(),
     )?;
 
-    // ponytail: no graceful shutdown (ctrl-c) yet — add when this stops being a devnet loop.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        thread::spawn(move || {
+            // ponytail: dedicated runtime just to await ctrl_c; the block-production
+            // loop stays plain sync.
+            if let Ok(runtime) = tokio::runtime::Runtime::new() {
+                runtime.block_on(async {
+                    let _ = tokio::signal::ctrl_c().await;
+                });
+                info!("shutdown signal received, exiting after current block");
+                shutdown.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
     loop {
         thread::sleep(BLOCK_INTERVAL);
+
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutting down");
+            return Ok(());
+        }
 
         let proposer = match &identity {
             Some((address, key)) => {
@@ -125,5 +158,60 @@ pub fn run() -> Result<()> {
             ),
             Err(err) => warn!("block production failed: {err}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn test_config() -> NodeConfig {
+        let base_path = std::env::temp_dir().join(format!(
+            "arxium-test-bootstrap-{}",
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        NodeConfig {
+            base_path,
+            port: 0,
+            is_validator: false,
+            rpc_token: None,
+            rpc_bind: "127.0.0.1".to_string(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_rejects_tampered_tip_block() {
+        let config = test_config();
+
+        // First boot: writes genesis (unsigned, so nothing to verify yet).
+        let (db, _snapshot) = bootstrap(&config).unwrap();
+
+        // Produce and sign block 1, same as a real validator would.
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        produce_block(&db, Vec::new(), 1, Some((&address, &key))).unwrap();
+        drop(db);
+
+        // Re-opening with an untampered signed tip must succeed.
+        bootstrap(&config).unwrap();
+
+        // Tamper with the tip block's content in place, signature unchanged —
+        // this must now be caught rather than silently built on top of.
+        let db = ArxiumDb::open(&config.base_path.join("data")).unwrap();
+        let mut tampered = db.get_block(1).unwrap().unwrap();
+        tampered.timestamp += 1;
+        db.write_batch(&tampered).unwrap();
+        drop(db);
+
+        assert!(
+            bootstrap(&config).is_err(),
+            "bootstrap must reject a tip block whose signature no longer verifies"
+        );
+
+        std::fs::remove_dir_all(&config.base_path).ok();
     }
 }

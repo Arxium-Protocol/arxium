@@ -18,14 +18,18 @@ pub enum ExecutorError {
 /// Applies each action to current state, in order, buffering every success
 /// in memory (an overlay on top of the DB) so later actions in the same
 /// batch see its effect (e.g. two transfers from the same sender at
-/// consecutive nonces) without touching the DB until the whole block is
-/// done. An action that fails on its own (bad signature, stale nonce,
-/// insufficient balance) is skipped and logged rather than aborting the
-/// batch — one bad action must not block valid actions from other senders.
-/// The buffered changes are written in a single atomic batch at the end, so
-/// a crash mid-block leaves either all of the block's effects applied or
-/// none of them. Returns the actions that were actually applied, in order.
-pub fn execute_actions(db: &ArxiumDb, actions: Vec<Action>) -> Result<Vec<Action>, ExecutorError> {
+/// consecutive nonces) without touching the DB at all. An action that fails
+/// on its own (bad signature, stale nonce, insufficient balance) is skipped
+/// and logged rather than aborting the batch — one bad action must not
+/// block valid actions from other senders. Returns the actions that were
+/// actually applied, in order, plus the resulting account changes —
+/// unwritten. The caller (`produce_block`) is responsible for committing
+/// these together with the block record in one atomic write, so a crash
+/// can never leave block bookkeeping and account state disagreeing.
+pub fn execute_actions(
+    db: &ArxiumDb,
+    actions: Vec<Action>,
+) -> Result<(Vec<Action>, AccountUpdates), ExecutorError> {
     let mut applied = Vec::with_capacity(actions.len());
     let mut overlay = HashMap::new();
 
@@ -53,9 +57,7 @@ pub fn execute_actions(db: &ArxiumDb, actions: Vec<Action>) -> Result<Vec<Action
         }
     }
 
-    db.write_batch(&AccountUpdates(overlay))?;
-
-    Ok(applied)
+    Ok((applied, AccountUpdates(overlay)))
 }
 
 #[cfg(test)]
@@ -122,12 +124,17 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let applied = execute_actions(&db, actions).unwrap();
+        let (applied, updates) = execute_actions(&db, actions).unwrap();
         assert_eq!(
             applied.len(),
             2,
             "both consecutive-nonce actions should apply"
         );
+
+        // Not yet written — execute_actions only buffers; the caller commits.
+        assert!(db.get_account(&bob).unwrap().is_none());
+
+        db.write_batch(&updates).unwrap();
 
         let alice_after = db.get_account(&alice).unwrap().unwrap();
         assert_eq!(alice_after.balance, 50);

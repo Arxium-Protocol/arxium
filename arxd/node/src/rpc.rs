@@ -92,9 +92,10 @@ async fn guard(
 /// the rest of the node (bootstrap, block production loop) stays plain sync.
 /// Serves `POST /actions` (submit a JSON-encoded `Action`, queued into
 /// `mempool` for the next block), `GET /accounts/{address}` (current
-/// balance/nonce, needed to sign the next action), and
+/// balance/nonce, needed to sign the next action),
 /// `GET /actions/{signature}` (pending/confirmed status of a submitted
-/// action). If `rpc_token` is set, every request must carry a matching
+/// action), and `GET /status` (chain name, tip height/hash). If `rpc_token`
+/// is set, every request must carry a matching
 /// `Authorization: Bearer` header. Blocks the caller until the listener is
 /// bound (or fails to bind), same as a sync server would, so startup
 /// failures surface immediately instead of on first request.
@@ -131,6 +132,7 @@ pub fn spawn_http_ingest(
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .route("/accounts/{address}", get(get_account))
                 .route("/actions/{signature}", get(get_action_status))
+                .route("/status", get(get_status))
                 .with_state(state.clone())
                 .layer(middleware::from_fn_with_state(state, guard));
 
@@ -142,7 +144,7 @@ pub fn spawn_http_ingest(
                 }
             };
             info!(
-                "RPC listening on {bind_addr}:{port} (POST /actions, GET /accounts/:address, GET /actions/:signature)"
+                "RPC listening on {bind_addr}:{port} (POST /actions, GET /accounts/:address, GET /actions/:signature, GET /status)"
             );
             let _ = ready_tx.send(Ok(()));
 
@@ -159,33 +161,103 @@ pub fn spawn_http_ingest(
         .with_context(|| format!("failed to bind RPC listener on port {port}"))
 }
 
+/// Validates what can be checked without executing the action: signature,
+/// and that its nonce isn't already stale against on-chain state. This is
+/// deliberately not a full re-check of `execute_actions` — balance can
+/// still change between now and this action's turn in a block, so
+/// insufficient-balance is still only caught at production time. Rejecting
+/// a bad signature or a replayed/stale nonce here means garbage never
+/// occupies a mempool slot waiting to be dropped later.
 async fn submit_action(
     State(state): State<AppState>,
     body: Result<Json<Action>, JsonRejection>,
 ) -> Response {
-    match body {
-        Ok(Json(action)) => {
-            let sender = action.sender.clone();
-            match state.mempool.lock().unwrap().push(action) {
-                Ok(()) => {
-                    info!("queued action from {sender} via RPC");
-                    StatusCode::ACCEPTED.into_response()
-                }
-                Err(err @ MempoolError::Full) => {
-                    warn!("rejected action from {sender}: {err}");
-                    (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
-                }
-                Err(err @ MempoolError::Duplicate { .. }) => {
-                    warn!("rejected action from {sender}: {err}");
-                    (StatusCode::CONFLICT, err.to_string()).into_response()
-                }
-            }
-        }
+    let action = match body {
+        Ok(Json(action)) => action,
         Err(err) => {
             warn!("rejected unparsable RPC action: {err}");
-            (StatusCode::BAD_REQUEST, err.to_string()).into_response()
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
+    };
+    let sender = action.sender.clone();
+
+    if let Err(err) = action.verify_signature() {
+        warn!("rejected action from {sender}: {err}");
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
+
+    let current_nonce = match state.db.get_account(&sender) {
+        Ok(account) => account.map(|entry| entry.nonce).unwrap_or(0),
+        Err(err) => {
+            warn!("failed to look up account {sender} for nonce check: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if action.nonce < current_nonce {
+        let msg = format!(
+            "stale nonce for {sender}: action has {}, current on-chain nonce is {current_nonce}",
+            action.nonce
+        );
+        warn!("rejected action from {sender}: {msg}");
+        return (StatusCode::BAD_REQUEST, msg).into_response();
+    }
+
+    match state.mempool.lock().unwrap().push(action) {
+        Ok(()) => {
+            info!("queued action from {sender} via RPC");
+            StatusCode::ACCEPTED.into_response()
+        }
+        Err(err @ MempoolError::Full) => {
+            warn!("rejected action from {sender}: {err}");
+            (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
+        }
+        Err(err @ MempoolError::Duplicate { .. }) => {
+            warn!("rejected action from {sender}: {err}");
+            (StatusCode::CONFLICT, err.to_string()).into_response()
         }
     }
+}
+
+/// Chain-wide health: name, tip height/hash. No per-account or per-action
+/// state, so unlike other routes it can't 404 — an initialized node always
+/// has at least the genesis block.
+async fn get_status(State(state): State<AppState>) -> Response {
+    let chain_name = match state.db.get_chain_name() {
+        Ok(Some(name)) => name,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            warn!("failed to read chain name: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let tip_height = match state.db.get_tip_height() {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            warn!("failed to read tip height: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let tip_hash = match state.db.get_block(tip_height) {
+        Ok(Some(block)) => block.hash(),
+        Ok(None) => {
+            warn!("tip height {tip_height} recorded but block is missing");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(err) => {
+            warn!("failed to load tip block {tip_height}: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    Json(serde_json::json!({
+        "chain_name": chain_name,
+        "tip_height": tip_height,
+        "tip_hash": tip_hash,
+    }))
+    .into_response()
 }
 
 async fn get_account(State(state): State<AppState>, Path(address): Path<String>) -> Response {
@@ -253,4 +325,122 @@ async fn get_action_status(
         "nonce": action.nonce,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::collections::BTreeMap;
+    use xc_primitives::{AccountEntry, ActionPayload, Snapshot};
+
+    fn test_state() -> AppState {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-rpc-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        AppState {
+            mempool: Arc::new(Mutex::new(Mempool::new())),
+            db: ArxiumDb::open(&dir).unwrap(),
+            rpc_token: None,
+            rate_limiter: Arc::new(RateLimiter::new()),
+        }
+    }
+
+    fn signed_action(key: &SigningKey, nonce: u64) -> Action {
+        let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let to = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let mut action = Action {
+            sender,
+            nonce,
+            signature: None,
+            payload: ActionPayload::Transfer { to, amount: 1 },
+        };
+        let sig = key.sign(&action.signing_bytes());
+        action.signature = Some(hex::encode(sig.to_bytes()));
+        action
+    }
+
+    #[test]
+    fn submit_action_rejects_bad_signature_and_stale_nonce_but_accepts_valid() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let key = SigningKey::from_bytes(&[4u8; 32]);
+            let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+
+            // Tampering with the nonce after signing invalidates the signature.
+            let mut tampered = signed_action(&key, 0);
+            tampered.nonce = 1;
+            let resp = submit_action(State(state.clone()), Ok(Json(tampered))).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            // Sender is already at on-chain nonce 5 — nonce 0 is a stale replay.
+            state
+                .db
+                .write_batch(&Snapshot {
+                    height: 0,
+                    chain_name: "test".into(),
+                    accounts: BTreeMap::from([(
+                        sender.clone(),
+                        AccountEntry {
+                            balance: 1000,
+                            nonce: 5,
+                            identity_hash: None,
+                        },
+                    )]),
+                    validators: BTreeMap::new(),
+                })
+                .unwrap();
+            let stale = signed_action(&key, 0);
+            let resp = submit_action(State(state.clone()), Ok(Json(stale))).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            // Correctly signed, current nonce: must be accepted into the mempool.
+            let valid = signed_action(&key, 5);
+            let resp = submit_action(State(state.clone()), Ok(Json(valid))).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+            assert_eq!(state.mempool.lock().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn status_reports_chain_name_and_tip_before_and_after_a_block() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+
+            // No genesis written yet: nothing to report.
+            let resp = get_status(State(state.clone())).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let genesis = xc_primitives::Block::genesis(0);
+            state
+                .db
+                .write_batch(&Snapshot {
+                    height: 0,
+                    chain_name: "test-chain".into(),
+                    accounts: BTreeMap::new(),
+                    validators: BTreeMap::new(),
+                })
+                .unwrap();
+            state.db.write_batch(&genesis).unwrap();
+
+            let resp = get_status(State(state.clone())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["chain_name"], "test-chain");
+            assert_eq!(json["tip_height"], 0);
+            assert_eq!(json["tip_hash"], genesis.hash());
+        });
+    }
 }
