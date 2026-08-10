@@ -1,9 +1,11 @@
 mod cli;
 mod genesis;
+pub mod payload;
 mod produce;
 mod rpc;
 mod validator;
 
+use crate::payload::{ChainBlock, dispatch};
 use crate::produce::produce_block;
 use crate::rpc::spawn_http_ingest;
 use anyhow::{Context, Result};
@@ -17,7 +19,7 @@ use tracing::{info, warn};
 use crate::cli::Cli;
 use xc_executor::execute_actions;
 use xc_mempool::Mempool;
-use xc_primitives::{Address, Block, NodeConfig, Snapshot, expected_proposer};
+use xc_primitives::{Address, NodeConfig, Snapshot, expected_proposer};
 use xc_storage::ArxiumDb;
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
@@ -47,9 +49,9 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         db.write_batch(&snapshot)?;
     }
 
-    if db.get_block(0)?.is_none() {
-        let genesis_block = Block::genesis(now_secs());
-        let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone())?;
+    if db.get_block::<payload::ActionPayload>(0)?.is_none() {
+        let genesis_block: ChainBlock = xc_primitives::Block::genesis(now_secs());
+        let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone(), dispatch)?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
         info!("wrote genesis block: {:?}", genesis_block);
     }
@@ -58,7 +60,7 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
     // a signed block whose signature no longer verifies means something is
     // wrong with this node's storage, not with the chain going forward.
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    if let Some(tip_block) = db.get_block(tip_height)?
+    if let Some(tip_block) = db.get_block::<payload::ActionPayload>(tip_height)?
         && tip_block.signature.is_some()
     {
         tip_block
@@ -90,8 +92,6 @@ pub fn run() -> Result<()> {
     };
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
-    // ponytail: no auth/rate-limiting on this endpoint — fine for a devnet operator
-    // hitting it directly, add before this is reachable from anywhere untrusted.
     spawn_http_ingest(
         mempool.clone(),
         db.clone(),
@@ -202,7 +202,7 @@ mod tests {
         // Tamper with the tip block's content in place, signature unchanged —
         // this must now be caught rather than silently built on top of.
         let db = ArxiumDb::open(&config.base_path.join("data")).unwrap();
-        let mut tampered = db.get_block(1).unwrap().unwrap();
+        let mut tampered: ChainBlock = db.get_block(1).unwrap().unwrap();
         tampered.timestamp += 1;
         db.write_batch(&tampered).unwrap();
         drop(db);

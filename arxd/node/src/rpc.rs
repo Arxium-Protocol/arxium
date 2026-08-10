@@ -15,8 +15,10 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use xc_mempool::{Mempool, MempoolError};
-use xc_primitives::{Action, Address};
+use xc_primitives::Address;
 use xc_storage::ArxiumDb;
+
+use crate::payload::{ActionPayload, ChainAction};
 
 // ponytail: fixed cap on a single JSON action body; make configurable if a
 // payload type ever legitimately needs more than this.
@@ -29,7 +31,7 @@ const RATE_LIMIT_MAX_REQUESTS: u32 = 60;
 
 #[derive(Clone)]
 struct AppState {
-    mempool: Arc<Mutex<Mempool>>,
+    mempool: Arc<Mutex<Mempool<ActionPayload>>>,
     db: ArxiumDb,
     rpc_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
@@ -100,7 +102,7 @@ async fn guard(
 /// bound (or fails to bind), same as a sync server would, so startup
 /// failures surface immediately instead of on first request.
 pub fn spawn_http_ingest(
-    mempool: Arc<Mutex<Mempool>>,
+    mempool: Arc<Mutex<Mempool<ActionPayload>>>,
     db: ArxiumDb,
     bind_addr: String,
     port: u16,
@@ -170,7 +172,7 @@ pub fn spawn_http_ingest(
 /// occupies a mempool slot waiting to be dropped later.
 async fn submit_action(
     State(state): State<AppState>,
-    body: Result<Json<Action>, JsonRejection>,
+    body: Result<Json<ChainAction>, JsonRejection>,
 ) -> Response {
     let action = match body {
         Ok(Json(action)) => action,
@@ -240,7 +242,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
         }
     };
 
-    let tip_hash = match state.db.get_block(tip_height) {
+    let tip_hash = match state.db.get_block::<ActionPayload>(tip_height) {
         Ok(Some(block)) => block.hash(),
         Ok(None) => {
             warn!("tip height {tip_height} recorded but block is missing");
@@ -296,7 +298,7 @@ async fn get_action_status(
         }
     };
 
-    let block = match state.db.get_block(height) {
+    let block = match state.db.get_block::<ActionPayload>(height) {
         Ok(Some(block)) => block,
         Ok(None) => {
             warn!("action index points at missing block {height} for {signature}");
@@ -332,7 +334,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
-    use xc_primitives::{AccountEntry, ActionPayload, Snapshot};
+    use xc_primitives::{AccountEntry, Snapshot};
 
     fn test_state() -> AppState {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -353,10 +355,10 @@ mod tests {
         }
     }
 
-    fn signed_action(key: &SigningKey, nonce: u64) -> Action {
+    fn signed_action(key: &SigningKey, nonce: u64) -> ChainAction {
         let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let to = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
-        let mut action = Action {
+        let mut action = ChainAction {
             sender,
             nonce,
             signature: None,
@@ -420,7 +422,7 @@ mod tests {
             let resp = get_status(State(state.clone())).await;
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-            let genesis = xc_primitives::Block::genesis(0);
+            let genesis: crate::payload::ChainBlock = xc_primitives::Block::genesis(0);
             state
                 .db
                 .write_batch(&Snapshot {

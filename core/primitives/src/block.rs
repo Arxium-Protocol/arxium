@@ -4,12 +4,13 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// `P` is the chain-specific action payload — see `Action<P>`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Block {
+pub struct Block<P> {
     pub height: u64,
     pub parent_hash: String,
     pub timestamp: u64,
-    pub actions: Vec<Action>,
+    pub actions: Vec<Action<P>>,
     /// Validator that produced this block. `None` for the (trusted, unsigned)
     /// genesis block, and for blocks produced by a non-validator solo node.
     pub proposer: Option<Address>,
@@ -19,15 +20,15 @@ pub struct Block {
 /// What actually gets signed: everything but the signature itself (it can't
 /// sign itself). Mirrors `Action`'s `SigningPayload`.
 #[derive(Serialize)]
-struct BlockSigningPayload<'a> {
+struct BlockSigningPayload<'a, P> {
     height: u64,
     parent_hash: &'a str,
     timestamp: u64,
-    actions: &'a [Action],
+    actions: &'a [Action<P>],
     proposer: &'a Address,
 }
 
-impl Block {
+impl<P: Serialize> Block<P> {
     pub fn genesis(timestamp: u64) -> Self {
         Self {
             height: 0,
@@ -103,7 +104,7 @@ mod tests {
     fn sign_then_verify_round_trips() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        let mut block = Block::genesis(1234);
+        let mut block: Block<()> = Block::genesis(1234);
         block.height = 5;
         block.sign(addr, &key);
 
@@ -114,7 +115,7 @@ mod tests {
     fn tampered_block_fails_verification() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        let mut block = Block::genesis(1234);
+        let mut block: Block<()> = Block::genesis(1234);
         block.sign(addr, &key);
 
         block.timestamp += 1;
@@ -123,7 +124,7 @@ mod tests {
 
     #[test]
     fn unsigned_block_fails_verification() {
-        let block = Block::genesis(1234);
+        let block: Block<()> = Block::genesis(1234);
         assert!(matches!(
             block.verify_proposer_signature(),
             Err(SignatureError::Missing)

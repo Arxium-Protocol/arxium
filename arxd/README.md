@@ -13,9 +13,14 @@ role — there is no separate binary per role.
 | Path               | Responsibility                                                                                                                                                                                                                                                                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `arxd/src/main.rs` | Binary entrypoint. Sets up tracing/logging, calls `node::run()`. Nothing else — keep this file thin.                                                                                                                                                                                                                  |
-| `arxd/node/`       | The orchestration crate (`node`). Owns the CLI (`cli.rs`), genesis bootstrap (`genesis.rs`), the block-production loop and role decision (`lib.rs`), validator key management (`validator.rs`), and the RPC ingest server (`rpc.rs`). This is the only crate allowed to decide "what role am I" and act on it.        |
-| `arxd/executor/`   | The `xc-executor` crate. Takes a batch of `Action`s, verifies signatures, dispatches each by `ActionPayload` variant to the matching crate in `circuits/`, and returns which ones actually applied. Knows about _dispatch_ (which payload → which circuit) but not about the business logic inside any given circuit. |
+| `arxd/node/`       | The orchestration crate (`node`). Owns the CLI (`cli.rs`), genesis bootstrap (`genesis.rs`), the block-production loop and role decision (`lib.rs`), validator key management (`validator.rs`), the RPC ingest server (`rpc.rs`), and CoreChain's own payload type + dispatch table (`payload.rs`, public — `ActionPayload`, `ChainAction`/`ChainBlock` type aliases, `dispatch`). This is the only crate allowed to decide "what role am I" and act on it, and the only place that decides what a CoreChain `ActionPayload::Transfer` means.        |
 | `arxd/runtime/`    | Reserved for CoreChain's actual runtime responsibilities as they get built out — validator set management, state root registry, conflict resolution, slashing. Not yet a real crate (no `Cargo.toml`, not a workspace member) — currently just a placeholder.                                                         |
+
+`xc-executor` (batch dispatch of `Action`s to `circuits/*`) used to live
+here but moved to `core/executor/` — its signature (DB handle + actions in,
+applied actions + updates out) never needed to know which chain/role was
+running it. `examples/toy-chain` is what proved that: it pulls in
+`xc-executor` unmodified with zero `arxd` dependency.
 
 ## The boundary rule
 

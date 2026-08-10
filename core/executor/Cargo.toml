@@ -4,12 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-circuit-account = { workspace = true }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+circuit-account = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
-use xc_primitives::{AccountEntry, Action, ActionPayload, Address};
-use xc_storage::{BatchWritable, StorageError};
+use xc_primitives::{AccountEntry, Address};
+use xc_storage::{AccountUpdates, StorageError};
 
 #[derive(Error, Debug)]
 pub enum AccountError {
@@ -22,61 +22,49 @@ pub enum AccountError {
     },
 }
 
-/// A set of account changes to be written atomically.
-pub struct AccountUpdates(pub HashMap<Address, AccountEntry>);
-
-impl BatchWritable for AccountUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        let config = bincode::config::standard();
-        let mut entries = Vec::new();
-        for (address, entry) in &self.0 {
-            let key = format!("account:{}", address).into_bytes();
-            let value = bincode::serde::encode_to_vec(entry, config)?;
-            entries.push((key, value));
-        }
-        Ok(entries)
-    }
-}
-/// Validates and applies a single Transfer action against current state.
-/// Returns the updated sender/receiver entries without writing them —
-/// caller decides when to commit (so a whole block can be batched together).
-/// `lookup` resolves an address to its current account state; the caller
-/// controls where that comes from (DB, or DB overlaid with not-yet-committed
-/// changes from earlier actions in the same block).
+/// Validates and applies a transfer of `amount` from `sender` (at `nonce`) to
+/// `to` against current state. Returns the updated sender/receiver entries
+/// without writing them — caller decides when to commit (so a whole block
+/// can be batched together). Takes plain values rather than an `Action`
+/// so any chain's payload shape can route into this without this crate
+/// knowing about it. `lookup` resolves an address to its current account
+/// state; the caller controls where that comes from (DB, or DB overlaid
+/// with not-yet-committed changes from earlier actions in the same block).
 pub fn apply_transfer(
     lookup: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    action: &Action,
+    sender: &Address,
+    nonce: u64,
+    to: &Address,
+    amount: u128,
 ) -> Result<AccountUpdates, AccountError> {
-    let ActionPayload::Transfer { to, amount } = &action.payload;
-
-    let mut sender_entry = lookup(&action.sender)?.unwrap_or(AccountEntry {
+    let mut sender_entry = lookup(sender)?.unwrap_or(AccountEntry {
         balance: 0,
         nonce: 0,
         identity_hash: None,
     });
 
-    if action.nonce != sender_entry.nonce {
+    if nonce != sender_entry.nonce {
         return Err(AccountError::InvalidNonce {
-            sender: action.sender.clone(),
+            sender: sender.clone(),
             expected: sender_entry.nonce,
-            got: action.nonce,
+            got: nonce,
         });
     }
 
-    if sender_entry.balance < *amount {
+    if sender_entry.balance < amount {
         return Err(AccountError::InsufficientBalance {
-            sender: action.sender.clone(),
+            sender: sender.clone(),
             balance: sender_entry.balance,
-            amount: *amount,
+            amount,
         });
     }
 
     // ponytail: self-transfer is balance-neutral (would otherwise overwrite
     // itself in `updates` and mint balance out of nowhere) — just bump nonce.
-    if *to == action.sender {
+    if to == sender {
         sender_entry.nonce += 1;
         let mut updates = HashMap::new();
-        updates.insert(action.sender.clone(), sender_entry);
+        updates.insert(sender.clone(), sender_entry);
         return Ok(AccountUpdates(updates));
     }
 
@@ -91,7 +79,7 @@ pub fn apply_transfer(
     receiver_entry.balance += amount;
 
     let mut updates = HashMap::new();
-    updates.insert(action.sender.clone(), sender_entry);
+    updates.insert(sender.clone(), sender_entry);
     updates.insert(to.clone(), receiver_entry);
 
     Ok(AccountUpdates(updates))
@@ -100,7 +88,6 @@ pub fn apply_transfer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xc_primitives::Action;
     use xc_storage::ArxiumDb;
 
     fn temp_db() -> ArxiumDb {
@@ -133,17 +120,7 @@ mod tests {
         )])))
         .unwrap();
 
-        let action = Action {
-            sender: sender.clone(),
-            nonce: 0,
-            signature: None,
-            payload: ActionPayload::Transfer {
-                to: sender.clone(),
-                amount: 30,
-            },
-        };
-
-        let updates = apply_transfer(|addr| db.get_account(addr), &action).unwrap();
+        let updates = apply_transfer(|addr| db.get_account(addr), &sender, 0, &sender, 30).unwrap();
         let entry = &updates.0[&sender];
         assert_eq!(entry.balance, 100, "self-transfer must not mint balance");
         assert_eq!(entry.nonce, 1, "self-transfer must still bump nonce");

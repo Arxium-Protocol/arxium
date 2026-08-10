@@ -10,7 +10,10 @@ hex = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+serde = { workspace = true, features = ["derive"] }
+
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-mempool = { workspace = true }
 xc-executor = { workspace = true }
+circuit-rwa-asset = { workspace = true }

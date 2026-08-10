@@ -1,13 +1,14 @@
 [workspace]
 members = [
     "circuits/account",
+    "circuits/rwa-asset",
     #
     "core/primitives",
     "core/storage",
     "core/mempool",
+    "core/executor",
     #
     "arxd/node",
-    "arxd/executor",
     "arxd",
     #
     "scripts/send-tx",
@@ -25,7 +26,9 @@ xc-storage = { path = "core/storage" }
 xc-mempool = { path = "core/mempool" }
 
 circuit-account = { path = "circuits/account" }
-xc-executor = { path = "arxd/executor" }
+circuit-rwa-asset = { path = "circuits/rwa-asset" }
+xc-executor = { path = "core/executor" }
+node = { path = "arxd/node" }
 
 # external packages
 clap = { version = "4.4", features = ["derive"] }

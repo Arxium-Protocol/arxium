@@ -1,25 +1,65 @@
-//! Toy Chain: a second, minimal chain built purely on `core/` +
-//! `circuits/account`, with no dependency on `arxd/*`. It exists to answer
-//! one question honestly: which pieces of `arxd` are actually chain-agnostic
-//! enough to belong in `core/`? Nothing gets promoted to `core/` until this
-//! (or another real chain) needs the exact same code unchanged.
+//! Toy Chain: RWA (real-world-asset) sovereign chain MVP built purely on
+//! `core/` + `circuits/rwa-asset`, with no dependency on `arxd/*`. It exists
+//! to answer one question honestly: does the `core/` design (generic
+//! `Action<P>`/`Block<P>`, dispatch-closure executor) actually hold up for a
+//! chain with *different* execution semantics than CoreChain's plain
+//! `Transfer`? So its payload is its own `RwaPayload` (`Issue`,
+//! compliance-gated `Transfer`), not CoreChain's.
 //!
-//! It runs a fixed number of blocks against a fresh on-disk DB and prints
-//! balances as it goes — no RPC, no networking, no CLI.
+//! Runs a fixed sequence of blocks against a fresh on-disk DB: the issuer
+//! mints supply to itself, transfers some to a KYC'd account (succeeds),
+//! then attempts a transfer to a non-KYC'd account (rejected by the
+//! compliance check, dropped rather than applied) — no RPC, no networking,
+//! no CLI.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use ed25519_dalek::{Signer, SigningKey};
+use serde::{Deserialize, Serialize};
 use tracing::info;
 use xc_executor::execute_actions;
 use xc_mempool::Mempool;
-use xc_primitives::{Action, AccountEntry, ActionPayload, Address, Block, Snapshot};
-use xc_storage::ArxiumDb;
+use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot};
+use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
 
-const CHAIN_NAME: &str = "toychain-devnet";
-const BLOCKS_TO_PRODUCE: u64 = 3;
+const CHAIN_NAME: &str = "toychain-rwa-devnet";
+
+/// The RWA chain's own action set — distinct from CoreChain's `ActionPayload`
+/// in `arxd/node`, proving payloads are chain-specific rather than one
+/// shared enum.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum RwaPayload {
+    Issue { amount: u128 },
+    Transfer { to: Address, amount: u128 },
+}
+
+type RwaAction = Action<RwaPayload>;
+type RwaBlock = Block<RwaPayload>;
+
+fn dispatch(
+    action: &RwaAction,
+    lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    issuer: &Address,
+) -> anyhow::Result<AccountUpdates> {
+    match &action.payload {
+        RwaPayload::Issue { amount } => Ok(circuit_rwa_asset::apply_issue(
+            lookup,
+            issuer,
+            &action.sender,
+            action.nonce,
+            *amount,
+        )?),
+        RwaPayload::Transfer { to, amount } => Ok(circuit_rwa_asset::apply_compliant_transfer(
+            lookup,
+            &action.sender,
+            action.nonce,
+            to,
+            *amount,
+        )?),
+    }
+}
 
 fn now() -> u64 {
     SystemTime::now()
@@ -28,98 +68,164 @@ fn now() -> u64 {
         .as_secs()
 }
 
-fn sign_transfer(key: &SigningKey, sender: &Address, nonce: u64, to: &Address, amount: u128) -> Action {
+fn sign_action(key: &SigningKey, sender: &Address, nonce: u64, payload: RwaPayload) -> RwaAction {
     let mut action = Action {
         sender: sender.clone(),
         nonce,
         signature: None,
-        payload: ActionPayload::Transfer {
-            to: to.clone(),
-            amount,
-        },
+        payload,
     };
     let signature = key.sign(&action.signing_bytes());
     action.signature = Some(hex::encode(signature.to_bytes()));
     action
 }
 
+fn produce_block(
+    db: &ArxiumDb,
+    actions: Vec<RwaAction>,
+    issuer: &Address,
+    timestamp: u64,
+) -> Result<RwaBlock> {
+    let tip_height = db.get_tip_height()?.unwrap_or(0);
+    let parent: RwaBlock = db
+        .get_block(tip_height)?
+        .expect("tip block must exist");
+
+    let (applied, updates) =
+        execute_actions(db, actions, |action, lookup| dispatch(action, lookup, issuer))?;
+
+    let block = Block {
+        height: tip_height + 1,
+        parent_hash: parent.hash(),
+        timestamp,
+        actions: applied,
+        proposer: None,
+        signature: None,
+    };
+    db.write_batches(&[&updates, &block])?;
+    Ok(block)
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    // Fresh DB every run — this is a demo, not a persistent devnet.
-    let dir = std::env::temp_dir().join("toychain-data");
-    std::fs::remove_dir_all(&dir).ok();
+    let dir = std::env::temp_dir().join(format!("arxium-toy-chain-rwa-{}", std::process::id()));
     let db = ArxiumDb::open(&dir)?;
 
-    let alice_key = SigningKey::from_bytes(&[11u8; 32]);
-    let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes())?;
-    let bob = Address::from_pubkey_bytes(&[22u8; 32])?;
+    let issuer_key = SigningKey::from_bytes(&[1u8; 32]);
+    let issuer = Address::from_pubkey_bytes(issuer_key.verifying_key().as_bytes())?;
+    let kyc_recipient = Address::from_pubkey_bytes(&[2u8; 32])?;
+    let non_kyc_recipient = Address::from_pubkey_bytes(&[3u8; 32])?;
 
     let mut accounts = BTreeMap::new();
     accounts.insert(
-        alice.clone(),
+        issuer.clone(),
         AccountEntry {
-            balance: 1_000,
+            balance: 0,
             nonce: 0,
-            identity_hash: None,
+            identity_hash: Some("kyc-issuer".into()),
         },
     );
     accounts.insert(
-        bob.clone(),
+        kyc_recipient.clone(),
+        AccountEntry {
+            balance: 0,
+            nonce: 0,
+            identity_hash: Some("kyc-recipient".into()),
+        },
+    );
+    accounts.insert(
+        non_kyc_recipient.clone(),
         AccountEntry {
             balance: 0,
             nonce: 0,
             identity_hash: None,
         },
     );
-
-    let genesis = Block::genesis(now());
-    let snapshot = Snapshot {
+    db.write_batch(&Snapshot {
         height: 0,
         chain_name: CHAIN_NAME.into(),
         accounts,
         validators: BTreeMap::new(),
-    };
-    db.write_batches(&[&snapshot, &genesis])?;
-    info!("genesis written: chain={CHAIN_NAME}");
+    })?;
+    let genesis: RwaBlock = Block::genesis(now());
+    db.write_batches(&[
+        &execute_actions(&db, genesis.actions.clone(), |action, lookup| {
+            dispatch(action, lookup, &issuer)
+        })?
+        .1,
+        &genesis,
+    ])?;
 
-    let mut mempool = Mempool::new();
-    for i in 0..BLOCKS_TO_PRODUCE {
-        mempool.push(sign_transfer(&alice_key, &alice, i, &bob, 100))?;
-    }
+    let mut mempool: Mempool<RwaPayload> = Mempool::new();
 
-    for _ in 0..BLOCKS_TO_PRODUCE {
-        let tip_height = db.get_tip_height()?.unwrap_or(0);
-        let parent = db.get_block(tip_height)?.expect("tip block must exist");
-
-        let pending = mempool.drain_pending(1);
-        let (applied, updates) = execute_actions(&db, pending)?;
-
-        let block = Block {
-            height: tip_height + 1,
-            parent_hash: parent.hash(),
-            timestamp: now(),
-            actions: applied,
-            proposer: None,
-            signature: None,
-        };
-        db.write_batches(&[&updates as &dyn xc_storage::BatchWritable, &block])?;
-
-        info!(
-            "block {}: alice={} bob={}",
-            block.height,
-            db.get_account(&alice)?.unwrap().balance,
-            db.get_account(&bob)?.unwrap().balance,
-        );
-    }
-
-    let alice_final = db.get_account(&alice)?.unwrap();
-    let bob_final = db.get_account(&bob)?.unwrap();
-    println!(
-        "final: alice balance={} nonce={}, bob balance={} nonce={}",
-        alice_final.balance, alice_final.nonce, bob_final.balance, bob_final.nonce
+    // Issuer mints 1000 units of the asset to itself.
+    mempool.push(sign_action(
+        &issuer_key,
+        &issuer,
+        0,
+        RwaPayload::Issue { amount: 1_000 },
+    ))?;
+    let block = produce_block(&db, mempool.drain_pending(1), &issuer, now())?;
+    info!(
+        "block {}: issued supply, issuer balance={}",
+        block.height,
+        db.get_account(&issuer)?.unwrap().balance
     );
-    assert_eq!(alice_final.balance + bob_final.balance, 1_000);
 
+    // Compliant transfer: both issuer and recipient are KYC'd — must succeed.
+    mempool.push(sign_action(
+        &issuer_key,
+        &issuer,
+        1,
+        RwaPayload::Transfer {
+            to: kyc_recipient.clone(),
+            amount: 400,
+        },
+    ))?;
+    let block = produce_block(&db, mempool.drain_pending(1), &issuer, now())?;
+    info!(
+        "block {}: compliant transfer applied, issuer={} kyc_recipient={}",
+        block.height,
+        db.get_account(&issuer)?.unwrap().balance,
+        db.get_account(&kyc_recipient)?.unwrap().balance
+    );
+    assert_eq!(block.actions.len(), 1, "compliant transfer must be applied");
+
+    // Non-compliant transfer: recipient isn't KYC'd — executor must drop it,
+    // not apply it silently.
+    mempool.push(sign_action(
+        &issuer_key,
+        &issuer,
+        2,
+        RwaPayload::Transfer {
+            to: non_kyc_recipient.clone(),
+            amount: 100,
+        },
+    ))?;
+    let block = produce_block(&db, mempool.drain_pending(1), &issuer, now())?;
+    info!(
+        "block {}: non-compliant transfer attempted, applied actions={}",
+        block.height,
+        block.actions.len()
+    );
+    assert_eq!(
+        block.actions.len(),
+        0,
+        "non-compliant transfer must be rejected, not applied"
+    );
+
+    let issuer_final = db.get_account(&issuer)?.unwrap();
+    let kyc_final = db.get_account(&kyc_recipient)?.unwrap();
+    let non_kyc_final = db.get_account(&non_kyc_recipient)?.unwrap();
+    println!(
+        "final: issuer balance={} nonce={}, kyc_recipient balance={}, non_kyc_recipient balance={}",
+        issuer_final.balance, issuer_final.nonce, kyc_final.balance, non_kyc_final.balance
+    );
+    assert_eq!(issuer_final.balance, 600);
+    assert_eq!(kyc_final.balance, 400);
+    assert_eq!(non_kyc_final.balance, 0, "non-KYC'd account must not receive funds");
+
+    std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }

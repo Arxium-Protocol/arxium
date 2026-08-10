@@ -1,4 +1,7 @@
 use rocksdb::{DB, WriteBatch};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -97,8 +100,9 @@ impl ArxiumDb {
         }
     }
 
-    /// Get the block from the DB
-    pub fn get_block(&self, height: u64) -> Result<Option<Block>, StorageError> {
+    /// Get the block from the DB. `P` is the chain-specific action payload
+    /// type — callers know it, storage doesn't.
+    pub fn get_block<P: DeserializeOwned>(&self, height: u64) -> Result<Option<Block<P>>, StorageError> {
         let key = format!("block:{}", height);
         match self.get(key.as_bytes())? {
             Some(bytes) => {
@@ -147,7 +151,7 @@ impl BatchWritable for Snapshot {
     }
 }
 
-impl BatchWritable for Block {
+impl<P: Serialize> BatchWritable for Block<P> {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let config = bincode::config::standard();
 
@@ -171,6 +175,24 @@ impl BatchWritable for Block {
             }
         }
 
+        Ok(entries)
+    }
+}
+
+/// A set of account changes to be written atomically. Not account-circuit
+/// business logic — just the write-batch shape any circuit that touches
+/// accounts (`circuit-account`, `circuit-rwa-asset`, ...) hands back.
+pub struct AccountUpdates(pub HashMap<Address, AccountEntry>);
+
+impl BatchWritable for AccountUpdates {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        for (address, entry) in &self.0 {
+            let key = format!("account:{}", address).into_bytes();
+            let value = bincode::serde::encode_to_vec(entry, config)?;
+            entries.push((key, value));
+        }
         Ok(entries)
     }
 }

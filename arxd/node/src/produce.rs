@@ -1,7 +1,8 @@
+use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use xc_executor::execute_actions;
-use xc_primitives::{Action, Address, Block};
+use xc_primitives::{Action, Address};
 use xc_storage::ArxiumDb;
 
 /// Build, execute, and store the next block using whatever actions are provided.
@@ -13,18 +14,18 @@ use xc_storage::ArxiumDb;
 /// unsigned-block behavior (solo/non-validator node).
 pub fn produce_block(
     db: &ArxiumDb,
-    actions: Vec<Action>,
+    actions: Vec<Action<ActionPayload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
-) -> Result<Block> {
+) -> Result<ChainBlock> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    let parent = db
+    let parent: ChainBlock = db
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height is set");
 
-    let (applied, account_updates) = execute_actions(db, actions)?;
+    let (applied, account_updates) = execute_actions(db, actions, dispatch)?;
 
-    let mut new_block = Block {
+    let mut new_block = ChainBlock {
         height: tip_height + 1,
         parent_hash: parent.hash(),
         timestamp,
@@ -48,7 +49,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
-    use xc_primitives::{AccountEntry, Action, ActionPayload, Address, Snapshot};
+    use xc_primitives::{AccountEntry, Snapshot};
 
     #[test]
     fn produce_block_applies_transfer_and_advances_tip() {
@@ -56,8 +57,8 @@ mod tests {
             std::env::temp_dir().join(format!("arxium-test-produce-block-{}", std::process::id()));
         let db = ArxiumDb::open(&dir).expect("open test db");
 
-        let genesis = Block::genesis(0);
-        let (_, genesis_updates) = execute_actions(&db, genesis.actions.clone()).unwrap();
+        let genesis: ChainBlock = xc_primitives::Block::genesis(0);
+        let (_, genesis_updates) = execute_actions(&db, genesis.actions.clone(), dispatch).unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();
 
         let alice_key = SigningKey::from_bytes(&[1u8; 32]);

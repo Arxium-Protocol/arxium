@@ -2,26 +2,24 @@ use crate::Address;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+/// `P` is the chain-specific action payload (e.g. CoreChain's `ActionPayload`
+/// or a spoke chain's own enum) — `Action` itself only knows about the
+/// envelope: who sent it, at what nonce, signed how.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Action {
+pub struct Action<P> {
     pub sender: Address,
     pub nonce: u64,
     pub signature: Option<String>,
-    pub payload: ActionPayload,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ActionPayload {
-    Transfer { to: Address, amount: u128 },
+    pub payload: P,
 }
 
 /// What actually gets signed: sender + nonce + payload, deterministically
 /// encoded. The signature field itself is excluded (it can't sign itself).
 #[derive(Serialize)]
-struct SigningPayload<'a> {
+struct SigningPayload<'a, P> {
     sender: &'a Address,
     nonce: u64,
-    payload: &'a ActionPayload,
+    payload: &'a P,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -38,7 +36,7 @@ pub enum SignatureError {
     Invalid,
 }
 
-impl Action {
+impl<P: Serialize> Action<P> {
     /// Deterministic bytes that a valid signature must cover.
     pub fn signing_bytes(&self) -> Vec<u8> {
         let payload = SigningPayload {

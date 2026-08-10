@@ -15,21 +15,29 @@ pub enum MempoolError {
     Duplicate { sender: Address, nonce: u64 },
 }
 
-#[derive(Default)]
-pub struct Mempool {
-    pending: VecDeque<Action>,
+pub struct Mempool<P> {
+    pending: VecDeque<Action<P>>,
     // Tracks (sender, nonce) pairs currently queued, so a resubmitted or
     // spammed action doesn't grow the queue unboundedly — only one action
     // per sender/nonce can ever land in a block anyway.
     seen: HashSet<(Address, u64)>,
 }
 
-impl Mempool {
+impl<P> Default for Mempool<P> {
+    fn default() -> Self {
+        Self {
+            pending: VecDeque::new(),
+            seen: HashSet::new(),
+        }
+    }
+}
+
+impl<P> Mempool<P> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn push(&mut self, action: Action) -> Result<(), MempoolError> {
+    pub fn push(&mut self, action: Action<P>) -> Result<(), MempoolError> {
         if self.pending.len() >= MAX_PENDING {
             return Err(MempoolError::Full);
         }
@@ -61,7 +69,7 @@ impl Mempool {
             .any(|action| action.signature.as_deref() == Some(signature))
     }
 
-    pub fn drain_pending(&mut self, max: usize) -> Vec<Action> {
+    pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
         let n = max.min(self.pending.len());
         self.pending
             .drain(..n)

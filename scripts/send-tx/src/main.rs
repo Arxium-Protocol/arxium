@@ -3,10 +3,11 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
+use node::payload::{ActionPayload, ChainAction};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use xc_primitives::{Action, ActionPayload, Address};
+use xc_primitives::Address;
 
 /// Signs and submits a Transfer action to a running arxd node. Devnet testing only.
 #[derive(Parser)]
@@ -31,7 +32,10 @@ struct Args {
 }
 
 fn keys_file() -> Value {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../arxd/node/specs/devnet-keys.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../arxd/node/specs/devnet-keys.json"
+    );
     let raw = std::fs::read_to_string(path).expect("read devnet-keys.json");
     serde_json::from_str(&raw).expect("parse devnet-keys.json")
 }
@@ -45,7 +49,9 @@ fn resolve_signer(name: &str, keys: &Value) -> Result<SigningKey> {
         hex_seed => hex_seed.to_string(),
     };
     let seed = hex::decode(&seed_hex).context("--from is not \"alice\", \"bob\", or a hex seed")?;
-    let seed: [u8; 32] = seed.try_into().map_err(|_| anyhow::anyhow!("seed must be 32 bytes"))?;
+    let seed: [u8; 32] = seed
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("seed must be 32 bytes"))?;
     Ok(SigningKey::from_bytes(&seed))
 }
 
@@ -57,7 +63,9 @@ fn resolve_address(name: &str, keys: &Value) -> Result<Address> {
                 .with_context(|| format!("no address for {name} in devnet-keys.json"))?;
             Address::parse(addr).context("bad address in devnet-keys.json")
         }
-        other => Address::parse(other).context("--to is not \"alice\", \"bob\", or a valid address"),
+        other => {
+            Address::parse(other).context("--to is not \"alice\", \"bob\", or a valid address")
+        }
     }
 }
 
@@ -73,7 +81,9 @@ fn http(method: &str, node: &str, path: &str, body: Option<&str>) -> Result<(u16
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
 
-    let (head, rest) = response.split_once("\r\n\r\n").context("malformed HTTP response")?;
+    let (head, rest) = response
+        .split_once("\r\n\r\n")
+        .context("malformed HTTP response")?;
     let status = head
         .lines()
         .next()
@@ -104,11 +114,14 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut action = Action {
+    let mut action = ChainAction {
         sender,
         nonce,
         signature: None,
-        payload: ActionPayload::Transfer { to, amount: args.amount },
+        payload: ActionPayload::Transfer {
+            to,
+            amount: args.amount,
+        },
     };
     let signature = signer.sign(&action.signing_bytes());
     action.signature = Some(hex::encode(signature.to_bytes()));

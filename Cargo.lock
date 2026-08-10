@@ -248,6 +248,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "circuit-rwa-asset"
+version = "0.1.0"
+dependencies = [
+ "circuit-account",
+ "thiserror 2.0.19",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -779,6 +789,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "circuit-account",
  "clap",
  "dirs",
  "ed25519-dalek",
@@ -1010,6 +1021,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "node",
  "serde_json",
  "xc-primitives",
 ]
@@ -1301,8 +1313,10 @@ name = "toy-chain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "circuit-rwa-asset",
  "ed25519-dalek",
  "hex",
+ "serde",
  "tracing",
  "tracing-subscriber",
  "xc-executor",
@@ -1521,9 +1535,11 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 name = "xc-executor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "circuit-account",
  "ed25519-dalek",
  "hex",
+ "serde",
  "thiserror 2.0.19",
  "tracing",
  "xc-primitives",
@@ -1557,6 +1573,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "rocksdb",
+ "serde",
  "thiserror 2.0.19",
  "xc-primitives",
 ]

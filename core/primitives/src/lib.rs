@@ -7,7 +7,7 @@ mod block;
 mod consensus;
 mod state;
 
-pub use action::{Action, ActionPayload, SignatureError};
+pub use action::{Action, SignatureError};
 pub use address::{Address, AddressError};
 pub use block::Block;
 pub use consensus::expected_proposer;

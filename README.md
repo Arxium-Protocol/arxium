@@ -9,24 +9,39 @@ architecture and the boundary rules between them.
 
 ## Done
 
-- **Primitives** (`core/primitives`): `Action`/`ActionPayload`, `Block`
-  (hashing, proposer signing + verification), bech32 `Address`,
-  `Snapshot`/`AccountEntry`/`ValidatorEntry`, deterministic round-robin
-  proposer selection (`expected_proposer`), ed25519 signature
-  verification for actions.
+- **Primitives** (`core/primitives`): `Action<P>`/`Block<P>`, generic over
+  a chain-specific payload type `P` (hashing, proposer signing +
+  verification), bech32 `Address`, `Snapshot`/`AccountEntry`/
+  `ValidatorEntry`, deterministic round-robin proposer selection
+  (`expected_proposer`), ed25519 signature verification for actions. Each
+  chain defines its own payload enum (e.g. `arxd/node`'s `ActionPayload`,
+  `examples/toy-chain`'s `RwaPayload`) — there is no shared payload type.
 - **Storage** (`core/storage`): `ArxiumDb`, a RocksDB wrapper with typed
   key encoding and a `BatchWritable` trait. Writes are atomic both
   single-item (`write_batch`) and multi-item (`write_batches`) — a block
   record and the account changes it caused commit together or not at all.
-- **Mempool** (`core/mempool`): capacity-bounded, deduplicated by
-  `(sender, nonce)`.
+  `AccountUpdates` (the write-batch shape account-touching circuits hand
+  back) lives here so any circuit can produce it without depending on
+  another circuit crate.
+- **Mempool** (`core/mempool`): `Mempool<P>`, capacity-bounded,
+  deduplicated by `(sender, nonce)`.
 - **Account circuit** (`circuits/account`): validates nonce and balance
-  for `ActionPayload::Transfer`, handles self-transfer correctly, returns
-  proposed changes without writing them.
-- **Executor** (`arxd/executor`): verifies action signatures, dispatches
-  by payload type, chains same-block actions from one sender through an
-  in-memory overlay, returns unwritten updates for the caller to commit
-  atomically.
+  for a plain sender/nonce/to/amount transfer (no `Action`/payload
+  knowledge), handles self-transfer correctly, returns proposed changes
+  without writing them.
+- **RWA asset circuit** (`circuits/rwa-asset`): `apply_issue` (self-mint
+  by the designated issuer) and `apply_compliant_transfer` (transfer
+  gated on both sender and recipient being KYC'd/allowlisted, via
+  `AccountEntry.identity_hash`) — composes with `circuits/account` for
+  the actual balance/nonce math rather than reimplementing it.
+- **Executor** (`core/executor`): verifies action signatures, dispatches
+  each action through a caller-supplied `dispatch` closure (payload →
+  circuit call is chain-specific, not hardcoded here), chains same-block
+  actions from one sender through an in-memory overlay, returns unwritten
+  updates for the caller to commit atomically. Chain-agnostic —
+  `examples/toy-chain` uses it with its own payload type and dispatch
+  table, proving the generic design holds for a chain with different
+  execution semantics than CoreChain's.
 - **Node** (`arxd/node`): CLI, genesis bootstrap (embedded devnet JSON +
   cached snapshot), fixed-interval block production, round-robin
   validator turn-taking with block signing, tip-block signature
