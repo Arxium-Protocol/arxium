@@ -13,14 +13,18 @@ role — there is no separate binary per role.
 | Path               | Responsibility                                                                                                                                                                                                                                                                                                        |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `arxd/src/main.rs` | Binary entrypoint. Sets up tracing/logging, calls `node::run()`. Nothing else — keep this file thin.                                                                                                                                                                                                                  |
-| `arxd/node/`       | The orchestration crate (`node`). Owns the CLI (`cli.rs`), genesis bootstrap (`genesis.rs`), the block-production loop and role decision (`lib.rs`), validator key management (`validator.rs`), the RPC ingest server (`rpc.rs`), and CoreChain's own payload type + dispatch table (`payload.rs`, public — `ActionPayload`, `ChainAction`/`ChainBlock` type aliases, `dispatch`). This is the only crate allowed to decide "what role am I" and act on it, and the only place that decides what a CoreChain `ActionPayload::Transfer` means.        |
+| `arxd/node/`       | The orchestration crate (`node`). Owns the block-production loop and role decision (`lib.rs`), validator key management (`validator.rs`), and CoreChain's own payload type + dispatch table (`payload.rs`, public — `ActionPayload`, `ChainAction`/`ChainBlock` type aliases, `dispatch`). This is the only crate allowed to decide "what role am I" and act on it, and the only place that decides what a CoreChain `ActionPayload::Transfer` means.        |
 | `arxd/runtime/`    | Reserved for CoreChain's actual runtime responsibilities as they get built out — validator set management, state root registry, conflict resolution, slashing. Not yet a real crate (no `Cargo.toml`, not a workspace member) — currently just a placeholder.                                                         |
 
-`xc-executor` (batch dispatch of `Action`s to `circuits/*`) used to live
-here but moved to `core/executor/` — its signature (DB handle + actions in,
-applied actions + updates out) never needed to know which chain/role was
-running it. `examples/toy-chain` is what proved that: it pulls in
-`xc-executor` unmodified with zero `arxd` dependency.
+`cli.rs`, `genesis.rs`, and `rpc.rs` used to live here but moved to
+`core/cli`, `core/genesis`, and `core/rpc` — none of them, once written,
+turned out to need chain/role knowledge: `Cli` is generic node-operator
+config, genesis bootstrap only needed the embedded JSON string as a
+parameter, and the RPC server only needed the payload type `P` as a
+generic instead of CoreChain's concrete `ActionPayload`. Same story as
+`xc-executor` before them — proven generic by making `examples/toy-chain`
+use the mechanism (`Mempool<P>`, `Action<P>`) even though it doesn't wire
+up its own RPC server today.
 
 ## The boundary rule
 
@@ -39,8 +43,8 @@ site, or the branching belongs at the orchestration layer in
 
 **Enforced dependency direction:** `arxd` depends on `core` (and
 `circuits`), never the reverse. `arxd` crates may depend on each other
-(`node` depends on `executor`), but nothing in `core/` may depend back
-into `arxd/`.
+(`arxd` depends on `node`), but nothing in `core/` may depend back into
+`arxd/`.
 
 ## Current pipeline (as of the R4 hardening pass)
 
@@ -48,11 +52,12 @@ into `arxd/`.
 RPC (POST /actions) → Mempool → produce_block → execute_actions → circuits/* → ArxiumDb
 ```
 
-Note: as of this writing, signature/nonce validation happens inside
-`execute_actions` at block-production time, not at the RPC boundary. The
-target design (per the R4 plan) is to validate at the RPC boundary before
-an `Action` ever enters the mempool — check `rpc.rs::submit_action` to see
-whether that's landed yet before assuming either way.
+Signature and stale-nonce validation happen at the RPC boundary
+(`core/rpc`'s `submit_action`) before an action ever enters the mempool —
+`execute_actions` still re-verifies the signature (defense in depth
+against a mempool populated some other way) and is the only place that
+catches insufficient-balance, since balance can still change between
+submission and the action's turn in a block.
 
 ## For AI agents
 

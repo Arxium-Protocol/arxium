@@ -1,13 +1,9 @@
-mod cli;
-mod genesis;
 pub mod payload;
 mod produce;
-mod rpc;
 mod validator;
 
-use crate::payload::{ChainBlock, dispatch};
+use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use crate::produce::produce_block;
-use crate::rpc::spawn_http_ingest;
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,11 +12,14 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use crate::cli::Cli;
+use xc_cli::Cli;
 use xc_executor::execute_actions;
 use xc_mempool::Mempool;
 use xc_primitives::{Address, NodeConfig, Snapshot, expected_proposer};
+use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
+
+const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
 const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
@@ -36,7 +35,7 @@ fn now_secs() -> u64 {
 /// Returns the snapshot too, since the produce loop needs the validator set
 /// for round-robin scheduling.
 fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
-    let snapshot = genesis::load_or_init_snapshot(&config.base_path)?;
+    let snapshot = xc_genesis::load_or_init_snapshot(&config.base_path, DEVNET_GENESIS_JSON)?;
     let db = ArxiumDb::open(&config.base_path.join("data"))?;
 
     if !db.is_initialized()? {
@@ -49,7 +48,7 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         db.write_batch(&snapshot)?;
     }
 
-    if db.get_block::<payload::ActionPayload>(0)?.is_none() {
+    if db.get_block::<ActionPayload>(0)?.is_none() {
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(now_secs());
         let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone(), dispatch)?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
@@ -60,7 +59,7 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
     // a signed block whose signature no longer verifies means something is
     // wrong with this node's storage, not with the chain going forward.
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    if let Some(tip_block) = db.get_block::<payload::ActionPayload>(tip_height)?
+    if let Some(tip_block) = db.get_block::<ActionPayload>(tip_height)?
         && tip_block.signature.is_some()
     {
         tip_block

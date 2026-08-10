@@ -7,6 +7,9 @@ members = [
     "core/storage",
     "core/mempool",
     "core/executor",
+    "core/cli",
+    "core/genesis",
+    "core/rpc",
     #
     "arxd/node",
     "arxd",
@@ -28,6 +31,9 @@ xc-mempool = { path = "core/mempool" }
 circuit-account = { path = "circuits/account" }
 circuit-rwa-asset = { path = "circuits/rwa-asset" }
 xc-executor = { path = "core/executor" }
+xc-cli = { path = "core/cli" }
+xc-genesis = { path = "core/genesis" }
+xc-rpc = { path = "core/rpc" }
 node = { path = "arxd/node" }
 
 # external packages

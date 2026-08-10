@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use xc_primitives::NodeConfig;
 
 #[derive(Parser, Clone, Debug)]
-#[command(name = "arxium-node", about = "Arxium Network Node")]
+#[command(about = "Arxium chain node")]
 pub struct Cli {
     #[arg(long, default_value_os_t = default_base_path())]
     pub base_path: PathBuf,
@@ -19,8 +19,8 @@ pub struct Cli {
     pub rpc_token: Option<String>,
 
     /// Address the RPC server binds to. Defaults to loopback-only; put a TLS-
-    /// terminating reverse proxy (see Caddyfile.example) in front for production,
-    /// or pass 0.0.0.0 to accept connections directly (devnet/LAN convenience).
+    /// terminating reverse proxy in front for production, or pass 0.0.0.0 to
+    /// accept connections directly (devnet/LAN convenience).
     #[arg(long, default_value = "127.0.0.1")]
     pub rpc_bind: String,
 }

@@ -787,23 +787,21 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
- "bincode",
  "circuit-account",
  "clap",
- "dirs",
  "ed25519-dalek",
  "hex",
  "rand",
  "serde",
- "serde_json",
- "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "xc-cli",
  "xc-executor",
+ "xc-genesis",
  "xc-mempool",
  "xc-primitives",
+ "xc-rpc",
  "xc-storage",
 ]
 
@@ -1532,6 +1530,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
+name = "xc-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dirs",
+ "xc-primitives",
+]
+
+[[package]]
 name = "xc-executor"
 version = "0.1.0"
 dependencies = [
@@ -1544,6 +1551,16 @@ dependencies = [
  "tracing",
  "xc-primitives",
  "xc-storage",
+]
+
+[[package]]
+name = "xc-genesis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "serde_json",
+ "xc-primitives",
 ]
 
 [[package]]
@@ -1565,6 +1582,24 @@ dependencies = [
  "serde",
  "sha2",
  "thiserror 2.0.19",
+]
+
+[[package]]
+name = "xc-rpc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tracing",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
 ]
 
 [[package]]

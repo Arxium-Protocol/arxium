@@ -1,11 +1,13 @@
 use anyhow::{Context, Result};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::mpsc;
@@ -15,10 +17,14 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
 use xc_mempool::{Mempool, MempoolError};
-use xc_primitives::Address;
-use xc_storage::ArxiumDb;
+use xc_primitives::{Action, Address};
+use xc_storage::{ArxiumDb, MAX_PAGE_SIZE};
 
-use crate::payload::{ActionPayload, ChainAction};
+/// Bound every chain's payload type must satisfy to be served over this RPC:
+/// JSON (de)serializable for the wire, `Clone` because `AppState` is cloned
+/// per request, `Send + Sync + 'static` to live inside the shared axum state.
+pub trait Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {}
+impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload for P {}
 
 // ponytail: fixed cap on a single JSON action body; make configurable if a
 // payload type ever legitimately needs more than this.
@@ -30,8 +36,8 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT_MAX_REQUESTS: u32 = 60;
 
 #[derive(Clone)]
-struct AppState {
-    mempool: Arc<Mutex<Mempool<ActionPayload>>>,
+struct AppState<P: Payload> {
+    mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
     rpc_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
@@ -63,8 +69,8 @@ impl RateLimiter {
     }
 }
 
-async fn guard(
-    State(state): State<AppState>,
+async fn guard<P: Payload>(
+    State(state): State<AppState<P>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
@@ -92,7 +98,11 @@ async fn guard(
 
 /// Runs the RPC server on its own tokio runtime, on a dedicated thread, so
 /// the rest of the node (bootstrap, block production loop) stays plain sync.
-/// Serves `POST /actions` (submit a JSON-encoded `Action`, queued into
+/// Generic over the chain's own payload type `P` — this crate never knows
+/// what an action's payload means, only how to move `Action<P>` in and out
+/// of JSON and the mempool.
+///
+/// Serves `POST /actions` (submit a JSON-encoded `Action<P>`, queued into
 /// `mempool` for the next block), `GET /accounts/{address}` (current
 /// balance/nonce, needed to sign the next action),
 /// `GET /actions/{signature}` (pending/confirmed status of a submitted
@@ -101,8 +111,8 @@ async fn guard(
 /// `Authorization: Bearer` header. Blocks the caller until the listener is
 /// bound (or fails to bind), same as a sync server would, so startup
 /// failures surface immediately instead of on first request.
-pub fn spawn_http_ingest(
-    mempool: Arc<Mutex<Mempool<ActionPayload>>>,
+pub fn spawn_http_ingest<P: Payload>(
+    mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
     bind_addr: String,
     port: u16,
@@ -130,13 +140,18 @@ pub fn spawn_http_ingest(
 
         runtime.block_on(async move {
             let app = Router::new()
-                .route("/actions", post(submit_action))
+                .route("/actions", post(submit_action::<P>))
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .route("/accounts/{address}", get(get_account))
-                .route("/actions/{signature}", get(get_action_status))
-                .route("/status", get(get_status))
+                .route("/accounts/{address}", get(get_account::<P>))
+                .route("/accounts/{address}/actions", get(get_address_actions::<P>))
+                .route("/actions/{signature}", get(get_action_status::<P>))
+                .route("/blocks", get(get_blocks::<P>))
+                .route("/blocks/{height}", get(get_block_by_height::<P>))
+                .route("/blocks/by-hash/{hash}", get(get_block_by_hash::<P>))
+                .route("/search", get(search::<P>))
+                .route("/status", get(get_status::<P>))
                 .with_state(state.clone())
-                .layer(middleware::from_fn_with_state(state, guard));
+                .layer(middleware::from_fn_with_state(state, guard::<P>));
 
             let listener = match tokio::net::TcpListener::bind((bind_addr.as_str(), port)).await {
                 Ok(listener) => listener,
@@ -170,9 +185,9 @@ pub fn spawn_http_ingest(
 /// insufficient-balance is still only caught at production time. Rejecting
 /// a bad signature or a replayed/stale nonce here means garbage never
 /// occupies a mempool slot waiting to be dropped later.
-async fn submit_action(
-    State(state): State<AppState>,
-    body: Result<Json<ChainAction>, JsonRejection>,
+async fn submit_action<P: Payload>(
+    State(state): State<AppState<P>>,
+    body: Result<Json<Action<P>>, JsonRejection>,
 ) -> Response {
     let action = match body {
         Ok(Json(action)) => action,
@@ -223,7 +238,7 @@ async fn submit_action(
 /// Chain-wide health: name, tip height/hash. No per-account or per-action
 /// state, so unlike other routes it can't 404 — an initialized node always
 /// has at least the genesis block.
-async fn get_status(State(state): State<AppState>) -> Response {
+async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
     let chain_name = match state.db.get_chain_name() {
         Ok(Some(name)) => name,
         Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -242,7 +257,7 @@ async fn get_status(State(state): State<AppState>) -> Response {
         }
     };
 
-    let tip_hash = match state.db.get_block::<ActionPayload>(tip_height) {
+    let tip_hash = match state.db.get_block::<P>(tip_height) {
         Ok(Some(block)) => block.hash(),
         Ok(None) => {
             warn!("tip height {tip_height} recorded but block is missing");
@@ -262,7 +277,10 @@ async fn get_status(State(state): State<AppState>) -> Response {
     .into_response()
 }
 
-async fn get_account(State(state): State<AppState>, Path(address): Path<String>) -> Response {
+async fn get_account<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
     let address = match Address::parse(&address) {
         Ok(address) => address,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
@@ -281,8 +299,8 @@ async fn get_account(State(state): State<AppState>, Path(address): Path<String>)
 /// looks the same as one that was never submitted — 404 — since neither is
 /// persisted anywhere; that's a real gap if a client needs to distinguish
 /// "never sent" from "sent then rejected", not addressed here.
-async fn get_action_status(
-    State(state): State<AppState>,
+async fn get_action_status<P: Payload>(
+    State(state): State<AppState<P>>,
     Path(signature): Path<String>,
 ) -> Response {
     if state.mempool.lock().unwrap().contains_signature(&signature) {
@@ -298,7 +316,7 @@ async fn get_action_status(
         }
     };
 
-    let block = match state.db.get_block::<ActionPayload>(height) {
+    let block = match state.db.get_block::<P>(height) {
         Ok(Some(block)) => block,
         Ok(None) => {
             warn!("action index points at missing block {height} for {signature}");
@@ -329,14 +347,146 @@ async fn get_action_status(
     .into_response()
 }
 
+#[derive(serde::Deserialize)]
+struct BlockRangeQuery {
+    from: u64,
+    to: u64,
+}
+
+/// Bounded window of blocks. Heights are sequential with no gaps (single
+/// proposer, no forks), so this is a per-height point-lookup loop capped at
+/// `MAX_PAGE_SIZE`, not a scan.
+async fn get_blocks<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(range): Query<BlockRangeQuery>,
+) -> Response {
+    if range.from > range.to {
+        return (StatusCode::BAD_REQUEST, "from must be <= to").into_response();
+    }
+    match state.db.get_block_range::<P>(range.from, range.to) {
+        Ok(blocks) => Json(blocks).into_response(),
+        Err(err) => {
+            warn!("failed to load block range {}..={}: {err}", range.from, range.to);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_block_by_height<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(height): Path<u64>,
+) -> Response {
+    match state.db.get_block::<P>(height) {
+        Ok(Some(block)) => Json(block).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            warn!("failed to load block {height}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_block_by_hash<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(hash): Path<String>,
+) -> Response {
+    let height = match state.db.get_block_height_by_hash(&hash) {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            warn!("failed to look up block hash {hash}: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    match state.db.get_block::<P>(height) {
+        Ok(Some(block)) => Json(block).into_response(),
+        Ok(None) => {
+            warn!("block_hash index points at missing block {height} for {hash}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        Err(err) => {
+            warn!("failed to load block {height} for hash {hash}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct AddressActionsQuery {
+    limit: Option<usize>,
+    before: Option<u64>,
+}
+
+/// Newest-first page of an address's action history.
+async fn get_address_actions<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+    Query(query): Query<AddressActionsQuery>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let limit = query.limit.unwrap_or(MAX_PAGE_SIZE);
+
+    match state
+        .db
+        .get_actions_by_address::<P>(&address, limit, query.before)
+    {
+        Ok(actions) => Json(actions).into_response(),
+        Err(err) => {
+            warn!("failed to load action history for {address}: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+/// Single lookup endpoint so a client doesn't need to guess whether `q` is
+/// a height, an address, or a block/action hash — tries each in turn.
+async fn search<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(SearchQuery { q }): Query<SearchQuery>,
+) -> Response {
+    if let Ok(height) = q.parse::<u64>() {
+        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+    }
+
+    if let Ok(address) = Address::parse(&q) {
+        return Json(serde_json::json!({ "kind": "account", "address": address }))
+            .into_response();
+    }
+
+    if let Ok(Some(height)) = state.db.get_block_height_by_hash(&q) {
+        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+    }
+
+    if let Ok(Some(height)) = state.db.get_action_block_height(&q) {
+        return Json(serde_json::json!({ "kind": "action", "signature": q, "height": height }))
+            .into_response();
+    }
+
+    StatusCode::NOT_FOUND.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use serde::Deserialize;
     use std::collections::BTreeMap;
     use xc_primitives::{AccountEntry, Snapshot};
 
-    fn test_state() -> AppState {
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    enum TestPayload {
+        Transfer { to: Address, amount: u128 },
+    }
+
+    fn test_state() -> AppState<TestPayload> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -355,14 +505,14 @@ mod tests {
         }
     }
 
-    fn signed_action(key: &SigningKey, nonce: u64) -> ChainAction {
+    fn signed_action(key: &SigningKey, nonce: u64) -> Action<TestPayload> {
         let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let to = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
-        let mut action = ChainAction {
+        let mut action = Action {
             sender,
             nonce,
             signature: None,
-            payload: ActionPayload::Transfer { to, amount: 1 },
+            payload: TestPayload::Transfer { to, amount: 1 },
         };
         let sig = key.sign(&action.signing_bytes());
         action.signature = Some(hex::encode(sig.to_bytes()));
@@ -422,7 +572,7 @@ mod tests {
             let resp = get_status(State(state.clone())).await;
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-            let genesis: crate::payload::ChainBlock = xc_primitives::Block::genesis(0);
+            let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
             state
                 .db
                 .write_batch(&Snapshot {
@@ -443,6 +593,130 @@ mod tests {
             assert_eq!(json["chain_name"], "test-chain");
             assert_eq!(json["tip_height"], 0);
             assert_eq!(json["tip_hash"], genesis.hash());
+        });
+    }
+
+    fn block_with_action(height: u64, action: Action<TestPayload>) -> xc_primitives::Block<TestPayload> {
+        let mut block: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(height);
+        block.height = height;
+        block.actions = vec![action];
+        block
+    }
+
+    #[test]
+    fn blocks_range_and_by_height_and_by_hash() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let key = SigningKey::from_bytes(&[4u8; 32]);
+            for h in 0..3u64 {
+                let block = block_with_action(h, signed_action(&key, h));
+                state.db.write_batch(&block).unwrap();
+            }
+
+            let resp = get_blocks(
+                State(state.clone()),
+                Query(BlockRangeQuery { from: 0, to: 2 }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json.as_array().unwrap().len(), 3);
+
+            let resp = get_block_by_height(State(state.clone()), Path(1)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let resp = get_block_by_height(State(state.clone()), Path(99)).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            let target_hash = state.db.get_block::<TestPayload>(1).unwrap().unwrap().hash();
+            let resp = get_block_by_hash(State(state.clone()), Path(target_hash)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    #[test]
+    fn address_actions_newest_first_and_search_resolves_each_kind() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let key = SigningKey::from_bytes(&[4u8; 32]);
+            let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+            let mut last_sig = String::new();
+            for h in 0..3u64 {
+                let action = signed_action(&key, h);
+                last_sig = action.signature.clone().unwrap();
+                let block = block_with_action(h, action);
+                state.db.write_batch(&block).unwrap();
+            }
+
+            let resp = get_address_actions(
+                State(state.clone()),
+                Path(sender.to_string()),
+                Query(AddressActionsQuery::default()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let heights: Vec<u64> = json
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry[0].as_u64().unwrap())
+                .collect();
+            assert_eq!(heights, vec![2, 1, 0]);
+
+            // search by height
+            let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() })).await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["kind"], "block");
+            assert_eq!(json["height"], 1);
+
+            // search by address
+            let resp = search(
+                State(state.clone()),
+                Query(SearchQuery {
+                    q: sender.to_string(),
+                }),
+            )
+            .await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["kind"], "account");
+
+            // search by action signature
+            let resp = search(
+                State(state.clone()),
+                Query(SearchQuery { q: last_sig }),
+            )
+            .await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["kind"], "action");
+
+            // search miss
+            let resp = search(
+                State(state.clone()),
+                Query(SearchQuery { q: "nonsense".into() }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });
     }
 }

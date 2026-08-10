@@ -42,18 +42,32 @@ architecture and the boundary rules between them.
   `examples/toy-chain` uses it with its own payload type and dispatch
   table, proving the generic design holds for a chain with different
   execution semantics than CoreChain's.
-- **Node** (`arxd/node`): CLI, genesis bootstrap (embedded devnet JSON +
-  cached snapshot), fixed-interval block production, round-robin
-  validator turn-taking with block signing, tip-block signature
-  verification on startup (rejects a corrupted/tampered tip instead of
-  building on it), graceful shutdown (ctrl-c/SIGTERM finishes the current
-  loop iteration before exiting), HTTP RPC (`POST /actions`,
-  `GET /accounts/:address`, `GET /actions/:signature`, `GET /status` for
-  chain name/tip height/tip hash) with constant-time bearer auth and per-IP
-  rate limiting. `POST /actions` rejects a bad signature or a stale/replayed
-  nonce (checked against on-chain state) before an action ever reaches the
+- **CLI** (`core/cli`): the shared `--base-path`/`--port`/`--validator`/
+  `--rpc-token`/`--rpc-bind` arg struct → `NodeConfig`. Generic
+  node-operator config, no chain-specific flags — moved out of `arxd/node`
+  once nothing about it turned out to need CoreChain knowledge.
+- **Genesis** (`core/genesis`): `load_or_init_snapshot` — cache-or-parse
+  mechanics for a chain's genesis `Snapshot` (bincode cache after first
+  JSON parse). Takes the embedded genesis JSON as a parameter; each chain
+  still owns its own JSON file (e.g. `arxd/node/specs/devnet.json`).
+- **RPC** (`core/rpc`): `spawn_http_ingest<P>`, generic over the chain's
+  payload type. HTTP ingest (`POST /actions`, `GET /accounts/:address`,
+  `GET /actions/:signature`, `GET /status` for chain name/tip height/tip
+  hash) with constant-time bearer auth and per-IP rate limiting.
+  `POST /actions` rejects a bad signature or a stale/replayed nonce
+  (checked against on-chain state) before an action ever reaches the
   mempool — insufficient-balance is still only caught at block-production
-  time, since balance can change before an action's turn.
+  time, since balance can change before an action's turn. Explorer-ready
+  reads: `GET /blocks` (bounded range), `GET /blocks/:height`,
+  `GET /blocks/by-hash/:hash`, `GET /accounts/:address/actions`
+  (paginated, newest-first history), and `GET /search` (height/address/hash,
+  one endpoint so a client doesn't need to guess input type).
+- **Node** (`arxd/node`): wires the above together for CoreChain —
+  fixed-interval block production, round-robin validator turn-taking with
+  block signing, tip-block signature verification on startup (rejects a
+  corrupted/tampered tip instead of building on it), graceful shutdown
+  (ctrl-c/SIGTERM finishes the current loop iteration before exiting),
+  and CoreChain's own `ActionPayload`/dispatch table.
 
 ## Missing for Phase 1
 
