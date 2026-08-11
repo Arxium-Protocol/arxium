@@ -470,7 +470,10 @@ async fn search<P: Payload>(
     Query(SearchQuery { q }): Query<SearchQuery>,
 ) -> Response {
     if let Ok(height) = q.parse::<u64>() {
-        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+        if matches!(state.db.get_block::<P>(height), Ok(Some(_))) {
+            return Json(serde_json::json!({ "kind": "block", "height": height }))
+                .into_response();
+        }
     }
 
     if let Ok(address) = Address::parse(&q) {
@@ -700,6 +703,14 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["kind"], "block");
             assert_eq!(json["height"], 1);
+
+            // search by a numeric height that doesn't exist on chain
+            let resp = search(
+                State(state.clone()),
+                Query(SearchQuery { q: "99999".into() }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             // search by address
             let resp = search(
