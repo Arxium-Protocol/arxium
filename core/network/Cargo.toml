@@ -1,0 +1,15 @@
+[package]
+name = "xc-network"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync"] }
+serde = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+xc-primitives = { workspace = true }
+xc-mempool = { workspace = true }
+xc-storage = { workspace = true }
+libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub"] }

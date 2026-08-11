@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tracing::{info, warn};
-use xc_mempool::{Mempool, MempoolError};
+use xc_mempool::{AdmissionError, Mempool, MempoolError, validate_action};
 use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, MAX_PAGE_SIZE};
 
@@ -44,6 +44,9 @@ struct AppState<P: Payload> {
     db: ArxiumDb,
     rpc_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
+    // Broadcasts freshly admitted actions out to peers over gossip. `None`
+    // in tests / any caller that doesn't wire up `xc-network`.
+    gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
 }
 
 struct RateLimiter {
@@ -124,6 +127,7 @@ pub fn spawn_http_ingest<P: Payload>(
     bind_addr: String,
     port: u16,
     rpc_token: Option<String>,
+    gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
@@ -131,6 +135,7 @@ pub fn spawn_http_ingest<P: Payload>(
         db,
         rpc_token: rpc_token.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
+        gossip_tx,
     };
 
     thread::spawn(move || {
@@ -185,13 +190,9 @@ pub fn spawn_http_ingest<P: Payload>(
         .with_context(|| format!("failed to bind RPC listener on port {port}"))
 }
 
-/// Validates what can be checked without executing the action: signature,
-/// and that its nonce isn't already stale against on-chain state. This is
-/// deliberately not a full re-check of `execute_actions` — balance can
-/// still change between now and this action's turn in a block, so
-/// insufficient-balance is still only caught at production time. Rejecting
-/// a bad signature or a replayed/stale nonce here means garbage never
-/// occupies a mempool slot waiting to be dropped later.
+/// Runs the action through `xc_mempool::validate_action` (signature +
+/// stale-nonce check — see its doc comment) before it ever touches the
+/// mempool, same as gossip-received actions do in `xc-network`.
 async fn submit_action<P: Payload>(
     State(state): State<AppState<P>>,
     body: Result<Json<Action<P>>, JsonRejection>,
@@ -205,27 +206,19 @@ async fn submit_action<P: Payload>(
     };
     let sender = action.sender.clone();
 
-    if let Err(err) = action.verify_signature() {
-        warn!("rejected action from {sender}: {err}");
-        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
-    }
-
-    let current_nonce = match state.db.get_account(&sender) {
-        Ok(account) => account.map(|entry| entry.nonce).unwrap_or(0),
-        Err(err) => {
-            warn!("failed to look up account {sender} for nonce check: {err}");
+    match validate_action(&state.db, &action) {
+        Ok(()) => {}
+        Err(err @ AdmissionError::Storage(_)) => {
+            warn!("failed to validate action from {sender}: {err}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    };
-    if action.nonce < current_nonce {
-        let msg = format!(
-            "stale nonce for {sender}: action has {}, current on-chain nonce is {current_nonce}",
-            action.nonce
-        );
-        warn!("rejected action from {sender}: {msg}");
-        return (StatusCode::BAD_REQUEST, msg).into_response();
+        Err(err) => {
+            warn!("rejected action from {sender}: {err}");
+            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+        }
     }
 
+    let gossip_action = state.gossip_tx.is_some().then(|| action.clone());
     match state
         .mempool
         .lock()
@@ -234,6 +227,9 @@ async fn submit_action<P: Payload>(
     {
         Ok(()) => {
             info!("queued action from {sender} via RPC");
+            if let (Some(tx), Some(action)) = (&state.gossip_tx, gossip_action) {
+                let _ = tx.send(action);
+            }
             StatusCode::ACCEPTED.into_response()
         }
         Err(err @ MempoolError::Full) => {
@@ -522,6 +518,7 @@ mod tests {
             db: ArxiumDb::open(&dir).unwrap(),
             rpc_token: None,
             rate_limiter: Arc::new(RateLimiter::new()),
+            gossip_tx: None,
         }
     }
 

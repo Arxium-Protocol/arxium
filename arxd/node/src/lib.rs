@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use xc_cli::Cli;
-use xc_executor::execute_actions;
+use xc_executor::{accept_block, execute_actions};
 use xc_mempool::Mempool;
+use xc_network::spawn_p2p_node;
 use xc_primitives::{Address, NodeConfig, Snapshot, expected_proposer};
 use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
@@ -49,7 +50,12 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
     }
 
     if db.get_block::<ActionPayload>(0)?.is_none() {
-        let genesis_block: ChainBlock = xc_primitives::Block::genesis(now_secs());
+        // Fixed timestamp, not `now_secs()` — every node bootstraps its own
+        // copy of genesis independently, and gossiped blocks get checked
+        // against local tip's hash, so genesis must hash identically
+        // everywhere or block 1 from any peer fails the parent-hash check
+        // before it's even out of the gate.
+        let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
         let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone(), dispatch)?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
         info!("wrote genesis block: {:?}", genesis_block);
@@ -91,12 +97,54 @@ pub fn run() -> Result<()> {
     };
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
+    let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
         mempool.clone(),
         db.clone(),
         config.rpc_bind.clone(),
         config.port,
         config.rpc_token.clone(),
+        Some(gossip_tx),
+    )?;
+
+    // Guards the read-tip / decide / write critical section shared by this
+    // node's own production loop below and the gossip block-accept path, so
+    // a self-produced block and a peer's gossiped block for the same height
+    // can never both land — whichever gets the lock first wins, and the
+    // other observes the advanced tip and backs off.
+    let chain_lock = Arc::new(Mutex::new(()));
+    let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let on_block = {
+        let db = db.clone();
+        let validator_addrs = validator_addrs.clone();
+        let chain_lock = chain_lock.clone();
+        move |block: ChainBlock| {
+            let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+            match accept_block(&db, block, &validator_addrs, dispatch) {
+                Ok(accepted) => info!(
+                    "accepted gossiped block {} with {} action(s), hash={}",
+                    accepted.height,
+                    accepted.actions.len(),
+                    accepted.hash()
+                ),
+                Err(err) => warn!("rejected gossiped block: {err}"),
+            }
+        }
+    };
+
+    // Every node joins the network, not just validators — the libp2p
+    // identity is separate from the validator signing key above.
+    spawn_p2p_node(
+        &config.base_path,
+        config.p2p_port,
+        &config.bootnodes,
+        config.is_bootnode,
+        mempool.clone(),
+        db.clone(),
+        gossip_rx,
+        block_rx,
+        on_block,
     )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -123,6 +171,12 @@ pub fn run() -> Result<()> {
             return Ok(());
         }
 
+        // Held for the whole read-tip / decide / write cycle, so a block
+        // accepted from gossip in between can't make this node produce a
+        // second, conflicting block for the height it just filled — the
+        // recomputed `next_height` below will already have moved past it.
+        let guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let proposer = match &identity {
             Some((address, key)) => {
                 let next_height = db.get_tip_height()?.unwrap_or(0) + 1;
@@ -130,10 +184,12 @@ pub fn run() -> Result<()> {
                     Some(expected) if &expected == address => Some((address, key)),
                     Some(_) => {
                         info!("height {next_height}: not our turn, skipping");
+                        drop(guard);
                         continue;
                     }
                     None => {
                         warn!("no validators in genesis set, skipping block production");
+                        drop(guard);
                         continue;
                     }
                 }
@@ -152,14 +208,23 @@ pub fn run() -> Result<()> {
         // and never reaches here; an Err means block-level bookkeeping itself failed
         // (e.g. storage), which is unexpected and logged rather than propagated.
         match produce_block(&db, pending, now_secs(), proposer) {
-            Ok(block) => info!(
-                "produced block {} with {} action(s), hash={}",
-                block.height,
-                block.actions.len(),
-                block.hash()
-            ),
+            Ok(block) => {
+                info!(
+                    "produced block {} with {} action(s), hash={}",
+                    block.height,
+                    block.actions.len(),
+                    block.hash()
+                );
+                // Only signed blocks are meaningful to peers — an unsigned
+                // block (non-validator solo mode) has no proposer for
+                // `accept_block`'s expected-proposer check to match.
+                if block.signature.is_some() {
+                    let _ = block_tx.send(block);
+                }
+            }
             Err(err) => warn!("block production failed: {err}"),
         }
+        drop(guard);
     }
 }
 
@@ -179,6 +244,9 @@ mod tests {
         NodeConfig {
             base_path,
             port: 0,
+            p2p_port: 0,
+            bootnodes: Vec::new(),
+            is_bootnode: false,
             is_validator: false,
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),

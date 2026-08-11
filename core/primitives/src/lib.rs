@@ -17,6 +17,16 @@ pub use state::{AccountEntry, Snapshot, ValidatorEntry};
 pub struct NodeConfig {
     pub base_path: PathBuf,
     pub port: u16,
+    /// Port for the P2P (libp2p) listener — TCP and QUIC. Separate from
+    /// `port` (the RPC listener) since they're independent services.
+    pub p2p_port: u16,
+    /// Explicit peer addresses (multiaddrs) to dial on startup, for
+    /// discovery beyond same-LAN mDNS.
+    pub bootnodes: Vec<String>,
+    /// DEVNET ONLY — makes this node use the well-known, seed-pinned network
+    /// identity that every other node's default `--bootnodes` value expects
+    /// to find at a fixed PeerId. See `xc_network::identity::DEVNET_BOOTNODE_SEED`.
+    pub is_bootnode: bool,
     pub is_validator: bool,
     /// If set, the RPC server requires `Authorization: Bearer <token>` on every request.
     pub rpc_token: Option<String>,

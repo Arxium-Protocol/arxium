@@ -1,7 +1,9 @@
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use thiserror::Error;
 use tracing::warn;
-use xc_primitives::{AccountEntry, Action, Address, SignatureError};
+use xc_primitives::{AccountEntry, Action, Address, Block, SignatureError, expected_proposer};
 use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
 
 #[derive(Error, Debug)]
@@ -10,6 +12,85 @@ pub enum ExecutorError {
     Storage(#[from] StorageError),
     #[error("signature check failed: {0}")]
     Signature(#[from] SignatureError),
+}
+
+/// Everything that must hold before a block received from a peer (gossip,
+/// eventually sync) is allowed to extend this node's chain. Mirrors
+/// `xc_mempool::validate_action`'s role for actions: the single place this
+/// check lives, so a locally-produced block and a gossiped one are held to
+/// the same bar.
+#[derive(Debug, Error)]
+pub enum AcceptBlockError {
+    #[error("proposer signature invalid: {0}")]
+    Signature(#[from] SignatureError),
+    #[error("wrong proposer for height {height}: expected {expected:?}, got {actual:?}")]
+    WrongProposer {
+        height: u64,
+        expected: Option<Address>,
+        actual: Option<Address>,
+    },
+    #[error("block height {block_height} does not extend local tip {tip_height}")]
+    NotNextHeight { block_height: u64, tip_height: u64 },
+    #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
+    ParentMismatch { local: String, expected: String },
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("failed to execute block actions: {0}")]
+    Execution(#[from] ExecutorError),
+}
+
+/// Validates a block received from a peer — proposer signature, that the
+/// signer was actually the expected round-robin proposer for that height
+/// (the check that makes round-robin meaningful across nodes, not just
+/// within one node's own loop), and that it extends the local tip — then
+/// applies it exactly like a locally-produced block would (re-running
+/// `execute_actions` against local state rather than trusting the sender's
+/// claimed results). Returns the stored block on success.
+pub fn accept_block<P>(
+    db: &ArxiumDb,
+    block: Block<P>,
+    validators: &[Address],
+    dispatch: impl Fn(
+        &Action<P>,
+        &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    ) -> anyhow::Result<AccountUpdates>,
+) -> Result<Block<P>, AcceptBlockError>
+where
+    P: Serialize + DeserializeOwned + Clone,
+{
+    block.verify_proposer_signature()?;
+
+    let expected = expected_proposer(validators, block.height);
+    if block.proposer != expected {
+        return Err(AcceptBlockError::WrongProposer {
+            height: block.height,
+            expected,
+            actual: block.proposer.clone(),
+        });
+    }
+
+    let tip_height = db.get_tip_height()?.unwrap_or(0);
+    if block.height != tip_height + 1 {
+        return Err(AcceptBlockError::NotNextHeight {
+            block_height: block.height,
+            tip_height,
+        });
+    }
+    let parent: Block<P> = db
+        .get_block(tip_height)?
+        .expect("tip block must exist if tip_height set");
+    if block.parent_hash != parent.hash() {
+        return Err(AcceptBlockError::ParentMismatch {
+            local: parent.hash(),
+            expected: block.parent_hash.clone(),
+        });
+    }
+
+    let (applied, account_updates) = execute_actions(db, block.actions.clone(), dispatch)?;
+    let mut accepted = block;
+    accepted.actions = applied;
+    db.write_batches(&[&account_updates, &accepted])?;
+    Ok(accepted)
 }
 
 /// Applies each action to current state, in order, buffering every success

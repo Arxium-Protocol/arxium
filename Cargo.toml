@@ -10,6 +10,7 @@ members = [
     "core/cli",
     "core/genesis",
     "core/rpc",
+    "core/network",
     #
     "arxd/node",
     "arxd",
@@ -34,6 +35,7 @@ xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
 xc-genesis = { path = "core/genesis" }
 xc-rpc = { path = "core/rpc" }
+xc-network = { path = "core/network" }
 node = { path = "arxd/node" }
 
 # external packages
