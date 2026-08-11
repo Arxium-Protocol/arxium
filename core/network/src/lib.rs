@@ -39,8 +39,12 @@ const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
 /// adds a second delivery mechanism, not new validation.
 const SYNC_PROTOCOL: &str = "/arxium/sync/1";
 /// How often a connected peer is re-asked for its tip, to catch a peer
-/// falling behind mid-connection (not just "was offline, just reconnected").
-const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+/// falling behind mid-connection (not just "was offline, just reconnected") —
+/// e.g. a gossiped block silently dropped rather than erroring, which the
+/// OutboundFailure retry above can't see. Kept a small multiple of a
+/// devnet-scale block interval (~2s) rather than a long fixed value, so a
+/// missed block self-heals in a couple of block times, not tens of seconds.
+const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
 /// `from`, capped at the local tip — never fabricates blocks the responder
