@@ -1,4 +1,4 @@
-# Arxium Protocol AG
+# Arxium Network: A Layer 0 blockchain
 
 # Arxium Network — Phase 1: Core Protocol
 
@@ -6,8 +6,6 @@ Single-validator (one-node) chain: accept signed `Action`s over RPC, order
 them into blocks on a fixed schedule, apply them to account state. See
 `core/README.md`, `arxd/README.md`, and `circuits/README.md` for the
 architecture and the boundary rules between them.
-
-## Done
 
 - **Primitives** (`core/primitives`): `Action<P>`/`Block<P>`, generic over
   a chain-specific payload type `P` (hashing, proposer signing +
@@ -68,18 +66,55 @@ architecture and the boundary rules between them.
   corrupted/tampered tip instead of building on it), graceful shutdown
   (ctrl-c/SIGTERM finishes the current loop iteration before exiting),
   and CoreChain's own `ActionPayload`/dispatch table.
+- **Hardening pass**: RPC/mempool mutex locks recover from poisoning
+  instead of taking the whole node or RPC server down permanently after
+  one panic; the rate limiter's per-IP map sweeps stale entries instead of
+  growing forever; the validator signing key file is locked to `0600` on
+  every load, not just on first generation; block/account commits fsync
+  (`WriteOptions::set_sync(true)`) so the on-disk tip can't outrun durable
+  data across a hard crash.
 
-## Missing for Phase 1
+Phase 1 has no remaining gaps of its own — the in-memory mempool isn't one:
+losing pending actions on restart is standard (Bitcoin/Ethereum included),
+and the intended recovery path is peer re-broadcast, not disk persistence.
+That makes it a Phase 2/networking capability, not something to fix here.
 
-- **No networking** — this is a single-node chain. No P2P, no gossip, no
-  block/state sync between nodes.
-- **Static validator set** — read once from the genesis snapshot; no
-  join/leave mechanism, and none would propagate without networking
-  anyway.
-- **`arxd/runtime` isn't a real crate yet** — validator-set management,
-  state-root registry, conflict resolution, and slashing are all
-  unbuilt; today's `Snapshot` has no commitment to post-transfer state.
-- **In-memory mempool** — pending actions do not survive a restart.
+## Phase 2: Networking & Multi-Validator
+
+Every item below traces back to the same root gap: a single node with no
+way to talk to any other node. No P2P, no gossip, no block/state sync — so
+the validator set is necessarily static (read once from the genesis
+snapshot, no join/leave mechanism, and none would propagate even if there
+were), and `arxd/runtime` (validator-set management, state-root registry,
+conflict resolution, slashing) isn't a real crate yet, since none of that
+means anything without a network to enforce it over. Concretely today:
+`arxd/node/specs/devnet.json` already declares two validators, but with no
+way for a second node to run and sync, only one validator's parity of
+heights can ever be produced — the chain advances once and then stalls
+forever waiting on the other validator's turn. That's not a bug to patch
+around; it's what "no networking" actually means once there's more than
+one validator.
+
+- **P2P/gossip layer** — block and action propagation between nodes.
+  Prerequisite for every other item below. Also what makes mempool loss on
+  restart a non-issue: a node re-syncs pending actions from peers instead
+  of needing its own mempool on disk.
+- **Block/state sync** — a node that joins late (or restarts far behind)
+  catches up from peers instead of only ever trusting its own local
+  RocksDB.
+- **Multi-validator round-robin that actually works** — the devnet's two
+  genesis validators both produce on their turn because both nodes are
+  running and syncing, closing the stall described above.
+- **`arxd/runtime` as a real crate** — validator-set management (join/leave
+  propagated over the network), a state-root registry, conflict
+  resolution, and slashing.
+- **Dynamic validator set** — join/leave against `arxd/runtime`, no longer
+  fixed at genesis.
+- **Explorer frontend** — `core/rpc` already serves the range/list/search
+  endpoints (`GET /blocks`, `GET /accounts/:address/actions`,
+  `GET /search`, …) an explorer needs; the UI consuming them hasn't been
+  built. Not networking-blocked itself, but a multi-node chain is what
+  makes an explorer worth having.
 
 ## Not started
 

@@ -141,7 +141,10 @@ pub fn run() -> Result<()> {
             None => None,
         };
 
-        let pending = mempool.lock().unwrap().drain_pending(100);
+        let pending = mempool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_pending(100);
         // Empty blocks still get produced — height must keep advancing on
         // schedule so `expected_proposer` round-robin doesn't stall waiting
         // for someone to submit an action.

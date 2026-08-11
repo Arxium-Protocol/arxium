@@ -87,7 +87,15 @@ impl ArxiumDb {
                 batch.put(key, value);
             }
         }
-        self.db.write(batch)?;
+        // Fsync every commit rather than trusting the OS page cache — this
+        // chain produces one batch per block on a multi-second interval, not
+        // per-transaction, so the extra fsync latency is cheap insurance
+        // against a hard crash leaving the on-disk tip ahead of durable data
+        // (which would violate the "tip block must exist" invariant on
+        // restart, see arxd/node/src/produce.rs).
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
+        self.db.write_opt(batch, &opts)?;
         Ok(())
     }
 

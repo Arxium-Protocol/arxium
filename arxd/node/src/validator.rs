@@ -32,9 +32,29 @@ pub fn load_or_generate_key(base_path: &Path) -> Result<SigningKey> {
         SigningKey::from_bytes(&seed)
     };
 
+    // Applied on every load, not just generation, so a key file created
+    // before this check existed (or by any other means) still gets locked
+    // down — the seed is the validator's full signing key.
+    restrict_key_file_permissions(&key_path)
+        .context("failed to restrict validator key file permissions")?;
+
     let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
         .context("validator key produced an invalid address")?;
     info!("validator identity: {address}");
 
     Ok(key)
+}
+
+#[cfg(unix)]
+fn restrict_key_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_key_file_permissions(_path: &Path) -> Result<()> {
+    // ponytail: no portable equivalent of chmod 0600 on non-Unix; revisit if
+    // this ever needs to run on Windows in production.
+    Ok(())
 }

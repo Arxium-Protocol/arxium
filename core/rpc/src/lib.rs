@@ -34,6 +34,9 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 // (redis, etc.) if this ever runs behind more than one RPC instance.
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 const RATE_LIMIT_MAX_REQUESTS: u32 = 60;
+// Sweep stale per-IP entries once the map crosses this size, bounding worst-
+// case memory instead of growing forever for a public/long-lived instance.
+const RATE_LIMIT_SWEEP_THRESHOLD: usize = 10_000;
 
 #[derive(Clone)]
 struct AppState<P: Payload> {
@@ -43,9 +46,6 @@ struct AppState<P: Payload> {
     rate_limiter: Arc<RateLimiter>,
 }
 
-// ponytail: HashMap entries are never evicted for IPs that stop sending
-// requests; fine for a devnet, add a sweep/LRU if this runs long-lived and
-// public.
 struct RateLimiter {
     hits: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
@@ -58,8 +58,15 @@ impl RateLimiter {
     }
 
     fn allow(&self, ip: IpAddr) -> bool {
-        let mut hits = self.hits.lock().unwrap();
+        let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
+
+        // Sweep stale entries once the map gets large rather than every call —
+        // bounds worst-case memory without paying a scan on every request.
+        if hits.len() > RATE_LIMIT_SWEEP_THRESHOLD {
+            hits.retain(|_, (seen, _)| now.duration_since(*seen) <= RATE_LIMIT_WINDOW);
+        }
+
         let entry = hits.entry(ip).or_insert((now, 0));
         if now.duration_since(entry.0) > RATE_LIMIT_WINDOW {
             *entry = (now, 0);
@@ -219,7 +226,12 @@ async fn submit_action<P: Payload>(
         return (StatusCode::BAD_REQUEST, msg).into_response();
     }
 
-    match state.mempool.lock().unwrap().push(action) {
+    match state
+        .mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(action)
+    {
         Ok(()) => {
             info!("queued action from {sender} via RPC");
             StatusCode::ACCEPTED.into_response()
@@ -303,7 +315,12 @@ async fn get_action_status<P: Payload>(
     State(state): State<AppState<P>>,
     Path(signature): Path<String>,
 ) -> Response {
-    if state.mempool.lock().unwrap().contains_signature(&signature) {
+    if state
+        .mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_signature(&signature)
+    {
         return Json(serde_json::json!({ "status": "pending" })).into_response();
     }
 
