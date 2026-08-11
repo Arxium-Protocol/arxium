@@ -37,6 +37,14 @@ pub enum AcceptBlockError {
     Storage(#[from] StorageError),
     #[error("failed to execute block actions: {0}")]
     Execution(#[from] ExecutorError),
+    #[error(
+        "block {block_height} claimed {claimed} action(s) but only {executed} executed successfully — proposer included an invalid action"
+    )]
+    ActionMismatch {
+        block_height: u64,
+        claimed: usize,
+        executed: usize,
+    },
 }
 
 /// Validates a block received from a peer — proposer signature, that the
@@ -86,11 +94,26 @@ where
         });
     }
 
+    // A gossiped block's `hash()` covers its full action list, computed by
+    // the proposer. If any action here fails execution locally (bad
+    // signature, stale nonce, whatever `dispatch` rejects), storing a
+    // trimmed `actions` list would make our copy hash differently from the
+    // proposer's — and every subsequent block's parent-hash check would
+    // then fail on this node, forever. A proposer's block must either apply
+    // exactly as claimed or be rejected outright; there's no partial credit
+    // for a block the way there is for a fresh batch from the mempool.
+    let claimed = block.actions.len();
     let (applied, account_updates) = execute_actions(db, block.actions.clone(), dispatch)?;
-    let mut accepted = block;
-    accepted.actions = applied;
-    db.write_batches(&[&account_updates, &accepted])?;
-    Ok(accepted)
+    if applied.len() != claimed {
+        return Err(AcceptBlockError::ActionMismatch {
+            block_height: block.height,
+            claimed,
+            executed: applied.len(),
+        });
+    }
+
+    db.write_batches(&[&account_updates, &block])?;
+    Ok(block)
 }
 
 /// Applies each action to current state, in order, buffering every success

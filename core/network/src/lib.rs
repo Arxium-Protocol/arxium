@@ -2,14 +2,17 @@ mod identity;
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
+use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{gossipsub, mdns, noise, tcp, yamux, Multiaddr, PeerId};
-use serde::Serialize;
+use libp2p::{StreamProtocol, gossipsub, mdns, noise, tcp, yamux, Multiaddr, PeerId};
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{info, warn};
 use xc_mempool::{Mempool, validate_action};
@@ -30,6 +33,29 @@ const ACTIONS_TOPIC: &str = "arxium/actions/v1";
 /// crate doesn't know how to execute a chain's actions, only how to move
 /// bytes between peers.
 const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
+/// Request/response protocol a node uses to catch up on blocks it missed
+/// (e.g. was offline for) instead of only ever hearing about the newest
+/// block over gossip. Same acceptance path as gossiped blocks — this only
+/// adds a second delivery mechanism, not new validation.
+const SYNC_PROTOCOL: &str = "/arxium/sync/1";
+/// How often a connected peer is re-asked for its tip, to catch a peer
+/// falling behind mid-connection (not just "was offline, just reconnected").
+const STATUS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
+/// `from`, capped at the local tip — never fabricates blocks the responder
+/// doesn't have. A node many blocks behind just takes multiple rounds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum SyncRequest {
+    Status,
+    Blocks { from: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum SyncResponse<P> {
+    Status { tip_height: u64 },
+    Blocks(Vec<Block<P>>),
+}
 
 /// Combined behaviour for this node. mDNS handles same-LAN discovery; gossipsub
 /// carries Actions between peers. An explicit `--bootnodes` list is dialed
@@ -41,6 +67,10 @@ const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
 struct Behaviour {
     mdns: mdns::tokio::Behaviour,
     gossipsub: gossipsub::Behaviour,
+    /// Carries `SyncRequest`/`SyncResponse<P>` bytes (bincode, encoded and
+    /// decoded by `run_swarm` — this behaviour itself just moves opaque
+    /// bytes, same as gossipsub does for actions/blocks).
+    sync: cbor::Behaviour<Vec<u8>, Vec<u8>>,
 }
 
 /// Starts this node's P2P identity, listeners, peer discovery, and Action +
@@ -113,6 +143,19 @@ pub fn spawn_p2p_node<P: Payload>(
     Ok(peer_id)
 }
 
+fn local_tip_height(db: &ArxiumDb) -> u64 {
+    db.get_tip_height().ok().flatten().unwrap_or(0)
+}
+
+fn send_sync_request(swarm: &mut libp2p::Swarm<Behaviour>, peer: &PeerId, request: &SyncRequest) {
+    match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
+        Ok(bytes) => {
+            swarm.behaviour_mut().sync.send_request(peer, bytes);
+        }
+        Err(err) => warn!("failed to encode sync request: {err}"),
+    }
+}
+
 fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behaviour>> {
     let local_peer_id = PeerId::from(keypair.public());
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -129,9 +172,14 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behav
                 gossipsub::Config::default(),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let sync = cbor::Behaviour::new(
+                [(StreamProtocol::new(SYNC_PROTOCOL), ProtocolSupport::Full)],
+                request_response::Config::default(),
+            );
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
                 gossipsub,
+                sync,
             })
         })?
         .build();
@@ -196,8 +244,20 @@ async fn run_swarm<P: Payload>(
         }
     }
 
+    // Tracks each peer's last-reported tip height, so a `Blocks` response
+    // knows whether to request the next batch or stop — set on every
+    // `Status` response, both the on-connect one and the periodic re-check.
+    let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+    let mut status_interval = tokio::time::interval(STATUS_INTERVAL);
+
     loop {
         tokio::select! {
+            _ = status_interval.tick() => {
+                let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                for peer in peers {
+                    send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
+                }
+            }
             action = gossip_rx.recv() => {
                 let Some(action) = action else {
                     // Sender side (RPC ingest) is gone — nothing left to publish.
@@ -235,6 +295,10 @@ async fn run_swarm<P: Payload>(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     info!("connected to peer {peer_id}");
+                    // Ask immediately — a node that was offline and just
+                    // reconnected shouldn't have to wait for the next
+                    // STATUS_INTERVAL tick to start catching up.
+                    send_sync_request(&mut swarm, &peer_id, &SyncRequest::Status);
                 }
                 // ponytail: mdns reports one entry per transport (tcp + quic),
                 // so a discovered peer gets dialed twice and briefly shows two
@@ -296,6 +360,92 @@ async fn run_swarm<P: Payload>(
                     };
                     on_block(block);
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
+                    peer,
+                    message,
+                    ..
+                })) => match message {
+                    request_response::Message::Request { request, channel, .. } => {
+                        let sync_request: SyncRequest = match bincode::serde::decode_from_slice(
+                            &request,
+                            bincode::config::standard(),
+                        ) {
+                            Ok((req, _)) => req,
+                            Err(err) => {
+                                warn!("failed to decode sync request from {peer}: {err}");
+                                continue;
+                            }
+                        };
+                        let response = match sync_request {
+                            SyncRequest::Status => SyncResponse::<P>::Status {
+                                tip_height: local_tip_height(&db),
+                            },
+                            SyncRequest::Blocks { from } => {
+                                let tip_height = local_tip_height(&db);
+                                let blocks = db
+                                    .get_block_range::<P>(from, tip_height)
+                                    .unwrap_or_else(|err| {
+                                        warn!(
+                                            "failed to read blocks {from}..={tip_height} for sync response to {peer}: {err}"
+                                        );
+                                        Vec::new()
+                                    });
+                                SyncResponse::Blocks(blocks)
+                            }
+                        };
+                        match bincode::serde::encode_to_vec(&response, bincode::config::standard()) {
+                            Ok(bytes) => {
+                                if swarm.behaviour_mut().sync.send_response(channel, bytes).is_err() {
+                                    warn!("failed to send sync response to {peer}: channel closed");
+                                }
+                            }
+                            Err(err) => warn!("failed to encode sync response for {peer}: {err}"),
+                        }
+                    }
+                    request_response::Message::Response { response, .. } => {
+                        let sync_response: SyncResponse<P> = match bincode::serde::decode_from_slice(
+                            &response,
+                            bincode::config::standard(),
+                        ) {
+                            Ok((resp, _)) => resp,
+                            Err(err) => {
+                                warn!("failed to decode sync response from {peer}: {err}");
+                                continue;
+                            }
+                        };
+                        match sync_response {
+                            SyncResponse::Status { tip_height } => {
+                                peer_tips.insert(peer, tip_height);
+                                let local_tip = local_tip_height(&db);
+                                if tip_height > local_tip {
+                                    info!(
+                                        "peer {peer} is ahead (tip {tip_height} vs local {local_tip}), requesting sync"
+                                    );
+                                    send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
+                                        from: local_tip + 1,
+                                    });
+                                }
+                            }
+                            SyncResponse::Blocks(blocks) => {
+                                if blocks.is_empty() {
+                                    continue;
+                                }
+                                // Same acceptance path as a gossiped block —
+                                // sync is only a second delivery mechanism,
+                                // not new validation logic.
+                                for block in blocks {
+                                    on_block(block);
+                                }
+                                let local_tip = local_tip_height(&db);
+                                if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
+                                    send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
+                                        from: local_tip + 1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                },
                 _ => {}
             }
         }

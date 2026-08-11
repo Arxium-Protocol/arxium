@@ -12,4 +12,4 @@ bincode = { workspace = true, features = ["serde"] }
 xc-primitives = { workspace = true }
 xc-mempool = { workspace = true }
 xc-storage = { workspace = true }
-libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub"] }
+libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub", "request-response", "cbor"] }
