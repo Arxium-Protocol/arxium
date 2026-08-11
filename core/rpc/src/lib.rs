@@ -565,6 +565,7 @@ mod tests {
                         },
                     )]),
                     validators: BTreeMap::new(),
+                    boot_nodes: Vec::new(),
                 })
                 .unwrap();
             let stale = signed_action(&key, 0);
@@ -597,6 +598,7 @@ mod tests {
                     chain_name: "test-chain".into(),
                     accounts: BTreeMap::new(),
                     validators: BTreeMap::new(),
+                    boot_nodes: Vec::new(),
                 })
                 .unwrap();
             state.db.write_batch(&genesis).unwrap();

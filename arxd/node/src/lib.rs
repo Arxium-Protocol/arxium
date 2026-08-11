@@ -133,12 +133,21 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // An explicit --bootnodes always wins; otherwise fall back to the chain
+    // spec's own boot_nodes list (devnet.json), same role as a Polkadot
+    // chain-spec's bootNodes — so a fresh node needs zero flags to join.
+    let bootnodes = if config.bootnodes.is_empty() {
+        &snapshot.boot_nodes
+    } else {
+        &config.bootnodes
+    };
+
     // Every node joins the network, not just validators — the libp2p
     // identity is separate from the validator signing key above.
     spawn_p2p_node(
         &config.base_path,
         config.p2p_port,
-        &config.bootnodes,
+        bootnodes,
         config.is_bootnode,
         mempool.clone(),
         db.clone(),

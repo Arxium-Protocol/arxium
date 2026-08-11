@@ -147,6 +147,7 @@ fn main() -> Result<()> {
         chain_name: CHAIN_NAME.into(),
         accounts,
         validators: BTreeMap::new(),
+        boot_nodes: Vec::new(),
     })?;
     let genesis: RwaBlock = Block::genesis(now());
     db.write_batches(&[

@@ -17,9 +17,10 @@ pub struct Cli {
 
     /// Explicit peer multiaddrs to dial on startup (e.g.
     /// /ip4/1.2.3.4/tcp/30334/p2p/12D3Koo...), comma-separated. Discovery
-    /// beyond same-LAN mDNS. Defaults to the well-known devnet bootnode
-    /// (see `--bootnode`) on localhost; pass `--bootnodes ""` to disable.
-    #[arg(long, value_delimiter = ',', default_value = DEFAULT_BOOTNODE)]
+    /// beyond same-LAN mDNS. If empty, falls back to the chain spec's
+    /// `boot_nodes` list (e.g. `devnet.json`) — same role as a Polkadot
+    /// chain-spec's `bootNodes`.
+    #[arg(long, value_delimiter = ',')]
     pub bootnodes: Vec<String>,
 
     /// DEVNET ONLY — use the well-known, seed-pinned network identity other
@@ -41,11 +42,6 @@ pub struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     pub rpc_bind: String,
 }
-
-// PeerId that `xc_network::identity::DEVNET_BOOTNODE_SEED` produces, and the
-// default `--p2p-port` above — this is where a `--bootnode` node listens.
-const DEFAULT_BOOTNODE: &str =
-    "/ip4/127.0.0.1/tcp/30334/p2p/12D3KooWHP2Ve7tpkRQMJACbU4xmq9aDwL6gphLRHLJ3xB6nU5KA";
 
 fn default_base_path() -> PathBuf {
     dirs::home_dir()

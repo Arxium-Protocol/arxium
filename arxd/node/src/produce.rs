@@ -79,6 +79,7 @@ mod tests {
             chain_name: "test".into(),
             accounts,
             validators: BTreeMap::new(),
+            boot_nodes: Vec::new(),
         })
         .unwrap();
 
