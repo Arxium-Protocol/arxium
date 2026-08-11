@@ -360,6 +360,26 @@ async fn run_swarm<P: Payload>(
                     };
                     on_block(block);
                 }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
+                    peer,
+                    error,
+                    ..
+                })) => {
+                    // A lost request otherwise just sits forever — nothing
+                    // else re-triggers it before the next STATUS_INTERVAL
+                    // tick (or a fresh connection). Re-asking for Status
+                    // immediately cascades back into a Blocks retry via the
+                    // Status response handler below if the peer's still ahead.
+                    warn!("sync request to {peer} failed: {error}; retrying");
+                    send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::InboundFailure {
+                    peer,
+                    error,
+                    ..
+                })) => {
+                    warn!("failed to answer sync request from {peer}: {error}");
+                }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
                     peer,
                     message,
