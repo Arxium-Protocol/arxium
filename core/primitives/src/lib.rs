@@ -10,7 +10,7 @@ mod state;
 pub use action::{Action, SignatureError};
 pub use address::{Address, AddressError};
 pub use block::Block;
-pub use consensus::expected_proposer;
+pub use consensus::{eligible_proposer, expected_proposer};
 pub use state::{AccountEntry, Snapshot, ValidatorChange, ValidatorEntry};
 
 #[derive(Debug)]

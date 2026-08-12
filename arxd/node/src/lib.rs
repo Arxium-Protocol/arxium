@@ -16,7 +16,7 @@ use xc_cli::Cli;
 use xc_executor::{accept_block, execute_actions};
 use xc_mempool::Mempool;
 use xc_network::spawn_p2p_node;
-use xc_primitives::{Address, NodeConfig, Snapshot, expected_proposer};
+use xc_primitives::{Address, NodeConfig, Snapshot, eligible_proposer};
 use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
 
@@ -24,6 +24,11 @@ const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
 const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
+
+// A validator's primary slot lasts this long before the next validator in
+// rotation becomes eligible to stand in — double BLOCK_INTERVAL so one
+// missed tick from ordinary network jitter doesn't trigger a takeover.
+const SLOT_DURATION: Duration = Duration::from_secs(BLOCK_INTERVAL.as_secs() * 2);
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -117,7 +122,7 @@ pub fn run() -> Result<()> {
         let chain_lock = chain_lock.clone();
         move |block: ChainBlock| {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
-            match accept_block(&db, block, dispatch) {
+            match accept_block(&db, block, SLOT_DURATION.as_secs(), dispatch) {
                 Ok(accepted) => info!(
                     "accepted gossiped block {} with {} action(s), hash={}",
                     accepted.height,
@@ -184,16 +189,22 @@ pub fn run() -> Result<()> {
 
         let proposer = match &identity {
             Some((address, key)) => {
-                let next_height = db.get_tip_height()?.unwrap_or(0) + 1;
-                match expected_proposer(&db.get_validator_set_at(next_height)?, next_height) {
+                let tip_height = db.get_tip_height()?.unwrap_or(0);
+                let next_height = tip_height + 1;
+                let parent: ChainBlock = db
+                    .get_block(tip_height)?
+                    .expect("tip block must exist if tip_height is set");
+                let elapsed = now_secs().saturating_sub(parent.timestamp);
+                let validators = db.get_validator_set_at(next_height)?;
+                match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())
+                {
                     Some(expected) if &expected == address => Some((address, key)),
                     Some(_) => {
-                        info!("height {next_height}: not our turn, skipping");
                         drop(guard);
                         continue;
                     }
                     None => {
-                        warn!("no validators in genesis set, skipping block production");
+                        warn!("no validators registered, skipping block production");
                         drop(guard);
                         continue;
                     }

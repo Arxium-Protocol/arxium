@@ -1,15 +1,36 @@
 use crate::Address;
 
 /// Deterministic round-robin: sorts the validator set and picks by height
-/// modulo its size. No stake weighting, no dynamic membership — validators
-/// come from the static genesis set for now.
+/// modulo its size. No stake weighting — the set can change over time (see
+/// `ValidatorChange`), but within a single height every node computes the
+/// same primary proposer from the same set.
 pub fn expected_proposer(validators: &[Address], height: u64) -> Option<Address> {
+    eligible_proposer(validators, height, 0, 1)
+}
+
+/// Like `expected_proposer`, but allows a later validator in the rotation to
+/// stand in once the primary has missed its window. `elapsed_secs` is the
+/// time since the parent block (`block.timestamp - parent.timestamp` for a
+/// candidate being validated, or `now - parent.timestamp` for a node
+/// deciding whether it may produce) — never wall-clock-at-receipt, so a live
+/// node and one replaying the same block during sync always agree on who was
+/// eligible. Every full `slot_duration_secs` of silence advances eligibility
+/// one validator further in rotation order, wrapping at most once around the
+/// set (a validator never gets two independent slots at the same height).
+pub fn eligible_proposer(
+    validators: &[Address],
+    height: u64,
+    elapsed_secs: u64,
+    slot_duration_secs: u64,
+) -> Option<Address> {
     if validators.is_empty() {
         return None;
     }
     let mut sorted = validators.to_vec();
     sorted.sort();
-    Some(sorted[(height as usize) % sorted.len()].clone())
+    let primary = (height as usize) % sorted.len();
+    let skip = ((elapsed_secs / slot_duration_secs.max(1)) as usize).min(sorted.len() - 1);
+    Some(sorted[(primary + skip) % sorted.len()].clone())
 }
 
 #[cfg(test)]
@@ -46,5 +67,26 @@ mod tests {
         unique.dedup();
         assert_eq!(unique.len(), 3);
         assert_eq!(picks[0], expected_proposer(&forward, 3)); // wraps around
+    }
+
+    #[test]
+    fn eligible_proposer_advances_through_rotation_as_primary_goes_silent() {
+        let mut sorted = vec![addr(1), addr(2), addr(3)];
+        sorted.sort();
+        let (a, b, c) = (sorted[0].clone(), sorted[1].clone(), sorted[2].clone());
+
+        // Within the primary's own window, only the primary is eligible.
+        assert_eq!(eligible_proposer(&sorted, 0, 0, 4), Some(a.clone()));
+        assert_eq!(eligible_proposer(&sorted, 0, 3, 4), Some(a));
+
+        // One full slot of silence hands eligibility to the next validator
+        // in rotation order — deterministic from elapsed time alone.
+        assert_eq!(eligible_proposer(&sorted, 0, 4, 4), Some(b.clone()));
+        assert_eq!(eligible_proposer(&sorted, 0, 7, 4), Some(b));
+
+        // Never skips past the whole set — caps at the last validator
+        // rather than wrapping back onto the primary.
+        assert_eq!(eligible_proposer(&sorted, 0, 8, 4), Some(c.clone()));
+        assert_eq!(eligible_proposer(&sorted, 0, 1000, 4), Some(c));
     }
 }

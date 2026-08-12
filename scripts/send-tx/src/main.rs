@@ -9,19 +9,28 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use xc_primitives::Address;
 
-/// Signs and submits a Transfer action to a running arxd node. Devnet testing only.
+/// Signs and submits an action to a running arxd node. Devnet testing only.
 #[derive(Parser)]
 struct Args {
     /// Sender: a name from devnet-keys.json (e.g. "alice"), or a raw hex ed25519 seed
     #[arg(long)]
     from: String,
 
-    /// Recipient: a name from devnet-keys.json, or a bech32 address
-    #[arg(long)]
-    to: String,
+    /// "transfer" (default), "join-validator", or "leave-validator"
+    #[arg(long, default_value = "transfer")]
+    action: String,
 
+    /// Recipient: a name from devnet-keys.json, or a bech32 address. Required for "transfer".
     #[arg(long)]
-    amount: u128,
+    to: Option<String>,
+
+    /// Required for "transfer".
+    #[arg(long)]
+    amount: Option<u128>,
+
+    /// Stake to bond, bookkeeping-only for now. Required for "join-validator".
+    #[arg(long)]
+    stake: Option<u128>,
 
     /// Override the auto-fetched nonce
     #[arg(long)]
@@ -99,7 +108,21 @@ fn main() -> Result<()> {
 
     let signer = resolve_signer(&args.from, &keys)?;
     let sender = resolve_address(&args.from, &keys)?;
-    let to = resolve_address(&args.to, &keys)?;
+
+    let action_payload = match args.action.as_str() {
+        "transfer" => ActionPayload::Transfer {
+            to: resolve_address(
+                args.to.as_deref().context("--to is required for transfer")?,
+                &keys,
+            )?,
+            amount: args.amount.context("--amount is required for transfer")?,
+        },
+        "join-validator" => ActionPayload::JoinValidator {
+            stake: args.stake.context("--stake is required for join-validator")?,
+        },
+        "leave-validator" => ActionPayload::LeaveValidator,
+        other => bail!("unknown --action {other:?}, expected transfer, join-validator, or leave-validator"),
+    };
 
     let nonce = match args.nonce {
         Some(n) => n,
@@ -118,10 +141,7 @@ fn main() -> Result<()> {
         sender,
         nonce,
         signature: None,
-        payload: ActionPayload::Transfer {
-            to,
-            amount: args.amount,
-        },
+        payload: action_payload,
     };
     let signature = signer.sign(&action.signing_bytes());
     action.signature = Some(hex::encode(signature.to_bytes()));

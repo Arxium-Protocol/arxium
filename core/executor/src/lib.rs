@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tracing::warn;
 use xc_primitives::{
-    AccountEntry, Action, Address, Block, SignatureError, ValidatorChange, expected_proposer,
+    AccountEntry, Action, Address, Block, SignatureError, ValidatorChange, eligible_proposer,
 };
 use xc_storage::{AccountUpdates, ArxiumDb, StorageError, ValidatorSetSnapshot};
 
@@ -81,6 +81,7 @@ pub enum AcceptBlockError {
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
+    slot_duration_secs: u64,
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
@@ -91,20 +92,6 @@ where
     P: Serialize + DeserializeOwned + Clone,
 {
     block.verify_proposer_signature()?;
-
-    // The set as of `block.height` — a change made *by* this block only
-    // takes effect at `block.height + 1` (see `ValidatorSetSnapshot`), so
-    // this is also the pre-block set `dispatch` should validate
-    // JoinValidator/LeaveValidator preconditions against below.
-    let validators = db.get_validator_set_at(block.height)?;
-    let expected = expected_proposer(&validators, block.height);
-    if block.proposer != expected {
-        return Err(AcceptBlockError::WrongProposer {
-            height: block.height,
-            expected,
-            actual: block.proposer.clone(),
-        });
-    }
 
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     if block.height != tip_height + 1 {
@@ -120,6 +107,25 @@ where
         return Err(AcceptBlockError::ParentMismatch {
             local: parent.hash(),
             expected: block.parent_hash.clone(),
+        });
+    }
+
+    // The set as of `block.height` — a change made *by* this block only
+    // takes effect at `block.height + 1` (see `ValidatorSetSnapshot`), so
+    // this is also the pre-block set `dispatch` should validate
+    // JoinValidator/LeaveValidator preconditions against below.
+    let validators = db.get_validator_set_at(block.height)?;
+    // `block.timestamp - parent.timestamp`, not wall-clock-at-receipt — every
+    // node (live or replaying during sync) computes the same elapsed time
+    // from the same two stored timestamps, so they always agree on who was
+    // eligible to stand in for a late primary.
+    let elapsed = block.timestamp.saturating_sub(parent.timestamp);
+    let expected = eligible_proposer(&validators, block.height, elapsed, slot_duration_secs);
+    if block.proposer != expected {
+        return Err(AcceptBlockError::WrongProposer {
+            height: block.height,
+            expected,
+            actual: block.proposer.clone(),
         });
     }
 
@@ -319,7 +325,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
         assert_eq!(accepted.actions.len(), 1, "join action must be applied");
 
         // Block 1 itself is still decided by the pre-join set.
