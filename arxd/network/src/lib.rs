@@ -3,6 +3,7 @@ pub mod identity;
 pub use libp2p::PeerId;
 
 use anyhow::{Context, Result};
+use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
@@ -55,6 +56,11 @@ const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 /// (a real reconnect) or any successful sync response clears the count.
 const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 5;
 
+/// A peer sending this many unambiguously-bad gossip messages (undecodable
+/// bytes, forged signatures) in a row gets disconnected — see
+/// `record_bad_gossip`.
+const MAX_BAD_GOSSIP: u32 = 10;
+
 /// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
 /// `from`, capped at the local tip — never fabricates blocks the responder
 /// doesn't have. A node many blocks behind just takes multiple rounds.
@@ -84,6 +90,9 @@ struct Behaviour {
     /// decoded by `run_swarm` — this behaviour itself just moves opaque
     /// bytes, same as gossipsub does for actions/blocks).
     sync: cbor::Behaviour<Vec<u8>, Vec<u8>>,
+    /// Caps connection counts so a burst of dials (malicious or just a noisy
+    /// LAN) can't grow unbounded memory/fd usage — see `build_swarm`.
+    limits: connection_limits::Behaviour,
 }
 
 /// Starts this node's P2P identity, listeners, peer discovery, and Action +
@@ -111,7 +120,9 @@ pub fn spawn_p2p_node<P: Payload>(
     db: ArxiumDb,
     gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
-    on_block: impl Fn(Block<P>) + Send + 'static,
+    // Returns `true` when the block's signature itself was forged, so the
+    // sending peer can be penalized — see `record_bad_gossip`.
+    on_block: impl Fn(Block<P>) -> bool + Send + 'static,
 ) -> Result<PeerId> {
     let keypair = if is_bootnode {
         identity::load_or_generate_devnet_bootnode_keypair(base_path)?
@@ -169,6 +180,27 @@ fn send_sync_request(swarm: &mut libp2p::Swarm<Behaviour>, peer: &PeerId, reques
     }
 }
 
+/// Records gossip that's unambiguously bad — undecodable bytes or a forged
+/// signature, never just "this peer is a bit behind" — and disconnects the
+/// peer once it crosses `MAX_BAD_GOSSIP`, so a hostile peer can't spam
+/// garbage at zero cost forever. `ConnectionEstablished` clears the count on
+/// reconnect, same as `sync_failures`.
+fn record_bad_gossip(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    bad_gossip: &mut HashMap<PeerId, u32>,
+    peer: PeerId,
+    reason: &str,
+) {
+    let count = bad_gossip.entry(peer).or_insert(0);
+    *count += 1;
+    if *count >= MAX_BAD_GOSSIP {
+        warn!("disconnecting {peer}: {reason} ({count} bad gossip messages)");
+        let _ = swarm.disconnect_peer_id(peer);
+    } else {
+        warn!("{reason} from {peer} ({count}/{MAX_BAD_GOSSIP})");
+    }
+}
+
 fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behaviour>> {
     let local_peer_id = PeerId::from(keypair.public());
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -189,10 +221,21 @@ fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behav
                 [(StreamProtocol::new(SYNC_PROTOCOL), ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
+            // ponytail: fixed caps sized for a devnet's handful of peers;
+            // revisit if a real deployment needs more concurrent peers than
+            // this. per-peer allows a few (mdns reports one entry per
+            // transport, so a single peer legitimately holds >1 connection).
+            let limits = connection_limits::Behaviour::new(
+                ConnectionLimits::default()
+                    .with_max_established_per_peer(Some(4))
+                    .with_max_established_incoming(Some(200))
+                    .with_max_pending_incoming(Some(100)),
+            );
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
                 gossipsub,
                 sync,
+                limits,
             })
         })?
         .build();
@@ -207,7 +250,7 @@ async fn run_swarm<P: Payload>(
     db: ArxiumDb,
     mut gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     mut block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
-    on_block: impl Fn(Block<P>) + Send + 'static,
+    on_block: impl Fn(Block<P>) -> bool + Send + 'static,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
     let mut swarm = match build_swarm(keypair) {
@@ -264,6 +307,9 @@ async fn run_swarm<P: Payload>(
     // Consecutive sync-request failures per peer since its last success or
     // reconnect — see `MAX_CONSECUTIVE_SYNC_FAILURES`.
     let mut sync_failures: HashMap<PeerId, u32> = HashMap::new();
+    // Consecutive unambiguously-bad gossip messages per peer — see
+    // `record_bad_gossip`.
+    let mut bad_gossip: HashMap<PeerId, u32> = HashMap::new();
     let mut status_interval = tokio::time::interval(STATUS_INTERVAL);
 
     loop {
@@ -317,6 +363,7 @@ async fn run_swarm<P: Payload>(
                     // Fresh connection — give it a clean slate rather than
                     // carrying over failures accrued before it dropped.
                     sync_failures.remove(&peer_id);
+                    bad_gossip.remove(&peer_id);
                     // Ask immediately — a node that was offline and just
                     // reconnected shouldn't have to wait for the next
                     // STATUS_INTERVAL tick to start catching up.
@@ -345,7 +392,12 @@ async fn run_swarm<P: Payload>(
                     ) {
                         Ok((action, _)) => action,
                         Err(err) => {
-                            warn!("failed to decode gossiped action from {propagation_source}: {err}");
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                &format!("undecodable gossiped action: {err}"),
+                            );
                             continue;
                         }
                     };
@@ -354,7 +406,20 @@ async fn run_swarm<P: Payload>(
                     // trusted than a stranger hitting RPC directly, so it runs
                     // through the exact same admission check.
                     if let Err(err) = validate_action(&db, &action) {
-                        warn!("rejected gossiped action from {propagation_source}: {err}");
+                        // A bad signature can't be innocent lag — it's forged
+                        // or corrupted. Stale-nonce/storage rejects are just
+                        // an honest peer relaying something already applied,
+                        // not counted against them.
+                        if matches!(err, xc_mempool::AdmissionError::BadSignature(_)) {
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                &format!("forged gossiped action: {err}"),
+                            );
+                        } else {
+                            warn!("rejected gossiped action from {propagation_source}: {err}");
+                        }
                         continue;
                     }
 
@@ -376,11 +441,23 @@ async fn run_swarm<P: Payload>(
                     ) {
                         Ok((block, _)) => block,
                         Err(err) => {
-                            warn!("failed to decode gossiped block from {propagation_source}: {err}");
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                &format!("undecodable gossiped block: {err}"),
+                            );
                             continue;
                         }
                     };
-                    on_block(block);
+                    if on_block(block) {
+                        record_bad_gossip(
+                            &mut swarm,
+                            &mut bad_gossip,
+                            propagation_source,
+                            "forged gossiped block signature",
+                        );
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
                     peer,
@@ -495,7 +572,14 @@ async fn run_swarm<P: Payload>(
                                 // sync is only a second delivery mechanism,
                                 // not new validation logic.
                                 for block in blocks {
-                                    on_block(block);
+                                    if on_block(block) {
+                                        record_bad_gossip(
+                                            &mut swarm,
+                                            &mut bad_gossip,
+                                            peer,
+                                            "forged synced block signature",
+                                        );
+                                    }
                                 }
                                 let local_tip = local_tip_height(&db);
                                 if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
@@ -533,7 +617,7 @@ mod tests {
         let (_gossip_tx, gossip_rx) = tokio_mpsc::unbounded_channel();
         let (_block_tx, block_rx) = tokio_mpsc::unbounded_channel();
 
-        let peer_id = spawn_p2p_node(&base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, |_| {})
+        let peer_id = spawn_p2p_node(&base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, |_| false)
             .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());
 

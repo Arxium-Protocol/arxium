@@ -126,19 +126,29 @@ pub fn run() -> Result<()> {
     let chain_lock = Arc::new(Mutex::new(()));
     let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // Returns `true` only when the block's signature itself didn't verify —
+    // unambiguously forged, never just an honest peer relaying something
+    // out of order (wrong turn, stale height, etc.) — so the network layer
+    // can penalize the sending peer for exactly that case and no other.
     let on_block = {
         let db = db.clone();
         let chain_lock = chain_lock.clone();
-        move |block: ChainBlock| {
+        move |block: ChainBlock| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             match accept_block(&db, block, SLOT_DURATION.as_secs(), dispatch) {
-                Ok(accepted) => info!(
-                    "accepted gossiped block {} with {} action(s), hash={}",
-                    accepted.height,
-                    accepted.actions.len(),
-                    accepted.hash()
-                ),
-                Err(err) => warn!("rejected gossiped block: {err}"),
+                Ok(accepted) => {
+                    info!(
+                        "accepted gossiped block {} with {} action(s), hash={}",
+                        accepted.height,
+                        accepted.actions.len(),
+                        accepted.hash()
+                    );
+                    false
+                }
+                Err(err) => {
+                    warn!("rejected gossiped block: {err}");
+                    matches!(err, xc_executor::AcceptBlockError::Signature(_))
+                }
             }
         }
     };

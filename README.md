@@ -88,19 +88,20 @@ sync, only one validator's parity of heights could ever be produced — the
 chain advanced once and then stalled forever waiting on the other
 validator's turn. That was fixed by the P2P/gossip and block/state sync
 work below, live-verified past height 100 across two real machines. The
-validator set itself is still static, though (read once from the genesis
-snapshot, no join/leave mechanism, and none would propagate even if there
-were) — `arxd/runtime` (validator-set management, state-root registry,
-conflict resolution, slashing) isn't a real crate yet, since none of that
-means anything without a network to enforce it over, which is now in place.
+validator set was static at first too (read once from the genesis snapshot,
+no join/leave mechanism) — that's now closed as well: join/leave is a
+regular action, no separate governance path or `arxd/runtime` dependency
+needed for it.
 
-- **P2P/gossip layer** (done) — `core/network`, generic over the chain's
+- **P2P/gossip layer** (done) — `arxd/network`, generic over the chain's
   payload type `P`. mDNS discovery on a LAN, `gossipsub` for action/block
   propagation, and a fixed-seed `--bootnode` identity plus a chain-spec-owned
   `Snapshot.boot_nodes` list (Polkadot-style) so a fresh node needs zero
   flags to find the network across separate machines/networks, not just a
-  shared LAN.
-- **Block/state sync** (done) — `libp2p::request_response` in `core/network`
+  shared LAN. Nested under `arxd/` rather than `core/`, mirroring how
+  Substrate/Polkadot keep `sc-network`/networking subsystems under
+  `client/`/`node/` rather than in role-agnostic primitives.
+- **Block/state sync** (done) — `libp2p::request_response` in `arxd/network`
   (`SyncRequest::Status`/`Blocks`, exchanged on connect and every 5s
   thereafter). A node behind a peer's reported tip requests the gap and
   applies each block through the same `accept_block` re-validation path
@@ -111,12 +112,25 @@ means anything without a network to enforce it over, which is now in place.
   two genesis validators both produce on their turn because both nodes are
   running, gossiping, and syncing, closing the stall described above.
   Verified live past height 100 across two machines.
+- **Peer/network hardening** (done) — `connection_limits::Behaviour` caps
+  established/pending connections per peer and overall; a per-peer
+  bad-gossip counter (`arxd/network`'s `record_bad_gossip`) disconnects a
+  peer sending unambiguously-bad gossip (undecodable bytes, forged action or
+  block signatures) past a threshold, without penalizing an honest peer
+  that's just behind (stale nonce, wrong turn, parent mismatch).
+- **Dynamic validator set** (done) — `JoinValidator`/`LeaveValidator` are
+  regular `ActionPayload` variants, going through the mempool and
+  `execute_actions`/`accept_block` exactly like a transfer. A change applied
+  in block `H` takes effect at block `H + 1` (a validator can't vote itself
+  into that block's own proposer slot), and the set is stored per-height in
+  `ArxiumDb` (`get_validator_set_at`) so a syncing/replaying node always
+  computes the same round-robin proposer a live node did at the time.
+  Leaving the last validator is rejected (would stall the chain forever).
+  Stake is bookkeeping only — `expected_proposer` still ignores it.
 - **`arxd/runtime` as a real crate** (not started) — currently just a
-  placeholder README, not a workspace member. Validator-set management
-  (join/leave propagated over the network), a state-root registry, conflict
-  resolution, and slashing.
-- **Dynamic validator set** (not started) — join/leave against
-  `arxd/runtime`, no longer fixed at genesis.
+  placeholder README, not a workspace member. A state-root registry,
+  cross-chain conflict resolution, and slashing — none of which the
+  now-working dynamic validator set needed.
 
 ## Not started
 
