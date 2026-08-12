@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, validate_action};
 use xc_primitives::{Action, Address};
@@ -79,6 +80,46 @@ impl RateLimiter {
     }
 }
 
+/// The client IP to key rate limiting on. `ConnectInfo` alone is wrong once
+/// this sits behind the reverse proxy the README already calls for in
+/// production (TLS termination) — every real client would collapse into the
+/// proxy's one IP and share a single limit. `X-Forwarded-For`'s first entry
+/// wins when present, `X-Real-IP` next — verified empirically against a real
+/// Caddy `reverse_proxy` (the documented deployment, see `Caddyfile.example`)
+/// rather than assumed: Caddy doesn't append to a client-supplied
+/// `X-Forwarded-For`, it overwrites it outright with its own observed remote
+/// address, so there's never more than one entry to pick between when Caddy
+/// is the immediate hop — a forged value from the actual client never
+/// survives the proxy. `.next()` on the split is just reading that one
+/// value; it isn't load-bearing leftmost-vs-rightmost logic. (A different
+/// proxy, or a chain of more than one, could behave differently — recheck if
+/// the deployment ever changes from a single Caddy hop.)
+///
+/// Only trusted from a loopback peer, though — the documented deployment is
+/// the proxy running on the same host and forwarding to a loopback-bound RPC
+/// (`rpc_bind` defaults to `127.0.0.1`). Trusting the header from *any* peer
+/// would mean a direct connection (a stray `--rpc-bind 0.0.0.0` before the
+/// proxy's wired up, a misconfigured deploy) could set a fresh
+/// `X-Forwarded-For` on every request and the rate limiter would never
+/// trigger — silently, no log line. A non-loopback peer always gets its own
+/// real `addr`, spoofable header or not.
+fn client_ip(req: &Request, addr: SocketAddr) -> IpAddr {
+    if !addr.ip().is_loopback() {
+        return addr.ip();
+    }
+    let header_ip = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .and_then(|v| v.parse::<IpAddr>().ok())
+    };
+    header_ip("x-forwarded-for")
+        .or_else(|| header_ip("x-real-ip"))
+        .unwrap_or(addr.ip())
+}
+
 async fn guard<P: Payload>(
     State(state): State<AppState<P>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -99,7 +140,7 @@ async fn guard<P: Payload>(
         }
     }
 
-    if !state.rate_limiter.allow(addr.ip()) {
+    if !state.rate_limiter.allow(client_ip(&req, addr)) {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
@@ -163,7 +204,17 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/search", get(search::<P>))
                 .route("/status", get(get_status::<P>))
                 .with_state(state.clone())
-                .layer(middleware::from_fn_with_state(state, guard::<P>));
+                .layer(middleware::from_fn_with_state(state, guard::<P>))
+                // All reads are public and writes are gated by the bearer
+                // token above (never a cookie), so there's no session to
+                // leak cross-origin — open to any origin, same as any public
+                // block explorer's backend, rather than hardcoding one.
+                .layer(
+                    CorsLayer::new()
+                        .allow_origin(Any)
+                        .allow_methods(Any)
+                        .allow_headers(Any),
+                );
 
             let listener = match tokio::net::TcpListener::bind((bind_addr.as_str(), port)).await {
                 Ok(listener) => listener,
@@ -534,6 +585,33 @@ mod tests {
         let sig = key.sign(&action.signing_bytes());
         action.signature = Some(hex::encode(sig.to_bytes()));
         action
+    }
+
+    #[test]
+    fn client_ip_trusts_forwarded_header_only_from_a_loopback_peer() {
+        let real_attacker: SocketAddr = "203.0.113.5:12345".parse().unwrap();
+        let proxy: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let spoofed = "198.51.100.7";
+
+        let req = Request::builder()
+            .header("x-forwarded-for", spoofed)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            client_ip(&req, real_attacker),
+            real_attacker.ip(),
+            "a direct, non-loopback peer must never have its header trusted"
+        );
+
+        let req = Request::builder()
+            .header("x-forwarded-for", spoofed)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            client_ip(&req, proxy),
+            spoofed.parse::<IpAddr>().unwrap(),
+            "the local reverse proxy's forwarded header must still be honored"
+        );
     }
 
     #[test]

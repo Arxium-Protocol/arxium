@@ -127,12 +127,12 @@ needed for it.
   computes the same round-robin proposer a live node did at the time.
   Leaving the last validator is rejected (would stall the chain forever).
   Stake is bookkeeping only — `expected_proposer` still ignores it.
-- **`arxd/runtime` as a real crate** (not started) — currently just a
-  placeholder README, not a workspace member. A state-root registry,
-  cross-chain conflict resolution, and slashing — none of which the
-  now-working dynamic validator set needed.
 
 ## Not started
 
 - **Spoke Chains** (multi-chain phase) — vocabulary decided, nothing
   built. Free to rename before any code lands.
+- **`arxd/runtime` as a real crate** (not started) — currently just a
+  placeholder README, not a workspace member. A state-root registry,
+  cross-chain conflict resolution, and slashing — none of which the
+  now-working dynamic validator set needed.
