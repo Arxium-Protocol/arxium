@@ -3,7 +3,7 @@ use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use xc_executor::execute_actions;
 use xc_primitives::{Action, Address};
-use xc_storage::ArxiumDb;
+use xc_storage::{ArxiumDb, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
 /// The stored block only lists the actions that were actually applied — see
@@ -19,14 +19,20 @@ pub fn produce_block(
     proposer: Option<(&Address, &SigningKey)>,
 ) -> Result<ChainBlock> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
+    let next_height = tip_height + 1;
     let parent: ChainBlock = db
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height is set");
 
-    let (applied, account_updates) = execute_actions(db, actions, dispatch)?;
+    // Pre-block set — matches `xc_executor::accept_block`'s
+    // `get_validator_set_at(block.height)` exactly, so a self-produced block
+    // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
+    let validators = db.get_validator_set_at(next_height)?;
+    let (applied, account_updates, validator_changes) =
+        execute_actions(db, actions, &validators, dispatch)?;
 
     let mut new_block = ChainBlock {
-        height: tip_height + 1,
+        height: next_height,
         parent_hash: parent.hash(),
         timestamp,
         actions: applied,
@@ -36,10 +42,19 @@ pub fn produce_block(
     if let Some((address, key)) = proposer {
         new_block.sign(address.clone(), key);
     }
-    // One atomic write for both the block record and the account changes it
-    // caused — a crash here must never leave the two disagreeing (e.g. nonces
-    // bumped with no block on record for it, or vice versa).
-    db.write_batches(&[&account_updates, &new_block])?;
+    // One atomic write for the block record, the account changes it caused,
+    // and (if any) the resulting validator-set change — a crash here must
+    // never leave these disagreeing (e.g. nonces bumped with no block on
+    // record for it, or vice versa).
+    if validator_changes.is_empty() {
+        db.write_batches(&[&account_updates, &new_block])?;
+    } else {
+        let snapshot = ValidatorSetSnapshot {
+            effective_height: next_height + 1,
+            validators: xc_executor::apply_validator_changes(validators, &validator_changes),
+        };
+        db.write_batches(&[&account_updates, &snapshot, &new_block])?;
+    }
 
     Ok(new_block)
 }
@@ -58,7 +73,8 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates) = execute_actions(&db, genesis.actions.clone(), dispatch).unwrap();
+        let (_, genesis_updates, _) =
+            execute_actions(&db, genesis.actions.clone(), &[], dispatch).unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();
 
         let alice_key = SigningKey::from_bytes(&[1u8; 32]);

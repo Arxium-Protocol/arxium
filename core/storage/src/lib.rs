@@ -156,6 +156,31 @@ impl ArxiumDb {
         Ok(blocks)
     }
 
+    /// The round-robin validator set effective as of `height` — the latest
+    /// `ValidatorSetSnapshot` recorded at or before `height`. A change
+    /// applied in block `H` is recorded effective at `H + 1` (see
+    /// `ValidatorSetSnapshot`), so a block's own proposer check always sees
+    /// the set as it stood before that block, never one it could vote itself
+    /// into. Falls back to an empty set only if genesis never wrote height 0
+    /// (shouldn't happen on a bootstrapped chain).
+    pub fn get_validator_set_at(&self, height: u64) -> Result<Vec<Address>, StorageError> {
+        let prefix = b"validator_set:";
+        let seek_key = format!("validator_set:{height:020}");
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (validators, _len) = bincode::serde::decode_from_slice(&value, config)?;
+            return Ok(validators);
+        }
+        Ok(Vec::new())
+    }
+
     /// Look up a block's height by its content hash.
     pub fn get_block_height_by_hash(&self, hash: &str) -> Result<Option<u64>, StorageError> {
         let key = format!("block_hash:{}", hash);
@@ -233,7 +258,36 @@ impl BatchWritable for Snapshot {
             let value = bincode::serde::encode_to_vec(validator, config)?;
             entries.push((key, value));
         }
+        let mut genesis_validators: Vec<Address> = self.validators.keys().cloned().collect();
+        genesis_validators.sort();
+        entries.push((
+            b"validator_set:00000000000000000000".to_vec(),
+            bincode::serde::encode_to_vec(&genesis_validators, config)?,
+        ));
         Ok(entries)
+    }
+}
+
+/// The round-robin validator set effective starting `effective_height`,
+/// written by `xc_executor::accept_block`/`produce_block` whenever a block
+/// contains a `ValidatorChange` — one full-set snapshot per change, looked up
+/// via `ArxiumDb::get_validator_set_at`. `effective_height` is the changing
+/// block's height + 1: the change can't affect who proposes the block that
+/// introduced it.
+pub struct ValidatorSetSnapshot {
+    pub effective_height: u64,
+    pub validators: Vec<Address>,
+}
+
+impl BatchWritable for ValidatorSetSnapshot {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut sorted = self.validators.clone();
+        sorted.sort();
+        Ok(vec![(
+            format!("validator_set:{:020}", self.effective_height).into_bytes(),
+            bincode::serde::encode_to_vec(&sorted, config)?,
+        )])
     }
 }
 
@@ -391,5 +445,27 @@ mod explorer_index_tests {
             next_page.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
             vec![1, 0]
         );
+    }
+
+    #[test]
+    fn validator_set_at_returns_latest_snapshot_at_or_before_height() {
+        let db = temp_db();
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr(1)],
+        })
+        .unwrap();
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 5,
+            validators: vec![addr(1), addr(2)],
+        })
+        .unwrap();
+        let mut expected_pair = vec![addr(1), addr(2)];
+        expected_pair.sort();
+
+        assert_eq!(db.get_validator_set_at(0).unwrap(), vec![addr(1)]);
+        assert_eq!(db.get_validator_set_at(4).unwrap(), vec![addr(1)]);
+        assert_eq!(db.get_validator_set_at(5).unwrap(), expected_pair);
+        assert_eq!(db.get_validator_set_at(100).unwrap(), expected_pair);
     }
 }

@@ -56,7 +56,8 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates) = execute_actions(&db, genesis_block.actions.clone(), dispatch)?;
+        let (_, genesis_updates, _) =
+            execute_actions(&db, genesis_block.actions.clone(), &[], dispatch)?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
         info!("wrote genesis block: {:?}", genesis_block);
     }
@@ -81,10 +82,6 @@ pub fn run() -> Result<()> {
     info!("{:?}", config);
 
     let (db, snapshot) = bootstrap(&config)?;
-    // ponytail: validator set comes from the static genesis snapshot — no
-    // join/leave mechanism exists yet, and there's no networking to gossip
-    // membership changes even if there were.
-    let validator_addrs: Vec<Address> = snapshot.validators.keys().cloned().collect();
 
     // Some((address, key)) if this node produces signed blocks on its turn;
     // None keeps the old always-produce/unsigned solo-node behavior.
@@ -117,11 +114,10 @@ pub fn run() -> Result<()> {
 
     let on_block = {
         let db = db.clone();
-        let validator_addrs = validator_addrs.clone();
         let chain_lock = chain_lock.clone();
         move |block: ChainBlock| {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
-            match accept_block(&db, block, &validator_addrs, dispatch) {
+            match accept_block(&db, block, dispatch) {
                 Ok(accepted) => info!(
                     "accepted gossiped block {} with {} action(s), hash={}",
                     accepted.height,
@@ -189,7 +185,7 @@ pub fn run() -> Result<()> {
         let proposer = match &identity {
             Some((address, key)) => {
                 let next_height = db.get_tip_height()?.unwrap_or(0) + 1;
-                match expected_proposer(&validator_addrs, next_height) {
+                match expected_proposer(&db.get_validator_set_at(next_height)?, next_height) {
                     Some(expected) if &expected == address => Some((address, key)),
                     Some(_) => {
                         info!("height {next_height}: not our turn, skipping");

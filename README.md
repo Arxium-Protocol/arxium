@@ -1,6 +1,6 @@
 # Arxium Network: A Layer 0 blockchain
 
-# Arxium Network — Phase 1: Core Protocol
+## Phase 1: Core Protocol
 
 Single-validator (one-node) chain: accept signed `Action`s over RPC, order
 them into blocks on a fixed schedule, apply them to account state. See
@@ -82,39 +82,41 @@ That makes it a Phase 2/networking capability, not something to fix here.
 ## Phase 2: Networking & Multi-Validator
 
 Every item below traces back to the same root gap: a single node with no
-way to talk to any other node. No P2P, no gossip, no block/state sync — so
-the validator set is necessarily static (read once from the genesis
+way to talk to any other node. Before networking, `arxd/node/specs/devnet.json`
+could declare two validators, but with no way for a second node to run and
+sync, only one validator's parity of heights could ever be produced — the
+chain advanced once and then stalled forever waiting on the other
+validator's turn. That was fixed by the P2P/gossip and block/state sync
+work below, live-verified past height 100 across two real machines. The
+validator set itself is still static, though (read once from the genesis
 snapshot, no join/leave mechanism, and none would propagate even if there
-were), and `arxd/runtime` (validator-set management, state-root registry,
+were) — `arxd/runtime` (validator-set management, state-root registry,
 conflict resolution, slashing) isn't a real crate yet, since none of that
-means anything without a network to enforce it over. Concretely today:
-`arxd/node/specs/devnet.json` already declares two validators, but with no
-way for a second node to run and sync, only one validator's parity of
-heights can ever be produced — the chain advances once and then stalls
-forever waiting on the other validator's turn. That's not a bug to patch
-around; it's what "no networking" actually means once there's more than
-one validator.
+means anything without a network to enforce it over, which is now in place.
 
-- **P2P/gossip layer** — block and action propagation between nodes.
-  Prerequisite for every other item below. Also what makes mempool loss on
-  restart a non-issue: a node re-syncs pending actions from peers instead
-  of needing its own mempool on disk.
-- **Block/state sync** — a node that joins late (or restarts far behind)
-  catches up from peers instead of only ever trusting its own local
-  RocksDB.
-- **Multi-validator round-robin that actually works** — the devnet's two
-  genesis validators both produce on their turn because both nodes are
-  running and syncing, closing the stall described above.
-- **`arxd/runtime` as a real crate** — validator-set management (join/leave
-  propagated over the network), a state-root registry, conflict
+- **P2P/gossip layer** (done) — `core/network`, generic over the chain's
+  payload type `P`. mDNS discovery on a LAN, `gossipsub` for action/block
+  propagation, and a fixed-seed `--bootnode` identity plus a chain-spec-owned
+  `Snapshot.boot_nodes` list (Polkadot-style) so a fresh node needs zero
+  flags to find the network across separate machines/networks, not just a
+  shared LAN.
+- **Block/state sync** (done) — `libp2p::request_response` in `core/network`
+  (`SyncRequest::Status`/`Blocks`, exchanged on connect and every 5s
+  thereafter). A node behind a peer's reported tip requests the gap and
+  applies each block through the same `accept_block` re-validation path
+  gossip uses — no separate execution logic, sync is just a second delivery
+  mechanism into the same acceptance path. Live-verified across two real
+  machines converging to an identical tip height and hash after a late join.
+- **Multi-validator round-robin that actually works** (done) — the devnet's
+  two genesis validators both produce on their turn because both nodes are
+  running, gossiping, and syncing, closing the stall described above.
+  Verified live past height 100 across two machines.
+- **`arxd/runtime` as a real crate** (not started) — currently just a
+  placeholder README, not a workspace member. Validator-set management
+  (join/leave propagated over the network), a state-root registry, conflict
   resolution, and slashing.
-- **Dynamic validator set** — join/leave against `arxd/runtime`, no longer
-  fixed at genesis.
-- **Explorer frontend** — `core/rpc` already serves the range/list/search
-  endpoints (`GET /blocks`, `GET /accounts/:address/actions`,
-  `GET /search`, …) an explorer needs; the UI consuming them hasn't been
-  built. Not networking-blocked itself, but a multi-node chain is what
-  makes an explorer worth having.
+- **Dynamic validator set** (not started) — join/leave against
+  `arxd/runtime`, no longer fixed at genesis.
 
 ## Not started
 

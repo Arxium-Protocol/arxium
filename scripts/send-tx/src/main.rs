@@ -12,11 +12,11 @@ use xc_primitives::Address;
 /// Signs and submits a Transfer action to a running arxd node. Devnet testing only.
 #[derive(Parser)]
 struct Args {
-    /// Sender: "alice", "bob", or a raw hex ed25519 seed
+    /// Sender: a name from devnet-keys.json (e.g. "alice"), or a raw hex ed25519 seed
     #[arg(long)]
     from: String,
 
-    /// Recipient: "alice", "bob", or a bech32 address
+    /// Recipient: a name from devnet-keys.json, or a bech32 address
     #[arg(long)]
     to: String,
 
@@ -41,14 +41,15 @@ fn keys_file() -> Value {
 }
 
 fn resolve_signer(name: &str, keys: &Value) -> Result<SigningKey> {
-    let seed_hex = match name {
-        "alice" | "bob" => keys[name]["ed25519_seed_hex"]
+    let seed_hex = match keys.get(name) {
+        Some(entry) => entry["ed25519_seed_hex"]
             .as_str()
             .with_context(|| format!("no seed for {name} in devnet-keys.json"))?
             .to_string(),
-        hex_seed => hex_seed.to_string(),
+        None => name.to_string(),
     };
-    let seed = hex::decode(&seed_hex).context("--from is not \"alice\", \"bob\", or a hex seed")?;
+    let seed = hex::decode(&seed_hex)
+        .context("--from is not a name in devnet-keys.json or a hex seed")?;
     let seed: [u8; 32] = seed
         .try_into()
         .map_err(|_| anyhow::anyhow!("seed must be 32 bytes"))?;
@@ -56,16 +57,15 @@ fn resolve_signer(name: &str, keys: &Value) -> Result<SigningKey> {
 }
 
 fn resolve_address(name: &str, keys: &Value) -> Result<Address> {
-    match name {
-        "alice" | "bob" => {
-            let addr = keys[name]["address"]
+    match keys.get(name) {
+        Some(entry) => {
+            let addr = entry["address"]
                 .as_str()
                 .with_context(|| format!("no address for {name} in devnet-keys.json"))?;
             Address::parse(addr).context("bad address in devnet-keys.json")
         }
-        other => {
-            Address::parse(other).context("--to is not \"alice\", \"bob\", or a valid address")
-        }
+        None => Address::parse(name)
+            .context("--to is not a name in devnet-keys.json or a valid address"),
     }
 }
 

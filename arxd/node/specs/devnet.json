@@ -11,6 +11,11 @@
       "balance": 1000000000,
       "nonce": 0,
       "identity_hash": null
+    },
+    "arx1a4yj333g68pvd6hfqvufqkv4vy54jfe6t33ljd3kc9rpfty8xlgshausgl": {
+      "balance": 1000000000,
+      "nonce": 0,
+      "identity_hash": null
     }
   },
   "validators": {

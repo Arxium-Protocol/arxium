@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use xc_executor::execute_actions;
 use xc_mempool::Mempool;
-use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot};
+use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, ValidatorChange};
 use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
 
 const CHAIN_NAME: &str = "toychain-rwa-devnet";
@@ -42,23 +42,24 @@ fn dispatch(
     action: &RwaAction,
     lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
     issuer: &Address,
-) -> anyhow::Result<AccountUpdates> {
-    match &action.payload {
-        RwaPayload::Issue { amount } => Ok(circuit_rwa_asset::apply_issue(
+) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
+    let updates = match &action.payload {
+        RwaPayload::Issue { amount } => circuit_rwa_asset::apply_issue(
             lookup,
             issuer,
             &action.sender,
             action.nonce,
             *amount,
-        )?),
-        RwaPayload::Transfer { to, amount } => Ok(circuit_rwa_asset::apply_compliant_transfer(
+        )?,
+        RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
             lookup,
             &action.sender,
             action.nonce,
             to,
             *amount,
-        )?),
-    }
+        )?,
+    };
+    Ok((updates, None))
 }
 
 fn now() -> u64 {
@@ -91,8 +92,9 @@ fn produce_block(
         .get_block(tip_height)?
         .expect("tip block must exist");
 
-    let (applied, updates) =
-        execute_actions(db, actions, |action, lookup| dispatch(action, lookup, issuer))?;
+    let (applied, updates, _) = execute_actions(db, actions, &[], |action, lookup, _validators| {
+        dispatch(action, lookup, issuer)
+    })?;
 
     let block = Block {
         height: tip_height + 1,
@@ -151,7 +153,7 @@ fn main() -> Result<()> {
     })?;
     let genesis: RwaBlock = Block::genesis(now());
     db.write_batches(&[
-        &execute_actions(&db, genesis.actions.clone(), |action, lookup| {
+        &execute_actions(&db, genesis.actions.clone(), &[], |action, lookup, _validators| {
             dispatch(action, lookup, &issuer)
         })?
         .1,

@@ -15,6 +15,17 @@ pub struct ValidatorEntry {
     pub stake: u128,
 }
 
+/// A membership change to the round-robin validator set, produced by a
+/// chain-specific dispatch (e.g. `ActionPayload::JoinValidator`) and applied
+/// generically by `xc_executor::accept_block`/`produce_block` — chain-agnostic
+/// like `expected_proposer` itself, since any `P`-chain wanting round-robin
+/// PoS needs the same join/leave bookkeeping.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ValidatorChange {
+    Join(Address, ValidatorEntry),
+    Leave(Address),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub height: u64,

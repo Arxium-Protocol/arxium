@@ -3,8 +3,32 @@ use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use thiserror::Error;
 use tracing::warn;
-use xc_primitives::{AccountEntry, Action, Address, Block, SignatureError, expected_proposer};
-use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
+use xc_primitives::{
+    AccountEntry, Action, Address, Block, SignatureError, ValidatorChange, expected_proposer,
+};
+use xc_storage::{AccountUpdates, ArxiumDb, StorageError, ValidatorSetSnapshot};
+
+/// Folds `changes` (in order) onto `set`, dedupes, and sorts — the same
+/// deterministic shape `expected_proposer` requires. A join for an address
+/// already present, or a leave for one that isn't, is a no-op rather than an
+/// error here: `dispatch` is where membership preconditions (e.g. "can't
+/// leave the last validator") get enforced before a `ValidatorChange` is
+/// ever produced.
+pub fn apply_validator_changes(mut set: Vec<Address>, changes: &[ValidatorChange]) -> Vec<Address> {
+    for change in changes {
+        match change {
+            ValidatorChange::Join(address, _entry) => {
+                if !set.contains(address) {
+                    set.push(address.clone());
+                }
+            }
+            ValidatorChange::Leave(address) => set.retain(|a| a != address),
+        }
+    }
+    set.sort();
+    set.dedup();
+    set
+}
 
 #[derive(Error, Debug)]
 pub enum ExecutorError {
@@ -57,18 +81,23 @@ pub enum AcceptBlockError {
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
-    validators: &[Address],
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    ) -> anyhow::Result<AccountUpdates>,
+        &[Address],
+    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)>,
 ) -> Result<Block<P>, AcceptBlockError>
 where
     P: Serialize + DeserializeOwned + Clone,
 {
     block.verify_proposer_signature()?;
 
-    let expected = expected_proposer(validators, block.height);
+    // The set as of `block.height` — a change made *by* this block only
+    // takes effect at `block.height + 1` (see `ValidatorSetSnapshot`), so
+    // this is also the pre-block set `dispatch` should validate
+    // JoinValidator/LeaveValidator preconditions against below.
+    let validators = db.get_validator_set_at(block.height)?;
+    let expected = expected_proposer(&validators, block.height);
     if block.proposer != expected {
         return Err(AcceptBlockError::WrongProposer {
             height: block.height,
@@ -103,7 +132,8 @@ where
     // exactly as claimed or be rejected outright; there's no partial credit
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
-    let (applied, account_updates) = execute_actions(db, block.actions.clone(), dispatch)?;
+    let (applied, account_updates, validator_changes) =
+        execute_actions(db, block.actions.clone(), &validators, dispatch)?;
     if applied.len() != claimed {
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -112,7 +142,19 @@ where
         });
     }
 
-    db.write_batches(&[&account_updates, &block])?;
+    let new_validator_set = if validator_changes.is_empty() {
+        None
+    } else {
+        Some(ValidatorSetSnapshot {
+            effective_height: block.height + 1,
+            validators: apply_validator_changes(validators, &validator_changes),
+        })
+    };
+
+    match &new_validator_set {
+        Some(snapshot) => db.write_batches(&[&account_updates, snapshot, &block])?,
+        None => db.write_batches(&[&account_updates, &block])?,
+    }
     Ok(block)
 }
 
@@ -135,16 +177,19 @@ where
 pub fn execute_actions<P>(
     db: &ArxiumDb,
     actions: Vec<Action<P>>,
+    validators: &[Address],
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    ) -> anyhow::Result<AccountUpdates>,
-) -> Result<(Vec<Action<P>>, AccountUpdates), ExecutorError>
+        &[Address],
+    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)>,
+) -> Result<(Vec<Action<P>>, AccountUpdates, Vec<ValidatorChange>), ExecutorError>
 where
     P: serde::Serialize,
 {
     let mut applied = Vec::with_capacity(actions.len());
     let mut overlay = HashMap::new();
+    let mut validator_changes = Vec::new();
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -157,16 +202,17 @@ where
             None => db.get_account(addr),
         };
 
-        match dispatch(&action, &lookup) {
-            Ok(updates) => {
+        match dispatch(&action, &lookup, validators) {
+            Ok((updates, validator_change)) => {
                 overlay.extend(updates.0);
+                validator_changes.extend(validator_change);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
         }
     }
 
-    Ok((applied, AccountUpdates(overlay)))
+    Ok((applied, AccountUpdates(overlay), validator_changes))
 }
 
 #[cfg(test)]
@@ -179,16 +225,26 @@ mod tests {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
         Transfer { to: Address, amount: u128 },
+        Join,
     }
 
     fn dispatch(
         action: &Action<TestPayload>,
         lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    ) -> anyhow::Result<AccountUpdates> {
+        _validators: &[Address],
+    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
         match &action.payload {
-            TestPayload::Transfer { to, amount } => {
-                Ok(apply_transfer(lookup, &action.sender, action.nonce, to, *amount)?)
-            }
+            TestPayload::Transfer { to, amount } => Ok((
+                apply_transfer(lookup, &action.sender, action.nonce, to, *amount)?,
+                None,
+            )),
+            TestPayload::Join => Ok((
+                AccountUpdates(Default::default()),
+                Some(ValidatorChange::Join(
+                    action.sender.clone(),
+                    xc_primitives::ValidatorEntry { stake: 0 },
+                )),
+            )),
         }
     }
 
@@ -224,6 +280,56 @@ mod tests {
         action
     }
 
+    fn signed_join(key: &SigningKey, sender: &Address, nonce: u64) -> Action<TestPayload> {
+        let mut action = Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload: TestPayload::Join,
+        };
+        let signature = key.sign(&action.signing_bytes());
+        action.signature = Some(hex::encode(signature.to_bytes()));
+        action
+    }
+
+    #[test]
+    fn validator_join_takes_effect_one_block_later_not_the_block_that_added_it() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[7u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let bob_key = SigningKey::from_bytes(&[8u8; 32]);
+        let bob = Address::from_pubkey_bytes(bob_key.verifying_key().as_bytes()).unwrap();
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![alice.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+            .unwrap();
+
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: 1,
+            actions: vec![signed_join(&bob_key, &bob, 0)],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(alice.clone(), &alice_key);
+
+        let accepted = accept_block(&db, block1, dispatch).unwrap();
+        assert_eq!(accepted.actions.len(), 1, "join action must be applied");
+
+        // Block 1 itself is still decided by the pre-join set.
+        assert_eq!(db.get_validator_set_at(1).unwrap(), vec![alice.clone()]);
+        // Bob only becomes a validator starting block 2.
+        let mut expected = vec![alice, bob];
+        expected.sort();
+        assert_eq!(db.get_validator_set_at(2).unwrap(), expected);
+    }
+
     #[test]
     fn same_block_actions_chain_and_commit_atomically() {
         let db = temp_db();
@@ -250,7 +356,9 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (applied, updates) = execute_actions(&db, actions, dispatch).unwrap();
+        let (applied, updates, validator_changes) =
+            execute_actions(&db, actions, &[], dispatch).unwrap();
+        assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),
             2,

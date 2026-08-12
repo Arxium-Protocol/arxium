@@ -7,5 +7,9 @@
   "bob": {
     "address": "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5",
     "ed25519_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+  },
+  "charlie": {
+    "address": "arx1a4yj333g68pvd6hfqvufqkv4vy54jfe6t33ljd3kc9rpfty8xlgshausgl",
+    "ed25519_seed_hex": "0303030303030303030303030303030303030303030303030303030303030303"
   }
 }
