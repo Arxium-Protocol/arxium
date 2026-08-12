@@ -1,10 +1,31 @@
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 use xc_primitives::NodeConfig;
 
+/// Flags accepted with no subcommand — runs the node, same as always
+/// (`arxd --validator ...`). `arxd node-key` is the only other subcommand.
 #[derive(Parser, Clone, Debug)]
 #[command(about = "Arxium chain node")]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+    #[command(flatten)]
+    pub run: RunArgs,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+pub enum Command {
+    /// Load (or, on first run, generate) this node's libp2p identity key and
+    /// print its PeerId, without starting the node — lets an operator learn
+    /// their node's network identity to hand to peers ahead of time.
+    NodeKey {
+        #[arg(long, default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+    },
+}
+
+#[derive(Args, Clone, Debug)]
+pub struct RunArgs {
     #[arg(long, default_value_os_t = default_base_path())]
     pub base_path: PathBuf,
 
@@ -49,7 +70,7 @@ fn default_base_path() -> PathBuf {
         .join(".arxium")
 }
 
-impl Cli {
+impl RunArgs {
     pub fn into_config(self) -> NodeConfig {
         NodeConfig {
             base_path: self.base_path,

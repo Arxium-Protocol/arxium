@@ -1,10 +1,12 @@
-mod identity;
+pub mod identity;
+
+pub use libp2p::PeerId;
 
 use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
 use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{StreamProtocol, gossipsub, mdns, noise, tcp, yamux, Multiaddr, PeerId};
+use libp2p::{StreamProtocol, gossipsub, mdns, noise, tcp, yamux, Multiaddr};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -45,6 +47,13 @@ const SYNC_PROTOCOL: &str = "/arxium/sync/1";
 /// devnet-scale block interval (~2s) rather than a long fixed value, so a
 /// missed block self-heals in a couple of block times, not tens of seconds.
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
+/// A peer whose sync requests fail this many times in a row (without a
+/// success in between) stops being retried until it reconnects — a flapping
+/// connection otherwise retries every single failure immediately, which on a
+/// bad link produces dozens of retries per second forever. Past this cap the
+/// peer is just skipped by the `STATUS_INTERVAL` tick; `ConnectionEstablished`
+/// (a real reconnect) or any successful sync response clears the count.
+const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 5;
 
 /// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
 /// `from`, capped at the local tip — never fabricates blocks the responder
@@ -252,6 +261,9 @@ async fn run_swarm<P: Payload>(
     // knows whether to request the next batch or stop — set on every
     // `Status` response, both the on-connect one and the periodic re-check.
     let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+    // Consecutive sync-request failures per peer since its last success or
+    // reconnect — see `MAX_CONSECUTIVE_SYNC_FAILURES`.
+    let mut sync_failures: HashMap<PeerId, u32> = HashMap::new();
     let mut status_interval = tokio::time::interval(STATUS_INTERVAL);
 
     loop {
@@ -259,6 +271,9 @@ async fn run_swarm<P: Payload>(
             _ = status_interval.tick() => {
                 let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
                 for peer in peers {
+                    if sync_failures.get(&peer).is_some_and(|&n| n >= MAX_CONSECUTIVE_SYNC_FAILURES) {
+                        continue;
+                    }
                     send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
                 }
             }
@@ -299,6 +314,9 @@ async fn run_swarm<P: Payload>(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     info!("connected to peer {peer_id}");
+                    // Fresh connection — give it a clean slate rather than
+                    // carrying over failures accrued before it dropped.
+                    sync_failures.remove(&peer_id);
                     // Ask immediately — a node that was offline and just
                     // reconnected shouldn't have to wait for the next
                     // STATUS_INTERVAL tick to start catching up.
@@ -369,13 +387,29 @@ async fn run_swarm<P: Payload>(
                     error,
                     ..
                 })) => {
-                    // A lost request otherwise just sits forever — nothing
-                    // else re-triggers it before the next STATUS_INTERVAL
-                    // tick (or a fresh connection). Re-asking for Status
-                    // immediately cascades back into a Blocks retry via the
-                    // Status response handler below if the peer's still ahead.
-                    warn!("sync request to {peer} failed: {error}; retrying");
-                    send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
+                    // Don't retry synchronously — on a flapping connection
+                    // each failure re-triggers another immediately, which
+                    // spins into a flood of retries per second. Record the
+                    // failure and let the next STATUS_INTERVAL tick (or a
+                    // fresh ConnectionEstablished) retry instead — a real
+                    // backoff, not a tight loop. Past
+                    // MAX_CONSECUTIVE_SYNC_FAILURES the tick skips this peer
+                    // entirely until it reconnects or a request succeeds.
+                    let failures = sync_failures.entry(peer).or_insert(0);
+                    *failures += 1;
+                    if *failures >= MAX_CONSECUTIVE_SYNC_FAILURES {
+                        warn!(
+                            "sync request to {peer} failed: {error} ({failures} consecutive failures, giving up until it reconnects)"
+                        );
+                    } else if swarm.is_connected(&peer) {
+                        warn!(
+                            "sync request to {peer} failed: {error} (will retry on next status interval)"
+                        );
+                    } else {
+                        warn!(
+                            "sync request to {peer} failed: {error} (not connected, will retry on reconnect)"
+                        );
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::InboundFailure {
                     peer,
@@ -437,6 +471,9 @@ async fn run_swarm<P: Payload>(
                                 continue;
                             }
                         };
+                        // A response means the peer is reachable again —
+                        // don't leave it skipped by a stale failure count.
+                        sync_failures.remove(&peer);
                         match sync_response {
                             SyncResponse::Status { tip_height } => {
                                 peer_tips.insert(peer, tip_height);

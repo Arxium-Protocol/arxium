@@ -2350,6 +2350,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "network"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "libp2p",
+ "serde",
+ "tokio",
+ "tracing",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2370,6 +2385,7 @@ dependencies = [
  "clap",
  "ed25519-dalek 3.0.0",
  "hex",
+ "network",
  "rand 0.9.5",
  "serde",
  "tokio",
@@ -2379,7 +2395,6 @@ dependencies = [
  "xc-executor",
  "xc-genesis",
  "xc-mempool",
- "xc-network",
  "xc-primitives",
  "xc-rpc",
  "xc-storage",
@@ -4202,21 +4217,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror 2.0.19",
- "xc-primitives",
- "xc-storage",
-]
-
-[[package]]
-name = "xc-network"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "libp2p",
- "serde",
- "tokio",
- "tracing",
- "xc-mempool",
  "xc-primitives",
  "xc-storage",
 ]

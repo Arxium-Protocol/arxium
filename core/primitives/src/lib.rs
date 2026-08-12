@@ -25,7 +25,7 @@ pub struct NodeConfig {
     pub bootnodes: Vec<String>,
     /// DEVNET ONLY — makes this node use the well-known, seed-pinned network
     /// identity that every other node's default `--bootnodes` value expects
-    /// to find at a fixed PeerId. See `xc_network::identity::DEVNET_BOOTNODE_SEED`.
+    /// to find at a fixed PeerId. See `network::identity::DEVNET_BOOTNODE_SEED`.
     pub is_bootnode: bool,
     pub is_validator: bool,
     /// If set, the RPC server requires `Authorization: Bearer <token>` on every request.

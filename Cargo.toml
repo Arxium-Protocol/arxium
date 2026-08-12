@@ -10,9 +10,9 @@ members = [
     "core/cli",
     "core/genesis",
     "core/rpc",
-    "core/network",
     #
     "arxd/node",
+    "arxd/network",
     "arxd",
     #
     "scripts/send-tx",
@@ -35,8 +35,8 @@ xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
 xc-genesis = { path = "core/genesis" }
 xc-rpc = { path = "core/rpc" }
-xc-network = { path = "core/network" }
 node = { path = "arxd/node" }
+network = { path = "arxd/network" }
 
 # external packages
 clap = { version = "4.4", features = ["derive"] }

@@ -12,10 +12,10 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
-use xc_cli::Cli;
+use network::{identity, spawn_p2p_node};
+use xc_cli::{Cli, Command};
 use xc_executor::{accept_block, execute_actions};
 use xc_mempool::Mempool;
-use xc_network::spawn_p2p_node;
 use xc_primitives::{Address, NodeConfig, Snapshot, eligible_proposer};
 use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
@@ -83,7 +83,16 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
 }
 
 pub fn run() -> Result<()> {
-    let config = Cli::parse().into_config();
+    let cli = Cli::parse();
+
+    if let Some(Command::NodeKey { base_path }) = cli.command {
+        std::fs::create_dir_all(&base_path).context("failed to create base-path directory")?;
+        let keypair = identity::load_or_generate_keypair(&base_path)?;
+        println!("{}", network::PeerId::from(keypair.public()));
+        return Ok(());
+    }
+
+    let config = cli.run.into_config();
     info!("{:?}", config);
 
     let (db, snapshot) = bootstrap(&config)?;
@@ -194,7 +203,14 @@ pub fn run() -> Result<()> {
                 let parent: ChainBlock = db
                     .get_block(tip_height)?
                     .expect("tip block must exist if tip_height is set");
-                let elapsed = now_secs().saturating_sub(parent.timestamp);
+                // Genesis's timestamp is a synthetic 0, not a real
+                // wall-clock moment — see the matching comment in
+                // `accept_block`. Height 1 always uses the plain primary.
+                let elapsed = if parent.height == 0 {
+                    0
+                } else {
+                    now_secs().saturating_sub(parent.timestamp)
+                };
                 let validators = db.get_validator_set_at(next_height)?;
                 match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())
                 {

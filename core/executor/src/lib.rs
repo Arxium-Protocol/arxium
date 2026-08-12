@@ -119,7 +119,16 @@ where
     // node (live or replaying during sync) computes the same elapsed time
     // from the same two stored timestamps, so they always agree on who was
     // eligible to stand in for a late primary.
-    let elapsed = block.timestamp.saturating_sub(parent.timestamp);
+    //
+    // Genesis is the one exception: its timestamp is a synthetic constant
+    // (0), not a real wall-clock moment, so `block.timestamp - 0` is really
+    // just block 1's real epoch timestamp — tens of years, always capping
+    // skip at max. Height 1 always uses the plain primary, no timeout.
+    let elapsed = if parent.height == 0 {
+        0
+    } else {
+        block.timestamp.saturating_sub(parent.timestamp)
+    };
     let expected = eligible_proposer(&validators, block.height, elapsed, slot_duration_secs);
     if block.proposer != expected {
         return Err(AcceptBlockError::WrongProposer {

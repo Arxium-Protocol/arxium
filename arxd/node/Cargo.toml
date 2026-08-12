@@ -21,5 +21,5 @@ xc-mempool = { workspace = true }
 xc-cli = { workspace = true }
 xc-genesis = { workspace = true }
 xc-rpc = { workspace = true }
-xc-network = { workspace = true }
+network = { workspace = true }
 circuit-account = { workspace = true }

@@ -45,7 +45,7 @@ struct AppState<P: Payload> {
     rpc_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
     // Broadcasts freshly admitted actions out to peers over gossip. `None`
-    // in tests / any caller that doesn't wire up `xc-network`.
+    // in tests / any caller that doesn't wire up `network`.
     gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
 }
 
@@ -192,7 +192,7 @@ pub fn spawn_http_ingest<P: Payload>(
 
 /// Runs the action through `xc_mempool::validate_action` (signature +
 /// stale-nonce check — see its doc comment) before it ever touches the
-/// mempool, same as gossip-received actions do in `xc-network`.
+/// mempool, same as gossip-received actions do in `network`.
 async fn submit_action<P: Payload>(
     State(state): State<AppState<P>>,
     body: Result<Json<Action<P>>, JsonRejection>,
