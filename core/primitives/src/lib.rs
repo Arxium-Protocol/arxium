@@ -11,7 +11,9 @@ pub use action::{Action, SignatureError};
 pub use address::{Address, AddressError};
 pub use block::Block;
 pub use consensus::{eligible_proposer, expected_proposer};
-pub use state::{AccountEntry, Snapshot, ValidatorChange, ValidatorEntry};
+pub use state::{
+    AccountEntry, Snapshot, StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
+};
 
 #[derive(Debug)]
 pub struct NodeConfig {

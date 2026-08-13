@@ -1,12 +1,41 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
 use thiserror::Error;
 use tracing::warn;
 use xc_primitives::{
-    AccountEntry, Action, Address, Block, SignatureError, ValidatorChange, eligible_proposer,
+    AccountEntry, Action, Address, Block, SignatureError, StakeAllocation, ValidatorChange,
+    eligible_proposer,
 };
-use xc_storage::{AccountUpdates, ArxiumDb, StorageError, ValidatorSetSnapshot};
+use xc_storage::{AccountUpdates, ArxiumDb, StakeUpdates, StorageError, ValidatorSetSnapshot};
+
+/// What a single dispatched action hands back: account changes, an optional
+/// validator-membership change, and any stake-allocation changes. Named
+/// struct instead of a growing positional tuple — every payload variant
+/// across every chain implements this contract, so a fourth effect kind
+/// would otherwise mean silently reordering fields everywhere.
+#[derive(Debug, Default)]
+pub struct BlockUpdates {
+    pub accounts: AccountUpdates,
+    pub validator_change: Option<ValidatorChange>,
+    pub stakes: StakeUpdates,
+}
+
+/// Resolves every stake allocation whose unbonding batch matured at or
+/// before `height`, crediting masters back and clearing the allocation —
+/// meant to run *before* the action-dispatch loop each block (as the `seed`
+/// passed to `execute_actions`), so a same-block `Stake`/`Unstake` action
+/// against a pair that just cleared sees the cleared state instead of
+/// hitting "already unbonding".
+pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpdates, StorageError> {
+    let due = db.get_allocations_with_unbonding_due(height)?;
+    let (accounts, stakes) =
+        circuit_staking::resolve_due_unbonding(|addr| db.get_account(addr), due)?;
+    Ok(BlockUpdates {
+        accounts,
+        validator_change: None,
+        stakes,
+    })
+}
 
 /// Folds `changes` (in order) onto `set`, dedupes, and sorts — the same
 /// deterministic shape `expected_proposer` requires. A join for an address
@@ -85,8 +114,10 @@ pub fn accept_block<P>(
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+        &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
+        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
-    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)>,
+    ) -> anyhow::Result<BlockUpdates>,
 ) -> Result<Block<P>, AcceptBlockError>
 where
     P: Serialize + DeserializeOwned + Clone,
@@ -147,8 +178,9 @@ where
     // exactly as claimed or be rejected outright; there's no partial credit
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
-    let (applied, account_updates, validator_changes) =
-        execute_actions(db, block.actions.clone(), &validators, dispatch)?;
+    let seed = resolve_matured_unbonding(db, block.height)?;
+    let (applied, account_updates, validator_changes, stake_updates) =
+        execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -167,8 +199,10 @@ where
     };
 
     match &new_validator_set {
-        Some(snapshot) => db.write_batches(&[&account_updates, snapshot, &block])?,
-        None => db.write_batches(&[&account_updates, &block])?,
+        Some(snapshot) => {
+            db.write_batches(&[&account_updates, &stake_updates, snapshot, &block])?
+        }
+        None => db.write_batches(&[&account_updates, &stake_updates, &block])?,
     }
     Ok(block)
 }
@@ -193,18 +227,34 @@ pub fn execute_actions<P>(
     db: &ArxiumDb,
     actions: Vec<Action<P>>,
     validators: &[Address],
+    seed: BlockUpdates,
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+        &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
+        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
-    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)>,
-) -> Result<(Vec<Action<P>>, AccountUpdates, Vec<ValidatorChange>), ExecutorError>
+    ) -> anyhow::Result<BlockUpdates>,
+) -> Result<
+    (
+        Vec<Action<P>>,
+        AccountUpdates,
+        Vec<ValidatorChange>,
+        StakeUpdates,
+    ),
+    ExecutorError,
+>
 where
     P: serde::Serialize,
 {
     let mut applied = Vec::with_capacity(actions.len());
-    let mut overlay = HashMap::new();
-    let mut validator_changes = Vec::new();
+    // Seeded from e.g. matured-unbonding resolution, run by the caller
+    // before this loop — so a same-block `Stake` action sees a just-cleared
+    // `unbonding` slot instead of hitting "already unbonding".
+    let mut overlay = seed.accounts.0;
+    let mut validator_changes: Vec<ValidatorChange> = seed.validator_change.into_iter().collect();
+    let mut stake_overlay = seed.stakes.allocations;
+    let mut validator_index_overlay = seed.stakes.validator_index;
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -216,18 +266,45 @@ where
             Some(entry) => Ok(Some(entry).cloned()),
             None => db.get_account(addr),
         };
+        let stake_lookup = |master: &Address, validator: &Address| match stake_overlay
+            .get(&(master.clone(), validator.clone()))
+        {
+            Some(entry) => Ok(Clone::clone(entry)),
+            None => db.get_stake_allocation(master, validator),
+        };
+        let validator_masters_lookup =
+            |validator: &Address| match validator_index_overlay.get(validator) {
+                Some(masters) => Ok(Clone::clone(masters)),
+                None => db.get_stakes_by_validator(validator),
+            };
 
-        match dispatch(&action, &lookup, validators) {
-            Ok((updates, validator_change)) => {
-                overlay.extend(updates.0);
-                validator_changes.extend(validator_change);
+        match dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            validators,
+        ) {
+            Ok(updates) => {
+                overlay.extend(updates.accounts.0);
+                validator_changes.extend(updates.validator_change);
+                stake_overlay.extend(updates.stakes.allocations);
+                validator_index_overlay.extend(updates.stakes.validator_index);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
         }
     }
 
-    Ok((applied, AccountUpdates(overlay), validator_changes))
+    Ok((
+        applied,
+        AccountUpdates(overlay),
+        validator_changes,
+        StakeUpdates {
+            allocations: stake_overlay,
+            validator_index: validator_index_overlay,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -236,30 +313,51 @@ mod tests {
     use circuit_account::apply_transfer;
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
+    use std::collections::HashMap;
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
         Transfer { to: Address, amount: u128 },
         Join,
+        Stake { validator: Address, amount: u128 },
     }
 
     fn dispatch(
         action: &Action<TestPayload>,
         lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+        stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
+        validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         _validators: &[Address],
-    ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
+    ) -> anyhow::Result<BlockUpdates> {
         match &action.payload {
-            TestPayload::Transfer { to, amount } => Ok((
-                apply_transfer(lookup, &action.sender, action.nonce, to, *amount)?,
-                None,
-            )),
-            TestPayload::Join => Ok((
-                AccountUpdates(Default::default()),
-                Some(ValidatorChange::Join(
+            TestPayload::Stake { validator, amount } => {
+                let (accounts, stakes) = circuit_staking::apply_stake(
+                    lookup,
+                    stake_lookup,
+                    validator_masters_lookup,
+                    &action.sender,
+                    action.nonce,
+                    validator,
+                    *amount,
+                    0,
+                )?;
+                Ok(BlockUpdates {
+                    accounts,
+                    stakes,
+                    ..Default::default()
+                })
+            }
+            TestPayload::Transfer { to, amount } => Ok(BlockUpdates {
+                accounts: apply_transfer(lookup, &action.sender, action.nonce, to, *amount)?,
+                ..Default::default()
+            }),
+            TestPayload::Join => Ok(BlockUpdates {
+                validator_change: Some(ValidatorChange::Join(
                     action.sender.clone(),
                     xc_primitives::ValidatorEntry { stake: 0 },
                 )),
-            )),
+                ..Default::default()
+            }),
         }
     }
 
@@ -371,8 +469,8 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (applied, updates, validator_changes) =
-            execute_actions(&db, actions, &[], dispatch).unwrap();
+        let (applied, updates, validator_changes, _stake_updates) =
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),
@@ -391,5 +489,170 @@ mod tests {
 
         let bob_after = db.get_account(&bob).unwrap().unwrap();
         assert_eq!(bob_after.balance, 50);
+    }
+
+    fn signed_stake(
+        key: &SigningKey,
+        sender: &Address,
+        nonce: u64,
+        validator: &Address,
+        amount: u128,
+    ) -> Action<TestPayload> {
+        let mut action = Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload: TestPayload::Stake {
+                validator: validator.clone(),
+                amount,
+            },
+        };
+        let signature = key.sign(&action.signing_bytes());
+        action.signature = Some(hex::encode(signature.to_bytes()));
+        action
+    }
+
+    #[test]
+    fn stake_allocation_and_block_height_commit_atomically() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[11u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let validator = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![alice.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[
+            &AccountUpdates(HashMap::from([(
+                alice.clone(),
+                AccountEntry {
+                    balance: 1000,
+                    nonce: 0,
+                    identity_hash: None,
+                },
+            )])),
+            &genesis,
+        ])
+        .unwrap();
+
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: 1,
+            actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 400)],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(alice.clone(), &alice_key);
+
+        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
+        assert_eq!(accepted.actions.len(), 1, "stake action must be applied");
+
+        // Never disagree: if the block landed, the stake it caused landed
+        // with it — both come out of the same `write_batches` call.
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        let allocation = db
+            .get_stake_allocation(&alice, &validator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocation.active_amount, 400);
+        assert_eq!(db.get_account(&alice).unwrap().unwrap().balance, 600);
+    }
+
+    #[test]
+    fn unbonding_resolves_before_same_block_actions_so_restaking_succeeds() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[13u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let validator = Address::from_pubkey_bytes(&[14u8; 32]).unwrap();
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![alice.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[
+            &AccountUpdates(HashMap::from([(
+                alice.clone(),
+                AccountEntry {
+                    balance: 1000,
+                    nonce: 0,
+                    identity_hash: None,
+                },
+            )])),
+            &genesis,
+        ])
+        .unwrap();
+
+        // Seed an allocation that's already fully unbonding, maturing at
+        // exactly block 1 — set up directly rather than waiting out
+        // `UNBONDING_BLOCKS` real blocks.
+        let mut stake_updates = StakeUpdates::default();
+        stake_updates.allocations.insert(
+            (alice.clone(), validator.clone()),
+            Some(StakeAllocation {
+                master: alice.clone(),
+                validator: validator.clone(),
+                active_amount: 0,
+                unbonding: Some(xc_primitives::Unbonding {
+                    amount: 300,
+                    unlock_at_height: 1,
+                }),
+                created_at: 0,
+                updated_at: 0,
+            }),
+        );
+        stake_updates
+            .validator_index
+            .insert(validator.clone(), vec![alice.clone()]);
+        db.write_batch(&stake_updates).unwrap();
+        // Sub-account must actually hold the unbonding amount — it's what
+        // `resolve_due_unbonding` debits back to alice.
+        let sub_account = circuit_staking::stake_subaccount(&validator);
+        db.write_batch(&AccountUpdates(HashMap::from([(
+            sub_account,
+            AccountEntry {
+                balance: 300,
+                nonce: 0,
+                identity_hash: None,
+            },
+        )])))
+        .unwrap();
+
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: 1,
+            // Without the unbonding-resolves-first ordering, this would hit
+            // `AlreadyUnbonding` since the allocation above is still mid-unbond.
+            actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 200)],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(alice.clone(), &alice_key);
+
+        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
+        assert_eq!(
+            accepted.actions.len(),
+            1,
+            "restaking in the same block the unbonding matures must succeed"
+        );
+
+        // The matured 300 landed back on alice's balance, then 200 of it was
+        // immediately restaked.
+        assert_eq!(
+            db.get_account(&alice).unwrap().unwrap().balance,
+            1000 + 300 - 200
+        );
+        let allocation = db
+            .get_stake_allocation(&alice, &validator)
+            .unwrap()
+            .unwrap();
+        assert_eq!(allocation.active_amount, 200);
+        assert!(allocation.unbonding.is_none());
     }
 }

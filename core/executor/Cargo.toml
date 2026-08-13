@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
+circuit-staking = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

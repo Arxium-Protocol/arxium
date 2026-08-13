@@ -19,7 +19,7 @@ use anyhow::Result;
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use tracing::info;
-use xc_executor::execute_actions;
+use xc_executor::{BlockUpdates, execute_actions};
 use xc_mempool::Mempool;
 use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, ValidatorChange};
 use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
@@ -44,13 +44,9 @@ fn dispatch(
     issuer: &Address,
 ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
     let updates = match &action.payload {
-        RwaPayload::Issue { amount } => circuit_rwa_asset::apply_issue(
-            lookup,
-            issuer,
-            &action.sender,
-            action.nonce,
-            *amount,
-        )?,
+        RwaPayload::Issue { amount } => {
+            circuit_rwa_asset::apply_issue(lookup, issuer, &action.sender, action.nonce, *amount)?
+        }
         RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
             lookup,
             &action.sender,
@@ -88,13 +84,22 @@ fn produce_block(
     timestamp: u64,
 ) -> Result<RwaBlock> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    let parent: RwaBlock = db
-        .get_block(tip_height)?
-        .expect("tip block must exist");
+    let parent: RwaBlock = db.get_block(tip_height)?.expect("tip block must exist");
 
-    let (applied, updates, _) = execute_actions(db, actions, &[], |action, lookup, _validators| {
-        dispatch(action, lookup, issuer)
-    })?;
+    let (applied, updates, _, _) = execute_actions(
+        db,
+        actions,
+        &[],
+        BlockUpdates::default(),
+        |action, lookup, _stake_lookup, _validator_masters_lookup, _validators| {
+            let (accounts, validator_change) = dispatch(action, lookup, issuer)?;
+            Ok(BlockUpdates {
+                accounts,
+                validator_change,
+                ..Default::default()
+            })
+        },
+    )?;
 
     let block = Block {
         height: tip_height + 1,
@@ -153,9 +158,20 @@ fn main() -> Result<()> {
     })?;
     let genesis: RwaBlock = Block::genesis(now());
     db.write_batches(&[
-        &execute_actions(&db, genesis.actions.clone(), &[], |action, lookup, _validators| {
-            dispatch(action, lookup, &issuer)
-        })?
+        &execute_actions(
+            &db,
+            genesis.actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            |action, lookup, _stake_lookup, _validator_masters_lookup, _validators| {
+                let (accounts, validator_change) = dispatch(action, lookup, &issuer)?;
+                Ok(BlockUpdates {
+                    accounts,
+                    validator_change,
+                    ..Default::default()
+                })
+            },
+        )?
         .1,
         &genesis,
     ])?;
@@ -227,7 +243,10 @@ fn main() -> Result<()> {
     );
     assert_eq!(issuer_final.balance, 600);
     assert_eq!(kyc_final.balance, 400);
-    assert_eq!(non_kyc_final.balance, 0, "non-KYC'd account must not receive funds");
+    assert_eq!(
+        non_kyc_final.balance, 0,
+        "non-KYC'd account must not receive funds"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
     Ok(())

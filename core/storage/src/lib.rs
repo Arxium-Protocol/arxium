@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
-use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot};
+use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, StakeAllocation};
 
 // ponytail: cap shared by range/history reads so an explorer client can't
 // force a full-chain scan in one request; bump if a real UI needs more.
@@ -34,6 +34,12 @@ pub struct ArxiumDb {
 /// Anything that can be turned into a set of key-value pairs for storage.
 pub trait BatchWritable {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
+
+    /// Keys to remove as part of the same atomic batch. Default empty —
+    /// most `BatchWritable`s (accounts, blocks, ...) only ever upsert.
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(Vec::new())
+    }
 }
 
 impl ArxiumDb {
@@ -85,6 +91,9 @@ impl ArxiumDb {
         for item in items {
             for (key, value) in item.batch_entries()? {
                 batch.put(key, value);
+            }
+            for key in item.batch_deletes()? {
+                batch.delete(key);
             }
         }
         // Fsync every commit rather than trusting the OS page cache — this
@@ -236,6 +245,93 @@ impl ArxiumDb {
         }
         Ok(results)
     }
+
+    /// A single `(master, validator)` stake allocation, if any.
+    pub fn get_stake_allocation(
+        &self,
+        master: &Address,
+        validator: &Address,
+    ) -> Result<Option<StakeAllocation>, StorageError> {
+        let key = format!("stake:{}:{}", master, validator);
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (allocation, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(allocation))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Masters currently staking to `validator`. One-master-per-validator is
+    /// an enforced invariant, not just an assumption — callers should treat
+    /// a `len() > 1` result as a bug, not a valid multi-delegator state.
+    pub fn get_stakes_by_validator(&self, validator: &Address) -> Result<Vec<Address>, StorageError> {
+        let key = format!("stake_by_validator:{}", validator);
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (masters, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(masters)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// All of `master`'s stake allocations, one per validator staked to.
+    pub fn get_stakes_by_master(
+        &self,
+        master: &Address,
+    ) -> Result<Vec<(Address, StakeAllocation)>, StorageError> {
+        let prefix = format!("stake:{}:", master);
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let validator_str = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|_| StorageError::CorruptedMeta)?;
+            let validator = Address::parse(validator_str).map_err(|_| StorageError::CorruptedMeta)?;
+            let config = bincode::config::standard();
+            let (allocation, _len) = bincode::serde::decode_from_slice(&value, config)?;
+            results.push((validator, allocation));
+        }
+        Ok(results)
+    }
+
+    /// Every allocation with an `Unbonding` batch matured as of `height`.
+    // ponytail: full `stake:` prefix scan — fine at current scale (matches
+    // the doc's "walking skeleton" allowance); add an unlock-height
+    // secondary index if allocation count ever makes this a bottleneck.
+    pub fn get_allocations_with_unbonding_due(
+        &self,
+        height: u64,
+    ) -> Result<Vec<StakeAllocation>, StorageError> {
+        let prefix = b"stake:";
+        let mut results = Vec::new();
+        let iter = self
+            .db
+            .iterator(IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (allocation, _len): (StakeAllocation, usize) =
+                bincode::serde::decode_from_slice(&value, config)?;
+            if let Some(unbonding) = &allocation.unbonding {
+                if unbonding.unlock_at_height <= height {
+                    results.push(allocation);
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 impl BatchWritable for Snapshot {
@@ -334,6 +430,7 @@ impl<P: Serialize> BatchWritable for Block<P> {
 /// A set of account changes to be written atomically. Not account-circuit
 /// business logic — just the write-batch shape any circuit that touches
 /// accounts (`circuit-account`, `circuit-rwa-asset`, ...) hands back.
+#[derive(Debug, Default)]
 pub struct AccountUpdates(pub HashMap<Address, AccountEntry>);
 
 impl BatchWritable for AccountUpdates {
@@ -346,6 +443,55 @@ impl BatchWritable for AccountUpdates {
             entries.push((key, value));
         }
         Ok(entries)
+    }
+}
+
+/// A set of stake-allocation changes to be written atomically alongside a
+/// block, same reasoning as `AccountUpdates`. `allocations` maps
+/// `(master, validator) -> Some(allocation)` for an upsert or `None` for a
+/// removal (fully slashed / fully resolved). `validator_index` maps
+/// `validator -> full new master list` for that validator's
+/// `stake_by_validator:` row — an empty list removes the row.
+#[derive(Debug, Default)]
+pub struct StakeUpdates {
+    pub allocations: std::collections::BTreeMap<(Address, Address), Option<StakeAllocation>>,
+    pub validator_index: std::collections::BTreeMap<Address, Vec<Address>>,
+}
+
+impl BatchWritable for StakeUpdates {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        for ((master, validator), allocation) in &self.allocations {
+            if let Some(allocation) = allocation {
+                let key = format!("stake:{}:{}", master, validator).into_bytes();
+                let value = bincode::serde::encode_to_vec(allocation, config)?;
+                entries.push((key, value));
+            }
+        }
+        for (validator, masters) in &self.validator_index {
+            if !masters.is_empty() {
+                let key = format!("stake_by_validator:{}", validator).into_bytes();
+                let value = bincode::serde::encode_to_vec(masters, config)?;
+                entries.push((key, value));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        let mut deletes = Vec::new();
+        for ((master, validator), allocation) in &self.allocations {
+            if allocation.is_none() {
+                deletes.push(format!("stake:{}:{}", master, validator).into_bytes());
+            }
+        }
+        for (validator, masters) in &self.validator_index {
+            if masters.is_empty() {
+                deletes.push(format!("stake_by_validator:{}", validator).into_bytes());
+            }
+        }
+        Ok(deletes)
     }
 }
 

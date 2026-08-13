@@ -1,7 +1,7 @@
 use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
-use xc_executor::execute_actions;
+use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, ValidatorSetSnapshot};
 
@@ -28,8 +28,23 @@ pub fn produce_block(
     // `get_validator_set_at(block.height)` exactly, so a self-produced block
     // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
     let validators = db.get_validator_set_at(next_height)?;
-    let (applied, account_updates, validator_changes) =
-        execute_actions(db, actions, &validators, dispatch)?;
+    let seed = resolve_matured_unbonding(db, next_height)?;
+    let (applied, account_updates, validator_changes, stake_updates) = execute_actions(
+        db,
+        actions,
+        &validators,
+        seed,
+        |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+            dispatch(
+                action,
+                lookup,
+                stake_lookup,
+                validator_masters_lookup,
+                validators,
+                next_height,
+            )
+        },
+    )?;
 
     let mut new_block = ChainBlock {
         height: next_height,
@@ -43,17 +58,18 @@ pub fn produce_block(
         new_block.sign(address.clone(), key);
     }
     // One atomic write for the block record, the account changes it caused,
-    // and (if any) the resulting validator-set change — a crash here must
-    // never leave these disagreeing (e.g. nonces bumped with no block on
-    // record for it, or vice versa).
+    // any stake-allocation changes (dispatched actions plus matured
+    // unbonding resolved above), and (if any) the resulting validator-set
+    // change — a crash here must never leave these disagreeing (e.g. nonces
+    // bumped with no block on record for it, or vice versa).
     if validator_changes.is_empty() {
-        db.write_batches(&[&account_updates, &new_block])?;
+        db.write_batches(&[&account_updates, &stake_updates, &new_block])?;
     } else {
         let snapshot = ValidatorSetSnapshot {
             effective_height: next_height + 1,
             validators: xc_executor::apply_validator_changes(validators, &validator_changes),
         };
-        db.write_batches(&[&account_updates, &snapshot, &new_block])?;
+        db.write_batches(&[&account_updates, &stake_updates, &snapshot, &new_block])?;
     }
 
     Ok(new_block)
@@ -64,6 +80,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
+    use xc_executor::BlockUpdates;
     use xc_primitives::{AccountEntry, Snapshot};
 
     #[test]
@@ -73,8 +90,23 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _) =
-            execute_actions(&db, genesis.actions.clone(), &[], dispatch).unwrap();
+        let (_, genesis_updates, _, _) = execute_actions(
+            &db,
+            genesis.actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+                dispatch(
+                    action,
+                    lookup,
+                    stake_lookup,
+                    validator_masters_lookup,
+                    validators,
+                    0,
+                )
+            },
+        )
+        .unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();
 
         let alice_key = SigningKey::from_bytes(&[1u8; 32]);

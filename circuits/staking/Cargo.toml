@@ -1,0 +1,10 @@
+[package]
+name = "circuit-staking"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+xc-storage = { workspace = true }
+xc-primitives = { workspace = true }

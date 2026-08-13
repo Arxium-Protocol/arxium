@@ -23,3 +23,4 @@ xc-genesis = { workspace = true }
 xc-rpc = { workspace = true }
 network = { workspace = true }
 circuit-account = { workspace = true }
+circuit-staking = { workspace = true }

@@ -556,6 +556,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "circuit-staking"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2382,6 +2392,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "circuit-account",
+ "circuit-staking",
  "clap",
  "ed25519-dalek 3.0.0",
  "hex",
@@ -4206,6 +4217,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "circuit-account",
+ "circuit-staking",
  "ed25519-dalek 3.0.0",
  "hex",
  "serde",

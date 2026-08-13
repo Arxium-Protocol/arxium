@@ -14,7 +14,7 @@ use tracing::{info, warn};
 
 use network::{identity, spawn_p2p_node};
 use xc_cli::{Cli, Command};
-use xc_executor::{accept_block, execute_actions};
+use xc_executor::{BlockUpdates, accept_block, execute_actions};
 use xc_mempool::Mempool;
 use xc_primitives::{Address, NodeConfig, Snapshot, eligible_proposer};
 use xc_rpc::spawn_http_ingest;
@@ -61,8 +61,15 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _) =
-            execute_actions(&db, genesis_block.actions.clone(), &[], dispatch)?;
+        let (_, genesis_updates, _, _) = execute_actions(
+            &db,
+            genesis_block.actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+                dispatch(action, lookup, stake_lookup, validator_masters_lookup, validators, 0)
+            },
+        )?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
         info!("wrote genesis block: {:?}", genesis_block);
     }
@@ -135,7 +142,15 @@ pub fn run() -> Result<()> {
         let chain_lock = chain_lock.clone();
         move |block: ChainBlock| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
-            match accept_block(&db, block, SLOT_DURATION.as_secs(), dispatch) {
+            let height = block.height;
+            match accept_block(
+                &db,
+                block,
+                SLOT_DURATION.as_secs(),
+                |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+                    dispatch(action, lookup, stake_lookup, validator_masters_lookup, validators, height)
+                },
+            ) {
                 Ok(accepted) => {
                     info!(
                         "accepted gossiped block {} with {} action(s), hash={}",
