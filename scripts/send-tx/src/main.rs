@@ -16,7 +16,8 @@ struct Args {
     #[arg(long)]
     from: String,
 
-    /// "transfer" (default), "join-validator", or "leave-validator"
+    /// "transfer" (default), "join-validator", "leave-validator", "stake", "unstake",
+    /// or "sub-account" (prints a validator's stake sub-account address, submits nothing)
     #[arg(long, default_value = "transfer")]
     action: String,
 
@@ -31,6 +32,10 @@ struct Args {
     /// Stake to bond, bookkeeping-only for now. Required for "join-validator".
     #[arg(long)]
     stake: Option<u128>,
+
+    /// Validator address (name from devnet-keys.json, or bech32 address). Required for "stake"/"unstake".
+    #[arg(long)]
+    validator: Option<String>,
 
     /// Override the auto-fetched nonce
     #[arg(long)]
@@ -106,6 +111,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let keys = keys_file();
 
+    // Not a real action — just prints the deterministic stake sub-account
+    // address for a validator, so `GET /accounts/{addr}` can check what
+    // actually landed on-chain after a stake/unstake/slash.
+    if args.action == "sub-account" {
+        let validator = resolve_address(
+            args.validator.as_deref().context("--validator is required for sub-account")?,
+            &keys,
+        )?;
+        println!("{}", circuit_staking::stake_subaccount(&validator));
+        return Ok(());
+    }
+
     let signer = resolve_signer(&args.from, &keys)?;
     let sender = resolve_address(&args.from, &keys)?;
 
@@ -121,7 +138,23 @@ fn main() -> Result<()> {
             stake: args.stake.context("--stake is required for join-validator")?,
         },
         "leave-validator" => ActionPayload::LeaveValidator,
-        other => bail!("unknown --action {other:?}, expected transfer, join-validator, or leave-validator"),
+        "stake" => ActionPayload::Stake {
+            validator: resolve_address(
+                args.validator.as_deref().context("--validator is required for stake")?,
+                &keys,
+            )?,
+            amount: args.amount.context("--amount is required for stake")?,
+        },
+        "unstake" => ActionPayload::Unstake {
+            validator: resolve_address(
+                args.validator.as_deref().context("--validator is required for unstake")?,
+                &keys,
+            )?,
+            amount: args.amount.context("--amount is required for unstake")?,
+        },
+        other => {
+            bail!("unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, or unstake")
+        }
     };
 
     let nonce = match args.nonce {

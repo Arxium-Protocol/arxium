@@ -1,18 +1,15 @@
 [package]
-name = "send-tx"
+name = "admin-slash"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "send-tx"
+name = "admin-slash"
 path = "src/main.rs"
 
 [dependencies]
 xc-primitives = { workspace = true }
+xc-storage = { workspace = true }
 circuit-staking = { workspace = true }
-node = { workspace = true }
-ed25519-dalek = { workspace = true }
-serde_json = { workspace = true }
-hex = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

@@ -17,6 +17,7 @@ members = [
     "arxd",
     #
     "scripts/send-tx",
+    "scripts/admin-slash",
     #
     "examples/toy-chain",
 ]

@@ -95,11 +95,17 @@ mod tests {
         ArxiumDb::open(&path).unwrap()
     }
 
+    // ponytail: nanos alone collide often enough under parallel test
+    // execution to hit RocksDB's single-writer LOCK — the atomic counter
+    // guarantees uniqueness even when two threads land on the same tick.
     fn uuid_like() -> u128 {
-        std::time::SystemTime::now()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos();
+        nanos + COUNTER.fetch_add(1, Ordering::Relaxed) as u128
     }
 
     fn addr() -> Address {
