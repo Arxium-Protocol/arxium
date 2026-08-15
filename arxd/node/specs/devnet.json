@@ -32,6 +32,6 @@
     }
   },
   "boot_nodes": [
-    "/ip4/192.168.1.156/tcp/30334/p2p/12D3KooWHP2Ve7tpkRQMJACbU4xmq9aDwL6gphLRHLJ3xB6nU5KA"
+    "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWHP2Ve7tpkRQMJACbU4xmq9aDwL6gphLRHLJ3xB6nU5KA"
   ]
 }

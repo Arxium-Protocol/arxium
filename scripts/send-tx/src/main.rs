@@ -43,6 +43,10 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1:30333")]
     node: String,
+
+    /// Sent as "Authorization: Bearer <token>" — required once the node runs with --rpc-token.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 fn keys_file() -> Value {
@@ -84,11 +88,14 @@ fn resolve_address(name: &str, keys: &Value) -> Result<Address> {
 }
 
 // Minimal HTTP/1.1 client: local testing only, plain text responses with Content-Length.
-fn http(method: &str, node: &str, path: &str, body: Option<&str>) -> Result<(u16, String)> {
+fn http(method: &str, node: &str, path: &str, body: Option<&str>, token: Option<&str>) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect(node).with_context(|| format!("connect to {node}"))?;
     let body = body.unwrap_or_default();
+    let auth_header = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {node}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.1\r\nHost: {node}\r\nConnection: close\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes())?;
@@ -124,7 +131,15 @@ fn main() -> Result<()> {
     }
 
     let signer = resolve_signer(&args.from, &keys)?;
-    let sender = resolve_address(&args.from, &keys)?;
+    // --from a name uses the keys file's recorded address; --from a raw seed
+    // has no such entry, so derive the address from the key itself (the same
+    // derivation validator.rs uses) instead of bech32-parsing the seed.
+    let sender = if keys.get(&args.from).is_some() {
+        resolve_address(&args.from, &keys)?
+    } else {
+        Address::from_pubkey_bytes(signer.verifying_key().as_bytes())
+            .context("failed to derive address from --from seed")?
+    };
 
     let action_payload = match args.action.as_str() {
         "transfer" => ActionPayload::Transfer {
@@ -160,7 +175,7 @@ fn main() -> Result<()> {
     let nonce = match args.nonce {
         Some(n) => n,
         None => {
-            let (status, body) = http("GET", &args.node, &format!("/accounts/{sender}"), None)?;
+            let (status, body) = http("GET", &args.node, &format!("/accounts/{sender}"), None, args.token.as_deref())?;
             if status != 200 {
                 bail!("GET /accounts/{sender} -> {status}: {body}");
             }
@@ -181,7 +196,7 @@ fn main() -> Result<()> {
 
     let payload = serde_json::to_string(&action)?;
     println!("submitting: {payload}");
-    let (status, body) = http("POST", &args.node, "/actions", Some(&payload))?;
+    let (status, body) = http("POST", &args.node, "/actions", Some(&payload), args.token.as_deref())?;
     println!("-> {status} {body}");
     if status != 202 {
         bail!("node rejected the action");
