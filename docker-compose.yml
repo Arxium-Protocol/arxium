@@ -1,0 +1,15 @@
+# Local dev/build — builds the image from source. For deploying a
+# pre-built image to a VPS, see docker-compose.prod.yml instead.
+services:
+  arxd:
+    build: .
+    ports:
+      - "30333:30333" # RPC — fine to publish for local testing
+      - "30334:30334/tcp" # P2P
+      - "30334:30334/udp" # P2P (QUIC)
+    volumes:
+      - arxd-data:/data
+    command: ["--base-path", "/data", "--rpc-bind", "0.0.0.0", "--bootnode", "--validator"]
+
+volumes:
+  arxd-data:

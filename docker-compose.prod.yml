@@ -1,0 +1,25 @@
+# VPS deployment — pulls the pre-built image from Docker Hub instead of
+# building on-box (a 2GB-RAM VPS shouldn't compile rocksdb from source).
+#
+#   docker buildx build --platform linux/amd64 -t d4rkriverr/arxd:latest --push .
+#   # on the VPS:
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# RPC (30333) is published and bound to 0.0.0.0 because Arx-Plus (the
+# mobile app) talks to the node over RPC, not P2P — NodeIndexer is the only
+# consumer that needs just the P2P port. --rpc-token gates it since it's
+# now internet-facing; set the same token in the app's Node Settings.
+services:
+  arxd:
+    image: d4rkriverr/arxd:latest
+    ports:
+      - "30333:30333" # RPC
+      - "30334:30334/tcp" # P2P
+      - "30334:30334/udp" # P2P (QUIC)
+    volumes:
+      - arxd-data:/data
+    command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-token", "1f311cd7d29a12ba8b3c7acb83535d0e67747cad5a3c1c7edc4842dc53a2e1ae"]
+    restart: unless-stopped
+
+volumes:
+  arxd-data:
