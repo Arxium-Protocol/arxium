@@ -1,11 +1,13 @@
-use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
-use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, StakeAllocation};
+use xc_primitives::{AccountEntry, Address, Block, Snapshot, StakeAllocation};
+#[cfg(test)]
+use xc_primitives::Action;
 
 // ponytail: cap shared by range/history reads so an explorer client can't
 // force a full-chain scan in one request; bump if a real UI needs more.
@@ -26,6 +28,28 @@ pub enum StorageError {
     CorruptedMeta,
 }
 
+const CF_META: &str = "meta";
+const CF_BLOCKS: &str = "blocks";
+const CF_ACCOUNTS: &str = "accounts";
+const CF_VALIDATORS: &str = "validators";
+const COLUMN_FAMILIES: [&str; 4] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS];
+
+/// Which column family a key belongs in, derived from its prefix rather than
+/// tracked separately at each call site — one place to keep in sync with the
+/// `format!("prefix:...")` calls below instead of every `get`/`put` call
+/// needing its own CF argument.
+fn cf_for_key(key: &[u8]) -> &'static str {
+    if key.starts_with(b"account:") {
+        CF_ACCOUNTS
+    } else if key.starts_with(b"block:") || key.starts_with(b"block_hash:") || key.starts_with(b"action:") {
+        CF_BLOCKS
+    } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
+        CF_VALIDATORS
+    } else {
+        CF_META
+    }
+}
+
 #[derive(Clone)]
 pub struct ArxiumDb {
     db: Arc<DB>,
@@ -44,11 +68,24 @@ pub trait BatchWritable {
 
 impl ArxiumDb {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
-        let db = DB::open_default(path)?;
+        let mut db_opts = RocksOptions::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        let cf_descriptors = COLUMN_FAMILIES
+            .iter()
+            .map(|name| ColumnFamilyDescriptor::new(*name, RocksOptions::default()));
+        let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
         Ok(Self { db: Arc::new(db) })
     }
+
+    /// Column family handle for `name` — always present since `open` creates
+    /// all of `COLUMN_FAMILIES` up front.
+    fn cf(&self, name: &str) -> &ColumnFamily {
+        self.db.cf_handle(name).expect("column family created in ArxiumDb::open")
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.db.get(key).map_err(StorageError::Rocks)
+        self.db.get_cf(self.cf(cf_for_key(key)), key).map_err(StorageError::Rocks)
     }
 
     /// Get the current tip height from the DB.
@@ -90,10 +127,10 @@ impl ArxiumDb {
         let mut batch = WriteBatch::default();
         for item in items {
             for (key, value) in item.batch_entries()? {
-                batch.put(key, value);
+                batch.put_cf(self.cf(cf_for_key(&key)), key, value);
             }
             for key in item.batch_deletes()? {
-                batch.delete(key);
+                batch.delete_cf(self.cf(cf_for_key(&key)), key);
             }
         }
         // Fsync every commit rather than trusting the OS page cache — this
@@ -124,7 +161,7 @@ impl ArxiumDb {
     /// Get the block from the DB. `P` is the chain-specific action payload
     /// type — callers know it, storage doesn't.
     pub fn get_block<P: DeserializeOwned>(&self, height: u64) -> Result<Option<Block<P>>, StorageError> {
-        let key = format!("block:{}", height);
+        let key = format!("block:{height:020}");
         match self.get(key.as_bytes())? {
             Some(bytes) => {
                 let config = bincode::config::standard();
@@ -177,7 +214,7 @@ impl ArxiumDb {
         let seek_key = format!("validator_set:{height:020}");
         let iter = self
             .db
-            .iterator(IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
@@ -200,50 +237,6 @@ impl ArxiumDb {
             }
             None => Ok(None),
         }
-    }
-
-    /// Newest-first page of `address`'s action history, capped at
-    /// `MAX_PAGE_SIZE`. `before_height` excludes that height and anything
-    /// newer, for paging further back.
-    pub fn get_actions_by_address<P: DeserializeOwned>(
-        &self,
-        address: &Address,
-        limit: usize,
-        before_height: Option<u64>,
-    ) -> Result<Vec<(u64, Action<P>)>, StorageError> {
-        let limit = limit.min(MAX_PAGE_SIZE);
-        let prefix = format!("addr_action:{}:", address);
-        let seek_height = match before_height {
-            Some(h) => h.saturating_sub(1),
-            None => u64::MAX,
-        };
-        // ":9999" sorts after any real 4-digit index suffix, so SeekForPrev
-        // (what Reverse does) lands on the last real entry at seek_height
-        // instead of skipping past it into the previous height.
-        let seek_key = format!("{}{:020}:9999", prefix, seek_height);
-
-        let mut results = Vec::new();
-        let iter = self
-            .db
-            .iterator(IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            let height_str = &key[prefix.len()..prefix.len() + 20];
-            let height: u64 = std::str::from_utf8(height_str)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or(StorageError::CorruptedMeta)?;
-            let config = bincode::config::standard();
-            let (action, _len) = bincode::serde::decode_from_slice(&value, config)?;
-            results.push((height, action));
-            if results.len() >= limit {
-                break;
-            }
-        }
-        Ok(results)
     }
 
     /// A single `(master, validator)` stake allocation, if any.
@@ -287,7 +280,7 @@ impl ArxiumDb {
         let mut results = Vec::new();
         let iter = self
             .db
-            .iterator(IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix.as_bytes()) {
@@ -315,7 +308,7 @@ impl ArxiumDb {
         let mut results = Vec::new();
         let iter = self
             .db
-            .iterator(IteratorMode::From(prefix, Direction::Forward));
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward));
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
@@ -391,7 +384,7 @@ impl<P: Serialize> BatchWritable for Block<P> {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let config = bincode::config::standard();
 
-        let block_key = format!("block:{}", self.height).into_bytes();
+        let block_key = format!("block:{:020}", self.height).into_bytes();
         let block_value = bincode::serde::encode_to_vec(self, config)?;
 
         let mut entries = vec![
@@ -406,21 +399,13 @@ impl<P: Serialize> BatchWritable for Block<P> {
             ),
         ];
 
-        for (index, action) in self.actions.iter().enumerate() {
+        for action in self.actions.iter() {
             if let Some(signature) = &action.signature {
                 entries.push((
                     format!("action:{}", signature).into_bytes(),
                     self.height.to_be_bytes().to_vec(),
                 ));
             }
-            entries.push((
-                format!(
-                    "addr_action:{}:{:020}:{:04}",
-                    action.sender, self.height, index
-                )
-                .into_bytes(),
-                bincode::serde::encode_to_vec(action, config)?,
-            ));
         }
 
         Ok(entries)
@@ -559,38 +544,6 @@ mod explorer_index_tests {
         db.write_batch(&b).unwrap();
         assert_eq!(db.get_block_height_by_hash(&hash).unwrap(), Some(7));
         assert_eq!(db.get_block_height_by_hash("0xnope").unwrap(), None);
-    }
-
-    #[test]
-    fn address_action_history_is_newest_first_and_paginates() {
-        let db = temp_db();
-        let sender = addr(1);
-        let other = addr(2);
-        for h in 0..3 {
-            db.write_batch(&block(
-                h,
-                vec![action(sender.clone(), h), action(other.clone(), h)],
-            ))
-            .unwrap();
-        }
-
-        let all = db.get_actions_by_address::<()>(&sender, 10, None).unwrap();
-        assert_eq!(
-            all.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
-            vec![2, 1, 0]
-        );
-
-        let first_page = db.get_actions_by_address::<()>(&sender, 1, None).unwrap();
-        assert_eq!(first_page.len(), 1);
-        assert_eq!(first_page[0].0, 2);
-
-        let next_page = db
-            .get_actions_by_address::<()>(&sender, 10, Some(2))
-            .unwrap();
-        assert_eq!(
-            next_page.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
-            vec![1, 0]
-        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, validate_action};
 use xc_primitives::{Action, Address};
-use xc_storage::{ArxiumDb, MAX_PAGE_SIZE};
+use xc_storage::ArxiumDb;
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
 /// JSON (de)serializable for the wire, `Clone` because `AppState` is cloned
@@ -196,7 +196,6 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/actions", post(submit_action::<P>))
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .route("/accounts/{address}", get(get_account::<P>))
-                .route("/accounts/{address}/actions", get(get_address_actions::<P>))
                 .route("/actions/{signature}", get(get_action_status::<P>))
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
@@ -475,36 +474,6 @@ async fn get_block_by_hash<P: Payload>(
     }
 }
 
-#[derive(serde::Deserialize, Default)]
-struct AddressActionsQuery {
-    limit: Option<usize>,
-    before: Option<u64>,
-}
-
-/// Newest-first page of an address's action history.
-async fn get_address_actions<P: Payload>(
-    State(state): State<AppState<P>>,
-    Path(address): Path<String>,
-    Query(query): Query<AddressActionsQuery>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let limit = query.limit.unwrap_or(MAX_PAGE_SIZE);
-
-    match state
-        .db
-        .get_actions_by_address::<P>(&address, limit, query.before)
-    {
-        Ok(actions) => Json(actions).into_response(),
-        Err(err) => {
-            warn!("failed to load action history for {address}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
-}
-
 #[derive(serde::Deserialize)]
 struct SearchQuery {
     q: String,
@@ -739,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn address_actions_newest_first_and_search_resolves_each_kind() {
+    fn search_resolves_each_kind() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = test_state();
@@ -752,25 +721,6 @@ mod tests {
                 let block = block_with_action(h, action);
                 state.db.write_batch(&block).unwrap();
             }
-
-            let resp = get_address_actions(
-                State(state.clone()),
-                Path(sender.to_string()),
-                Query(AddressActionsQuery::default()),
-            )
-            .await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            let heights: Vec<u64> = json
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| entry[0].as_u64().unwrap())
-                .collect();
-            assert_eq!(heights, vec![2, 1, 0]);
 
             // search by height
             let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() })).await;
