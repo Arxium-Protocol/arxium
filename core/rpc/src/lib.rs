@@ -196,6 +196,7 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/actions", post(submit_action::<P>))
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .route("/accounts/{address}", get(get_account::<P>))
+                .route("/accounts/{address}/stake", get(get_account_stake::<P>))
                 .route("/actions/{signature}", get(get_action_status::<P>))
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
@@ -346,6 +347,22 @@ async fn get_account<P: Payload>(
 
     match state.db.get_account(&address) {
         Ok(Some(account)) => Json(account).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn get_account_stake<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    match state.db.get_stake_allocation(&address, &address) {
+        Ok(Some(allocation)) => Json(allocation).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -554,6 +571,39 @@ mod tests {
         let sig = key.sign(&action.signing_bytes());
         action.signature = Some(hex::encode(sig.to_bytes()));
         action
+    }
+
+    #[test]
+    fn account_stake_returns_allocation_when_present_and_404_otherwise() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let alice = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            let allocation = xc_primitives::StakeAllocation {
+                master: alice.clone(),
+                validator: alice.clone(),
+                active_amount: 5_000,
+                unbonding: None,
+                created_at: 1,
+                updated_at: 1,
+            };
+            let mut allocations = BTreeMap::new();
+            allocations.insert((alice.clone(), alice.clone()), Some(allocation));
+            state
+                .db
+                .write_batch(&xc_storage::StakeUpdates {
+                    allocations,
+                    validator_index: BTreeMap::new(),
+                })
+                .unwrap();
+
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        });
     }
 
     #[test]
