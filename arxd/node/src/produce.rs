@@ -3,7 +3,7 @@ use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_primitives::{Action, Address};
-use xc_storage::{ArxiumDb, ValidatorSetSnapshot};
+use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
 /// The stored block only lists the actions that were actually applied — see
@@ -29,22 +29,24 @@ pub fn produce_block(
     // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
     let validators = db.get_validator_set_at(next_height)?;
     let seed = resolve_matured_unbonding(db, next_height)?;
-    let (applied, account_updates, validator_changes, stake_updates) = execute_actions(
-        db,
-        actions,
-        &validators,
-        seed,
-        |action, lookup, stake_lookup, validator_masters_lookup, validators| {
-            dispatch(
-                action,
-                lookup,
-                stake_lookup,
-                validator_masters_lookup,
-                validators,
-                next_height,
-            )
-        },
-    )?;
+    let (applied, account_updates, validator_changes, stake_updates, evidence_markers) =
+        execute_actions(
+            db,
+            actions,
+            &validators,
+            seed,
+            |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+                dispatch(
+                    action,
+                    lookup,
+                    stake_lookup,
+                    validator_masters_lookup,
+                    validators,
+                    next_height,
+                    &|h, p| db.evidence_processed(h, p),
+                )
+            },
+        )?;
 
     let mut new_block = ChainBlock {
         height: next_height,
@@ -62,15 +64,23 @@ pub fn produce_block(
     // unbonding resolved above), and (if any) the resulting validator-set
     // change — a crash here must never leave these disagreeing (e.g. nonces
     // bumped with no block on record for it, or vice versa).
-    if validator_changes.is_empty() {
-        db.write_batches(&[&account_updates, &stake_updates, &new_block])?;
+    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+    let snapshot = if validator_changes.is_empty() {
+        None
     } else {
-        let snapshot = ValidatorSetSnapshot {
+        Some(ValidatorSetSnapshot {
             effective_height: next_height + 1,
             validators: xc_executor::apply_validator_changes(validators, &validator_changes),
-        };
-        db.write_batches(&[&account_updates, &stake_updates, &snapshot, &new_block])?;
+        })
+    };
+    if let Some(snapshot) = &snapshot {
+        writables.push(snapshot);
     }
+    for marker in &evidence_markers {
+        writables.push(marker);
+    }
+    writables.push(&new_block);
+    db.write_batches(&writables)?;
 
     Ok(new_block)
 }
@@ -90,7 +100,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _) = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -103,6 +113,7 @@ mod tests {
                     validator_masters_lookup,
                     validators,
                     0,
+                    &|_, _| -> std::result::Result<bool, xc_storage::StorageError> { std::result::Result::Ok(false) },
                 )
             },
         )

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
 use xc_primitives::{AccountEntry, Action, Address, StakeAllocation, ValidatorChange, ValidatorEntry};
-use xc_storage::StorageError;
+use xc_storage::{EvidenceMarker, StorageError};
 
 /// Devnet stub — tune once real economics are decided. Below this,
 /// `JoinValidator` is rejected before `circuit_staking::apply_stake` even
@@ -48,6 +48,16 @@ pub enum ActionPayload {
     /// user-submitted, so it's unreachable from RPC/mempool by construction
     /// (see `circuit_staking::apply_slash`).
     Unstake { validator: Address, amount: u128 },
+    /// Proof that a validator signed two different blocks at the same
+    /// height — normally built and submitted by `runtime::spawn_runtime`
+    /// when it observes a competing block, never hand-crafted by an
+    /// ordinary user. Anyone *could* submit one given the two blocks, but
+    /// `runtime::verify_equivocation` is what actually gates the slash, not
+    /// who submitted it — so that's fine.
+    SubmitEquivocationEvidence {
+        block_a: Box<ChainBlock>,
+        block_b: Box<ChainBlock>,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -66,6 +76,7 @@ pub fn dispatch(
     validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
     current_height: u64,
+    evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
         ActionPayload::Transfer { to, amount } => Ok(BlockUpdates {
@@ -95,7 +106,7 @@ pub fn dispatch(
                 current_height,
             )?;
             let change = ValidatorChange::Join(action.sender.clone(), ValidatorEntry { stake: *stake });
-            Ok(BlockUpdates { accounts, stakes, validator_change: Some(change) })
+            Ok(BlockUpdates { accounts, stakes, validator_change: Some(change), evidence: None })
         }
         ActionPayload::LeaveValidator => {
             if !validators.contains(&action.sender) {
@@ -120,6 +131,7 @@ pub fn dispatch(
                 accounts,
                 stakes,
                 validator_change: Some(ValidatorChange::Leave(action.sender.clone())),
+                evidence: None,
             })
         }
         ActionPayload::Stake { validator, amount } => {
@@ -146,6 +158,46 @@ pub fn dispatch(
                 current_height,
             )?;
             Ok(BlockUpdates { accounts, stakes, ..Default::default() })
+        }
+        ActionPayload::SubmitEquivocationEvidence { block_a, block_b } => {
+            let evidence = runtime::EquivocationEvidence {
+                block_a: (**block_a).clone(),
+                block_b: (**block_b).clone(),
+            };
+            let equivocator = runtime::verify_equivocation(&evidence)
+                .map_err(|err| anyhow::anyhow!("invalid equivocation evidence: {err}"))?;
+            if evidence_processed(block_a.height, &equivocator)? {
+                anyhow::bail!(
+                    "equivocation evidence for {equivocator} at height {} already processed",
+                    block_a.height
+                );
+            }
+
+            let masters = validator_masters_lookup(&equivocator)?;
+            let master = masters.first().cloned().ok_or_else(|| {
+                anyhow::anyhow!("{equivocator} has no stake to slash for equivocation")
+            })?;
+            let allocation = stake_lookup(&master, &equivocator)?.ok_or_else(|| {
+                anyhow::anyhow!("{equivocator} has no active stake allocation to slash")
+            })?;
+            let total = allocation.active_amount
+                + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+
+            let (accounts, stakes) = circuit_staking::apply_slash(
+                lookup,
+                stake_lookup,
+                validator_masters_lookup,
+                &equivocator,
+                runtime::slash_amount(total),
+                circuit_staking::SlashReason::DoubleSign,
+                current_height,
+            )?;
+            Ok(BlockUpdates {
+                accounts,
+                stakes,
+                evidence: Some(EvidenceMarker { height: block_a.height, proposer: equivocator }),
+                ..Default::default()
+            })
         }
     }
 }
@@ -204,7 +256,7 @@ mod tests {
             payload: ActionPayload::LeaveValidator,
         };
 
-        let err = match dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice], 0) {
+        let err = match dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice], 0, &|_, _| Ok::<bool, StorageError>(false)) {
             Err(err) => err,
             Ok(_) => panic!("expected leaving the last validator to be rejected"),
         };
@@ -226,7 +278,7 @@ mod tests {
         };
 
         let updates =
-            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 0).unwrap();
+            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 0, &|_, _| Ok::<bool, StorageError>(false)).unwrap();
         assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(a)) if a == alice));
     }
 
@@ -243,7 +295,7 @@ mod tests {
         };
 
         let updates =
-            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10).unwrap();
+            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10, &|_, _| Ok::<bool, StorageError>(false)).unwrap();
 
         assert!(matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice));
         assert_eq!(updates.accounts.0.get(&alice).unwrap().balance, 5_000 - MIN_VALIDATOR_STAKE);
@@ -269,7 +321,7 @@ mod tests {
         };
 
         let updates =
-            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone()], 10).unwrap();
+            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone()], 10, &|_, _| Ok::<bool, StorageError>(false)).unwrap();
 
         let allocation = updates.stakes.allocations.get(&(alice.clone(), alice)).unwrap().clone().unwrap();
         assert_eq!(allocation.active_amount, MIN_VALIDATOR_STAKE + 500, "top-up adds to the existing self-stake");
@@ -287,7 +339,7 @@ mod tests {
             payload: ActionPayload::JoinValidator { stake: MIN_VALIDATOR_STAKE },
         };
 
-        let err = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10).unwrap_err();
+        let err = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10, &|_, _| Ok::<bool, StorageError>(false)).unwrap_err();
         assert!(err.to_string().contains("insufficient balance") || err.to_string().contains("InsufficientBalance"));
     }
 
@@ -303,7 +355,7 @@ mod tests {
             payload: ActionPayload::JoinValidator { stake: MIN_VALIDATOR_STAKE - 1 },
         };
 
-        let err = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10).unwrap_err();
+        let err = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10, &|_, _| Ok::<bool, StorageError>(false)).unwrap_err();
         assert!(err.to_string().contains("minimum validator stake"));
     }
 
@@ -324,7 +376,7 @@ mod tests {
         };
 
         let updates =
-            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 5).unwrap();
+            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 5, &|_, _| Ok::<bool, StorageError>(false)).unwrap();
 
         assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice));
         let allocation = updates.stakes.allocations.get(&(alice.clone(), alice.clone())).unwrap().clone().unwrap();
@@ -334,6 +386,84 @@ mod tests {
         assert_eq!(unbonding.unlock_at_height, 5 + circuit_staking::UNBONDING_BLOCKS);
         // No balance credited back yet — still sitting in the sub-account, slashable.
         assert_eq!(updates.accounts.0.get(&alice).map(|a| a.balance).unwrap_or(0), 0);
+    }
+
+    fn signed_chain_block(key: &ed25519_dalek::SigningKey, height: u64, timestamp: u64) -> ChainBlock {
+        let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let mut block: ChainBlock = xc_primitives::Block::genesis(timestamp);
+        block.height = height;
+        block.sign(addr, key);
+        block
+    }
+
+    #[test]
+    fn equivocation_evidence_slashes_the_equivocator() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let block_a = signed_chain_block(&key, 5, 100);
+        let block_b = signed_chain_block(&key, 5, 200);
+
+        let sub_account = circuit_staking::stake_subaccount(&equivocator);
+        let lookup = make_lookup(HashMap::from([(sub_account, funded(10_000))]));
+        let stake_lookup = make_stake_lookup(HashMap::from([(
+            (equivocator.clone(), equivocator.clone()),
+            self_allocation(&equivocator, 10_000),
+        )]));
+        let equivocator_for_masters = equivocator.clone();
+        let validator_masters_lookup =
+            move |_v: &Address| -> Result<Vec<Address>, StorageError> { Ok(vec![equivocator_for_masters.clone()]) };
+        let action = Action {
+            sender: equivocator.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::SubmitEquivocationEvidence {
+                block_a: Box::new(block_a),
+                block_b: Box::new(block_b),
+            },
+        };
+
+        let updates = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10, &|_, _| {
+            Ok::<bool, StorageError>(false)
+        })
+        .unwrap();
+
+        let allocation = updates
+            .stakes
+            .allocations
+            .get(&(equivocator.clone(), equivocator.clone()))
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(allocation.active_amount, 10_000 - runtime::slash_amount(10_000));
+        let marker = updates.evidence.expect("must write an evidence marker");
+        assert_eq!(marker.height, 5);
+        assert_eq!(marker.proposer, equivocator);
+    }
+
+    #[test]
+    fn equivocation_evidence_rejected_when_already_processed() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let block_a = signed_chain_block(&key, 5, 100);
+        let block_b = signed_chain_block(&key, 5, 200);
+
+        let lookup = make_lookup(HashMap::new());
+        let stake_lookup = make_stake_lookup(HashMap::new());
+        let action = Action {
+            sender: equivocator.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::SubmitEquivocationEvidence {
+                block_a: Box::new(block_a),
+                block_b: Box::new(block_b),
+            },
+        };
+
+        let err = dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[], 10, &|_, _| {
+            Ok::<bool, StorageError>(true)
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already processed"));
     }
 
     #[test]
@@ -355,7 +485,7 @@ mod tests {
         };
 
         let err =
-            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 5).unwrap_err();
+            dispatch(&action, &lookup, &stake_lookup, &validator_masters_lookup, &[alice.clone(), bob], 5, &|_, _| Ok::<bool, StorageError>(false)).unwrap_err();
         assert!(err.to_string().contains("already has an unbonding batch"));
     }
 }

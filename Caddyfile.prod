@@ -1,0 +1,12 @@
+# Used by docker-compose.prod.yml — Caddy terminates TLS (automatic cert via
+# Let's Encrypt) and reverse-proxies to arxd over the compose network.
+#
+# /metrics is excluded from the public proxy — it's ungated (no bearer
+# token) by design, meant for an internal Prometheus scraping arxd:30333
+# directly over the compose network, not for the internet.
+{$ARXD_DOMAIN} {
+    handle /metrics {
+        respond 404
+    }
+    reverse_proxy arxd:30333
+}

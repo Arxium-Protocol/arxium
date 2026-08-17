@@ -316,6 +316,7 @@ async fn run_swarm<P: Payload>(
         tokio::select! {
             _ = status_interval.tick() => {
                 let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
+                metrics::gauge!("arxium_connected_peers").set(peers.len() as f64);
                 for peer in peers {
                     if sync_failures.get(&peer).is_some_and(|&n| n >= MAX_CONSECUTIVE_SYNC_FAILURES) {
                         continue;

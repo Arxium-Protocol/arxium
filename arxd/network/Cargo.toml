@@ -9,6 +9,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync"] }
 serde = { workspace = true }
 bincode = { workspace = true, features = ["serde"] }
+metrics = { workspace = true }
 xc-primitives = { workspace = true }
 xc-mempool = { workspace = true }
 xc-storage = { workspace = true }

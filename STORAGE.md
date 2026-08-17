@@ -16,3 +16,13 @@ If disk growth ever becomes the trigger: prune block bodies older than
 `H - N` once NodeIndexer confirms ingestion past that height, keeping
 `account`/`validators` CF entries (current state) untouched. Not built until
 that trigger is actually hit — see `implementation_plan.md` Phase 5.
+
+## Backups
+
+`scripts/backup-node.sh <data-dir> <backup-dir> [keep-count]` tars the data
+directory (RocksDB + `validator.key` + `network.key`) to a dated,
+auto-pruned archive. Run it from cron and copy the resulting tarballs
+off-box — `validator.key` is the validator's entire signing identity with
+no recovery path if the disk is lost, so this is the one thing on the node
+that actually needs backing up (unlike block history, which NodeIndexer
+already durably holds).

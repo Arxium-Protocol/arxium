@@ -14,6 +14,7 @@ members = [
     #
     "arxd/node",
     "arxd/network",
+    "arxd/runtime",
     "arxd",
     #
     "scripts/send-tx",
@@ -40,6 +41,7 @@ xc-genesis = { path = "core/genesis" }
 xc-rpc = { path = "core/rpc" }
 node = { path = "arxd/node" }
 network = { path = "arxd/network" }
+runtime = { path = "arxd/runtime" }
 
 # external packages
 clap = { version = "4.4", features = ["derive"] }
@@ -61,3 +63,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "signal"] }
 axum = "0.8"
 subtle = "2.6.1"
 tower-http = { version = "0.6", features = ["cors"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }

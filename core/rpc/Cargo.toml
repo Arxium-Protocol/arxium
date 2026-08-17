@@ -13,6 +13,8 @@ tokio = { workspace = true }
 axum = { workspace = true }
 subtle = { workspace = true }
 tower-http = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }

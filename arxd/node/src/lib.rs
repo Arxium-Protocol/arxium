@@ -6,17 +6,22 @@ use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use crate::produce::produce_block;
 use anyhow::{Context, Result};
 use clap::Parser;
+use ed25519_dalek::Signer;
+use metrics::{counter, gauge};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use network::{identity, spawn_p2p_node};
+use runtime::{EquivocationEvidence, RuntimeEvent, spawn_runtime};
 use xc_cli::{Cli, Command};
 use xc_executor::{BlockUpdates, accept_block, execute_actions};
 use xc_mempool::Mempool;
-use xc_primitives::{Address, NodeConfig, Snapshot, eligible_proposer};
+use xc_primitives::{Action, Address, NodeConfig, Snapshot, eligible_proposer};
 use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
 
@@ -61,13 +66,21 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _) = execute_actions(
             &db,
             genesis_block.actions.clone(),
             &[],
             BlockUpdates::default(),
             |action, lookup, stake_lookup, validator_masters_lookup, validators| {
-                dispatch(action, lookup, stake_lookup, validator_masters_lookup, validators, 0)
+                dispatch(
+                    action,
+                    lookup,
+                    stake_lookup,
+                    validator_masters_lookup,
+                    validators,
+                    0,
+                    &|_, _| Ok(false),
+                )
             },
         )?;
         db.write_batches(&[&genesis_updates, &genesis_block])?;
@@ -114,7 +127,48 @@ pub fn run() -> Result<()> {
         None
     };
 
+    // Installs the global recorder the `counter!`/`gauge!` calls below write
+    // to; the handle is just a read side onto the same data, handed to the
+    // RPC server so `GET /metrics` can render it.
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context("failed to install metrics recorder")?;
+    gauge!("arxium_tip_height").set(db.get_tip_height()?.unwrap_or(0) as f64);
+
     let mempool = Arc::new(Mutex::new(Mempool::new()));
+
+    // The runtime subsystem's own message-passing seam: `on_block` below
+    // sends it competing-block sightings, it decides whether that's real
+    // equivocation and (if this node has a validator key) reports it —
+    // this thread never calls into slashing logic directly.
+    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let build_evidence_action = identity.as_ref().map(|(address, key)| {
+        let address = address.clone();
+        let key = key.clone();
+        let db = db.clone();
+        move |evidence: EquivocationEvidence<ActionPayload>| -> Action<ActionPayload> {
+            let nonce = db
+                .get_account(&address)
+                .ok()
+                .flatten()
+                .map(|entry| entry.nonce)
+                .unwrap_or(0);
+            let mut action = Action {
+                sender: address.clone(),
+                nonce,
+                signature: None,
+                payload: ActionPayload::SubmitEquivocationEvidence {
+                    block_a: Box::new(evidence.block_a),
+                    block_b: Box::new(evidence.block_b),
+                },
+            };
+            let signature = key.sign(&action.signing_bytes());
+            action.signature = Some(hex::encode(signature.to_bytes()));
+            action
+        }
+    });
+    spawn_runtime(db.clone(), mempool.clone(), runtime_rx, build_evidence_action);
+
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
         mempool.clone(),
@@ -123,6 +177,7 @@ pub fn run() -> Result<()> {
         config.port,
         config.rpc_token.clone(),
         Some(gossip_tx),
+        metrics_handle,
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -140,15 +195,25 @@ pub fn run() -> Result<()> {
     let on_block = {
         let db = db.clone();
         let chain_lock = chain_lock.clone();
+        let runtime_tx = runtime_tx.clone();
         move |block: ChainBlock| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
+            let candidate = block.clone();
             match accept_block(
                 &db,
                 block,
                 SLOT_DURATION.as_secs(),
                 |action, lookup, stake_lookup, validator_masters_lookup, validators| {
-                    dispatch(action, lookup, stake_lookup, validator_masters_lookup, validators, height)
+                    dispatch(
+                        action,
+                        lookup,
+                        stake_lookup,
+                        validator_masters_lookup,
+                        validators,
+                        height,
+                        &|h, p| db.evidence_processed(h, p),
+                    )
                 },
             ) {
                 Ok(accepted) => {
@@ -158,10 +223,22 @@ pub fn run() -> Result<()> {
                         accepted.actions.len(),
                         accepted.hash()
                     );
+                    counter!("arxium_blocks_accepted_total").increment(1);
+                    gauge!("arxium_tip_height").set(accepted.height as f64);
                     false
                 }
                 Err(err) => {
                     warn!("rejected gossiped block: {err}");
+                    counter!("arxium_blocks_rejected_total").increment(1);
+                    // Competing block for the height we already committed —
+                    // not just "behind" — is the one shape that's worth
+                    // handing to the runtime subsystem to check for
+                    // equivocation.
+                    if let xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height } = &err {
+                        if block_height == tip_height {
+                            let _ = runtime_tx.send(RuntimeEvent::BlockObserved(candidate));
+                        }
+                    }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }
             }
@@ -254,6 +331,9 @@ pub fn run() -> Result<()> {
             None => None,
         };
 
+        gauge!("arxium_mempool_pending_actions")
+            .set(mempool.lock().unwrap_or_else(|e| e.into_inner()).len() as f64);
+
         let pending = mempool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -272,6 +352,8 @@ pub fn run() -> Result<()> {
                     block.actions.len(),
                     block.hash()
                 );
+                counter!("arxium_blocks_produced_total").increment(1);
+                gauge!("arxium_tip_height").set(block.height as f64);
                 // Only signed blocks are meaningful to peers — an unsigned
                 // block (non-validator solo mode) has no proposer for
                 // `accept_block`'s expected-proposer check to match.
@@ -279,7 +361,10 @@ pub fn run() -> Result<()> {
                     let _ = block_tx.send(block);
                 }
             }
-            Err(err) => warn!("block production failed: {err}"),
+            Err(err) => {
+                warn!("block production failed: {err}");
+                counter!("arxium_block_production_errors_total").increment(1);
+            }
         }
         drop(guard);
     }

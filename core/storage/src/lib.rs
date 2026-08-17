@@ -104,6 +104,15 @@ impl ArxiumDb {
         Ok(self.get(b"meta:height")?.is_some())
     }
 
+    /// Whether equivocation evidence against `proposer` at `height` has
+    /// already been slashed — replay protection for
+    /// `ActionPayload::SubmitEquivocationEvidence`, since the same pair of
+    /// conflicting blocks could otherwise be resubmitted for a repeat slash.
+    pub fn evidence_processed(&self, height: u64, proposer: &Address) -> Result<bool, StorageError> {
+        let key = format!("meta:evidence:{height:020}:{proposer}");
+        Ok(self.get(key.as_bytes())?.is_some())
+    }
+
     /// Get the chain name recorded at genesis.
     pub fn get_chain_name(&self) -> Result<Option<String>, StorageError> {
         match self.get(b"meta:chain_name")? {
@@ -409,6 +418,23 @@ impl<P: Serialize> BatchWritable for Block<P> {
         }
 
         Ok(entries)
+    }
+}
+
+/// Marks equivocation evidence against `proposer` at `height` as processed,
+/// so `ArxiumDb::evidence_processed` can reject a resubmission. Written
+/// alongside the slash's `AccountUpdates`/`StakeUpdates` in the same atomic
+/// batch — see `evidence_processed`.
+#[derive(Debug)]
+pub struct EvidenceMarker {
+    pub height: u64,
+    pub proposer: Address,
+}
+
+impl BatchWritable for EvidenceMarker {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:evidence:{:020}:{}", self.height, self.proposer).into_bytes();
+        Ok(vec![(key, vec![1u8])])
     }
 }
 

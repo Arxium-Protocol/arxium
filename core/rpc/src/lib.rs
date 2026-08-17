@@ -6,6 +6,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -48,6 +49,7 @@ struct AppState<P: Payload> {
     // Broadcasts freshly admitted actions out to peers over gossip. `None`
     // in tests / any caller that doesn't wire up `network`.
     gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
+    metrics_handle: PrometheusHandle,
 }
 
 struct RateLimiter {
@@ -126,6 +128,11 @@ async fn guard<P: Payload>(
     req: Request,
     next: Next,
 ) -> Response {
+    // Path only (never the query string — addresses/signatures/heights can
+    // appear there and would blow up the metric's cardinality), captured
+    // before `req` moves into `next.run`.
+    let path = req.uri().path().to_string();
+
     if let Some(token) = &state.rpc_token {
         let expected = format!("Bearer {token}");
         let authorized = req
@@ -136,15 +143,40 @@ async fn guard<P: Payload>(
                 value.len() == expected.len() && value.as_bytes().ct_eq(expected.as_bytes()).into()
             });
         if !authorized {
+            record_request(&path, StatusCode::UNAUTHORIZED);
             return StatusCode::UNAUTHORIZED.into_response();
         }
     }
 
     if !state.rate_limiter.allow(client_ip(&req, addr)) {
+        record_request(&path, StatusCode::TOO_MANY_REQUESTS);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
 
-    next.run(req).await
+    let response = next.run(req).await;
+    record_request(&path, response.status());
+    response
+}
+
+fn record_request(path: &str, status: StatusCode) {
+    metrics::counter!(
+        "arxium_rpc_requests_total",
+        "path" => path.to_string(),
+        "status" => status.as_u16().to_string(),
+    )
+    .increment(1);
+}
+
+/// Renders the current metrics snapshot in Prometheus text format. Outside
+/// the bearer-token guard (metrics aren't secret and this endpoint isn't
+/// meant to be internet-facing — see `docker-compose.prod.yml` / `Caddyfile.prod`,
+/// which don't route it through the public TLS proxy).
+async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics_handle.render(),
+    )
+        .into_response()
 }
 
 /// Runs the RPC server on its own tokio runtime, on a dedicated thread, so
@@ -157,7 +189,8 @@ async fn guard<P: Payload>(
 /// `mempool` for the next block), `GET /accounts/{address}` (current
 /// balance/nonce, needed to sign the next action),
 /// `GET /actions/{signature}` (pending/confirmed status of a submitted
-/// action), and `GET /status` (chain name, tip height/hash). If `rpc_token`
+/// action), `GET /status` (chain name, tip height/hash), and `GET /metrics`
+/// (Prometheus text format, ungated — see `get_metrics`). If `rpc_token`
 /// is set, every request must carry a matching
 /// `Authorization: Bearer` header. Blocks the caller until the listener is
 /// bound (or fails to bind), same as a sync server would, so startup
@@ -169,6 +202,7 @@ pub fn spawn_http_ingest<P: Payload>(
     port: u16,
     rpc_token: Option<String>,
     gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
+    metrics_handle: PrometheusHandle,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
@@ -177,6 +211,7 @@ pub fn spawn_http_ingest<P: Payload>(
         rpc_token: rpc_token.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new()),
         gossip_tx,
+        metrics_handle,
     };
 
     thread::spawn(move || {
@@ -192,7 +227,12 @@ pub fn spawn_http_ingest<P: Payload>(
         };
 
         runtime.block_on(async move {
-            let app = Router::new()
+            // /metrics is deliberately outside the guarded router below — a
+            // scrape endpoint shouldn't need the RPC bearer token, and it's
+            // never routed through the public TLS proxy in production (see
+            // Caddyfile.prod) since it's only meant for an internal scraper
+            // on the same docker network.
+            let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .route("/accounts/{address}", get(get_account::<P>))
@@ -204,7 +244,12 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/search", get(search::<P>))
                 .route("/status", get(get_status::<P>))
                 .with_state(state.clone())
-                .layer(middleware::from_fn_with_state(state, guard::<P>))
+                .layer(middleware::from_fn_with_state(state.clone(), guard::<P>));
+
+            let app = Router::new()
+                .route("/metrics", get(get_metrics::<P>))
+                .with_state(state)
+                .merge(guarded)
                 // All reads are public and writes are gated by the bearer
                 // token above (never a cookie), so there's no session to
                 // leak cross-origin — open to any origin, same as any public
@@ -556,6 +601,11 @@ mod tests {
             rpc_token: None,
             rate_limiter: Arc::new(RateLimiter::new()),
             gossip_tx: None,
+            // Not installed as the global recorder — tests don't assert on
+            // rendered metric values, just that requests still succeed.
+            metrics_handle: metrics_exporter_prometheus::PrometheusBuilder::new()
+                .build_recorder()
+                .handle(),
         }
     }
 

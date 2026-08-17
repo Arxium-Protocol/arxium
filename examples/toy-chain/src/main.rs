@@ -86,7 +86,7 @@ fn produce_block(
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let parent: RwaBlock = db.get_block(tip_height)?.expect("tip block must exist");
 
-    let (applied, updates, _, _) = execute_actions(
+    let (applied, updates, _, _, _) = execute_actions(
         db,
         actions,
         &[],

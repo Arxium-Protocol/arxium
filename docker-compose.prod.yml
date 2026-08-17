@@ -3,23 +3,43 @@
 #
 #   docker buildx build --platform linux/amd64 -t d4rkriverr/arxd:latest --push .
 #   # on the VPS:
+#   cp .env.example .env && edit .env (ARXD_DOMAIN, ARXD_RPC_TOKEN)
 #   docker compose -f docker-compose.prod.yml up -d
 #
-# RPC (30333) is published and bound to 0.0.0.0 because Arx-Plus (the
-# mobile app) talks to the node over RPC, not P2P — NodeIndexer is the only
-# consumer that needs just the P2P port. --rpc-token gates it since it's
-# now internet-facing; set the same token in the app's Node Settings.
+# Caddy is the only internet-facing service — it terminates TLS (automatic
+# cert via Let's Encrypt) and reverse-proxies to arxd over the private
+# compose network. arxd itself is never published to the host, so RPC
+# traffic (including the bearer token on every request) never crosses the
+# internet in plaintext. NodeIndexer is the only consumer that talks to
+# arxd directly, over P2P (30334), which stays published since P2P has no
+# TLS-terminating proxy in front of it.
 services:
   arxd:
     image: d4rkriverr/arxd:latest
     ports:
-      - "30333:30333" # RPC
       - "30334:30334/tcp" # P2P
       - "30334:30334/udp" # P2P (QUIC)
     volumes:
       - arxd-data:/data
-    command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-token", "1f311cd7d29a12ba8b3c7acb83535d0e67747cad5a3c1c7edc4842dc53a2e1ae"]
+    command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-token", "${ARXD_RPC_TOKEN:?set ARXD_RPC_TOKEN in .env}"]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      ARXD_DOMAIN: "${ARXD_DOMAIN:?set ARXD_DOMAIN in .env}"
+    volumes:
+      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - arxd
     restart: unless-stopped
 
 volumes:
   arxd-data:
+  caddy-data:
+  caddy-config:

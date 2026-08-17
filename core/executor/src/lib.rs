@@ -6,7 +6,10 @@ use xc_primitives::{
     AccountEntry, Action, Address, Block, SignatureError, StakeAllocation, ValidatorChange,
     eligible_proposer,
 };
-use xc_storage::{AccountUpdates, ArxiumDb, StakeUpdates, StorageError, ValidatorSetSnapshot};
+use xc_storage::{
+    AccountUpdates, ArxiumDb, BatchWritable, EvidenceMarker, StakeUpdates, StorageError,
+    ValidatorSetSnapshot,
+};
 
 /// What a single dispatched action hands back: account changes, an optional
 /// validator-membership change, and any stake-allocation changes. Named
@@ -18,6 +21,9 @@ pub struct BlockUpdates {
     pub accounts: AccountUpdates,
     pub validator_change: Option<ValidatorChange>,
     pub stakes: StakeUpdates,
+    /// Set only by `SubmitEquivocationEvidence` — marks the evidence
+    /// processed so it can't be resubmitted for a repeat slash.
+    pub evidence: Option<EvidenceMarker>,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -34,6 +40,7 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         accounts,
         validator_change: None,
         stakes,
+        evidence: None,
     })
 }
 
@@ -179,7 +186,7 @@ where
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
     let seed = resolve_matured_unbonding(db, block.height)?;
-    let (applied, account_updates, validator_changes, stake_updates) =
+    let (applied, account_updates, validator_changes, stake_updates, evidence_markers) =
         execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
         return Err(AcceptBlockError::ActionMismatch {
@@ -198,12 +205,15 @@ where
         })
     };
 
-    match &new_validator_set {
-        Some(snapshot) => {
-            db.write_batches(&[&account_updates, &stake_updates, snapshot, &block])?
-        }
-        None => db.write_batches(&[&account_updates, &stake_updates, &block])?,
+    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+    if let Some(snapshot) = &new_validator_set {
+        writables.push(snapshot);
     }
+    for marker in &evidence_markers {
+        writables.push(marker);
+    }
+    writables.push(&block);
+    db.write_batches(&writables)?;
     Ok(block)
 }
 
@@ -241,6 +251,7 @@ pub fn execute_actions<P>(
         AccountUpdates,
         Vec<ValidatorChange>,
         StakeUpdates,
+        Vec<EvidenceMarker>,
     ),
     ExecutorError,
 >
@@ -255,6 +266,7 @@ where
     let mut validator_changes: Vec<ValidatorChange> = seed.validator_change.into_iter().collect();
     let mut stake_overlay = seed.stakes.allocations;
     let mut validator_index_overlay = seed.stakes.validator_index;
+    let mut evidence_markers: Vec<EvidenceMarker> = seed.evidence.into_iter().collect();
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -290,6 +302,7 @@ where
                 validator_changes.extend(updates.validator_change);
                 stake_overlay.extend(updates.stakes.allocations);
                 validator_index_overlay.extend(updates.stakes.validator_index);
+                evidence_markers.extend(updates.evidence);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
@@ -304,6 +317,7 @@ where
             allocations: stake_overlay,
             validator_index: validator_index_overlay,
         },
+        evidence_markers,
     ))
 }
 
@@ -477,7 +491,7 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (applied, updates, validator_changes, _stake_updates) =
+        let (applied, updates, validator_changes, _stake_updates, _evidence_markers) =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
