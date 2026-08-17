@@ -248,6 +248,7 @@ pub fn run() -> Result<()> {
         let chain_lock = chain_lock.clone();
         let runtime_tx = runtime_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
+        let mempool = mempool.clone();
         move |block: ChainBlock| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
@@ -277,6 +278,12 @@ pub fn run() -> Result<()> {
                     );
                     counter!("arxium_blocks_accepted_total").increment(1);
                     gauge!("arxium_tip_height").set(accepted.height as f64);
+                    {
+                        let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                        for action in &accepted.actions {
+                            mempool.purge_stale(&action.sender, action.nonce + 1);
+                        }
+                    }
                     let _ = finality_event_tx.send(FinalityEvent::BlockObserved(accepted));
                     false
                 }

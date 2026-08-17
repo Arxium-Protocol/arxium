@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use finality::PrecommitVote;
 use xc_mempool::{Mempool, validate_action};
 use xc_primitives::{Action, Block};
@@ -328,6 +328,12 @@ async fn run_swarm<P: Payload>(
     // `record_bad_gossip`.
     let mut bad_gossip: HashMap<PeerId, u32> = HashMap::new();
     let mut status_interval = tokio::time::interval(STATUS_INTERVAL);
+    // Tracks (height, consecutive rounds without progress) so a sync loop
+    // that keeps re-fetching the same block(s) `on_block` keeps rejecting
+    // (state genuinely diverged from this peer — there's no reorg/rollback
+    // in this codebase to recover automatically) logs once loudly instead
+    // of an unbounded `warn!` every `STATUS_INTERVAL` forever.
+    let mut stuck_tip: Option<(u64, u32)> = None;
 
     loop {
         tokio::select! {
@@ -636,6 +642,18 @@ async fn run_swarm<P: Payload>(
                                     }
                                 }
                                 let local_tip = local_tip_height(&db);
+                                match stuck_tip {
+                                    Some((height, rounds)) if height == local_tip => {
+                                        let rounds = rounds + 1;
+                                        stuck_tip = Some((height, rounds));
+                                        if rounds == MAX_CONSECUTIVE_SYNC_FAILURES {
+                                            error!(
+                                                "local tip stuck at {local_tip} after {rounds} sync rounds — peer {peer} keeps serving a block this node rejects (state has diverged; no automatic reorg/rollback exists, needs manual intervention)"
+                                            );
+                                        }
+                                    }
+                                    _ => stuck_tip = Some((local_tip, 0)),
+                                }
                                 if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
                                     send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
                                         from: local_tip + 1,

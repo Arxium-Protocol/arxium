@@ -125,4 +125,71 @@ impl<P> Mempool<P> {
             })
             .collect()
     }
+
+    /// Drops any queued action for `sender` whose nonce is now stale
+    /// against `current_nonce` — e.g. because some *other* block (gossiped
+    /// or synced, not drained from this queue) already consumed it. Without
+    /// this, a stale entry sits in the queue until this node's own turn to
+    /// propose, gets silently dropped by `execute_actions` at that point,
+    /// and produces exactly the same claimed/executed block mismatch a
+    /// peer re-executing it would reject.
+    pub fn purge_stale(&mut self, sender: &Address, current_nonce: u64) {
+        let seen = &mut self.seen;
+        self.pending.retain(|action| {
+            if &action.sender == sender && action.nonce < current_nonce {
+                seen.remove(&(action.sender.clone(), action.nonce));
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(byte: u8) -> Address {
+        Address::from_pubkey_bytes(&[byte; 32]).unwrap()
+    }
+
+    fn action(sender: Address, nonce: u64) -> Action<()> {
+        Action {
+            sender,
+            nonce,
+            signature: Some(format!("sig-{nonce}")),
+            payload: (),
+        }
+    }
+
+    #[test]
+    fn purge_stale_drops_only_the_now_consumed_sender_nonce() {
+        let mut mempool = Mempool::new();
+        let a = addr(1);
+        let b = addr(2);
+        mempool.push(action(a.clone(), 1)).unwrap();
+        mempool.push(action(a.clone(), 2)).unwrap();
+        mempool.push(action(b.clone(), 1)).unwrap();
+
+        // Some other block already advanced `a`'s on-chain nonce to 2 —
+        // nonce 1 is now stale, nonce 2 still pending, `b` untouched.
+        mempool.purge_stale(&a, 2);
+
+        assert_eq!(mempool.len(), 2);
+        let drained = mempool.drain_pending(10);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|act| (act.sender.clone(), act.nonce))
+                .collect::<Vec<_>>(),
+            vec![(a, 2), (b, 1)]
+        );
+
+        // The purged (a, 1) slot is free again, not stuck in `seen`.
+        let mut mempool2 = Mempool::new();
+        mempool2.push(action(addr(1), 1)).unwrap();
+        mempool2.purge_stale(&addr(1), 2);
+        assert!(mempool2.push(action(addr(1), 1)).is_ok());
+    }
 }
