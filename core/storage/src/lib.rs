@@ -1,10 +1,11 @@
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
+use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_primitives::{AccountEntry, Address, Block, Snapshot, StakeAllocation};
 #[cfg(test)]
 use xc_primitives::Action;
@@ -111,6 +112,35 @@ impl ArxiumDb {
     pub fn evidence_processed(&self, height: u64, proposer: &Address) -> Result<bool, StorageError> {
         let key = format!("meta:evidence:{height:020}:{proposer}");
         Ok(self.get(key.as_bytes())?.is_some())
+    }
+
+    /// A validator's registered BLS pubkey, if any — set via
+    /// `BlsKeyRegistration`, looked up by `arxd/finality` when tallying
+    /// precommit votes and verifying the resulting aggregate signature.
+    pub fn get_bls_pubkey(&self, address: &Address) -> Result<Option<BlsPublicKey>, StorageError> {
+        let key = format!("meta:blskey:{address}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (pubkey, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(pubkey))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The finality certificate for `height`, if 2/3+ of that height's
+    /// validator set has precommitted — see `arxd/finality`.
+    pub fn get_finality_record(&self, height: u64) -> Result<Option<FinalityRecord>, StorageError> {
+        let key = format!("meta:finality:{height:020}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (record, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Get the chain name recorded at genesis.
@@ -355,6 +385,28 @@ impl BatchWritable for Snapshot {
             let key = format!("validator:{}", address).into_bytes();
             let value = bincode::serde::encode_to_vec(validator, config)?;
             entries.push((key, value));
+
+            // ponytail: genesis's `validator.stake` was cosmetic-only — no
+            // StakeAllocation was ever materialized, so genesis validators
+            // could never be slashed (equivocation silently no-oped) or
+            // leave (`stake_lookup` found nothing). Write the same
+            // self-stake shape `circuit_staking::apply_stake` would.
+            let allocation = StakeAllocation {
+                master: address.clone(),
+                validator: address.clone(),
+                active_amount: validator.stake,
+                unbonding: None,
+                created_at: self.height,
+                updated_at: self.height,
+            };
+            entries.push((
+                format!("stake:{}:{}", address, address).into_bytes(),
+                bincode::serde::encode_to_vec(&allocation, config)?,
+            ));
+            entries.push((
+                format!("stake_by_validator:{}", address).into_bytes(),
+                bincode::serde::encode_to_vec(&vec![address.clone()], config)?,
+            ));
         }
         let mut genesis_validators: Vec<Address> = self.validators.keys().cloned().collect();
         genesis_validators.sort();
@@ -435,6 +487,48 @@ impl BatchWritable for EvidenceMarker {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let key = format!("meta:evidence:{:020}:{}", self.height, self.proposer).into_bytes();
         Ok(vec![(key, vec![1u8])])
+    }
+}
+
+/// Registers `address`'s BLS pubkey so `arxd/finality` can verify precommit
+/// votes and the resulting aggregate signature against it. Kept separate
+/// from `Address` (an Ed25519-derived bech32 identity) rather than folded
+/// in — BLS pubkeys are a different byte length and only meaningful once/if
+/// the address is in the validator set, not an identity of their own.
+#[derive(Debug)]
+pub struct BlsKeyRegistration {
+    pub address: Address,
+    pub pubkey: BlsPublicKey,
+}
+
+impl BatchWritable for BlsKeyRegistration {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:blskey:{}", self.address).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
+/// A block finality certificate: proof 2/3+ of `height`'s validator set
+/// independently BLS-signed `block_hash`. Stored as its own record rather
+/// than a `Block<P>` field — it's produced in a second round after the
+/// block already propagated, so embedding it would mean mutating an
+/// already-gossiped/stored block.
+#[derive(Serialize, Deserialize)]
+pub struct FinalityRecord {
+    pub height: u64,
+    pub block_hash: String,
+    pub signers: Vec<Address>,
+    pub aggregate_signature: BlsSignature,
+}
+
+impl BatchWritable for FinalityRecord {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:finality:{:020}", self.height).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
     }
 }
 
@@ -592,5 +686,24 @@ mod explorer_index_tests {
         assert_eq!(db.get_validator_set_at(4).unwrap(), vec![addr(1)]);
         assert_eq!(db.get_validator_set_at(5).unwrap(), expected_pair);
         assert_eq!(db.get_validator_set_at(100).unwrap(), expected_pair);
+    }
+
+    #[test]
+    fn genesis_validator_gets_a_real_self_stake_allocation() {
+        let db = temp_db();
+        let mut validators = std::collections::BTreeMap::new();
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000 });
+        db.write_batch(&Snapshot {
+            height: 0,
+            chain_name: "test".into(),
+            accounts: Default::default(),
+            validators,
+            boot_nodes: vec![],
+        })
+        .unwrap();
+
+        let allocation = db.get_stake_allocation(&addr(1), &addr(1)).unwrap().unwrap();
+        assert_eq!(allocation.active_amount, 1_000_000);
+        assert_eq!(db.get_stakes_by_validator(&addr(1)).unwrap(), vec![addr(1)]);
     }
 }

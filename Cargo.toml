@@ -3,8 +3,10 @@ members = [
     "circuits/account",
     "circuits/rwa-asset",
     "circuits/staking",
+    "circuits/identity-zk",
     #
     "core/primitives",
+    "core/bls",
     "core/storage",
     "core/mempool",
     "core/executor",
@@ -15,6 +17,7 @@ members = [
     "arxd/node",
     "arxd/network",
     "arxd/runtime",
+    "arxd/finality",
     "arxd",
     #
     "scripts/send-tx",
@@ -29,12 +32,14 @@ default-members = ["arxd"]
 [workspace.dependencies]
 # internal packages
 xc-primitives = { path = "core/primitives" }
+xc-bls = { path = "core/bls" }
 xc-storage = { path = "core/storage" }
 xc-mempool = { path = "core/mempool" }
 
 circuit-account = { path = "circuits/account" }
 circuit-rwa-asset = { path = "circuits/rwa-asset" }
 circuit-staking = { path = "circuits/staking" }
+circuit-identity-zk = { path = "circuits/identity-zk" }
 xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
 xc-genesis = { path = "core/genesis" }
@@ -42,6 +47,7 @@ xc-rpc = { path = "core/rpc" }
 node = { path = "arxd/node" }
 network = { path = "arxd/network" }
 runtime = { path = "arxd/runtime" }
+finality = { path = "arxd/finality" }
 
 # external packages
 clap = { version = "4.4", features = ["derive"] }
@@ -52,6 +58,16 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 rand = "0.9"
 dirs = "5.0"
 thiserror = "2.0.19"
+blst = "0.3.17"
+ark-bls12-381 = "0.6.0"
+ark-groth16 = { version = "0.6.0", default-features = false }
+ark-relations = { version = "0.6.0", default-features = false }
+ark-r1cs-std = { version = "0.6.0", default-features = false }
+ark-crypto-primitives = { version = "0.6.0", default-features = false, features = ["std", "crh", "constraints"] }
+ark-snark = { version = "0.6.0", default-features = false }
+ark-ff = { version = "0.6.0", default-features = false }
+ark-std = { version = "0.6.0", default-features = false }
+ark-serialize = { version = "0.6.0", default-features = false }
 rocksdb = "0.24.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

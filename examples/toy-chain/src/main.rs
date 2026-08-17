@@ -86,7 +86,7 @@ fn produce_block(
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let parent: RwaBlock = db.get_block(tip_height)?.expect("tip block must exist");
 
-    let (applied, updates, _, _, _) = execute_actions(
+    let (applied, updates, _, _, _, _) = execute_actions(
         db,
         actions,
         &[],
@@ -131,6 +131,7 @@ fn main() -> Result<()> {
             balance: 0,
             nonce: 0,
             identity_hash: Some("kyc-issuer".into()),
+            zk_identity_verified: false,
         },
     );
     accounts.insert(
@@ -139,6 +140,7 @@ fn main() -> Result<()> {
             balance: 0,
             nonce: 0,
             identity_hash: Some("kyc-recipient".into()),
+            zk_identity_verified: false,
         },
     );
     accounts.insert(
@@ -147,6 +149,7 @@ fn main() -> Result<()> {
             balance: 0,
             nonce: 0,
             identity_hash: None,
+            zk_identity_verified: false,
         },
     );
     db.write_batch(&Snapshot {

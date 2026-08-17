@@ -7,8 +7,8 @@ use xc_primitives::{
     eligible_proposer,
 };
 use xc_storage::{
-    AccountUpdates, ArxiumDb, BatchWritable, EvidenceMarker, StakeUpdates, StorageError,
-    ValidatorSetSnapshot,
+    AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, StakeUpdates,
+    StorageError, ValidatorSetSnapshot,
 };
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -24,6 +24,9 @@ pub struct BlockUpdates {
     /// Set only by `SubmitEquivocationEvidence` — marks the evidence
     /// processed so it can't be resubmitted for a repeat slash.
     pub evidence: Option<EvidenceMarker>,
+    /// Set only by `RegisterBlsKey` — registers the sender's BLS pubkey for
+    /// `arxd/finality` precommit-vote verification.
+    pub bls_key: Option<BlsKeyRegistration>,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -41,6 +44,7 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         validator_change: None,
         stakes,
         evidence: None,
+        bls_key: None,
     })
 }
 
@@ -186,7 +190,7 @@ where
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
     let seed = resolve_matured_unbonding(db, block.height)?;
-    let (applied, account_updates, validator_changes, stake_updates, evidence_markers) =
+    let (applied, account_updates, validator_changes, stake_updates, evidence_markers, bls_keys) =
         execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
         return Err(AcceptBlockError::ActionMismatch {
@@ -211,6 +215,9 @@ where
     }
     for marker in &evidence_markers {
         writables.push(marker);
+    }
+    for registration in &bls_keys {
+        writables.push(registration);
     }
     writables.push(&block);
     db.write_batches(&writables)?;
@@ -252,6 +259,7 @@ pub fn execute_actions<P>(
         Vec<ValidatorChange>,
         StakeUpdates,
         Vec<EvidenceMarker>,
+        Vec<BlsKeyRegistration>,
     ),
     ExecutorError,
 >
@@ -267,6 +275,7 @@ where
     let mut stake_overlay = seed.stakes.allocations;
     let mut validator_index_overlay = seed.stakes.validator_index;
     let mut evidence_markers: Vec<EvidenceMarker> = seed.evidence.into_iter().collect();
+    let mut bls_keys: Vec<BlsKeyRegistration> = seed.bls_key.into_iter().collect();
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -303,6 +312,7 @@ where
                 stake_overlay.extend(updates.stakes.allocations);
                 validator_index_overlay.extend(updates.stakes.validator_index);
                 evidence_markers.extend(updates.evidence);
+                bls_keys.extend(updates.bls_key);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
@@ -318,6 +328,7 @@ where
             validator_index: validator_index_overlay,
         },
         evidence_markers,
+        bls_keys,
     ))
 }
 
@@ -478,6 +489,7 @@ mod tests {
                 balance: 100,
                 nonce: 0,
                 identity_hash: None,
+                zk_identity_verified: false,
             },
         )])))
         .unwrap();
@@ -491,7 +503,7 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (applied, updates, validator_changes, _stake_updates, _evidence_markers) =
+        let (applied, updates, validator_changes, _stake_updates, _evidence_markers, _bls_keys) =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
@@ -554,6 +566,7 @@ mod tests {
                     balance: 1000,
                     nonce: 0,
                     identity_hash: None,
+                    zk_identity_verified: false,
                 },
             )])),
             &genesis,
@@ -604,6 +617,7 @@ mod tests {
                     balance: 1000,
                     nonce: 0,
                     identity_hash: None,
+                    zk_identity_verified: false,
                 },
             )])),
             &genesis,
@@ -641,6 +655,7 @@ mod tests {
                 balance: 300,
                 nonce: 0,
                 identity_hash: None,
+                zk_identity_verified: false,
             },
         )])))
         .unwrap();

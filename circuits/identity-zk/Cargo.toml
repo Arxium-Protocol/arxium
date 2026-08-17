@@ -1,0 +1,18 @@
+[package]
+name = "circuit-identity-zk"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ark-bls12-381 = { workspace = true }
+ark-groth16 = { workspace = true }
+ark-relations = { workspace = true }
+ark-r1cs-std = { workspace = true }
+ark-crypto-primitives = { workspace = true }
+ark-snark = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+ark-serialize = { workspace = true }
+
+[[example]]
+name = "generate_keys"

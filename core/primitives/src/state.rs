@@ -8,6 +8,10 @@ pub struct AccountEntry {
     pub balance: u128,
     pub nonce: u64,
     pub identity_hash: Option<String>,
+    // `#[serde(default)]` so existing RocksDB entries deserialize as `false`
+    // without a migration.
+    #[serde(default)]
+    pub zk_identity_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

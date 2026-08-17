@@ -29,7 +29,7 @@ pub fn produce_block(
     // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
     let validators = db.get_validator_set_at(next_height)?;
     let seed = resolve_matured_unbonding(db, next_height)?;
-    let (applied, account_updates, validator_changes, stake_updates, evidence_markers) =
+    let (applied, account_updates, validator_changes, stake_updates, evidence_markers, bls_keys) =
         execute_actions(
             db,
             actions,
@@ -79,6 +79,9 @@ pub fn produce_block(
     for marker in &evidence_markers {
         writables.push(marker);
     }
+    for registration in &bls_keys {
+        writables.push(registration);
+    }
     writables.push(&new_block);
     db.write_batches(&writables)?;
 
@@ -100,7 +103,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _) = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -113,7 +116,9 @@ mod tests {
                     validator_masters_lookup,
                     validators,
                     0,
-                    &|_, _| -> std::result::Result<bool, xc_storage::StorageError> { std::result::Result::Ok(false) },
+                    &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
+                        std::result::Result::Ok(false)
+                    },
                 )
             },
         )
@@ -131,6 +136,7 @@ mod tests {
                 balance: 1000,
                 nonce: 0,
                 identity_hash: None,
+                zk_identity_verified: false,
             },
         );
         db.write_batch(&Snapshot {

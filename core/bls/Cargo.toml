@@ -1,0 +1,9 @@
+[package]
+name = "xc-bls"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+blst = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }

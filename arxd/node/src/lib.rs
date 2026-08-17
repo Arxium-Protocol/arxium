@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
+use finality::{FinalityEvent, PrecommitVote, spawn_finality};
 use network::{identity, spawn_p2p_node};
 use runtime::{EquivocationEvidence, RuntimeEvent, spawn_runtime};
 use xc_cli::{Cli, Command};
@@ -66,7 +67,7 @@ fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _) = execute_actions(
             &db,
             genesis_block.actions.clone(),
             &[],
@@ -127,6 +128,18 @@ pub fn run() -> Result<()> {
         None
     };
 
+    // Same address as the Ed25519 identity above — a validator's BLS key is
+    // only meaningful once its pubkey is registered on-chain via a
+    // `RegisterBlsKey` action (`arxd/node/src/payload.rs`), which is an
+    // operator step, not automated here.
+    let bls_identity = identity
+        .as_ref()
+        .map(|(address, _)| -> Result<(Address, xc_bls::BlsSecretKey)> {
+            let (bls_key, _pubkey) = validator::load_or_generate_bls_key(&config.base_path)?;
+            Ok((address.clone(), bls_key))
+        })
+        .transpose()?;
+
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the
     // RPC server so `GET /metrics` can render it.
@@ -167,7 +180,45 @@ pub fn run() -> Result<()> {
             action
         }
     });
-    spawn_runtime(db.clone(), mempool.clone(), runtime_rx, build_evidence_action);
+    spawn_runtime(
+        db.clone(),
+        mempool.clone(),
+        runtime_rx,
+        build_evidence_action,
+    );
+
+    // Finality subsystem's own message-passing seam: locally observed
+    // blocks and peer precommit votes both funnel in as `FinalityEvent`s;
+    // freshly-signed votes come back out on `finality_vote_rx` to be
+    // gossiped over the network layer's precommit topic.
+    let (finality_event_tx, finality_event_rx) =
+        std_mpsc::channel::<FinalityEvent<ActionPayload>>();
+    let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
+    spawn_finality(
+        db.clone(),
+        bls_identity,
+        finality_event_rx,
+        finality_vote_tx,
+    );
+
+    let (precommit_tx, precommit_rx) = tokio::sync::mpsc::unbounded_channel::<PrecommitVote>();
+    // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
+    // network layer's tokio channel — same shape as `runtime`/`gossip_tx`
+    // bridging elsewhere in this file.
+    thread::spawn(move || {
+        for vote in finality_vote_rx {
+            if precommit_tx.send(vote).is_err() {
+                break;
+            }
+        }
+    });
+
+    let on_precommit_vote = {
+        let finality_event_tx = finality_event_tx.clone();
+        move |vote: PrecommitVote| {
+            let _ = finality_event_tx.send(FinalityEvent::VoteObserved(vote));
+        }
+    };
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
@@ -196,6 +247,7 @@ pub fn run() -> Result<()> {
         let db = db.clone();
         let chain_lock = chain_lock.clone();
         let runtime_tx = runtime_tx.clone();
+        let finality_event_tx = finality_event_tx.clone();
         move |block: ChainBlock| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
@@ -225,6 +277,7 @@ pub fn run() -> Result<()> {
                     );
                     counter!("arxium_blocks_accepted_total").increment(1);
                     gauge!("arxium_tip_height").set(accepted.height as f64);
+                    let _ = finality_event_tx.send(FinalityEvent::BlockObserved(accepted));
                     false
                 }
                 Err(err) => {
@@ -234,7 +287,11 @@ pub fn run() -> Result<()> {
                     // not just "behind" — is the one shape that's worth
                     // handing to the runtime subsystem to check for
                     // equivocation.
-                    if let xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height } = &err {
+                    if let xc_executor::AcceptBlockError::NotNextHeight {
+                        block_height,
+                        tip_height,
+                    } = &err
+                    {
                         if block_height == tip_height {
                             let _ = runtime_tx.send(RuntimeEvent::BlockObserved(candidate));
                         }
@@ -265,7 +322,9 @@ pub fn run() -> Result<()> {
         db.clone(),
         gossip_rx,
         block_rx,
+        precommit_rx,
         on_block,
+        on_precommit_vote,
     )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -358,6 +417,7 @@ pub fn run() -> Result<()> {
                 // block (non-validator solo mode) has no proposer for
                 // `accept_block`'s expected-proposer check to match.
                 if block.signature.is_some() {
+                    let _ = finality_event_tx.send(FinalityEvent::BlockObserved(block.clone()));
                     let _ = block_tx.send(block);
                 }
             }

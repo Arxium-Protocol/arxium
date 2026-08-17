@@ -41,6 +41,7 @@ pub fn apply_transfer(
         balance: 0,
         nonce: 0,
         identity_hash: None,
+        zk_identity_verified: false,
     });
 
     if nonce != sender_entry.nonce {
@@ -72,6 +73,7 @@ pub fn apply_transfer(
         balance: 0,
         nonce: 0,
         identity_hash: None,
+        zk_identity_verified: false,
     });
 
     sender_entry.balance -= amount;
@@ -122,6 +124,7 @@ mod tests {
                 balance: 100,
                 nonce: 0,
                 identity_hash: None,
+                zk_identity_verified: false,
             },
         )])))
         .unwrap();

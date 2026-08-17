@@ -42,7 +42,7 @@ pub enum StakingError {
 }
 
 fn default_account() -> AccountEntry {
-    AccountEntry { balance: 0, nonce: 0, identity_hash: None }
+    AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false }
 }
 
 /// Deterministically derives the address staked coins for `validator` are
@@ -313,7 +313,7 @@ mod tests {
 
     fn write_balance(db: &ArxiumDb, address: &Address, balance: u128) {
         let mut updates = HashMap::new();
-        updates.insert(address.clone(), AccountEntry { balance, nonce: 0, identity_hash: None });
+        updates.insert(address.clone(), AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false });
         db.write_batch(&AccountUpdates(updates)).unwrap();
     }
 

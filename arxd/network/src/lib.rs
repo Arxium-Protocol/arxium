@@ -18,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{info, warn};
+use finality::PrecommitVote;
 use xc_mempool::{Mempool, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
@@ -36,6 +37,10 @@ const ACTIONS_TOPIC: &str = "arxium/actions/v1";
 /// crate doesn't know how to execute a chain's actions, only how to move
 /// bytes between peers.
 const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
+/// One pub/sub topic for BLS precommit votes (`finality::PrecommitVote`) —
+/// same "gossip is just another untrusted entry point" rule as actions;
+/// signature/voter/quorum validation happens in `arxd/finality`, not here.
+const PRECOMMITS_TOPIC: &str = "arxium/precommits/v1";
 /// Request/response protocol a node uses to catch up on blocks it missed
 /// (e.g. was offline for) instead of only ever hearing about the newest
 /// block over gossip. Same acceptance path as gossiped blocks — this only
@@ -120,9 +125,13 @@ pub fn spawn_p2p_node<P: Payload>(
     db: ArxiumDb,
     gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
+    precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     // Returns `true` when the block's signature itself was forged, so the
     // sending peer can be penalized — see `record_bad_gossip`.
     on_block: impl Fn(Block<P>) -> bool + Send + 'static,
+    // Undecodable-bytes handling only — `arxd/finality` owns signature and
+    // quorum validation, this crate just moves the bytes.
+    on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
 ) -> Result<PeerId> {
     let keypair = if is_bootnode {
         identity::load_or_generate_devnet_bootnode_keypair(base_path)?
@@ -156,7 +165,8 @@ pub fn spawn_p2p_node<P: Payload>(
         };
 
         runtime.block_on(run_swarm(
-            keypair, listen_port, bootnodes, mempool, db, gossip_rx, block_rx, on_block, ready_tx,
+            keypair, listen_port, bootnodes, mempool, db, gossip_rx, block_rx, precommit_rx,
+            on_block, on_precommit_vote, ready_tx,
         ));
     });
 
@@ -250,7 +260,9 @@ async fn run_swarm<P: Payload>(
     db: ArxiumDb,
     mut gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     mut block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
+    mut precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     on_block: impl Fn(Block<P>) -> bool + Send + 'static,
+    on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
     let mut swarm = match build_swarm(keypair) {
@@ -268,6 +280,11 @@ async fn run_swarm<P: Payload>(
         return;
     }
     if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic) {
+        let _ = ready_tx.send(Err(err.into()));
+        return;
+    }
+    let precommits_topic = gossipsub::IdentTopic::new(PRECOMMITS_TOPIC);
+    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&precommits_topic) {
         let _ = ready_tx.send(Err(err.into()));
         return;
     }
@@ -350,6 +367,20 @@ async fn run_swarm<P: Payload>(
                         }
                     }
                     Err(err) => warn!("failed to encode block for gossip: {err}"),
+                }
+            }
+            vote = precommit_rx.recv() => {
+                let Some(vote) = vote else {
+                    // Sender side (finality subsystem) is gone — nothing left to publish.
+                    continue;
+                };
+                match bincode::serde::encode_to_vec(&vote, bincode::config::standard()) {
+                    Ok(bytes) => {
+                        if let Err(err) = swarm.behaviour_mut().gossipsub.publish(precommits_topic.clone(), bytes) {
+                            warn!("failed to publish precommit vote to gossip: {err}");
+                        }
+                    }
+                    Err(err) => warn!("failed to encode precommit vote for gossip: {err}"),
                 }
             }
             event = swarm.select_next_some() => match event {
@@ -459,6 +490,28 @@ async fn run_swarm<P: Payload>(
                             "forged gossiped block signature",
                         );
                     }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message,
+                    ..
+                })) if message.topic == precommits_topic.hash() => {
+                    let vote: PrecommitVote = match bincode::serde::decode_from_slice(
+                        &message.data,
+                        bincode::config::standard(),
+                    ) {
+                        Ok((vote, _)) => vote,
+                        Err(err) => {
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                &format!("undecodable gossiped precommit vote: {err}"),
+                            );
+                            continue;
+                        }
+                    };
+                    on_precommit_vote(vote);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
                     peer,
@@ -617,9 +670,13 @@ mod tests {
         let db = ArxiumDb::open(&base_path.join("data")).unwrap();
         let (_gossip_tx, gossip_rx) = tokio_mpsc::unbounded_channel();
         let (_block_tx, block_rx) = tokio_mpsc::unbounded_channel();
+        let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
 
-        let peer_id = spawn_p2p_node(&base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, |_| false)
-            .expect("node should start on OS-assigned port");
+        let peer_id = spawn_p2p_node(
+            &base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, precommit_rx, |_| false,
+            |_| {},
+        )
+        .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());
 
         std::fs::remove_dir_all(&base_path).ok();

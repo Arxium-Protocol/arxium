@@ -709,6 +709,7 @@ mod tests {
                             balance: 1000,
                             nonce: 5,
                             identity_hash: None,
+                            zk_identity_verified: false,
                         },
                     )]),
                     validators: BTreeMap::new(),

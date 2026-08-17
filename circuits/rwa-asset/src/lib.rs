@@ -43,6 +43,7 @@ pub fn apply_issue(
         balance: 0,
         nonce: 0,
         identity_hash: None,
+        zk_identity_verified: false,
     });
 
     if nonce != entry.nonce {
@@ -144,6 +145,7 @@ mod tests {
                     balance: 100,
                     nonce: 0,
                     identity_hash: Some("kyc-1".into()),
+                    zk_identity_verified: false,
                 },
             ),
             (
@@ -152,6 +154,7 @@ mod tests {
                     balance: 0,
                     nonce: 0,
                     identity_hash: Some("kyc-2".into()),
+                    zk_identity_verified: false,
                 },
             ),
             (
@@ -160,6 +163,7 @@ mod tests {
                     balance: 0,
                     nonce: 0,
                     identity_hash: None,
+                    zk_identity_verified: false,
                 },
             ),
         ])))
