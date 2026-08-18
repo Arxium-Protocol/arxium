@@ -86,12 +86,12 @@ fn produce_block(
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let parent: RwaBlock = db.get_block(tip_height)?.expect("tip block must exist");
 
-    let (applied, updates, _, _, _, _) = execute_actions(
+    let (applied, updates, _, _, _, _, _) = execute_actions(
         db,
         actions,
         &[],
         BlockUpdates::default(),
-        |action, lookup, _stake_lookup, _validator_masters_lookup, _validators| {
+        |action, lookup, _stake_lookup, _validator_masters_lookup, _operator_lookup, _operator_validators_lookup, _validators| {
             let (accounts, validator_change) = dispatch(action, lookup, issuer)?;
             Ok(BlockUpdates {
                 accounts,
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
             genesis.actions.clone(),
             &[],
             BlockUpdates::default(),
-            |action, lookup, _stake_lookup, _validator_masters_lookup, _validators| {
+            |action, lookup, _stake_lookup, _validator_masters_lookup, _operator_lookup, _operator_validators_lookup, _validators| {
                 let (accounts, validator_change) = dispatch(action, lookup, &issuer)?;
                 Ok(BlockUpdates {
                     accounts,

@@ -51,10 +51,20 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Command::BlsKey { base_path }) = &cli.command {
+    if let Some(Command::BlsKey { base_path, qr }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
         let (_secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
-        println!("{}", hex::encode(pubkey.0));
+        let hex_pubkey = hex::encode(pubkey.0);
+        println!("{hex_pubkey}");
+        if *qr {
+            let code = qrcode::QrCode::new(&hex_pubkey).context("failed to render BLS pubkey as a QR code")?;
+            let image = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build();
+            println!("{image}");
+        }
         return Ok(());
     }
 
@@ -202,12 +212,14 @@ pub fn run() -> Result<()> {
                 &db,
                 block,
                 SLOT_DURATION.as_secs(),
-                |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+                |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
                     dispatch(
                         action,
                         lookup,
                         stake_lookup,
                         validator_masters_lookup,
+                        operator_lookup,
+                        operator_validators_lookup,
                         validators,
                         height,
                         &|h, p| db.evidence_processed(h, p),

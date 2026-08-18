@@ -15,6 +15,7 @@ hex = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+qrcode = { version = "0.14", default-features = false }
 
 xc-primitives = { workspace = true }
 xc-bls = { workspace = true }

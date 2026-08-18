@@ -31,17 +31,19 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
         let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _, _) = execute_actions(
             &db,
             genesis_block.actions.clone(),
             &[],
             BlockUpdates::default(),
-            |action, lookup, stake_lookup, validator_masters_lookup, validators| {
+            |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
                 dispatch(
                     action,
                     lookup,
                     stake_lookup,
                     validator_masters_lookup,
+                    operator_lookup,
+                    operator_validators_lookup,
                     validators,
                     0,
                     &|_, _| Ok(false),

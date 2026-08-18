@@ -129,6 +129,38 @@ impl ArxiumDb {
         }
     }
 
+    /// The address currently authorized to submit `JoinValidator`/
+    /// `LeaveValidator`/`RegisterBlsKey` on `validator`'s behalf, if any —
+    /// set via `OperatorUpdates::authorization`, looked up by `arxd/node`'s
+    /// dispatch to gate delegated actions. At most one operator per
+    /// validator at a time, mirroring `circuit_staking::apply_stake`'s
+    /// single-master invariant.
+    pub fn get_operator(&self, validator: &Address) -> Result<Option<Address>, StorageError> {
+        let key = format!("meta:operator:{validator}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (operator, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(operator))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Every validator address currently authorizing `operator` to act for
+    /// them — drives a "your validators" listing for a delegated client.
+    pub fn get_validators_for_operator(&self, operator: &Address) -> Result<Vec<Address>, StorageError> {
+        let key = format!("meta:operator_index:{operator}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (validators, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(validators)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// The finality certificate for `height`, if 2/3+ of that height's
     /// validator set has precommitted — see `arxd/finality`.
     pub fn get_finality_record(&self, height: u64) -> Result<Option<FinalityRecord>, StorageError> {
@@ -507,6 +539,58 @@ impl BatchWritable for BlsKeyRegistration {
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
         Ok(vec![(key, value)])
+    }
+}
+
+/// Grants or revokes authorization for an operator to submit
+/// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` on one or more
+/// validators' behalf (see `arxd/node`'s `AuthorizeOperator`/
+/// `RevokeOperator`), plus the full updated reverse-index list for every
+/// operator whose list changed as a result — same "caller computes the full
+/// new value via a lookup closure, storage just writes it, `None`/empty
+/// means delete" shape as `StakeUpdates`.
+#[derive(Debug, Default)]
+pub struct OperatorUpdates {
+    /// `validator -> Some(operator)` to authorize, `validator -> None` to revoke.
+    pub authorization: std::collections::BTreeMap<Address, Option<Address>>,
+    /// `operator -> full new validator list` (empty means delete).
+    pub operator_index: std::collections::BTreeMap<Address, Vec<Address>>,
+}
+
+impl BatchWritable for OperatorUpdates {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        for (validator, operator) in &self.authorization {
+            if let Some(operator) = operator {
+                let key = format!("meta:operator:{validator}").into_bytes();
+                let value = bincode::serde::encode_to_vec(operator, config)?;
+                entries.push((key, value));
+            }
+        }
+        for (operator, validators) in &self.operator_index {
+            if !validators.is_empty() {
+                let key = format!("meta:operator_index:{operator}").into_bytes();
+                let value = bincode::serde::encode_to_vec(validators, config)?;
+                entries.push((key, value));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        let mut deletes = Vec::new();
+        for (validator, operator) in &self.authorization {
+            if operator.is_none() {
+                deletes.push(format!("meta:operator:{validator}").into_bytes());
+            }
+        }
+        for (operator, validators) in &self.operator_index {
+            if validators.is_empty() {
+                deletes.push(format!("meta:operator_index:{operator}").into_bytes());
+            }
+        }
+        Ok(deletes)
     }
 }
 

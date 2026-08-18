@@ -6,7 +6,7 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{
     AccountEntry, Action, Address, StakeAllocation, ValidatorChange, ValidatorEntry,
 };
-use xc_storage::{AccountUpdates, BlsKeyRegistration, EvidenceMarker, StorageError};
+use xc_storage::{AccountUpdates, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StorageError};
 
 /// Devnet Groth16 verifying key, checked into `circuits/identity-zk` — see
 /// that crate's module docs for why it isn't from a real trusted-setup
@@ -36,32 +36,50 @@ pub enum ActionPayload {
         to: Address,
         amount: u128,
     },
-    /// Self-staking: routed through `circuit_staking::apply_stake` with
-    /// `master == validator == sender`, so it's held in the same
-    /// `stake_subaccount` mechanism regular delegators use — same balance
-    /// check, same "already controlled by another master" rejection, no new
-    /// bookkeeping. Takes effect one block after this action lands
-    /// (`xc_executor::accept_block`'s effective-height rule) — can't vote
-    /// itself into this block's own proposer slot. `stake` on
+    /// Staking to join the validator set: routed through
+    /// `circuit_staking::apply_stake` with `master == sender`, so it's held
+    /// in the same `stake_subaccount` mechanism regular delegators use —
+    /// same balance check, same "already controlled by another master"
+    /// rejection, no new bookkeeping. Takes effect one block after this
+    /// action lands (`xc_executor::accept_block`'s effective-height rule) —
+    /// can't vote itself into this block's own proposer slot. `stake` on
     /// `ValidatorEntry` is informational only; `ValidatorSetSnapshot` never
-    /// persists it, so the `StakeAllocation` for `(sender, sender)` is the
+    /// persists it, so the `StakeAllocation` for `(sender, validator)` is the
     /// real source of truth for how much a validator has at stake.
+    ///
+    /// `sender == validator` for ordinary self-service joining. `sender !=
+    /// validator` is a *delegated* join — `sender` must be `validator`'s
+    /// authorized operator (see `AuthorizeOperator`), and `sender`'s own
+    /// balance funds the stake, same as a third-party `Stake` action. That
+    /// also means `sender` becomes `validator`'s stake master going forward
+    /// (`circuit_staking::apply_stake`'s single-master invariant) — the
+    /// validator can't separately self-stake later while a delegated master
+    /// holds that slot.
     JoinValidator {
+        validator: Address,
         stake: u128,
     },
-    /// Self-service removal, now routed through
-    /// `circuit_staking::apply_unstake` for the sender's full self-stake
-    /// before the `ValidatorChange::Leave` is allowed. Leaving drops you
-    /// from the proposer rotation immediately, but the stake sits in
-    /// `Unbonding` for `circuit_staking::UNBONDING_BLOCKS` — and stays
+    /// Removal from the validator set, routed through
+    /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
+    /// before the `ValidatorChange::Leave` is allowed. Leaving drops the
+    /// validator from the proposer rotation immediately, but the stake sits
+    /// in `Unbonding` for `circuit_staking::UNBONDING_BLOCKS` — and stays
     /// slashable that whole time (`circuit_staking::apply_slash` treats
-    /// unbonding funds as fair game). Rejected if the sender isn't currently
-    /// a validator, or if they're the last one — an empty validator set
-    /// means `expected_proposer` returns `None` forever and the chain can
-    /// never produce another block (the same deadlock hit live this session
-    /// from running `--bootnode` on two machines, self-inflicted here
-    /// instead).
-    LeaveValidator,
+    /// unbonding funds as fair game). Rejected if `validator` isn't
+    /// currently a validator, or if they're the last one — an empty
+    /// validator set means `expected_proposer` returns `None` forever and
+    /// the chain can never produce another block (the same deadlock hit live
+    /// this session from running `--bootnode` on two machines,
+    /// self-inflicted here instead).
+    ///
+    /// `sender == validator` for self-service leaving. `sender != validator`
+    /// is delegated — same authorization rule as `JoinValidator` — and the
+    /// unstaked funds return to whoever `validator`'s recorded master is
+    /// (`sender` in the self-service case, the authorized operator in the
+    /// delegated case), never anywhere else.
+    LeaveValidator {
+        validator: Address,
+    },
     /// MW-signature-only stake into a validator's sub-account
     /// (`circuit_staking::stake_subaccount`). See `circuit_staking::apply_stake`.
     Stake {
@@ -87,11 +105,17 @@ pub enum ActionPayload {
         block_a: Box<ChainBlock>,
         block_b: Box<ChainBlock>,
     },
-    /// Registers the sender's BLS pubkey for finality-certificate
-    /// precommit voting (`arxd/finality`). Any address may register — the
-    /// key is only meaningful once/if that address is also in the
+    /// Registers `validator`'s BLS pubkey for finality-certificate
+    /// precommit voting (`arxd/finality`). Any address may be registered —
+    /// the key is only meaningful once/if that address is also in the
     /// validator set at some height; no membership check happens here.
+    /// `sender == validator` for self-registration; `sender != validator` is
+    /// delegated, same authorization rule as `JoinValidator`. This lets a
+    /// validator's operator register the key on its behalf without the
+    /// validator's own key ever leaving the machine it was generated on
+    /// (`arxd bls-key`).
     RegisterBlsKey {
+        validator: Address,
         pubkey: Vec<u8>,
     },
     /// A Groth16 proof of knowledge of a preimage hashing (via
@@ -103,6 +127,26 @@ pub enum ActionPayload {
     VerifyIdentityCredential {
         proof: Vec<u8>,
     },
+    /// Grants `operator` authority to submit `JoinValidator`/
+    /// `LeaveValidator`/`RegisterBlsKey` on the sender's behalf — self-signed
+    /// only, this is how a validator opts in to delegated management, never
+    /// something an operator can grant itself. Overwrites any previously
+    /// authorized operator (at most one at a time, mirroring
+    /// `circuit_staking::apply_stake`'s single-master invariant).
+    ///
+    /// Appended here rather than inserted among the existing variants —
+    /// `ActionPayload`'s wire format (bincode, used for gossip/sync, and
+    /// hand-mirrored by out-of-process codecs like Arx-Plus's Swift one)
+    /// encodes enum variants by discriminant index, so inserting earlier
+    /// would silently shift every later variant's index.
+    AuthorizeOperator {
+        operator: Address,
+    },
+    /// Revokes the sender's currently authorized operator, if any —
+    /// self-signed only, so a validator can always unilaterally cut off a
+    /// compromised or unwanted operator regardless of what that operator
+    /// does or doesn't do.
+    RevokeOperator,
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -114,11 +158,29 @@ pub type ChainBlock = xc_primitives::Block<ActionPayload>;
 /// one `accept_block`/`produce_block` will fold this action's
 /// `ValidatorChange` onto. `current_height` is the height of the block being
 /// built/accepted — needed to timestamp `Stake`/`Unstake`'s unbonding clock.
+/// `sender == validator` covers self-service management, unchanged from
+/// before delegation existed. `sender != validator` is only ever allowed if
+/// `validator` has authorized `sender` as its operator via
+/// `ActionPayload::AuthorizeOperator` — never the other way around, and
+/// never transitively.
+fn is_authorized(
+    sender: &Address,
+    validator: &Address,
+    operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+) -> anyhow::Result<bool> {
+    if sender == validator {
+        return Ok(true);
+    }
+    Ok(operator_lookup(validator)?.as_ref() == Some(sender))
+}
+
 pub fn dispatch(
     action: &ChainAction,
     lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
     stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
     validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+    operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+    operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
     current_height: u64,
     evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
@@ -134,11 +196,14 @@ pub fn dispatch(
             )?,
             ..Default::default()
         }),
-        ActionPayload::JoinValidator { stake } => {
+        ActionPayload::JoinValidator { validator, stake } => {
+            if !is_authorized(&action.sender, validator, operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
             // The floor is on total self-stake, not this call's delta — a
             // validator already at/above it topping up further shouldn't be
             // re-charged the whole minimum again.
-            let existing_active = stake_lookup(&action.sender, &action.sender)?
+            let existing_active = stake_lookup(&action.sender, validator)?
                 .map(|a| a.active_amount)
                 .unwrap_or(0);
             if existing_active + *stake < MIN_VALIDATOR_STAKE {
@@ -152,12 +217,11 @@ pub fn dispatch(
                 validator_masters_lookup,
                 &action.sender,
                 action.nonce,
-                &action.sender,
+                validator,
                 *stake,
                 current_height,
             )?;
-            let change =
-                ValidatorChange::Join(action.sender.clone(), ValidatorEntry { stake: *stake });
+            let change = ValidatorChange::Join(validator.clone(), ValidatorEntry { stake: *stake });
             Ok(BlockUpdates {
                 accounts,
                 stakes,
@@ -165,28 +229,51 @@ pub fn dispatch(
                 ..Default::default()
             })
         }
-        ActionPayload::LeaveValidator => {
-            if !validators.contains(&action.sender) {
-                anyhow::bail!("{} is not a current validator", action.sender);
+        ActionPayload::LeaveValidator { validator } => {
+            if !is_authorized(&action.sender, validator, operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
+            if !validators.contains(validator) {
+                anyhow::bail!("{validator} is not a current validator");
             }
             if validators.len() <= 1 {
                 anyhow::bail!("cannot remove the last validator, chain would stall forever");
             }
-            let self_stake = stake_lookup(&action.sender, &action.sender)?
-                .ok_or_else(|| anyhow::anyhow!("{} has no self-stake to unstake", action.sender))?;
+            // Whose funds actually move is never assumed to be `action.sender`
+            // — it's whoever the storage-recorded master is
+            // (`circuit_staking::apply_stake`'s single-master invariant),
+            // resolved fresh here. `action.sender` only had to pass the
+            // `is_authorized` check above; after an operator is revoked and
+            // replaced, the *new* operator (or the validator itself) is
+            // authorized to trigger leaving, but the stake still sits under
+            // whichever address actually funded it — using `action.sender`
+            // here would either find no allocation at all or, worse, silently
+            // touch the wrong one.
+            let master = validator_masters_lookup(validator)?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| action.sender.clone());
+            let self_stake = stake_lookup(&master, validator)?
+                .ok_or_else(|| anyhow::anyhow!("{master} has no stake in {validator} to unstake"))?;
+            // The master's own nonce, not `action.sender`'s — this action's
+            // own replay protection already happened at admission (keyed on
+            // `action.sender`'s nonce); `apply_unstake`'s nonce check is
+            // master-account bookkeeping, meaningless against a different
+            // account's counter when `master != action.sender`.
+            let master_nonce = lookup(&master)?.map(|entry| entry.nonce).unwrap_or(0);
             let (accounts, stakes) = circuit_staking::apply_unstake(
                 lookup,
                 stake_lookup,
-                &action.sender,
-                action.nonce,
-                &action.sender,
+                &master,
+                master_nonce,
+                validator,
                 self_stake.active_amount,
                 current_height,
             )?;
             Ok(BlockUpdates {
                 accounts,
                 stakes,
-                validator_change: Some(ValidatorChange::Leave(action.sender.clone())),
+                validator_change: Some(ValidatorChange::Leave(validator.clone())),
                 ..Default::default()
             })
         }
@@ -266,7 +353,10 @@ pub fn dispatch(
                 ..Default::default()
             })
         }
-        ActionPayload::RegisterBlsKey { pubkey } => {
+        ActionPayload::RegisterBlsKey { validator, pubkey } => {
+            if !is_authorized(&action.sender, validator, operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
             // Reject malformed/off-curve bytes now rather than at the first
             // failed precommit-vote verification later.
             blst::min_pk::PublicKey::from_bytes(pubkey)
@@ -278,7 +368,7 @@ pub fn dispatch(
                 .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))?;
             Ok(BlockUpdates {
                 bls_key: Some(BlsKeyRegistration {
-                    address: action.sender.clone(),
+                    address: validator.clone(),
                     pubkey: xc_bls::BlsPublicKey(bytes),
                 }),
                 ..Default::default()
@@ -311,6 +401,48 @@ pub fn dispatch(
                 ..Default::default()
             })
         }
+        ActionPayload::AuthorizeOperator { operator } => {
+            let validator = action.sender.clone();
+            let mut operator_index = std::collections::BTreeMap::new();
+            if let Some(previous) = operator_lookup(&validator)? {
+                if &previous != operator {
+                    let mut previous_list = operator_validators_lookup(&previous)?;
+                    previous_list.retain(|v| v != &validator);
+                    operator_index.insert(previous, previous_list);
+                }
+            }
+            let mut new_list = operator_validators_lookup(operator)?;
+            if !new_list.contains(&validator) {
+                new_list.push(validator.clone());
+            }
+            operator_index.insert(operator.clone(), new_list);
+
+            let mut authorization = std::collections::BTreeMap::new();
+            authorization.insert(validator, Some(operator.clone()));
+
+            Ok(BlockUpdates {
+                operator: OperatorUpdates { authorization, operator_index },
+                ..Default::default()
+            })
+        }
+        ActionPayload::RevokeOperator => {
+            let validator = action.sender.clone();
+            let previous = operator_lookup(&validator)?
+                .ok_or_else(|| anyhow::anyhow!("{validator} has no authorized operator to revoke"))?;
+
+            let mut list = operator_validators_lookup(&previous)?;
+            list.retain(|v| v != &validator);
+            let mut operator_index = std::collections::BTreeMap::new();
+            operator_index.insert(previous, list);
+
+            let mut authorization = std::collections::BTreeMap::new();
+            authorization.insert(validator, None);
+
+            Ok(BlockUpdates {
+                operator: OperatorUpdates { authorization, operator_index },
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -334,6 +466,14 @@ mod tests {
         Ok(Vec::new())
     }
 
+    fn operator_lookup(_validator: &Address) -> Result<Option<Address>, StorageError> {
+        Ok(None)
+    }
+
+    fn operator_validators_lookup(_operator: &Address) -> Result<Vec<Address>, StorageError> {
+        Ok(Vec::new())
+    }
+
     fn make_lookup(
         accounts: HashMap<Address, AccountEntry>,
     ) -> impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError> {
@@ -348,6 +488,12 @@ mod tests {
                 .get(&(master.clone(), validator.clone()))
                 .cloned())
         }
+    }
+
+    fn make_operator_lookup(
+        authorizations: HashMap<Address, Address>,
+    ) -> impl Fn(&Address) -> Result<Option<Address>, StorageError> {
+        move |validator| Ok(authorizations.get(validator).cloned())
     }
 
     fn funded(balance: u128) -> AccountEntry {
@@ -377,7 +523,7 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator,
+            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
         };
 
         let err = match dispatch(
@@ -385,6 +531,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[alice],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -408,7 +556,7 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator,
+            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
         };
 
         let updates = dispatch(
@@ -416,6 +564,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[alice.clone(), bob],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -434,6 +584,7 @@ mod tests {
             nonce: 0,
             signature: None,
             payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
             },
         };
@@ -443,6 +594,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -483,7 +636,7 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { stake: 500 },
+            payload: ActionPayload::JoinValidator { validator: alice.clone(), stake: 500 },
         };
 
         let updates = dispatch(
@@ -491,6 +644,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[alice.clone()],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -521,6 +676,7 @@ mod tests {
             nonce: 0,
             signature: None,
             payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
             },
         };
@@ -530,6 +686,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -551,6 +709,7 @@ mod tests {
             nonce: 0,
             signature: None,
             payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE - 1,
             },
         };
@@ -560,6 +719,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -581,7 +742,7 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator,
+            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
         };
 
         let updates = dispatch(
@@ -589,6 +750,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[alice.clone(), bob],
             5,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -673,6 +836,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -719,6 +884,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(true),
@@ -748,7 +915,7 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator,
+            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
         };
 
         let err = dispatch(
@@ -756,6 +923,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[alice.clone(), bob],
             5,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -773,6 +942,7 @@ mod tests {
             nonce: 0,
             signature: None,
             payload: ActionPayload::RegisterBlsKey {
+                validator: alice.clone(),
                 pubkey: pubkey.0.to_vec(),
             },
         };
@@ -782,6 +952,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -796,10 +968,11 @@ mod tests {
     fn register_bls_key_rejects_malformed_bytes() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let action = Action {
-            sender: alice,
+            sender: alice.clone(),
             nonce: 0,
             signature: None,
             payload: ActionPayload::RegisterBlsKey {
+                validator: alice.clone(),
                 pubkey: vec![0u8; 48],
             },
         };
@@ -809,6 +982,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -854,6 +1029,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -885,6 +1062,8 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
@@ -929,11 +1108,252 @@ mod tests {
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed verification"));
+    }
+
+    #[test]
+    fn join_validator_rejected_when_sender_not_authorized_for_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
+        let stake_lookup = make_stake_lookup(HashMap::new());
+        let action = Action {
+            sender: bob,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+        };
+
+        let err = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not authorized to manage"));
+    }
+
+    #[test]
+    fn authorized_operator_can_join_validator_on_behalf_of_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
+        let stake_lookup = make_stake_lookup(HashMap::new());
+        let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
+        let action = Action {
+            sender: bob.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
+                stake: MIN_VALIDATOR_STAKE,
+            },
+        };
+
+        let updates = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice)
+        );
+        // The operator's own balance funds a delegated join, same as a
+        // third-party `Stake` action would.
+        assert_eq!(
+            updates.accounts.0.get(&bob).unwrap().balance,
+            5_000 - MIN_VALIDATOR_STAKE
+        );
+        let allocation = updates
+            .stakes
+            .allocations
+            .get(&(bob, alice))
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert_eq!(allocation.active_amount, MIN_VALIDATOR_STAKE);
+    }
+
+    /// Regression test for a fund-lock found in review: operator A stakes
+    /// for validator V, V revokes A and authorizes B instead — B (now
+    /// authorized to trigger leaving) must not be assumed to be the funder.
+    /// The unstake has to resolve to A's actual allocation via
+    /// `validator_masters_lookup`, not `(action.sender, validator)`, or the
+    /// stake becomes permanently unreachable (no code path ever finds it
+    /// again).
+    #[test]
+    fn leave_validator_after_operator_revoked_and_replaced_still_credits_the_true_funder() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap(); // validator
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap(); // revoked ex-operator, real funder
+        let charlie = Address::from_pubkey_bytes(&[3u8; 32]).unwrap(); // newly authorized operator
+
+        let lookup = make_lookup(HashMap::new());
+        let stake_lookup = make_stake_lookup(HashMap::from([(
+            (bob.clone(), alice.clone()),
+            StakeAllocation {
+                master: bob.clone(),
+                validator: alice.clone(),
+                active_amount: MIN_VALIDATOR_STAKE,
+                unbonding: None,
+                created_at: 0,
+                updated_at: 0,
+            },
+        )]));
+        let validator_masters_lookup = |v: &Address| {
+            Ok(if *v == alice { vec![bob.clone()] } else { Vec::new() })
+        };
+        // Current state after revoke-then-reauthorize: charlie, not bob, is
+        // now alice's authorized operator.
+        let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), charlie.clone())]));
+
+        let action = Action {
+            sender: charlie,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+        };
+
+        let updates = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[alice.clone(), bob.clone()],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap();
+
+        assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice));
+        let allocation = updates
+            .stakes
+            .allocations
+            .get(&(bob, alice))
+            .unwrap()
+            .clone()
+            .unwrap();
+        assert!(allocation.unbonding.is_some(), "unstake must land on the real funder's allocation");
+        assert_eq!(allocation.active_amount, 0);
+    }
+
+    #[test]
+    fn authorize_operator_then_revoke_updates_forward_and_reverse_index() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let authorize = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::AuthorizeOperator { operator: bob.clone() },
+        };
+
+        let updates = dispatch(
+            &authorize,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap();
+        assert_eq!(
+            updates.operator.authorization.get(&alice).cloned().flatten(),
+            Some(bob.clone())
+        );
+        assert_eq!(
+            updates.operator.operator_index.get(&bob).cloned().unwrap_or_default(),
+            vec![alice.clone()]
+        );
+
+        // Once authorized, revoking must be reflected in the same two places
+        // — forward record cleared, reverse index no longer lists alice.
+        let operator_lookup_after = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
+        let alice_for_closure = alice.clone();
+        let bob_for_closure = bob.clone();
+        let operator_validators_lookup_after = move |op: &Address| {
+            Ok(if *op == bob_for_closure { vec![alice_for_closure.clone()] } else { Vec::new() })
+        };
+        let revoke = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RevokeOperator,
+        };
+        let updates = dispatch(
+            &revoke,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup_after,
+            &operator_validators_lookup_after,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap();
+        assert_eq!(updates.operator.authorization.get(&alice).cloned(), Some(None));
+        assert!(
+            updates
+                .operator
+                .operator_index
+                .values()
+                .all(|validators| !validators.contains(&alice))
+        );
+    }
+
+    #[test]
+    fn revoked_operator_can_no_longer_join_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
+        let stake_lookup = make_stake_lookup(HashMap::new());
+        // No entry for alice: same state as after a `RevokeOperator`.
+        let operator_lookup = make_operator_lookup(HashMap::new());
+        let action = Action {
+            sender: bob,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+        };
+
+        let err = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("is not authorized to manage"));
     }
 }

@@ -7,8 +7,8 @@ use xc_primitives::{
     eligible_proposer,
 };
 use xc_storage::{
-    AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, StakeUpdates,
-    StorageError, ValidatorSetSnapshot,
+    AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, OperatorUpdates,
+    StakeUpdates, StorageError, ValidatorSetSnapshot,
 };
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -27,6 +27,8 @@ pub struct BlockUpdates {
     /// Set only by `RegisterBlsKey` — registers the sender's BLS pubkey for
     /// `arxd/finality` precommit-vote verification.
     pub bls_key: Option<BlsKeyRegistration>,
+    /// Set only by `AuthorizeOperator`/`RevokeOperator`.
+    pub operator: OperatorUpdates,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -45,6 +47,7 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         stakes,
         evidence: None,
         bls_key: None,
+        operator: OperatorUpdates::default(),
     })
 }
 
@@ -127,6 +130,8 @@ pub fn accept_block<P>(
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
         &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
 ) -> Result<Block<P>, AcceptBlockError>
@@ -190,8 +195,15 @@ where
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
     let seed = resolve_matured_unbonding(db, block.height)?;
-    let (applied, account_updates, validator_changes, stake_updates, evidence_markers, bls_keys) =
-        execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
+    let (
+        applied,
+        account_updates,
+        validator_changes,
+        stake_updates,
+        evidence_markers,
+        bls_keys,
+        operator_updates,
+    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -219,6 +231,7 @@ where
     for registration in &bls_keys {
         writables.push(registration);
     }
+    writables.push(&operator_updates);
     writables.push(&block);
     db.write_batches(&writables)?;
     Ok(block)
@@ -250,6 +263,8 @@ pub fn execute_actions<P>(
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
         &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
 ) -> Result<
@@ -260,6 +275,7 @@ pub fn execute_actions<P>(
         StakeUpdates,
         Vec<EvidenceMarker>,
         Vec<BlsKeyRegistration>,
+        OperatorUpdates,
     ),
     ExecutorError,
 >
@@ -276,6 +292,8 @@ where
     let mut validator_index_overlay = seed.stakes.validator_index;
     let mut evidence_markers: Vec<EvidenceMarker> = seed.evidence.into_iter().collect();
     let mut bls_keys: Vec<BlsKeyRegistration> = seed.bls_key.into_iter().collect();
+    let mut operator_overlay = seed.operator.authorization;
+    let mut operator_index_overlay = seed.operator.operator_index;
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -298,12 +316,23 @@ where
                 Some(masters) => Ok(Clone::clone(masters)),
                 None => db.get_stakes_by_validator(validator),
             };
+        let operator_lookup = |validator: &Address| match operator_overlay.get(validator) {
+            Some(operator) => Ok(Clone::clone(operator)),
+            None => db.get_operator(validator),
+        };
+        let operator_validators_lookup =
+            |operator: &Address| match operator_index_overlay.get(operator) {
+                Some(validators) => Ok(Clone::clone(validators)),
+                None => db.get_validators_for_operator(operator),
+            };
 
         match dispatch(
             &action,
             &lookup,
             &stake_lookup,
             &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
             validators,
         ) {
             Ok(updates) => {
@@ -313,6 +342,8 @@ where
                 validator_index_overlay.extend(updates.stakes.validator_index);
                 evidence_markers.extend(updates.evidence);
                 bls_keys.extend(updates.bls_key);
+                operator_overlay.extend(updates.operator.authorization);
+                operator_index_overlay.extend(updates.operator.operator_index);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
@@ -329,6 +360,10 @@ where
         },
         evidence_markers,
         bls_keys,
+        OperatorUpdates {
+            authorization: operator_overlay,
+            operator_index: operator_index_overlay,
+        },
     ))
 }
 
@@ -352,6 +387,8 @@ mod tests {
         lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
         stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
         validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        _operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+        _operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         _validators: &[Address],
     ) -> anyhow::Result<BlockUpdates> {
         match &action.payload {
@@ -503,8 +540,15 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (applied, updates, validator_changes, _stake_updates, _evidence_markers, _bls_keys) =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
+        let (
+            applied,
+            updates,
+            validator_changes,
+            _stake_updates,
+            _evidence_markers,
+            _bls_keys,
+            _operator_updates,
+        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),

@@ -237,6 +237,9 @@ pub fn spawn_http_ingest<P: Payload>(
                 .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
                 .route("/accounts/{address}", get(get_account::<P>))
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
+                .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
+                .route("/validators", get(get_validators::<P>))
+                .route("/operators/{address}/validators", get(get_operator_validators::<P>))
                 .route("/actions/{signature}", get(get_action_status::<P>))
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
@@ -409,6 +412,60 @@ async fn get_account_stake<P: Payload>(
     match state.db.get_stake_allocation(&address, &address) {
         Ok(Some(allocation)) => Json(allocation).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Whether `address` has a BLS key registered for finality precommit voting
+/// (`ActionPayload::RegisterBlsKey`) — a validator without one can be in the
+/// validator set but its votes are silently dropped by `arxd/finality`.
+async fn get_account_bls_key<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    match state.db.get_bls_pubkey(&address) {
+        Ok(Some(pubkey)) => Json(serde_json::json!({ "pubkey": pubkey })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The current validator set, i.e. as of the chain's tip — same set
+/// `xc_executor::accept_block` would check the next block's proposer
+/// against.
+async fn get_validators<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    let tip_height = match state.db.get_tip_height() {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match state.db.get_validator_set_at(tip_height) {
+        Ok(validators) => Json(validators).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Every validator address currently authorizing `address` to submit
+/// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` on its behalf (see
+/// `ActionPayload::AuthorizeOperator`) — drives a "your validators" listing
+/// for a delegated-management client.
+async fn get_operator_validators<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    match state.db.get_validators_for_operator(&address) {
+        Ok(validators) => Json(validators).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

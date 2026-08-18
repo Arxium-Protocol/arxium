@@ -17,8 +17,9 @@ struct Args {
     from: String,
 
     /// "transfer" (default), "join-validator", "leave-validator", "stake", "unstake",
-    /// "register-bls-key", or "sub-account" (prints a validator's stake
-    /// sub-account address, submits nothing)
+    /// "register-bls-key", "authorize-operator", "revoke-operator", or
+    /// "sub-account" (prints a validator's stake sub-account address,
+    /// submits nothing)
     #[arg(long, default_value = "transfer")]
     action: String,
 
@@ -34,13 +35,21 @@ struct Args {
     #[arg(long)]
     stake: Option<u128>,
 
-    /// Validator address (name from devnet-keys.json, or bech32 address). Required for "stake"/"unstake".
+    /// Validator address (name from devnet-keys.json, or bech32 address). Required for
+    /// "stake"/"unstake". For "join-validator"/"leave-validator"/"register-bls-key", defaults
+    /// to --from (self-management); pass explicitly to act as that validator's authorized
+    /// operator instead (see "authorize-operator").
     #[arg(long)]
     validator: Option<String>,
 
     /// BLS pubkey, hex-encoded (from `arxd bls-key`). Required for "register-bls-key".
     #[arg(long)]
     bls_pubkey: Option<String>,
+
+    /// Operator address (name from devnet-keys.json, or bech32 address) to authorize.
+    /// Required for "authorize-operator".
+    #[arg(long)]
+    operator: Option<String>,
 
     /// Override the auto-fetched nonce
     #[arg(long)]
@@ -146,6 +155,16 @@ fn main() -> Result<()> {
             .context("failed to derive address from --from seed")?
     };
 
+    // Defaults to `sender` (self-management) when --validator isn't given —
+    // pass --validator explicitly to submit as that validator's authorized
+    // operator instead (see "authorize-operator").
+    let target_validator = || -> Result<Address> {
+        match args.validator.as_deref() {
+            Some(v) => resolve_address(v, &keys),
+            None => Ok(sender.clone()),
+        }
+    };
+
     let action_payload = match args.action.as_str() {
         "transfer" => ActionPayload::Transfer {
             to: resolve_address(
@@ -155,9 +174,10 @@ fn main() -> Result<()> {
             amount: args.amount.context("--amount is required for transfer")?,
         },
         "join-validator" => ActionPayload::JoinValidator {
+            validator: target_validator()?,
             stake: args.stake.context("--stake is required for join-validator")?,
         },
-        "leave-validator" => ActionPayload::LeaveValidator,
+        "leave-validator" => ActionPayload::LeaveValidator { validator: target_validator()? },
         "stake" => ActionPayload::Stake {
             validator: resolve_address(
                 args.validator.as_deref().context("--validator is required for stake")?,
@@ -173,14 +193,22 @@ fn main() -> Result<()> {
             amount: args.amount.context("--amount is required for unstake")?,
         },
         "register-bls-key" => ActionPayload::RegisterBlsKey {
+            validator: target_validator()?,
             pubkey: hex::decode(
                 args.bls_pubkey.as_deref().context("--bls-pubkey is required for register-bls-key")?,
             )
             .context("--bls-pubkey is not valid hex")?,
         },
+        "authorize-operator" => ActionPayload::AuthorizeOperator {
+            operator: resolve_address(
+                args.operator.as_deref().context("--operator is required for authorize-operator")?,
+                &keys,
+            )?,
+        },
+        "revoke-operator" => ActionPayload::RevokeOperator,
         other => {
             bail!(
-                "unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, unstake, or register-bls-key"
+                "unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, unstake, register-bls-key, authorize-operator, or revoke-operator"
             )
         }
     };
