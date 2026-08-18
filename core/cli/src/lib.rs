@@ -22,6 +22,14 @@ pub enum Command {
         #[arg(long, default_value_os_t = default_base_path())]
         base_path: PathBuf,
     },
+    /// Load (or, on first run, generate) this node's BLS finality-signing key
+    /// and print its pubkey (hex), without starting the node — hand this to
+    /// `send-tx --action register-bls-key` so this validator's precommit
+    /// votes count toward finality quorum.
+    BlsKey {
+        #[arg(long, default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+    },
 }
 
 #[derive(Args, Clone, Debug)]

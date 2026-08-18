@@ -1,119 +1,43 @@
 pub mod identity;
+mod discovery;
+mod gossip;
+mod sync;
+mod transport;
 
+pub use gossip::Payload;
 pub use libp2p::PeerId;
 
 use anyhow::{Context, Result};
-use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::futures::StreamExt;
-use libp2p::request_response::{self, ProtocolSupport, cbor};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{StreamProtocol, gossipsub, mdns, noise, tcp, yamux, Multiaddr};
-use serde::{Deserialize, Serialize};
-use serde::de::DeserializeOwned;
+use libp2p::request_response;
+use libp2p::swarm::SwarmEvent;
+use libp2p::{Multiaddr, gossipsub, mdns};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
+
 use finality::PrecommitVote;
 use xc_mempool::{Mempool, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
 
-/// Bound the chain's payload type must satisfy to travel over gossip:
-/// bincode (de)serializable for the wire, `Send + Sync + 'static` to cross
-/// into the swarm's own thread.
-pub trait Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {}
-impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload for P {}
+use discovery::{dial_bootnodes, dial_discovered};
+use gossip::{ACTIONS_TOPIC, BLOCKS_TOPIC, PRECOMMITS_TOPIC, record_bad_gossip};
+use sync::{
+    MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse, local_tip_height,
+    send_sync_request,
+};
+use transport::{BehaviourEvent, build_swarm};
 
-/// One pub/sub topic for actions — gossip is just another untrusted entry
-/// point into the mempool, no more trusted than a stranger hitting RPC.
-const ACTIONS_TOPIC: &str = "arxium/actions/v1";
-/// One pub/sub topic for blocks. Validation (signature, expected proposer,
-/// parent hash) happens in the caller-supplied `on_block` callback — this
-/// crate doesn't know how to execute a chain's actions, only how to move
-/// bytes between peers.
-const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
-/// One pub/sub topic for BLS precommit votes (`finality::PrecommitVote`) —
-/// same "gossip is just another untrusted entry point" rule as actions;
-/// signature/voter/quorum validation happens in `arxd/finality`, not here.
-const PRECOMMITS_TOPIC: &str = "arxium/precommits/v1";
-/// Request/response protocol a node uses to catch up on blocks it missed
-/// (e.g. was offline for) instead of only ever hearing about the newest
-/// block over gossip. Same acceptance path as gossiped blocks — this only
-/// adds a second delivery mechanism, not new validation.
-const SYNC_PROTOCOL: &str = "/arxium/sync/1";
-/// How often a connected peer is re-asked for its tip, to catch a peer
-/// falling behind mid-connection (not just "was offline, just reconnected") —
-/// e.g. a gossiped block silently dropped rather than erroring, which the
-/// OutboundFailure retry above can't see. Kept a small multiple of a
-/// devnet-scale block interval (~2s) rather than a long fixed value, so a
-/// missed block self-heals in a couple of block times, not tens of seconds.
-const STATUS_INTERVAL: Duration = Duration::from_secs(5);
-/// A peer whose sync requests fail this many times in a row (without a
-/// success in between) stops being retried until it reconnects — a flapping
-/// connection otherwise retries every single failure immediately, which on a
-/// bad link produces dozens of retries per second forever. Past this cap the
-/// peer is just skipped by the `STATUS_INTERVAL` tick; `ConnectionEstablished`
-/// (a real reconnect) or any successful sync response clears the count.
-const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 5;
-
-/// A peer sending this many unambiguously-bad gossip messages (undecodable
-/// bytes, forged signatures) in a row gets disconnected — see
-/// `record_bad_gossip`.
-const MAX_BAD_GOSSIP: u32 = 10;
-
-/// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
-/// `from`, capped at the local tip — never fabricates blocks the responder
-/// doesn't have. A node many blocks behind just takes multiple rounds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum SyncRequest {
-    Status,
-    Blocks { from: u64 },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum SyncResponse<P> {
-    Status { tip_height: u64 },
-    Blocks(Vec<Block<P>>),
-}
-
-/// Combined behaviour for this node. mDNS handles same-LAN discovery; gossipsub
-/// carries Actions between peers. An explicit `--bootnodes` list is dialed
-/// directly on startup instead of going through a behaviour, and a real DHT
-/// (Kademlia) isn't worth it until the validator set outgrows a
-/// hand-maintained list.
-#[derive(NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
-struct Behaviour {
-    mdns: mdns::tokio::Behaviour,
-    gossipsub: gossipsub::Behaviour,
-    /// Carries `SyncRequest`/`SyncResponse<P>` bytes (bincode, encoded and
-    /// decoded by `run_swarm` — this behaviour itself just moves opaque
-    /// bytes, same as gossipsub does for actions/blocks).
-    sync: cbor::Behaviour<Vec<u8>, Vec<u8>>,
-    /// Caps connection counts so a burst of dials (malicious or just a noisy
-    /// LAN) can't grow unbounded memory/fd usage — see `build_swarm`.
-    limits: connection_limits::Behaviour,
-}
-
-/// Starts this node's P2P identity, listeners, peer discovery, and Action +
-/// Block gossip on a dedicated thread with its own tokio runtime — same
-/// shape as `xc_rpc::spawn_http_ingest`, kept separate from the node's
-/// synchronous block-production loop.
-///
-/// Discovery is mDNS (same-LAN) plus dialing `bootnodes` explicitly; no DHT.
-/// Actions received on `gossip_rx` (e.g. freshly admitted via RPC) are
-/// published to the actions topic; actions received from peers over that
-/// topic are run through `xc_mempool::validate_action` — the same admission
-/// check RPC submissions get — before landing in `mempool`. Blocks received
-/// on `block_rx` (e.g. freshly produced locally) are published to the
-/// blocks topic; blocks received from peers are handed to `on_block`
-/// unvalidated — this crate has no idea what a chain's actions mean, so all
-/// verification and application is the caller's job. Returns once the
+/// Starts this node's P2P networking on its own thread with its own tokio
+/// runtime (libp2p's swarm isn't `Send` across an existing async runtime the
+/// caller might be using). Gossiped/synced messages only get as far as
+/// bincode decoding and, for actions, the same admission check RPC uses —
+/// deeper application verification is the caller's job. Returns once the
 /// listeners are registered, so the caller finds out synchronously if the
 /// port is unusable.
 pub fn spawn_p2p_node<P: Payload>(
@@ -126,11 +50,11 @@ pub fn spawn_p2p_node<P: Payload>(
     gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
-    // Returns `true` when the block's signature itself was forged, so the
+    // Returns `true` if the block's signature is itself forged, so the
     // sending peer can be penalized — see `record_bad_gossip`.
     on_block: impl Fn(Block<P>) -> bool + Send + 'static,
     // Undecodable-bytes handling only — `arxd/finality` owns signature and
-    // quorum validation, this crate just moves the bytes.
+    // quorum validation, this crate just moves bytes.
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
 ) -> Result<PeerId> {
     let keypair = if is_bootnode {
@@ -175,81 +99,6 @@ pub fn spawn_p2p_node<P: Payload>(
         .context("p2p thread exited before signaling readiness")??;
 
     Ok(peer_id)
-}
-
-fn local_tip_height(db: &ArxiumDb) -> u64 {
-    db.get_tip_height().ok().flatten().unwrap_or(0)
-}
-
-fn send_sync_request(swarm: &mut libp2p::Swarm<Behaviour>, peer: &PeerId, request: &SyncRequest) {
-    match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
-        Ok(bytes) => {
-            swarm.behaviour_mut().sync.send_request(peer, bytes);
-        }
-        Err(err) => warn!("failed to encode sync request: {err}"),
-    }
-}
-
-/// Records gossip that's unambiguously bad — undecodable bytes or a forged
-/// signature, never just "this peer is a bit behind" — and disconnects the
-/// peer once it crosses `MAX_BAD_GOSSIP`, so a hostile peer can't spam
-/// garbage at zero cost forever. `ConnectionEstablished` clears the count on
-/// reconnect, same as `sync_failures`.
-fn record_bad_gossip(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    bad_gossip: &mut HashMap<PeerId, u32>,
-    peer: PeerId,
-    reason: &str,
-) {
-    let count = bad_gossip.entry(peer).or_insert(0);
-    *count += 1;
-    if *count >= MAX_BAD_GOSSIP {
-        warn!("disconnecting {peer}: {reason} ({count} bad gossip messages)");
-        let _ = swarm.disconnect_peer_id(peer);
-    } else {
-        warn!("{reason} from {peer} ({count}/{MAX_BAD_GOSSIP})");
-    }
-}
-
-fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behaviour>> {
-    let local_peer_id = PeerId::from(keypair.public());
-    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_quic()
-        .with_behaviour(|keypair| {
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-                gossipsub::Config::default(),
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            let sync = cbor::Behaviour::new(
-                [(StreamProtocol::new(SYNC_PROTOCOL), ProtocolSupport::Full)],
-                request_response::Config::default(),
-            );
-            // ponytail: fixed caps sized for a devnet's handful of peers;
-            // revisit if a real deployment needs more concurrent peers than
-            // this. per-peer allows a few (mdns reports one entry per
-            // transport, so a single peer legitimately holds >1 connection).
-            let limits = connection_limits::Behaviour::new(
-                ConnectionLimits::default()
-                    .with_max_established_per_peer(Some(4))
-                    .with_max_established_incoming(Some(200))
-                    .with_max_pending_incoming(Some(100)),
-            );
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour {
-                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
-                gossipsub,
-                sync,
-                limits,
-            })
-        })?
-        .build();
-    Ok(swarm)
 }
 
 async fn run_swarm<P: Payload>(
@@ -311,11 +160,7 @@ async fn run_swarm<P: Payload>(
         return;
     }
 
-    for addr in bootnodes {
-        if let Err(err) = swarm.dial(addr.clone()) {
-            warn!("failed to dial bootnode {addr}: {err}");
-        }
-    }
+    dial_bootnodes(&mut swarm, bootnodes);
 
     // Tracks each peer's last-reported tip height, so a `Blocks` response
     // knows whether to request the next batch or stop — set on every
@@ -407,17 +252,8 @@ async fn run_swarm<P: Payload>(
                     // STATUS_INTERVAL tick to start catching up.
                     send_sync_request(&mut swarm, &peer_id, &SyncRequest::Status);
                 }
-                // ponytail: mdns reports one entry per transport (tcp + quic),
-                // so a discovered peer gets dialed twice and briefly shows two
-                // connections. Harmless while nothing beyond gossip messages is
-                // exchanged over them; collapse to one dial per peer if that changes.
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
-                    for (peer_id, addr) in peers {
-                        info!("mdns discovered peer {peer_id} at {addr}");
-                        if let Err(err) = swarm.dial(addr.clone()) {
-                            warn!("failed to dial discovered peer {peer_id} at {addr}: {err}");
-                        }
-                    }
+                    dial_discovered(&mut swarm, peers);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,

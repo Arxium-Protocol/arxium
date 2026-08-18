@@ -1,8 +1,17 @@
 use crate::payload::{ActionPayload, ChainBlock, dispatch};
+use crate::{BLOCK_INTERVAL, SLOT_DURATION, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
+use finality::FinalityEvent;
+use metrics::{counter, gauge};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
-use xc_primitives::{Action, Address};
+use xc_mempool::Mempool;
+use xc_primitives::{Action, Address, eligible_proposer};
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
@@ -86,6 +95,106 @@ pub fn produce_block(
     db.write_batches(&writables)?;
 
     Ok(new_block)
+}
+
+/// Ticks every `BLOCK_INTERVAL`, producing a block when this node is either
+/// not a validator (always produces, unsigned) or is the validator whose
+/// turn it is. Runs until `shutdown` is set, e.g. by the ctrl_c handler
+/// spawned in `run`.
+pub fn produce_loop(
+    db: &ArxiumDb,
+    mempool: &Arc<Mutex<Mempool<ActionPayload>>>,
+    identity: Option<(Address, SigningKey)>,
+    chain_lock: &Arc<Mutex<()>>,
+    finality_event_tx: &std_mpsc::Sender<FinalityEvent<ActionPayload>>,
+    block_tx: &tokio::sync::mpsc::UnboundedSender<ChainBlock>,
+    shutdown: &Arc<AtomicBool>,
+) -> Result<()> {
+    loop {
+        thread::sleep(BLOCK_INTERVAL);
+
+        if shutdown.load(Ordering::Relaxed) {
+            info!("shutting down");
+            return Ok(());
+        }
+
+        // Held for the whole read-tip / decide / write cycle, so a block
+        // accepted from gossip in between can't make this node produce a
+        // second, conflicting block for the height it just filled — the
+        // recomputed `next_height` below will already have moved past it.
+        let guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+        let proposer = match &identity {
+            Some((address, key)) => {
+                let tip_height = db.get_tip_height()?.unwrap_or(0);
+                let next_height = tip_height + 1;
+                let parent: ChainBlock = db
+                    .get_block(tip_height)?
+                    .expect("tip block must exist if tip_height is set");
+                // Genesis's timestamp is a synthetic 0, not a real
+                // wall-clock moment — see the matching comment in
+                // `accept_block`. Height 1 always uses the plain primary.
+                let elapsed = if parent.height == 0 {
+                    0
+                } else {
+                    now_secs().saturating_sub(parent.timestamp)
+                };
+                let validators = db.get_validator_set_at(next_height)?;
+                match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())
+                {
+                    Some(expected) if &expected == address => Some((address, key)),
+                    Some(_) => {
+                        drop(guard);
+                        continue;
+                    }
+                    None => {
+                        warn!("no validators registered, skipping block production");
+                        drop(guard);
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        gauge!("arxium_mempool_pending_actions")
+            .set(mempool.lock().unwrap_or_else(|e| e.into_inner()).len() as f64);
+
+        let pending = mempool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_pending(100);
+        // Empty blocks still get produced — height must keep advancing on
+        // schedule so `expected_proposer` round-robin doesn't stall waiting
+        // for someone to submit an action.
+        // A bad action (forged signature, stale nonce) is skipped by execute_actions
+        // and never reaches here; an Err means block-level bookkeeping itself failed
+        // (e.g. storage), which is unexpected and logged rather than propagated.
+        match produce_block(db, pending, now_secs(), proposer) {
+            std::result::Result::Ok(block) => {
+                info!(
+                    "produced block {} with {} action(s), hash={}",
+                    block.height,
+                    block.actions.len(),
+                    block.hash()
+                );
+                counter!("arxium_blocks_produced_total").increment(1);
+                gauge!("arxium_tip_height").set(block.height as f64);
+                // Only signed blocks are meaningful to peers — an unsigned
+                // block (non-validator solo mode) has no proposer for
+                // `accept_block`'s expected-proposer check to match.
+                if block.signature.is_some() {
+                    let _ = finality_event_tx.send(FinalityEvent::BlockObserved(block.clone()));
+                    let _ = block_tx.send(block);
+                }
+            }
+            Err(err) => {
+                warn!("block production failed: {err}");
+                counter!("arxium_block_production_errors_total").increment(1);
+            }
+        }
+        drop(guard);
+    }
 }
 
 #[cfg(test)]

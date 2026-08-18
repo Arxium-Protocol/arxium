@@ -17,7 +17,8 @@ struct Args {
     from: String,
 
     /// "transfer" (default), "join-validator", "leave-validator", "stake", "unstake",
-    /// or "sub-account" (prints a validator's stake sub-account address, submits nothing)
+    /// "register-bls-key", or "sub-account" (prints a validator's stake
+    /// sub-account address, submits nothing)
     #[arg(long, default_value = "transfer")]
     action: String,
 
@@ -36,6 +37,10 @@ struct Args {
     /// Validator address (name from devnet-keys.json, or bech32 address). Required for "stake"/"unstake".
     #[arg(long)]
     validator: Option<String>,
+
+    /// BLS pubkey, hex-encoded (from `arxd bls-key`). Required for "register-bls-key".
+    #[arg(long)]
+    bls_pubkey: Option<String>,
 
     /// Override the auto-fetched nonce
     #[arg(long)]
@@ -167,8 +172,16 @@ fn main() -> Result<()> {
             )?,
             amount: args.amount.context("--amount is required for unstake")?,
         },
+        "register-bls-key" => ActionPayload::RegisterBlsKey {
+            pubkey: hex::decode(
+                args.bls_pubkey.as_deref().context("--bls-pubkey is required for register-bls-key")?,
+            )
+            .context("--bls-pubkey is not valid hex")?,
+        },
         other => {
-            bail!("unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, or unstake")
+            bail!(
+                "unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, unstake, or register-bls-key"
+            )
         }
     };
 
