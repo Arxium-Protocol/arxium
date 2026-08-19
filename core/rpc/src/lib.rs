@@ -87,15 +87,15 @@ impl RateLimiter {
 /// production (TLS termination) — every real client would collapse into the
 /// proxy's one IP and share a single limit. `X-Forwarded-For`'s first entry
 /// wins when present, `X-Real-IP` next — verified empirically against a real
-/// Caddy `reverse_proxy` (the documented deployment, see `Caddyfile.example`)
-/// rather than assumed: Caddy doesn't append to a client-supplied
+/// Nginx `proxy_pass` (the documented deployment, see `nginx-gateway.conf`)
+/// rather than assumed: Nginx appends to a client-supplied
 /// `X-Forwarded-For`, it overwrites it outright with its own observed remote
-/// address, so there's never more than one entry to pick between when Caddy
+/// address, so there can be more than one entry to pick between when Nginx
 /// is the immediate hop — a forged value from the actual client never
 /// survives the proxy. `.next()` on the split is just reading that one
 /// value; it isn't load-bearing leftmost-vs-rightmost logic. (A different
 /// proxy, or a chain of more than one, could behave differently — recheck if
-/// the deployment ever changes from a single Caddy hop.)
+/// the deployment ever changes from a single Nginx hop.)
 ///
 /// Only trusted from a loopback peer, though — the documented deployment is
 /// the proxy running on the same host and forwarding to a loopback-bound RPC
@@ -169,7 +169,7 @@ fn record_request(path: &str, status: StatusCode) {
 
 /// Renders the current metrics snapshot in Prometheus text format. Outside
 /// the bearer-token guard (metrics aren't secret and this endpoint isn't
-/// meant to be internet-facing — see `docker-compose.prod.yml` / `Caddyfile.prod`,
+/// meant to be internet-facing — see `docker-compose.prod.yml` / `nginx-gateway.conf`,
 /// which don't route it through the public TLS proxy).
 async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
     (
@@ -230,7 +230,7 @@ pub fn spawn_http_ingest<P: Payload>(
             // /metrics is deliberately outside the guarded router below — a
             // scrape endpoint shouldn't need the RPC bearer token, and it's
             // never routed through the public TLS proxy in production (see
-            // Caddyfile.prod) since it's only meant for an internal scraper
+            // nginx-gateway.conf) since it's only meant for an internal scraper
             // on the same docker network.
             let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))

@@ -6,8 +6,8 @@
 #   cp .env.example .env && edit .env (ARXD_DOMAIN, ARXD_RPC_TOKEN)
 #   docker compose -f docker-compose.prod.yml up -d
 #
-# Caddy is the only internet-facing service — it terminates TLS (automatic
-# cert via Let's Encrypt) and reverse-proxies to arxd over the private
+# Nginx is the only internet-facing service — it terminates TLS (automatic
+# Let's Encrypt renewal) and reverse-proxies to arxd over the private
 # compose network. arxd itself is never published to the host, so RPC
 # traffic (including the bearer token on every request) never crosses the
 # internet in plaintext. NodeIndexer is the only consumer that talks to
@@ -24,22 +24,48 @@ services:
     command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-token", "${ARXD_RPC_TOKEN:?set ARXD_RPC_TOKEN in .env}"]
     restart: unless-stopped
 
-  caddy:
-    image: caddy:2-alpine
+  nginx:
+    image: nginxproxy/nginx-proxy:alpine
     ports:
       - "80:80"
       - "443:443"
-    environment:
-      ARXD_DOMAIN: "${ARXD_DOMAIN:?set ARXD_DOMAIN in .env}"
     volumes:
-      - ./Caddyfile.prod:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - nginx-certs:/etc/nginx/certs:ro
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+    restart: unless-stopped
+
+  acme:
+    image: nginxproxy/acme-companion:2.5.1
+    depends_on:
+      - nginx
+    environment:
+      DEFAULT_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+      NGINX_PROXY_CONTAINER: ${COMPOSE_PROJECT_NAME:-arxium}-nginx-1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nginx-certs:/etc/nginx/certs:rw
+      - nginx-vhost:/etc/nginx/vhost.d
+      - nginx-html:/usr/share/nginx/html
+      - acme-data:/etc/acme.sh
+    restart: unless-stopped
+
+  gateway:
+    image: nginx:1.27-alpine
     depends_on:
       - arxd
+    environment:
+      VIRTUAL_HOST: "${ARXD_DOMAIN:?set ARXD_DOMAIN in .env}"
+      LETSENCRYPT_HOST: "${ARXD_DOMAIN:?set ARXD_DOMAIN in .env}"
+      LETSENCRYPT_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./nginx-gateway.conf:/etc/nginx/conf.d/default.conf:ro
     restart: unless-stopped
 
 volumes:
   arxd-data:
-  caddy-data:
-  caddy-config:
+  nginx-certs:
+  nginx-vhost:
+  nginx-html:
+  acme-data:
