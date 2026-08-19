@@ -1,10 +1,11 @@
 mod bootstrap;
+mod pair;
 pub mod payload;
 mod produce;
 mod validator;
 
 use crate::bootstrap::bootstrap;
-use crate::payload::{ActionPayload, ChainBlock, dispatch};
+use crate::payload::{ActionPayload, ChainBlock, admission_precheck, dispatch};
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -68,13 +69,18 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Pair { base_path, node, token, revoke }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        return pair::run(base_path, node, token.as_deref(), *revoke);
+    }
+
     let config = cli.run.into_config();
     info!("{:?}", config);
 
     let (db, snapshot) = bootstrap(&config)?;
 
     // Some((address, key)) if this node produces signed blocks on its turn;
-    // None keeps the old always-produce/unsigned solo-node behavior.
+    // None means it never produces — it only accepts blocks from peers.
     let identity = if config.is_validator {
         let key = validator::load_or_generate_key(&config.base_path)?;
         let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes())?;
@@ -175,6 +181,13 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // Shared between RPC submission and gossip receipt so a `JoinValidator`/
+    // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
+    // `dispatch` gets rejected here instead, immediately and with a real
+    // reason — see `payload::admission_precheck`'s doc comment.
+    let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> =
+        Arc::new(admission_precheck);
+
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
         mempool.clone(),
@@ -184,6 +197,9 @@ pub fn run() -> Result<()> {
         config.rpc_token.clone(),
         Some(gossip_tx),
         metrics_handle,
+        Some(payload_precheck.clone()),
+        Some(payload::MIN_VALIDATOR_STAKE),
+        Some(payload::ACTION_FEE),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -289,6 +305,7 @@ pub fn run() -> Result<()> {
         precommit_rx,
         on_block,
         on_precommit_vote,
+        Some(payload_precheck.clone()),
     )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));

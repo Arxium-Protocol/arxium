@@ -34,6 +34,35 @@ pub enum Command {
         #[arg(long)]
         qr: bool,
     },
+    /// Authorizes an operator wallet (e.g. the app) to submit
+    /// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey`/staking actions on
+    /// this validator's behalf, without this validator's signing key ever
+    /// leaving this machine. Shows a QR code the app scans; once the app
+    /// reports back which address to authorize, this signs and submits
+    /// `AuthorizeOperator` itself. See `--revoke` to remove the current
+    /// operator instead (no scanning needed).
+    Pair {
+        #[arg(long, default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+        /// RPC address of a node reachable both by this command and by the
+        /// app (typically the same gateway the app already submits actions
+        /// through) — not necessarily this validator's own node's RPC. The
+        /// pairing session lives only in that node process's memory
+        /// (`core/rpc`'s `PairingStore`), so this must match whatever
+        /// `NODE_RPC_URL` the app's backend is configured with, or the app
+        /// polls a node that never saw this session and reports it as
+        /// expired. Falls back to `$ARXD_NODE` so that doesn't have to be
+        /// retyped every run.
+        #[arg(long, env = "ARXD_NODE", default_value = "127.0.0.1:30333")]
+        node: String,
+        /// Sent as "Authorization: Bearer <token>" if that node requires
+        /// one. Falls back to `$ARXD_RPC_TOKEN`.
+        #[arg(long, env = "ARXD_RPC_TOKEN")]
+        token: Option<String>,
+        /// Revoke the current operator instead of pairing a new one.
+        #[arg(long)]
+        revoke: bool,
+    },
 }
 
 #[derive(Args, Clone, Debug)]

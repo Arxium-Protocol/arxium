@@ -3,6 +3,10 @@ use std::collections::BTreeMap;
 use crate::Address;
 use serde::{Deserialize, Serialize};
 
+// Every raw `u128` amount/balance/stake field on this page is denominated in
+// IUM — 1 ARX = 1_000_000_000 IUM, an app-level convention (see `ArxAmount`
+// on the Swift side), not a field the chain itself defines.
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountEntry {
     pub balance: u128,

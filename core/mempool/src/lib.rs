@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 
 use serde::Serialize;
 use thiserror::Error;
@@ -61,6 +62,17 @@ pub fn validate_action<P: Serialize>(
 
     Ok(())
 }
+
+/// Optional payload-specific admission hook layered on top of
+/// `validate_action`'s payload-agnostic checks. This crate has no idea what
+/// a payload variant means (a different chain's `P` might have nothing like
+/// `JoinValidator`) — this is just the shared plumbing so a chain that
+/// *does* have such rules (see `arxd/node/src/payload.rs`'s
+/// `admission_precheck`) can plug them in once and have RPC submission and
+/// gossip receipt both run the exact same check, instead of a bad
+/// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` only being caught (and
+/// silently dropped) at block-production time.
+pub type PayloadPrecheck<P> = Arc<dyn Fn(&Action<P>, &ArxiumDb) -> anyhow::Result<()> + Send + Sync>;
 
 pub struct Mempool<P> {
     pending: VecDeque<Action<P>>,
