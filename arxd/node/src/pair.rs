@@ -142,6 +142,12 @@ fn sign_and_submit(
 /// transmitted anywhere; only the resulting signed `AuthorizeOperator` /
 /// `RevokeOperator` action is sent over the wire.
 pub fn run(base_path: &std::path::Path, node: &str, token: Option<&str>, revoke: bool) -> Result<()> {
+    // The pairing session this command creates lives only in this node
+    // process's memory (see core/rpc's PairingStore) — printed up front so
+    // a mismatch against whatever node the app's backend actually talks to
+    // (NODE_RPC_URL) is obvious immediately, not after a confusing "expired"
+    // report from the app minutes later.
+    println!("Connecting to node at {node}{}", if token.is_some() { " (with token)" } else { "" });
     let key = validator::load_or_generate_key(base_path)?;
     let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
         .context("validator key produced an invalid address")?;
