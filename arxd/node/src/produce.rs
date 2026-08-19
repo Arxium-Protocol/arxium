@@ -19,8 +19,9 @@ use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 /// `execute_actions` for why a subset can be dropped.
 ///
 /// `proposer` is `Some((address, key))` when this node is a validator whose
-/// turn it is to produce — the block gets signed. `None` keeps today's
-/// unsigned-block behavior (solo/non-validator node).
+/// turn it is to produce — the block gets signed. `produce_loop` never
+/// calls this with `None` (a non-validator node doesn't produce at all);
+/// unsigned blocks remain reachable here only from tests.
 pub fn produce_block(
     db: &ArxiumDb,
     actions: Vec<Action<ActionPayload>>,
@@ -107,9 +108,10 @@ pub fn produce_block(
     Ok(new_block)
 }
 
-/// Ticks every `BLOCK_INTERVAL`, producing a block when this node is either
-/// not a validator (always produces, unsigned) or is the validator whose
-/// turn it is. Runs until `shutdown` is set, e.g. by the ctrl_c handler
+/// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
+/// the validator whose turn it is. A non-validator node (`identity: None`)
+/// never produces — it only accepts blocks gossiped/synced from peers (see
+/// `accept_block`). Runs until `shutdown` is set, e.g. by the ctrl_c handler
 /// spawned in `run`.
 pub fn produce_loop(
     db: &ArxiumDb,
@@ -164,7 +166,14 @@ pub fn produce_loop(
                     }
                 }
             }
-            None => None,
+            // Not a validator: nothing to propose with, and no business
+            // producing blocks at all — this node only accepts blocks
+            // from peers. Previously fell through to `produce_block` with
+            // `proposer: None`, which produced an unsigned block anyway.
+            None => {
+                drop(guard);
+                continue;
+            }
         };
 
         gauge!("arxium_mempool_pending_actions")

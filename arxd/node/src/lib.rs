@@ -80,7 +80,7 @@ pub fn run() -> Result<()> {
     let (db, snapshot) = bootstrap(&config)?;
 
     // Some((address, key)) if this node produces signed blocks on its turn;
-    // None keeps the old always-produce/unsigned solo-node behavior.
+    // None means it never produces — it only accepts blocks from peers.
     let identity = if config.is_validator {
         let key = validator::load_or_generate_key(&config.base_path)?;
         let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes())?;

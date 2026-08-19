@@ -23,11 +23,11 @@ fn identity_zk_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls12_381> {
     })
 }
 
-/// Devnet stub — tune once real economics are decided. Below this,
-/// `JoinValidator` is rejected before `circuit_staking::apply_stake` even
-/// runs: round-robin proposer selection ignores stake size, so without a
-/// floor "becoming a validator" would be free.
-pub const MIN_VALIDATOR_STAKE: u128 = 1_000;
+/// 100,000 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM). Below
+/// this, `JoinValidator` is rejected before `circuit_staking::apply_stake`
+/// even runs: round-robin proposer selection ignores stake size, so without
+/// a floor "becoming a validator" would be free.
+pub const MIN_VALIDATOR_STAKE: u128 = 100_000 * 1_000_000_000;
 
 /// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
 /// themselves. A different chain (e.g. `examples/toy-chain`) defines its
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn join_validator_debits_sender_and_credits_own_subaccount() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(5_000))]));
+        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 5_000))]));
         let stake_lookup = make_stake_lookup(HashMap::new());
         let action = Action {
             sender: alice.clone(),
@@ -666,7 +666,7 @@ mod tests {
         );
         assert_eq!(
             updates.accounts.0.get(&alice).unwrap().balance,
-            5_000 - MIN_VALIDATOR_STAKE
+            5_000
         );
         let sub = circuit_staking::stake_subaccount(&alice);
         assert_eq!(
@@ -1209,7 +1209,7 @@ mod tests {
     fn authorized_operator_can_join_validator_on_behalf_of_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
+        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 5_000))]));
         let stake_lookup = make_stake_lookup(HashMap::new());
         let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
         let action = Action {
@@ -1242,7 +1242,7 @@ mod tests {
         // third-party `Stake` action would.
         assert_eq!(
             updates.accounts.0.get(&bob).unwrap().balance,
-            5_000 - MIN_VALIDATOR_STAKE
+            5_000
         );
         let allocation = updates
             .stakes
