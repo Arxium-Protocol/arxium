@@ -21,7 +21,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
 use finality::PrecommitVote;
-use xc_mempool::{Mempool, validate_action};
+use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
 
@@ -36,8 +36,10 @@ use transport::{BehaviourEvent, build_swarm};
 /// Starts this node's P2P networking on its own thread with its own tokio
 /// runtime (libp2p's swarm isn't `Send` across an existing async runtime the
 /// caller might be using). Gossiped/synced messages only get as far as
-/// bincode decoding and, for actions, the same admission check RPC uses —
-/// deeper application verification is the caller's job. Returns once the
+/// bincode decoding and, for actions, the same admission checks RPC uses —
+/// payload-agnostic (`validate_action`) and, if provided, the chain-specific
+/// `payload_precheck` — deeper application verification is the caller's
+/// job. Returns once the
 /// listeners are registered, so the caller finds out synchronously if the
 /// port is unusable.
 pub fn spawn_p2p_node<P: Payload>(
@@ -56,6 +58,10 @@ pub fn spawn_p2p_node<P: Payload>(
     // Undecodable-bytes handling only — `arxd/finality` owns signature and
     // quorum validation, this crate just moves bytes.
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
+    // Same chain-specific admission hook RPC submission runs — see
+    // `xc_mempool::PayloadPrecheck` doc comment. `None` for chains with no
+    // such rules.
+    payload_precheck: Option<PayloadPrecheck<P>>,
 ) -> Result<PeerId> {
     let keypair = if is_bootnode {
         identity::load_or_generate_devnet_bootnode_keypair(base_path)?
@@ -90,7 +96,7 @@ pub fn spawn_p2p_node<P: Payload>(
 
         runtime.block_on(run_swarm(
             keypair, listen_port, bootnodes, mempool, db, gossip_rx, block_rx, precommit_rx,
-            on_block, on_precommit_vote, ready_tx,
+            on_block, on_precommit_vote, payload_precheck, ready_tx,
         ));
     });
 
@@ -112,6 +118,7 @@ async fn run_swarm<P: Payload>(
     mut precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     on_block: impl Fn(Block<P>) -> bool + Send + 'static,
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
+    payload_precheck: Option<PayloadPrecheck<P>>,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
     let mut swarm = match build_swarm(keypair) {
@@ -295,6 +302,13 @@ async fn run_swarm<P: Payload>(
                             warn!("rejected gossiped action from {propagation_source}: {err}");
                         }
                         continue;
+                    }
+
+                    if let Some(precheck) = &payload_precheck {
+                        if let Err(err) = precheck(&action, &db) {
+                            warn!("rejected gossiped action from {propagation_source}: {err}");
+                            continue;
+                        }
                     }
 
                     let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
@@ -528,7 +542,7 @@ mod tests {
 
         let peer_id = spawn_p2p_node(
             &base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, precommit_rx, |_| false,
-            |_| {},
+            |_| {}, None,
         )
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());

@@ -2993,6 +2993,7 @@ dependencies = [
  "rand 0.9.5",
  "runtime",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5048,6 +5049,7 @@ dependencies = [
 name = "xc-mempool"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
  "thiserror 2.0.19",
  "xc-primitives",
@@ -5077,6 +5079,7 @@ dependencies = [
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "subtle",

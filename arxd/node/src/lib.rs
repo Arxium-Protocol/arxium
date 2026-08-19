@@ -1,10 +1,11 @@
 mod bootstrap;
+mod pair;
 pub mod payload;
 mod produce;
 mod validator;
 
 use crate::bootstrap::bootstrap;
-use crate::payload::{ActionPayload, ChainBlock, dispatch};
+use crate::payload::{ActionPayload, ChainBlock, admission_precheck, dispatch};
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -66,6 +67,11 @@ pub fn run() -> Result<()> {
             println!("{image}");
         }
         return Ok(());
+    }
+
+    if let Some(Command::Pair { base_path, node, token, revoke }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        return pair::run(base_path, node, token.as_deref(), *revoke);
     }
 
     let config = cli.run.into_config();
@@ -175,6 +181,13 @@ pub fn run() -> Result<()> {
         }
     };
 
+    // Shared between RPC submission and gossip receipt so a `JoinValidator`/
+    // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
+    // `dispatch` gets rejected here instead, immediately and with a real
+    // reason — see `payload::admission_precheck`'s doc comment.
+    let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> =
+        Arc::new(admission_precheck);
+
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
         mempool.clone(),
@@ -184,6 +197,8 @@ pub fn run() -> Result<()> {
         config.rpc_token.clone(),
         Some(gossip_tx),
         metrics_handle,
+        Some(payload_precheck.clone()),
+        Some(payload::MIN_VALIDATOR_STAKE),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -289,6 +304,7 @@ pub fn run() -> Result<()> {
         precommit_rx,
         on_block,
         on_precommit_vote,
+        Some(payload_precheck.clone()),
     )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));

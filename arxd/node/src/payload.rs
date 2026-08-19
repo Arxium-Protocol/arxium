@@ -6,7 +6,9 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{
     AccountEntry, Action, Address, StakeAllocation, ValidatorChange, ValidatorEntry,
 };
-use xc_storage::{AccountUpdates, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StorageError};
+use xc_storage::{
+    AccountUpdates, ArxiumDb, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StorageError,
+};
 
 /// Devnet Groth16 verifying key, checked into `circuits/identity-zk` — see
 /// that crate's module docs for why it isn't from a real trusted-setup
@@ -172,6 +174,62 @@ fn is_authorized(
         return Ok(true);
     }
     Ok(operator_lookup(validator)?.as_ref() == Some(sender))
+}
+
+/// Cheap pre-check for the payload variants whose `dispatch` rejection
+/// reason (bad `is_authorized`, below `MIN_VALIDATOR_STAKE`, not a current
+/// validator) previously only surfaced during block production — the
+/// action would just silently vanish from the mempool with no way for the
+/// submitter to find out why. Runs the same authorization/minimum-stake
+/// logic `dispatch` enforces, straight against current chain state, so RPC
+/// submission and gossip receipt (via `xc_mempool::PayloadPrecheck`) can
+/// both reject with a real reason immediately instead of a false 202.
+///
+/// Not a full re-implementation of `dispatch` — this only covers checks
+/// that don't depend on same-block ordering. Anything it misses (e.g. a
+/// same-block race between two actions) is still caught, just later, by
+/// `dispatch` itself, which remains the authoritative check.
+pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result<()> {
+    let operator_lookup = |validator: &Address| db.get_operator(validator);
+    match &action.payload {
+        ActionPayload::JoinValidator { validator, stake } => {
+            if !is_authorized(&action.sender, validator, &operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
+            let existing_active = db
+                .get_stake_allocation(&action.sender, validator)?
+                .map(|a| a.active_amount)
+                .unwrap_or(0);
+            if existing_active + *stake < MIN_VALIDATOR_STAKE {
+                anyhow::bail!(
+                    "stake {stake} is below the minimum validator stake {MIN_VALIDATOR_STAKE}"
+                );
+            }
+        }
+        ActionPayload::LeaveValidator { validator } => {
+            if !is_authorized(&action.sender, validator, &operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
+            let tip_height = db.get_tip_height()?.unwrap_or(0);
+            let validators = db.get_validator_set_at(tip_height)?;
+            if !validators.contains(validator) {
+                anyhow::bail!("{validator} is not a current validator");
+            }
+            if validators.len() <= 1 {
+                anyhow::bail!("cannot remove the last validator, chain would stall forever");
+            }
+        }
+        ActionPayload::RegisterBlsKey { validator, pubkey } => {
+            if !is_authorized(&action.sender, validator, &operator_lookup)? {
+                anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
+            }
+            blst::min_pk::PublicKey::from_bytes(pubkey)
+                .and_then(|pk| pk.validate())
+                .map_err(|_| anyhow::anyhow!("invalid BLS public key"))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn dispatch(
@@ -449,6 +507,7 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xc_storage::ValidatorSetSnapshot;
     use std::collections::HashMap;
 
     fn lookup(_addr: &Address) -> Result<Option<AccountEntry>, StorageError> {
@@ -1355,5 +1414,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("is not authorized to manage"));
+    }
+
+    // admission_precheck runs against a real ArxiumDb (unlike the closure-based
+    // dispatch tests above) since it's meant to run at RPC/gossip admission
+    // time, before a block-execution context exists.
+    fn precheck_test_db(validators: &[Address]) -> ArxiumDb {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-admission-precheck-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let db = ArxiumDb::open(&dir).expect("open test db");
+        let genesis: ChainBlock = xc_primitives::Block::genesis(0);
+        db.write_batches(&[&genesis]).unwrap();
+        db.write_batches(&[&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: validators.to_vec(),
+        }])
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn admission_precheck_rejects_unauthorized_sender() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = precheck_test_db(&[]);
+        let action = Action {
+            sender: bob,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+        };
+
+        let err = admission_precheck(&action, &db).unwrap_err();
+        assert!(err.to_string().contains("is not authorized to manage"));
+    }
+
+    #[test]
+    fn admission_precheck_rejects_below_minimum_stake() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = precheck_test_db(&[]);
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE - 1,
+            },
+        };
+
+        let err = admission_precheck(&action, &db).unwrap_err();
+        assert!(err.to_string().contains("below the minimum validator stake"));
+    }
+
+    #[test]
+    fn admission_precheck_rejects_leaving_the_last_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = precheck_test_db(&[alice.clone()]);
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::LeaveValidator { validator: alice },
+        };
+
+        let err = admission_precheck(&action, &db).unwrap_err();
+        assert!(err.to_string().contains("last validator"));
+    }
+
+    #[test]
+    fn admission_precheck_accepts_authorized_sufficient_join() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = precheck_test_db(&[]);
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+        };
+
+        admission_precheck(&action, &db).expect("self-join at the minimum stake should pass");
+    }
+
+    #[test]
+    fn admission_precheck_accepts_authorized_operator_join() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = precheck_test_db(&[]);
+        db.write_batches(&[&OperatorUpdates {
+            authorization: std::collections::BTreeMap::from([(alice.clone(), Some(bob.clone()))]),
+            operator_index: std::collections::BTreeMap::from([(bob.clone(), vec![alice.clone()])]),
+        }])
+        .unwrap();
+        let action = Action {
+            sender: bob,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+        };
+
+        admission_precheck(&action, &db)
+            .expect("operator authorized via AuthorizeOperator should be allowed to join");
     }
 }
