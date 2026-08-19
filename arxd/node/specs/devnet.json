@@ -21,12 +21,14 @@
       "balance": 100000000000000,
       "nonce": 0,
       "identity_hash": null
+    },
+    "arx158g2xle8kllejmp56cselgunrxpp4yyzxae7fawgegwnz8e8zlmqr84zy7": {
+      "balance": 100000000000000,
+      "nonce": 0,
+      "identity_hash": null
     }
   },
   "validators": {
-    "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz": {
-      "stake": 1000000
-    },
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
       "stake": 1000000
     }
