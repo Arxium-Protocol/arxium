@@ -263,7 +263,7 @@ mod tests {
         accounts.insert(
             alice.clone(),
             AccountEntry {
-                balance: 1000,
+                balance: 2_000_000,
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(block.height, 1);
         assert_eq!(
             db.get_account(&alice).unwrap().unwrap().balance,
-            600 - crate::payload::ACTION_FEE
+            2_000_000 - 400 - crate::payload::ACTION_FEE
         );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
 
