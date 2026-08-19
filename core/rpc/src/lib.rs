@@ -59,6 +59,9 @@ struct AppState<P: Payload> {
     // `MIN_VALIDATOR_STAKE`), so a client never has to hardcode it. `None`
     // for chains with no such floor.
     min_stake: Option<u128>,
+    // Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so
+    // a client can show it before submitting. `None` for chains with no fee.
+    action_fee: Option<u128>,
 }
 
 struct RateLimiter {
@@ -318,6 +321,7 @@ pub fn spawn_http_ingest<P: Payload>(
     metrics_handle: PrometheusHandle,
     payload_precheck: Option<PayloadPrecheck<P>>,
     min_stake: Option<u128>,
+    action_fee: Option<u128>,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
@@ -330,6 +334,7 @@ pub fn spawn_http_ingest<P: Payload>(
         payload_precheck,
         pairing: Arc::new(PairingStore::new()),
         min_stake,
+        action_fee,
     };
 
     thread::spawn(move || {
@@ -369,6 +374,7 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/search", get(search::<P>))
                 .route("/status", get(get_status::<P>))
                 .route("/min-stake", get(get_min_stake::<P>))
+                .route("/action-fee", get(get_action_fee::<P>))
                 .route("/pairing", post(start_pairing::<P>))
                 .route(
                     "/pairing/{nonce}",
@@ -607,6 +613,15 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
 async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response {
     match state.min_stake {
         Some(min_stake) => Json(serde_json::json!({ "min_stake": min_stake })).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so a
+/// client can show it before submitting. `404` for a chain with no fee.
+async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    match state.action_fee {
+        Some(action_fee) => Json(serde_json::json!({ "action_fee": action_fee })).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -916,6 +931,7 @@ mod tests {
             payload_precheck: None,
             pairing: Arc::new(PairingStore::new()),
             min_stake: None,
+            action_fee: None,
         }
     }
 
@@ -1146,6 +1162,26 @@ mod tests {
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["min_stake"], 1_000);
+        });
+    }
+
+    #[test]
+    fn action_fee_reports_404_when_unset_and_the_value_when_set() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let resp = get_action_fee(State(state.clone())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            let mut state = state;
+            state.action_fee = Some(10);
+            let resp = get_action_fee(State(state)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["action_fee"], 10);
         });
     }
 

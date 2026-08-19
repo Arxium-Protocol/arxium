@@ -293,7 +293,10 @@ mod tests {
         let block = produce_block(&db, vec![transfer], 1, None).unwrap();
 
         assert_eq!(block.height, 1);
-        assert_eq!(db.get_account(&alice).unwrap().unwrap().balance, 600);
+        assert_eq!(
+            db.get_account(&alice).unwrap().unwrap().balance,
+            600 - crate::payload::ACTION_FEE
+        );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
 
         std::fs::remove_dir_all(&dir).ok();

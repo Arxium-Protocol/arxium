@@ -199,6 +199,7 @@ pub fn run() -> Result<()> {
         metrics_handle,
         Some(payload_precheck.clone()),
         Some(payload::MIN_VALIDATOR_STAKE),
+        Some(payload::ACTION_FEE),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
