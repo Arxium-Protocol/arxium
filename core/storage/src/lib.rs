@@ -194,7 +194,28 @@ impl ArxiumDb {
     /// Use this when two items must land together or not at all — e.g. a
     /// block record and the account changes it caused, so a crash can never
     /// leave one committed without the other.
+    ///
+    /// Fsyncs before returning — this chain produces one batch per block on
+    /// a multi-second interval outside of sync catch-up, so the extra fsync
+    /// latency is cheap insurance against a hard crash leaving the on-disk
+    /// tip ahead of durable data (which would violate the "tip block must
+    /// exist" invariant on restart, see arxd/node/src/produce.rs).
     pub fn write_batches(&self, items: &[&dyn BatchWritable]) -> Result<(), StorageError> {
+        self.write_batches_opt(items, true)
+    }
+
+    /// Same as `write_batches` but skips the fsync — for replaying a run of
+    /// already-finalized blocks during sync catch-up, where a crash just
+    /// means re-fetching and re-applying the same page from a peer rather
+    /// than losing anything, so paying one fsync per block (vs. one per
+    /// ~100-block page, see `arxd/network`'s sync handler) is pure overhead.
+    /// Callers on this path must still call `flush_wal` once per page so the
+    /// tip is actually durable before it's reported to peers/RPC callers.
+    pub fn write_batches_unsynced(&self, items: &[&dyn BatchWritable]) -> Result<(), StorageError> {
+        self.write_batches_opt(items, false)
+    }
+
+    fn write_batches_opt(&self, items: &[&dyn BatchWritable], sync: bool) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
         for item in items {
             for (key, value) in item.batch_entries()? {
@@ -204,15 +225,17 @@ impl ArxiumDb {
                 batch.delete_cf(self.cf(cf_for_key(&key)), key);
             }
         }
-        // Fsync every commit rather than trusting the OS page cache — this
-        // chain produces one batch per block on a multi-second interval, not
-        // per-transaction, so the extra fsync latency is cheap insurance
-        // against a hard crash leaving the on-disk tip ahead of durable data
-        // (which would violate the "tip block must exist" invariant on
-        // restart, see arxd/node/src/produce.rs).
         let mut opts = rocksdb::WriteOptions::default();
-        opts.set_sync(true);
+        opts.set_sync(sync);
         self.db.write_opt(batch, &opts)?;
+        Ok(())
+    }
+
+    /// Fsyncs the WAL for every write since the last sync — pairs with
+    /// `write_batches_unsynced` to turn a page of deferred-fsync block
+    /// writes into one durable commit instead of zero.
+    pub fn flush_wal(&self) -> Result<(), StorageError> {
+        self.db.flush_wal(true)?;
         Ok(())
     }
 

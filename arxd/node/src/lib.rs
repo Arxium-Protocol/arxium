@@ -220,7 +220,7 @@ pub fn run() -> Result<()> {
         let runtime_tx = runtime_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
         let mempool = mempool.clone();
-        move |block: ChainBlock| -> bool {
+        move |block: ChainBlock, sync: bool| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
             let candidate = block.clone();
@@ -228,6 +228,7 @@ pub fn run() -> Result<()> {
                 &db,
                 block,
                 SLOT_DURATION.as_secs(),
+                sync,
                 |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
                     dispatch(
                         action,
