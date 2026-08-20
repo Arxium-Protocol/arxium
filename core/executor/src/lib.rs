@@ -121,10 +121,17 @@ pub enum AcceptBlockError {
 /// applies it exactly like a locally-produced block would (re-running
 /// `execute_actions` against local state rather than trusting the sender's
 /// claimed results). Returns the stored block on success.
+///
+/// `sync`: false for a single gossiped block (fsync immediately — it may be
+/// the only block for a while). true when replaying a page of already-
+/// finalized blocks from `SyncRequest::Blocks` catch-up — skips the fsync
+/// per block; the caller must call `ArxiumDb::flush_wal` once after the
+/// whole page lands.
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
     slot_duration_secs: u64,
+    sync: bool,
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
@@ -233,7 +240,11 @@ where
     }
     writables.push(&operator_updates);
     writables.push(&block);
-    db.write_batches(&writables)?;
+    if sync {
+        db.write_batches_unsynced(&writables)?;
+    } else {
+        db.write_batches(&writables)?;
+    }
     Ok(block)
 }
 
@@ -502,7 +513,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
         assert_eq!(accepted.actions.len(), 1, "join action must be applied");
 
         // Block 1 itself is still decided by the pre-join set.
@@ -627,7 +638,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
         assert_eq!(accepted.actions.len(), 1, "stake action must be applied");
 
         // Never disagree: if the block landed, the stake it caused landed
@@ -716,7 +727,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
         assert_eq!(
             accepted.actions.len(),
             1,

@@ -53,8 +53,11 @@ pub fn spawn_p2p_node<P: Payload>(
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     // Returns `true` if the block's signature is itself forged, so the
-    // sending peer can be penalized — see `record_bad_gossip`.
-    on_block: impl Fn(Block<P>) -> bool + Send + 'static,
+    // sending peer can be penalized — see `record_bad_gossip`. Second
+    // argument is `sync`: true when applying a `SyncRequest::Blocks` page
+    // during catch-up (fsync deferred to one `flush_wal` per page below),
+    // false for a single gossiped block (fsync immediately).
+    on_block: impl Fn(Block<P>, bool) -> bool + Send + 'static,
     // Undecodable-bytes handling only — `arxd/finality` owns signature and
     // quorum validation, this crate just moves bytes.
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
@@ -116,7 +119,7 @@ async fn run_swarm<P: Payload>(
     mut gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     mut block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     mut precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
-    on_block: impl Fn(Block<P>) -> bool + Send + 'static,
+    on_block: impl Fn(Block<P>, bool) -> bool + Send + 'static,
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
     payload_precheck: Option<PayloadPrecheck<P>>,
     ready_tx: std_mpsc::Sender<Result<()>>,
@@ -338,7 +341,7 @@ async fn run_swarm<P: Payload>(
                             continue;
                         }
                     };
-                    if on_block(block) {
+                    if on_block(block, false) {
                         record_bad_gossip(
                             &mut swarm,
                             &mut bad_gossip,
@@ -480,9 +483,17 @@ async fn run_swarm<P: Payload>(
                                 }
                                 // Same acceptance path as a gossiped block —
                                 // sync is only a second delivery mechanism,
-                                // not new validation logic.
+                                // not new validation logic. Fsync is deferred
+                                // per-block (`on_block(_, true)`) and paid
+                                // once for the whole page below instead —
+                                // this is the batch of up to `MAX_PAGE_SIZE`
+                                // already-finalized blocks the response
+                                // carries, not a single live block, so there
+                                // is nothing to lose by amortizing the fsync
+                                // over the page: a crash before `flush_wal`
+                                // just means re-fetching this page from a peer.
                                 for block in blocks {
-                                    if on_block(block) {
+                                    if on_block(block, true) {
                                         record_bad_gossip(
                                             &mut swarm,
                                             &mut bad_gossip,
@@ -490,6 +501,9 @@ async fn run_swarm<P: Payload>(
                                             "forged synced block signature",
                                         );
                                     }
+                                }
+                                if let Err(err) = db.flush_wal() {
+                                    warn!("failed to flush WAL after sync page: {err}");
                                 }
                                 let local_tip = local_tip_height(&db);
                                 match stuck_tip {
@@ -541,7 +555,7 @@ mod tests {
         let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
 
         let peer_id = spawn_p2p_node(
-            &base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, precommit_rx, |_| false,
+            &base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, precommit_rx, |_, _| false,
             |_| {}, None,
         )
         .expect("node should start on OS-assigned port");
