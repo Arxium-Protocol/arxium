@@ -1,10 +1,22 @@
-name: Test and rebuild devnet chain
+name: Test and update Arxium chain
 
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Chain operation after the main-branch test gate
+        required: true
+        default: update-chain
+        type: choice
+        options:
+          - update-chain
+          - rebuild-chain
 
 permissions:
   contents: read
@@ -36,13 +48,15 @@ jobs:
         shell: bash
         run: cargo test --workspace --locked
 
-  rebuild-devnet:
-    name: Request the SHA-bound devnet rebuild
+  chain-operation:
+    name: Request the SHA-bound chain operation
     needs: test
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     environment: production
+    env:
+      CHAIN_OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'update-chain' }}
 
     steps:
       - name: Validate the deployment token
@@ -56,15 +70,20 @@ jobs:
             exit 1
           }
 
-      - name: Request the restricted devnet rebuild
+      - name: Request the restricted chain operation
         shell: bash
         env:
           ARXIUM_DEPLOY_TOKEN: ${{ secrets.ARXIUM_DEPLOY_TOKEN }}
         run: |
           set -Eeuo pipefail
+          [[ "$CHAIN_OPERATION" == update-chain || "$CHAIN_OPERATION" == rebuild-chain ]] || {
+            printf 'error: unsupported chain operation\n' >&2
+            exit 1
+          }
           payload="$(jq -cn \
+            --arg event_type "$CHAIN_OPERATION" \
             --arg sha "$GITHUB_SHA" \
-            '{event_type:"rebuild-chain",client_payload:{sha:$sha}}')"
+            '{event_type:$event_type,client_payload:{sha:$sha}}')"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
