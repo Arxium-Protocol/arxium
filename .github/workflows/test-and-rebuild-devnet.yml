@@ -1,0 +1,75 @@
+name: Test and rebuild devnet chain
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arxium-chain-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test the SHA-bound chain source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out Arxium
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Show the Rust toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustc --version
+          cargo --version
+
+      - name: Test the workspace
+        shell: bash
+        run: cargo test --workspace --locked
+
+  rebuild-devnet:
+    name: Request the SHA-bound devnet rebuild
+    needs: test
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: production
+
+    steps:
+      - name: Validate the deployment token
+        shell: bash
+        env:
+          ARXIUM_DEPLOY_TOKEN: ${{ secrets.ARXIUM_DEPLOY_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          [[ -n "$ARXIUM_DEPLOY_TOKEN" ]] || {
+            printf 'error: ARXIUM_DEPLOY_TOKEN is missing\n' >&2
+            exit 1
+          }
+
+      - name: Request the restricted devnet rebuild
+        shell: bash
+        env:
+          ARXIUM_DEPLOY_TOKEN: ${{ secrets.ARXIUM_DEPLOY_TOKEN }}
+        run: |
+          set -Eeuo pipefail
+          payload="$(jq -cn \
+            --arg sha "$GITHUB_SHA" \
+            '{event_type:"rebuild-chain",client_payload:{sha:$sha}}')"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $ARXIUM_DEPLOY_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            https://api.github.com/repos/Arxium-Protocol/Arxium-Deploy/dispatches \
+            --data "$payload"
