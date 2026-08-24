@@ -1,8 +1,7 @@
 use libp2p::PeerId;
-use serde::{Deserialize, Serialize};
+use metrics::counter;
 use std::time::Duration;
 use tracing::warn;
-use xc_primitives::Block;
 use xc_storage::ArxiumDb;
 
 use crate::transport::Behaviour;
@@ -11,7 +10,11 @@ use crate::transport::Behaviour;
 /// (e.g. was offline for) instead of only ever hearing about the newest
 /// block over gossip. Same acceptance path as gossiped blocks — this only
 /// adds a second delivery mechanism, not new validation.
-pub(crate) const SYNC_PROTOCOL: &str = "/arxium/sync/1";
+///
+/// The shapes themselves live in `xc-wire` so external consumers compile
+/// against the same definitions instead of copying them; see that crate for the
+/// variant-compatibility rules.
+pub(crate) use xc_wire::SYNC_PROTOCOL;
 /// How often a connected peer is re-asked for its tip, to catch a peer
 /// falling behind mid-connection (not just "was offline, just reconnected") —
 /// e.g. a gossiped block silently dropped rather than erroring, which the
@@ -27,20 +30,7 @@ pub(crate) const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 /// (a real reconnect) or any successful sync response clears the count.
 pub(crate) const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 5;
 
-/// `Blocks` returns at most `xc_storage::MAX_PAGE_SIZE` blocks starting at
-/// `from`, capped at the local tip — never fabricates blocks the responder
-/// doesn't have. A node many blocks behind just takes multiple rounds.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum SyncRequest {
-    Status,
-    Blocks { from: u64 },
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum SyncResponse<P> {
-    Status { tip_height: u64 },
-    Blocks(Vec<Block<P>>),
-}
+pub(crate) use xc_wire::{NodeInfo, SyncRequest, SyncResponse};
 
 pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
     db.get_tip_height().ok().flatten().unwrap_or(0)
@@ -51,8 +41,15 @@ pub(crate) fn send_sync_request(
     peer: &PeerId,
     request: &SyncRequest,
 ) {
+    let kind = match request {
+        SyncRequest::Status => "status",
+        SyncRequest::Blocks { .. } => "blocks",
+        SyncRequest::NodeInfo => "node_info",
+        SyncRequest::Hashes { .. } => "hashes",
+    };
     match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
         Ok(bytes) => {
+            counter!("arxium_sync_requests_total", "kind" => kind).increment(1);
             swarm.behaviour_mut().sync.send_request(peer, bytes);
         }
         Err(err) => warn!("failed to encode sync request: {err}"),

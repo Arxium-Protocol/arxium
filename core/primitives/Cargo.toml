@@ -1,7 +1,18 @@
+# Publishable metadata: external indexers need this crate to decode the wire
+# format, and today they can only get it as a path dependency on a checkout of
+# this repo — which means `cargo add xc-primitives` does not work and a builder
+# outside the organisation cannot compile against Arxium at all. Filling these
+# in is the prerequisite for `cargo publish`; the publish itself is a release
+# decision, not a code one.
 [package]
 name = "xc-primitives"
 version = "0.1.0"
 edition = "2024"
+description = "Core wire types for the Arxium chain: addresses, actions, and blocks"
+license = "Apache-2.0"
+repository = "https://github.com/Arxium-Protocol/Arxium"
+keywords = ["arxium", "blockchain"]
+categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
 ed25519-dalek = { workspace = true }

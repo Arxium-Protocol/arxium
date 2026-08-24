@@ -1,12 +1,42 @@
 use std::collections::HashMap;
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use xc_primitives::{AccountEntry, Address, StakeAllocation, Unbonding};
 use xc_storage::{AccountUpdates, StakeUpdates, StorageError};
 
+/// Re-exported so existing callers (`circuit_staking::stake_subaccount`, etc.)
+/// keep working unchanged — the implementations moved to `xc_primitives`
+/// because genesis construction in `xc-storage` needs them too, and
+/// `xc-storage` can't depend on this crate (this crate depends on it). See
+/// the doc comments on the originals in `xc_primitives::state` for why.
+pub use xc_primitives::{reward_pool_account, stake_subaccount, treasury_account};
+
 /// Devnet stub — tune once real economics are decided.
 pub const UNBONDING_BLOCKS: u64 = 100;
+
+/// 4.3 ARX/block in IUM — whitepaper §9.1/9.3 Y1 target (750M-ARX pool,
+/// 15% of the 5B fixed non-mintable supply, emitted to validators).
+/// Flat devnet-stub rate, no 8%/yr decay curve — tune once real economics
+/// are decided, same as `UNBONDING_BLOCKS`.
+pub const REWARD_PER_BLOCK: u128 = 4_300_000_000;
+
+/// Fee split, whitepaper §9.4: 30% to the block proposer, 20% to treasury,
+/// remaining 50% stays burned (the sender already paid the full fee in
+/// `charge_action_fee`; this module never credits that other 50% anywhere).
+/// Basis points out of 10_000 so the shares are exact integer fractions.
+const FEE_PROPOSER_BPS: u128 = 3_000;
+const FEE_TREASURY_BPS: u128 = 2_000;
+
+/// Whitepaper §9.5: max 10,000,000 ARX delegated to a single validator.
+/// Since this module allows only one master per validator (see
+/// `ValidatorHasOtherMaster` below), this caps that one master's total.
+pub const MAX_DELEGATION_PER_VALIDATOR: u128 = 10_000_000 * 1_000_000_000;
+
+/// Whitepaper §7.3: 0.01% of total stake burned per missed block. Applied
+/// automatically (see `apply_downtime_slash`), not via submitted evidence —
+/// every node deterministically agrees on who missed a slot from the same
+/// stored block, so there's nothing to prove.
+const DOWNTIME_SLASH_BPS: u128 = 1;
 
 /// Stub taxonomy — no consensus fault-detection exists yet in this
 /// codebase; extend when a real fault detector lands.
@@ -39,20 +69,52 @@ pub enum StakingError {
     InsufficientStake { master: Address, validator: Address, active: u128, amount: u128 },
     #[error("validator {validator} has no stake to slash")]
     NoStakeForValidator { validator: Address },
+    #[error(
+        "stake would push {validator}'s total delegation to {new_total}, over the \
+         {MAX_DELEGATION_PER_VALIDATOR} cap"
+    )]
+    DelegationCapExceeded { validator: Address, new_total: u128 },
 }
 
 fn default_account() -> AccountEntry {
     AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false }
 }
 
-/// Deterministically derives the address staked coins for `validator` are
-/// held in. Any node computes this locally — no lookup table needed.
-pub fn stake_subaccount(validator: &Address) -> Address {
-    // ponytail: domain-separated hash; grep confirmed no other
-    // from_pubkey_bytes-as-hash usage in xc-primitives to collide with.
-    let preimage = [b"xc-stake-subaccount:".as_slice(), validator.to_string().as_bytes()].concat();
-    let digest = Sha256::digest(preimage);
-    Address::from_pubkey_bytes(&digest).expect("sha256 digest is always 32 bytes")
+/// Once per block: pays the proposer the flat block reward (capped at
+/// whatever's left in `reward_pool_account` — never exceeds it, so total
+/// emission is bounded by the pool's genesis balance) plus the proposer's
+/// cut of `fees_collected`, and credits treasury its cut. `fees_collected`
+/// is `applied_action_count * per-action fee`, computed by the caller
+/// (chain-specific — this module doesn't know the fee amount, only how to
+/// split it once collected). The other fee share was already burned when
+/// each action was dispatched (sender debited, nobody credited); this
+/// function only ever adds, never re-debits the sender.
+pub fn apply_block_reward(
+    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    proposer: &Address,
+    fees_collected: u128,
+) -> Result<AccountUpdates, StorageError> {
+    let pool_account = reward_pool_account();
+    let treasury = treasury_account();
+
+    let mut pool_entry = accounts(&pool_account)?.unwrap_or_else(default_account);
+    let block_reward = REWARD_PER_BLOCK.min(pool_entry.balance);
+    pool_entry.balance -= block_reward;
+
+    let proposer_fee_share = fees_collected * FEE_PROPOSER_BPS / 10_000;
+    let treasury_fee_share = fees_collected * FEE_TREASURY_BPS / 10_000;
+
+    let mut proposer_entry = accounts(proposer)?.unwrap_or_else(default_account);
+    proposer_entry.balance += block_reward + proposer_fee_share;
+
+    let mut treasury_entry = accounts(&treasury)?.unwrap_or_else(default_account);
+    treasury_entry.balance += treasury_fee_share;
+
+    let mut updates = HashMap::new();
+    updates.insert(pool_account, pool_entry);
+    updates.insert(proposer.clone(), proposer_entry);
+    updates.insert(treasury, treasury_entry);
+    Ok(AccountUpdates(updates))
 }
 
 /// Debits `master`, credits `validator`'s sub-account, upserts the
@@ -96,6 +158,12 @@ pub fn apply_stake(
         if existing.unbonding.is_some() {
             return Err(StakingError::AlreadyUnbonding { master: master.clone(), validator: validator.clone() });
         }
+    }
+
+    let current_total = existing.as_ref().map(|e| e.active_amount).unwrap_or(0);
+    let new_total = current_total + amount;
+    if new_total > MAX_DELEGATION_PER_VALIDATOR {
+        return Err(StakingError::DelegationCapExceeded { validator: validator.clone(), new_total });
     }
 
     let sub_account = stake_subaccount(validator);
@@ -223,7 +291,16 @@ pub fn apply_slash(
 
     let sub_account = stake_subaccount(validator);
     let mut sub_entry = accounts(&sub_account)?.unwrap_or_else(default_account);
-    sub_entry.balance -= slash_amount;
+    // ponytail: saturating, not `-=`. A well-formed allocation (created via
+    // `apply_stake`) always has sub-account balance >= active_amount, so this
+    // never actually clamps on that path. Genesis validators are the
+    // exception — their StakeAllocation is synthesized directly (see
+    // `Snapshot::batch_entries` in xc_storage) without ever crediting a
+    // matching sub-account balance, so slashing one for real would otherwise
+    // underflow a u128 and panic. Clamping to 0 is the safe direction to
+    // fail in for a money-boundary bug: worst case a slash burns less than
+    // the ledger says, never the reverse.
+    sub_entry.balance = sub_entry.balance.saturating_sub(slash_amount);
     // ponytail: burned, not credited anywhere — deliberate v1 default. A
     // treasury-credit would go right here once that circuit exists.
 
@@ -239,6 +316,45 @@ pub fn apply_slash(
     }
 
     Ok((AccountUpdates(account_updates), stake_updates))
+}
+
+/// Once per accepted/produced block: if `primary` (the height's no-timeout
+/// round-robin proposer, i.e. `xc_primitives::expected_proposer`) isn't who
+/// actually produced the block, burns a small downtime slash from their
+/// stake. No evidence submission needed — every node computes `primary` and
+/// `actual_proposer` from the same stored block, so both sides agree without
+/// proof. No-ops (rather than erroring) if the primary has nothing staked
+/// left to slash — a missed slot from an already-exiting validator isn't a
+/// block-production failure.
+pub fn apply_downtime_slash(
+    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    allocation: impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
+    validator_masters: impl Fn(&Address) -> Result<Vec<Address>, StorageError>,
+    primary: &Address,
+    actual_proposer: &Address,
+    now_height: u64,
+) -> Result<(AccountUpdates, StakeUpdates), StorageError> {
+    if primary == actual_proposer {
+        return Ok(Default::default());
+    }
+    let masters = validator_masters(primary)?;
+    let Some(master) = masters.first() else {
+        return Ok(Default::default());
+    };
+    let Some(existing) = allocation(master, primary)? else {
+        return Ok(Default::default());
+    };
+    let total = existing.active_amount + existing.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let amount = total * DOWNTIME_SLASH_BPS / 10_000;
+    if amount == 0 {
+        return Ok(Default::default());
+    }
+
+    match apply_slash(accounts, allocation, validator_masters, primary, amount, SlashReason::Downtime, now_height) {
+        Ok(result) => Ok(result),
+        Err(StakingError::Storage(err)) => Err(err),
+        Err(_) => Ok(Default::default()),
+    }
 }
 
 /// Folds every `due` allocation's matured unbonding batch back to its
@@ -618,5 +734,220 @@ mod tests {
         commit(&db, accounts, stakes);
         assert_eq!(supply(&db), 850, "unbonding resolution moves funds within the same supply");
         assert_eq!(db.get_account(&master).unwrap().unwrap().balance, 400 + 200);
+    }
+
+    #[test]
+    fn block_reward_splits_fees_and_pays_proposer_from_the_pool_without_minting() {
+        let db = temp_db();
+        let proposer = addr(9);
+        write_balance(&db, &reward_pool_account(), 10_000_000_000); // pool: ~10 ARX
+
+        let supply = |db: &ArxiumDb| {
+            db.get_account(&reward_pool_account()).unwrap().map(|a| a.balance).unwrap_or(0)
+                + db.get_account(&proposer).unwrap().map(|a| a.balance).unwrap_or(0)
+                + db.get_account(&treasury_account()).unwrap().map(|a| a.balance).unwrap_or(0)
+        };
+        let pool_before = supply(&db);
+
+        // 10 actions at 1_000_000 IUM fee each == 10_000_000 collected.
+        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 10_000_000).unwrap();
+        db.write_batch(&updates).unwrap();
+
+        assert_eq!(
+            db.get_account(&proposer).unwrap().unwrap().balance,
+            REWARD_PER_BLOCK + 3_000_000,
+            "proposer gets the flat block reward plus its 30% fee share"
+        );
+        assert_eq!(
+            db.get_account(&treasury_account()).unwrap().unwrap().balance,
+            2_000_000,
+            "treasury gets its 20% fee share"
+        );
+        assert_eq!(
+            db.get_account(&reward_pool_account()).unwrap().unwrap().balance,
+            10_000_000_000 - REWARD_PER_BLOCK,
+            "block reward is debited from the pool, never minted"
+        );
+        // Fee's other 50% (5_000_000) was already burned by charge_action_fee
+        // before this ever runs — not this function's job to account for it.
+        assert_eq!(
+            supply(&db),
+            pool_before + REWARD_PER_BLOCK - REWARD_PER_BLOCK + 5_000_000,
+            "sum across pool+proposer+treasury only grows by the non-burned fee share"
+        );
+    }
+
+    #[test]
+    fn block_reward_caps_at_the_pool_balance_once_it_runs_dry() {
+        let db = temp_db();
+        let proposer = addr(9);
+        write_balance(&db, &reward_pool_account(), 1_000_000); // far less than REWARD_PER_BLOCK
+
+        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 0).unwrap();
+        db.write_batch(&updates).unwrap();
+
+        assert_eq!(
+            db.get_account(&proposer).unwrap().unwrap().balance,
+            1_000_000,
+            "capped at whatever the pool had left, not the full REWARD_PER_BLOCK"
+        );
+        assert_eq!(db.get_account(&reward_pool_account()).unwrap().unwrap().balance, 0);
+
+        // Pool empty: further blocks mint nothing further, forever.
+        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 0).unwrap();
+        db.write_batch(&updates).unwrap();
+        assert_eq!(db.get_account(&proposer).unwrap().unwrap().balance, 1_000_000);
+    }
+
+    #[test]
+    fn stake_rejects_delegation_over_the_cap() {
+        let db = temp_db();
+        let master = addr(1);
+        let validator = addr(2);
+        write_balance(&db, &master, MAX_DELEGATION_PER_VALIDATOR + 1);
+
+        let err = apply_stake(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &master,
+            0,
+            &validator,
+            MAX_DELEGATION_PER_VALIDATOR + 1,
+            10,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StakingError::DelegationCapExceeded { .. }));
+
+        // Right at the cap still succeeds.
+        let (accounts, stakes) = apply_stake(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &master,
+            0,
+            &validator,
+            MAX_DELEGATION_PER_VALIDATOR,
+            10,
+        )
+        .unwrap();
+        commit(&db, accounts, stakes);
+        assert_eq!(
+            db.get_stake_allocation(&master, &validator).unwrap().unwrap().active_amount,
+            MAX_DELEGATION_PER_VALIDATOR
+        );
+
+        // A top-up that would push the same master over the cap is rejected too.
+        // (write directly, not via `write_balance`, so the nonce `apply_stake`
+        // just bumped to 1 above survives — `write_balance` always resets it to 0.)
+        let mut entry = db.get_account(&master).unwrap().unwrap();
+        entry.balance = 1;
+        let mut updates = HashMap::new();
+        updates.insert(master.clone(), entry);
+        db.write_batch(&AccountUpdates(updates)).unwrap();
+
+        let err = apply_stake(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &master,
+            1,
+            &validator,
+            1,
+            11,
+        )
+        .unwrap_err();
+        assert!(matches!(err, StakingError::DelegationCapExceeded { .. }));
+    }
+
+    #[test]
+    fn downtime_slash_is_a_noop_when_primary_matches_actual() {
+        let db = temp_db();
+        let master = addr(1);
+        let validator = addr(2);
+        write_balance(&db, &master, 1000);
+        let (accounts, stakes) = apply_stake(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &master,
+            0,
+            &validator,
+            500,
+            1,
+        )
+        .unwrap();
+        commit(&db, accounts, stakes);
+
+        let (accounts, stakes) = apply_downtime_slash(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &validator,
+            &validator,
+            2,
+        )
+        .unwrap();
+        assert!(accounts.0.is_empty());
+        assert!(stakes.allocations.is_empty());
+        let sub = stake_subaccount(&validator);
+        assert_eq!(db.get_account(&sub).unwrap().unwrap().balance, 500, "untouched");
+    }
+
+    #[test]
+    fn downtime_slash_burns_a_small_share_when_primary_missed_its_slot() {
+        let db = temp_db();
+        let master = addr(1);
+        let primary = addr(2);
+        let actual = addr(3);
+        write_balance(&db, &master, 1_000_000_000);
+        let (accounts, stakes) = apply_stake(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &master,
+            0,
+            &primary,
+            1_000_000_000,
+            1,
+        )
+        .unwrap();
+        commit(&db, accounts, stakes);
+
+        let (accounts, stakes) = apply_downtime_slash(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &primary,
+            &actual,
+            2,
+        )
+        .unwrap();
+        commit(&db, accounts, stakes);
+
+        let allocation = db.get_stake_allocation(&master, &primary).unwrap().unwrap();
+        assert_eq!(
+            allocation.active_amount, 999_900_000,
+            "0.01% of 1_000_000_000 == 100_000 burned"
+        );
+    }
+
+    #[test]
+    fn downtime_slash_is_a_noop_when_primary_has_no_stake() {
+        let db = temp_db();
+        let primary = addr(9);
+        let actual = addr(3);
+
+        let (accounts, stakes) = apply_downtime_slash(
+            |a| db.get_account(a),
+            |m, v| db.get_stake_allocation(m, v),
+            |v| db.get_stakes_by_validator(v),
+            &primary,
+            &actual,
+            2,
+        )
+        .unwrap();
+        assert!(accounts.0.is_empty());
+        assert!(stakes.allocations.is_empty());
     }
 }

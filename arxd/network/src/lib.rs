@@ -12,6 +12,7 @@ use libp2p::futures::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, gossipsub, mdns};
+use metrics::counter;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
@@ -28,7 +29,8 @@ use xc_storage::ArxiumDb;
 use discovery::{dial_bootnodes, dial_discovered};
 use gossip::{ACTIONS_TOPIC, BLOCKS_TOPIC, PRECOMMITS_TOPIC, record_bad_gossip};
 use sync::{
-    MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse, local_tip_height,
+    MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
+    local_tip_height,
     send_sync_request,
 };
 use transport::{BehaviourEvent, build_swarm};
@@ -253,10 +255,11 @@ async fn run_swarm<P: Payload>(
                 }
                 SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                     info!("connected to peer {peer_id}");
-                    // Fresh connection — give it a clean slate rather than
-                    // carrying over failures accrued before it dropped.
+                    // Fresh connection — give it a clean slate for sync
+                    // failures (honest transient network issues). Bad-gossip
+                    // counts deliberately do NOT reset here — see
+                    // `gossip::record_bad_gossip`.
                     sync_failures.remove(&peer_id);
-                    bad_gossip.remove(&peer_id);
                     // Ask immediately — a node that was offline and just
                     // reconnected shouldn't have to wait for the next
                     // STATUS_INTERVAL tick to start catching up.
@@ -280,6 +283,7 @@ async fn run_swarm<P: Payload>(
                                 &mut swarm,
                                 &mut bad_gossip,
                                 propagation_source,
+                                "actions",
                                 &format!("undecodable gossiped action: {err}"),
                             );
                             continue;
@@ -299,9 +303,11 @@ async fn run_swarm<P: Payload>(
                                 &mut swarm,
                                 &mut bad_gossip,
                                 propagation_source,
+                                "actions",
                                 &format!("forged gossiped action: {err}"),
                             );
                         } else {
+                            counter!("arxium_gossip_rejected_total", "topic" => "actions", "reason" => "stale").increment(1);
                             warn!("rejected gossiped action from {propagation_source}: {err}");
                         }
                         continue;
@@ -309,6 +315,7 @@ async fn run_swarm<P: Payload>(
 
                     if let Some(precheck) = &payload_precheck {
                         if let Err(err) = precheck(&action, &db) {
+                            counter!("arxium_gossip_rejected_total", "topic" => "actions", "reason" => "stale").increment(1);
                             warn!("rejected gossiped action from {propagation_source}: {err}");
                             continue;
                         }
@@ -316,7 +323,10 @@ async fn run_swarm<P: Payload>(
 
                     let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
                     match mempool.push(action) {
-                        Ok(()) => info!("admitted gossiped action from {propagation_source}"),
+                        Ok(()) => {
+                            counter!("arxium_gossip_accepted_total", "topic" => "actions").increment(1);
+                            info!("admitted gossiped action from {propagation_source}");
+                        }
                         Err(xc_mempool::MempoolError::Duplicate { .. }) => {}
                         Err(err) => warn!("failed to queue gossiped action: {err}"),
                     }
@@ -336,6 +346,7 @@ async fn run_swarm<P: Payload>(
                                 &mut swarm,
                                 &mut bad_gossip,
                                 propagation_source,
+                                "blocks",
                                 &format!("undecodable gossiped block: {err}"),
                             );
                             continue;
@@ -346,8 +357,11 @@ async fn run_swarm<P: Payload>(
                             &mut swarm,
                             &mut bad_gossip,
                             propagation_source,
+                            "blocks",
                             "forged gossiped block signature",
                         );
+                    } else {
+                        counter!("arxium_gossip_accepted_total", "topic" => "blocks").increment(1);
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -365,11 +379,13 @@ async fn run_swarm<P: Payload>(
                                 &mut swarm,
                                 &mut bad_gossip,
                                 propagation_source,
+                                "precommits",
                                 &format!("undecodable gossiped precommit vote: {err}"),
                             );
                             continue;
                         }
                     };
+                    counter!("arxium_gossip_accepted_total", "topic" => "precommits").increment(1);
                     on_precommit_vote(vote);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
@@ -385,6 +401,7 @@ async fn run_swarm<P: Payload>(
                     // backoff, not a tight loop. Past
                     // MAX_CONSECUTIVE_SYNC_FAILURES the tick skips this peer
                     // entirely until it reconnects or a request succeeds.
+                    counter!("arxium_sync_outbound_failures_total").increment(1);
                     let failures = sync_failures.entry(peer).or_insert(0);
                     *failures += 1;
                     if *failures >= MAX_CONSECUTIVE_SYNC_FAILURES {
@@ -406,6 +423,7 @@ async fn run_swarm<P: Payload>(
                     error,
                     ..
                 })) => {
+                    counter!("arxium_sync_inbound_failures_total").increment(1);
                     warn!("failed to answer sync request from {peer}: {error}");
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::Message {
@@ -425,7 +443,7 @@ async fn run_swarm<P: Payload>(
                             }
                         };
                         let response = match sync_request {
-                            SyncRequest::Status => SyncResponse::<P>::Status {
+                            SyncRequest::Status => SyncResponse::<Block<P>>::Status {
                                 tip_height: local_tip_height(&db),
                             },
                             SyncRequest::Blocks { from } => {
@@ -440,6 +458,47 @@ async fn run_swarm<P: Payload>(
                                     });
                                 SyncResponse::Blocks(blocks)
                             }
+                            // Everything a follower would otherwise have to
+                            // hardcode or guess: the page size it must match,
+                            // how far finality has actually got, and which
+                            // wire generation we speak.
+                            SyncRequest::NodeInfo => {
+                                let tip_height = local_tip_height(&db);
+                                let tip_hash = db
+                                    .get_block_range::<P>(tip_height, tip_height)
+                                    .ok()
+                                    .and_then(|blocks| blocks.first().map(|b| b.hash()));
+                                SyncResponse::<Block<P>>::NodeInfo(NodeInfo {
+                                    wire_version: xc_wire::WIRE_VERSION,
+                                    tip_height,
+                                    tip_hash,
+                                    finalized_height: db
+                                        .get_finalized_height()
+                                        .unwrap_or_else(|err| {
+                                            warn!("failed to read finalized height: {err}");
+                                            None
+                                        }),
+                                    max_page_size: xc_storage::MAX_PAGE_SIZE as u32,
+                                })
+                            }
+                            // Hashes without bodies, so a follower resolving a
+                            // fork can binary-search for the common ancestor
+                            // instead of downloading one block per round trip.
+                            SyncRequest::Hashes { from, to } => {
+                                let to = to.min(local_tip_height(&db));
+                                let hashes = db
+                                    .get_block_range::<P>(from, to)
+                                    .unwrap_or_else(|err| {
+                                        warn!(
+                                            "failed to read blocks {from}..={to} for hash response to {peer}: {err}"
+                                        );
+                                        Vec::new()
+                                    })
+                                    .into_iter()
+                                    .map(|block| (block.height, block.hash()))
+                                    .collect();
+                                SyncResponse::<Block<P>>::Hashes(hashes)
+                            }
                         };
                         match bincode::serde::encode_to_vec(&response, bincode::config::standard()) {
                             Ok(bytes) => {
@@ -451,7 +510,7 @@ async fn run_swarm<P: Payload>(
                         }
                     }
                     request_response::Message::Response { response, .. } => {
-                        let sync_response: SyncResponse<P> = match bincode::serde::decode_from_slice(
+                        let sync_response: SyncResponse<Block<P>> = match bincode::serde::decode_from_slice(
                             &response,
                             bincode::config::standard(),
                         ) {
@@ -464,7 +523,21 @@ async fn run_swarm<P: Payload>(
                         // A response means the peer is reachable again —
                         // don't leave it skipped by a stale failure count.
                         sync_failures.remove(&peer);
+                        let kind = match &sync_response {
+                            SyncResponse::Status { .. } => "status",
+                            SyncResponse::Blocks(_) => "blocks",
+                            SyncResponse::NodeInfo(_) => "node_info",
+                            SyncResponse::Hashes(_) => "hashes",
+                        };
+                        counter!("arxium_sync_responses_total", "kind" => kind).increment(1);
                         match sync_response {
+                            // The node never asks for these — they exist for
+                            // followers. Receiving one means a peer answered a
+                            // question we didn't ask, so note it and move on
+                            // rather than treating it as protocol breakage.
+                            SyncResponse::NodeInfo(_) | SyncResponse::Hashes(_) => {
+                                warn!("unsolicited {kind} response from {peer}, ignoring");
+                            }
                             SyncResponse::Status { tip_height } => {
                                 peer_tips.insert(peer, tip_height);
                                 let local_tip = local_tip_height(&db);
@@ -498,8 +571,11 @@ async fn run_swarm<P: Payload>(
                                             &mut swarm,
                                             &mut bad_gossip,
                                             peer,
+                                            "sync",
                                             "forged synced block signature",
                                         );
+                                    } else {
+                                        counter!("arxium_gossip_accepted_total", "topic" => "sync").increment(1);
                                     }
                                 }
                                 if let Err(err) = db.flush_wal() {

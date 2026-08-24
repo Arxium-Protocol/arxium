@@ -229,6 +229,7 @@ pub fn run() -> Result<()> {
                 block,
                 SLOT_DURATION.as_secs(),
                 sync,
+                payload::ACTION_FEE,
                 |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
                     dispatch(
                         action,

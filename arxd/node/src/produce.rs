@@ -1,4 +1,4 @@
-use crate::payload::{ActionPayload, ChainBlock, dispatch};
+use crate::payload::{ACTION_FEE, ActionPayload, ChainBlock, dispatch};
 use crate::{BLOCK_INTERVAL, SLOT_DURATION, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
@@ -11,7 +11,7 @@ use std::thread;
 use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address, eligible_proposer};
+use xc_primitives::{Action, Address, eligible_proposer, expected_proposer};
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
@@ -41,9 +41,9 @@ pub fn produce_block(
     let seed = resolve_matured_unbonding(db, next_height)?;
     let (
         applied,
-        account_updates,
+        mut account_updates,
         validator_changes,
-        stake_updates,
+        mut stake_updates,
         evidence_markers,
         bls_keys,
         operator_updates,
@@ -66,6 +66,52 @@ pub fn produce_block(
             )
         },
     )?;
+
+    // Same block-reward split `accept_block` applies to a gossiped block —
+    // a locally-produced block must pay itself the same way, or a solo
+    // validator would never see its own reward pool debited/credited.
+    if let Some((address, _)) = proposer {
+        let fees_collected = applied.len() as u128 * ACTION_FEE;
+        let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
+            Some(entry) => std::result::Result::Ok(Some(entry.clone())),
+            None => db.get_account(addr),
+        };
+        let reward_updates =
+            circuit_staking::apply_block_reward(account_lookup, address, fees_collected)?;
+        account_updates.0.extend(reward_updates.0);
+
+        // §7.3 downtime slash — same rule `accept_block` applies to a
+        // gossiped block: if the height's primary round-robin proposer
+        // wasn't the one who actually produced it, burn a small automatic
+        // slash from their stake.
+        if let Some(primary) = expected_proposer(&validators, next_height) {
+            let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
+                Some(entry) => std::result::Result::Ok(Some(entry.clone())),
+                None => db.get_account(addr),
+            };
+            let allocation_lookup = |m: &Address, v: &Address| {
+                match stake_updates.allocations.get(&(m.clone(), v.clone())) {
+                    Some(a) => std::result::Result::Ok(a.clone()),
+                    None => db.get_stake_allocation(m, v),
+                }
+            };
+            let masters_lookup = |v: &Address| match stake_updates.validator_index.get(v) {
+                Some(m) => std::result::Result::Ok(m.clone()),
+                None => db.get_stakes_by_validator(v),
+            };
+            let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
+                account_lookup,
+                allocation_lookup,
+                masters_lookup,
+                &primary,
+                address,
+                next_height,
+            )?;
+            account_updates.0.extend(downtime_accounts.0);
+            stake_updates.allocations.extend(downtime_stakes.allocations);
+            stake_updates.validator_index.extend(downtime_stakes.validator_index);
+        }
+    }
 
     let mut new_block = ChainBlock {
         height: next_height,

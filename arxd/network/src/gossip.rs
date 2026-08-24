@@ -1,4 +1,5 @@
 use libp2p::PeerId;
+use metrics::counter;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -26,27 +27,62 @@ pub(crate) const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
 pub(crate) const PRECOMMITS_TOPIC: &str = "arxium/precommits/v1";
 
 /// A peer sending this many unambiguously-bad gossip messages (undecodable
-/// bytes, forged signatures) in a row gets disconnected — see
-/// `record_bad_gossip`.
+/// bytes, forged signatures) in a row gets banned — see `record_bad_gossip`.
 pub(crate) const MAX_BAD_GOSSIP: u32 = 10;
 
 /// Records gossip that's unambiguously bad — undecodable bytes or a forged
-/// signature, never just "this peer is a bit behind" — and disconnects the
-/// peer once it crosses `MAX_BAD_GOSSIP`, so a hostile peer can't spam
-/// garbage at zero cost forever. `ConnectionEstablished` clears the count on
-/// reconnect, same as `sync_failures`.
+/// signature, never just "this peer is a bit behind" — and bans the peer
+/// once it crosses `MAX_BAD_GOSSIP`, so a hostile peer can't spam garbage at
+/// zero cost forever. Deliberately *not* cleared on `ConnectionEstablished`
+/// (unlike `sync_failures`, which tracks honest transient failures): this
+/// counter exists specifically to survive reconnects, otherwise a peer about
+/// to hit the cap can just drop and redial to reset it to zero and keep
+/// spamming indefinitely. Once banned, `blocked_peers` (an
+/// `allow_block_list::Behaviour`) refuses the peer at the swarm level, so a
+/// redial doesn't even get a fresh connection to spam a few more messages on
+/// before being cut off again.
 pub(crate) fn record_bad_gossip(
     swarm: &mut libp2p::Swarm<Behaviour>,
     bad_gossip: &mut HashMap<PeerId, u32>,
     peer: PeerId,
+    topic: &str,
     reason: &str,
 ) {
+    counter!("arxium_gossip_rejected_total", "topic" => topic.to_string(), "reason" => "bad")
+        .increment(1);
     let count = bad_gossip.entry(peer).or_insert(0);
     *count += 1;
     if *count >= MAX_BAD_GOSSIP {
-        warn!("disconnecting {peer}: {reason} ({count} bad gossip messages)");
-        let _ = swarm.disconnect_peer_id(peer);
+        warn!("banning {peer}: {reason} ({count} bad gossip messages)");
+        swarm.behaviour_mut().blocked_peers.block_peer(peer);
+        counter!("arxium_gossip_peers_banned_total").increment(1);
     } else {
         warn!("{reason} from {peer} ({count}/{MAX_BAD_GOSSIP})");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::build_swarm;
+
+    /// Regression check for the reconnect ban-bypass: a peer that
+    /// accumulates `MAX_BAD_GOSSIP` reports across separate calls (standing
+    /// in for separate connections, since `run_swarm` no longer resets this
+    /// map on `ConnectionEstablished`) ends up in `blocked_peers`, and a
+    /// peer that stays under the cap does not.
+    #[test]
+    fn crossing_threshold_bans_peer_permanently() {
+        let mut swarm = build_swarm(libp2p::identity::Keypair::generate_ed25519()).unwrap();
+        let mut bad_gossip = HashMap::new();
+        let peer = PeerId::random();
+
+        for _ in 0..MAX_BAD_GOSSIP - 1 {
+            record_bad_gossip(&mut swarm, &mut bad_gossip, peer, "test", "test");
+        }
+        assert!(!swarm.behaviour().blocked_peers.blocked_peers().contains(&peer));
+
+        record_bad_gossip(&mut swarm, &mut bad_gossip, peer, "test", "test");
+        assert!(swarm.behaviour().blocked_peers.blocked_peers().contains(&peer));
     }
 }

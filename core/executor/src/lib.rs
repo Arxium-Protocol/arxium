@@ -4,7 +4,7 @@ use thiserror::Error;
 use tracing::warn;
 use xc_primitives::{
     AccountEntry, Action, Address, Block, SignatureError, StakeAllocation, ValidatorChange,
-    eligible_proposer,
+    eligible_proposer, expected_proposer,
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, OperatorUpdates,
@@ -127,11 +127,19 @@ pub enum AcceptBlockError {
 /// finalized blocks from `SyncRequest::Blocks` catch-up — skips the fsync
 /// per block; the caller must call `ArxiumDb::flush_wal` once after the
 /// whole page lands.
+///
+/// `fee_per_action`: the chain's flat per-action fee (e.g. arxd/node's
+/// `ACTION_FEE`, 0 for a chain with none) — this crate doesn't know the fee
+/// amount itself (that's chain-specific, charged inside `dispatch`), only
+/// how many actions applied. `applied.len() * fee_per_action` is handed to
+/// `circuit_staking::apply_block_reward` to split between the block
+/// proposer and treasury.
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
     slot_duration_secs: u64,
     sync: bool,
+    fee_per_action: u128,
     dispatch: impl Fn(
         &Action<P>,
         &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
@@ -204,9 +212,9 @@ where
     let seed = resolve_matured_unbonding(db, block.height)?;
     let (
         applied,
-        account_updates,
+        mut account_updates,
         validator_changes,
-        stake_updates,
+        mut stake_updates,
         evidence_markers,
         bls_keys,
         operator_updates,
@@ -217,6 +225,49 @@ where
             claimed,
             executed: applied.len(),
         });
+    }
+
+    // `verify_proposer_signature` above already guarantees `Some` — an
+    // unsigned block never reaches this point.
+    let proposer = block.proposer.as_ref().expect("signed block always has a proposer");
+    let fees_collected = applied.len() as u128 * fee_per_action;
+    let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
+        Some(entry) => Ok(Some(entry.clone())),
+        None => db.get_account(addr),
+    };
+    let reward_updates = circuit_staking::apply_block_reward(account_lookup, proposer, fees_collected)?;
+    account_updates.0.extend(reward_updates.0);
+
+    // §7.3 downtime slash: if the height's primary round-robin proposer
+    // wasn't who actually produced it, they missed their slot — burn a
+    // small automatic slash. No evidence needed, every node agrees from
+    // the same stored block.
+    if let Some(primary) = expected_proposer(&validators, block.height) {
+        let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
+            Some(entry) => Ok(Some(entry.clone())),
+            None => db.get_account(addr),
+        };
+        let allocation_lookup = |m: &Address, v: &Address| {
+            match stake_updates.allocations.get(&(m.clone(), v.clone())) {
+                Some(a) => Ok(a.clone()),
+                None => db.get_stake_allocation(m, v),
+            }
+        };
+        let masters_lookup = |v: &Address| match stake_updates.validator_index.get(v) {
+            Some(m) => Ok(m.clone()),
+            None => db.get_stakes_by_validator(v),
+        };
+        let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
+            account_lookup,
+            allocation_lookup,
+            masters_lookup,
+            &primary,
+            proposer,
+            block.height,
+        )?;
+        account_updates.0.extend(downtime_accounts.0);
+        stake_updates.allocations.extend(downtime_stakes.allocations);
+        stake_updates.validator_index.extend(downtime_stakes.validator_index);
     }
 
     let new_validator_set = if validator_changes.is_empty() {
@@ -513,7 +564,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
         assert_eq!(accepted.actions.len(), 1, "join action must be applied");
 
         // Block 1 itself is still decided by the pre-join set.
@@ -638,7 +689,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
         assert_eq!(accepted.actions.len(), 1, "stake action must be applied");
 
         // Never disagree: if the block landed, the stake it caused landed
@@ -727,7 +778,7 @@ mod tests {
         };
         block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, dispatch).unwrap();
+        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
         assert_eq!(
             accepted.actions.len(),
             1,

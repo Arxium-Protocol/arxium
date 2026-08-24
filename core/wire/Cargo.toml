@@ -1,0 +1,21 @@
+# The peer-to-peer sync protocol's wire types, in their own crate so the node
+# and any external indexer compile against the *same* definitions instead of
+# hand-maintained copies.
+#
+# Before this existed, Retracer vendored `SyncRequest`/`SyncResponse` by hand
+# because they were `pub(crate)` in `arxd/network`. bincode is positional and
+# carries no version tag, so a field added on one side decoded as garbage on the
+# other — no compile error, no handshake failure. Sharing the definitions makes
+# that a build error instead of a silent one.
+#
+# Deliberately tiny: serde plus xc-primitives, no storage, no libp2p. Anything
+# heavier and an indexer couldn't depend on it without dragging in the node.
+[package]
+name = "xc-wire"
+version = "0.1.0"
+edition = "2024"
+description = "Wire types for the Arxium peer-to-peer block sync protocol"
+license = "Apache-2.0"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }

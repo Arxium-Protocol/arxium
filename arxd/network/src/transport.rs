@@ -1,10 +1,20 @@
 use anyhow::Result;
+use libp2p::allow_block_list::{self, BlockedPeers};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, StreamProtocol, gossipsub, mdns, noise, tcp, yamux};
 
 use crate::sync::SYNC_PROTOCOL;
+
+/// gossipsub's own default (`65536` bytes) is close enough to this chain's
+/// worst-case block size (100 actions/block, and the larger action variants
+/// carry a ZK proof or BLS pubkey) that a legitimately full block risks being
+/// silently dropped from gossip rather than erroring. Set explicitly with
+/// real headroom instead of relying on the tight default — 1 MiB is in line
+/// with other chains' gossip caps (e.g. Cosmos ~4 MiB, Ethereum consensus
+/// 10 MiB) while still bounding message size against abuse.
+const MAX_GOSSIP_TRANSMIT_SIZE: usize = 1024 * 1024;
 
 /// Combined behaviour for this node. mDNS handles same-LAN discovery; gossipsub
 /// carries Actions between peers. An explicit `--bootnodes` list is dialed
@@ -23,6 +33,11 @@ pub(crate) struct Behaviour {
     /// Caps connection counts so a burst of dials (malicious or just a noisy
     /// LAN) can't grow unbounded memory/fd usage — see `build_swarm`.
     pub(crate) limits: connection_limits::Behaviour,
+    /// Peers banned for unambiguously-bad gossip (see `gossip::record_bad_gossip`).
+    /// A hard block at the swarm level, not just a connection drop — a
+    /// blocked peer's redial is refused outright instead of getting a fresh
+    /// connection to spam on.
+    pub(crate) blocked_peers: allow_block_list::Behaviour<BlockedPeers>,
 }
 
 pub(crate) fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behaviour>> {
@@ -36,9 +51,13 @@ pub(crate) fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::
         )?
         .with_quic()
         .with_behaviour(|keypair| {
+            let gossipsub_config = gossipsub::ConfigBuilder::default()
+                .max_transmit_size(MAX_GOSSIP_TRANSMIT_SIZE)
+                .build()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-                gossipsub::Config::default(),
+                gossipsub_config,
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let sync = cbor::Behaviour::new(
@@ -60,6 +79,7 @@ pub(crate) fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::
                 gossipsub,
                 sync,
                 limits,
+                blocked_peers: allow_block_list::Behaviour::default(),
             })
         })?
         .build();

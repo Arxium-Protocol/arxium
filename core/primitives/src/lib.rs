@@ -12,7 +12,8 @@ pub use address::{Address, AddressError};
 pub use block::Block;
 pub use consensus::{eligible_proposer, expected_proposer};
 pub use state::{
-    AccountEntry, Snapshot, StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
+    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Snapshot,
+    StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
 };
 
 #[derive(Debug)]

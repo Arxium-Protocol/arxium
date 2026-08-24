@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{StatusCode, header};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -35,7 +35,17 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 // ponytail: fixed window, single-node in-memory; move to a shared store
 // (redis, etc.) if this ever runs behind more than one RPC instance.
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-const RATE_LIMIT_MAX_REQUESTS: u32 = 60;
+// Writes (state-mutating: POST /actions, POST /pairing) keep the original
+// tight budget — this is the one that actually needs to bound spam/DoS
+// risk against the mempool and chain state.
+const RATE_LIMIT_MAX_WRITE_REQUESTS: u32 = 60;
+// Reads (GET /accounts/*, /blocks/*, etc.) are cheap lookups against
+// already-committed state, not a mempool/consensus risk, so they get a much
+// higher ceiling. Load-testing this RPC (scripts/load-test) surfaced the
+// bug a single shared budget causes: a client's own status-check polling
+// right after a submission burst would get starved by its own writes,
+// making confirmed-on-chain actions look "still pending" indefinitely.
+const RATE_LIMIT_MAX_READ_REQUESTS: u32 = 600;
 // Sweep stale per-IP entries once the map crosses this size, bounding worst-
 // case memory instead of growing forever for a public/long-lived instance.
 const RATE_LIMIT_SWEEP_THRESHOLD: usize = 10_000;
@@ -65,7 +75,10 @@ struct AppState<P: Payload> {
 }
 
 struct RateLimiter {
-    hits: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    // Keyed by (ip, is_write) so a client's write budget and read budget
+    // are tracked — and exhausted — independently. Same map/sweep shape as
+    // the single-budget version, just keyed one level deeper.
+    hits: Mutex<HashMap<(IpAddr, bool), (Instant, u32)>>,
 }
 
 impl RateLimiter {
@@ -75,7 +88,7 @@ impl RateLimiter {
         }
     }
 
-    fn allow(&self, ip: IpAddr) -> bool {
+    fn allow(&self, ip: IpAddr, is_write: bool) -> bool {
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
@@ -85,12 +98,13 @@ impl RateLimiter {
             hits.retain(|_, (seen, _)| now.duration_since(*seen) <= RATE_LIMIT_WINDOW);
         }
 
-        let entry = hits.entry(ip).or_insert((now, 0));
+        let max = if is_write { RATE_LIMIT_MAX_WRITE_REQUESTS } else { RATE_LIMIT_MAX_READ_REQUESTS };
+        let entry = hits.entry((ip, is_write)).or_insert((now, 0));
         if now.duration_since(entry.0) > RATE_LIMIT_WINDOW {
             *entry = (now, 0);
         }
         entry.1 += 1;
-        entry.1 <= RATE_LIMIT_MAX_REQUESTS
+        entry.1 <= max
     }
 }
 
@@ -203,15 +217,15 @@ enum PollOutcome {
 /// production (TLS termination) — every real client would collapse into the
 /// proxy's one IP and share a single limit. `X-Forwarded-For`'s first entry
 /// wins when present, `X-Real-IP` next — verified empirically against a real
-/// Nginx `proxy_pass` (the documented deployment, see `nginx-gateway.conf`)
-/// rather than assumed: Nginx appends to a client-supplied
+/// Caddy `reverse_proxy` (the documented deployment, see `Caddyfile.example`)
+/// rather than assumed: Caddy doesn't append to a client-supplied
 /// `X-Forwarded-For`, it overwrites it outright with its own observed remote
-/// address, so there can be more than one entry to pick between when Nginx
+/// address, so there's never more than one entry to pick between when Caddy
 /// is the immediate hop — a forged value from the actual client never
 /// survives the proxy. `.next()` on the split is just reading that one
 /// value; it isn't load-bearing leftmost-vs-rightmost logic. (A different
 /// proxy, or a chain of more than one, could behave differently — recheck if
-/// the deployment ever changes from a single Nginx hop.)
+/// the deployment ever changes from a single Caddy hop.)
 ///
 /// Only trusted from a loopback peer, though — the documented deployment is
 /// the proxy running on the same host and forwarding to a loopback-bound RPC
@@ -248,6 +262,7 @@ async fn guard<P: Payload>(
     // appear there and would blow up the metric's cardinality), captured
     // before `req` moves into `next.run`.
     let path = req.uri().path().to_string();
+    let is_write = req.method() != Method::GET;
 
     if let Some(token) = &state.rpc_token {
         let expected = format!("Bearer {token}");
@@ -264,7 +279,7 @@ async fn guard<P: Payload>(
         }
     }
 
-    if !state.rate_limiter.allow(client_ip(&req, addr)) {
+    if !state.rate_limiter.allow(client_ip(&req, addr), is_write) {
         record_request(&path, StatusCode::TOO_MANY_REQUESTS);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
@@ -285,7 +300,7 @@ fn record_request(path: &str, status: StatusCode) {
 
 /// Renders the current metrics snapshot in Prometheus text format. Outside
 /// the bearer-token guard (metrics aren't secret and this endpoint isn't
-/// meant to be internet-facing — see `docker-compose.prod.yml` / `nginx-gateway.conf`,
+/// meant to be internet-facing — see `docker-compose.prod.yml` / `Caddyfile.prod`,
 /// which don't route it through the public TLS proxy).
 async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
     (
@@ -353,7 +368,7 @@ pub fn spawn_http_ingest<P: Payload>(
             // /metrics is deliberately outside the guarded router below — a
             // scrape endpoint shouldn't need the RPC bearer token, and it's
             // never routed through the public TLS proxy in production (see
-            // nginx-gateway.conf) since it's only meant for an internal scraper
+            // Caddyfile.prod) since it's only meant for an internal scraper
             // on the same docker network.
             let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))
@@ -700,17 +715,48 @@ async fn get_account_bls_key<P: Payload>(
     }
 }
 
-/// The current validator set, i.e. as of the chain's tip — same set
-/// `xc_executor::accept_block` would check the next block's proposer
-/// against.
-async fn get_validators<P: Payload>(State(state): State<AppState<P>>) -> Response {
+#[derive(serde::Deserialize)]
+struct ValidatorSetQuery {
+    /// Historical height to answer for. Absent means the chain's tip.
+    height: Option<u64>,
+}
+
+/// The validator set, by default as of the chain's tip — the same set
+/// `xc_executor::accept_block` would check the next block's proposer against.
+///
+/// `?height=N` answers for a past height instead. The snapshots have always
+/// been persisted (`validator_set:{height}`, read back by
+/// `get_validator_set_at`, which `arxd/finality` already relies on to tally
+/// votes against the set that was live at the voted height) — they simply had
+/// no route. Exposing them is what lets an external indexer compute validator
+/// uptime: turns proposed over turns *owed* needs the set at each historical
+/// height, and the denominator was unobtainable while this only answered for
+/// the tip.
+async fn get_validators<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(query): Query<ValidatorSetQuery>,
+) -> Response {
     let tip_height = match state.db.get_tip_height() {
         Ok(Some(height)) => height,
         Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    match state.db.get_validator_set_at(tip_height) {
+    // A height above the tip is a caller mistake worth naming: answering with
+    // the tip's set would look like data rather than a misunderstanding.
+    let height = match query.height {
+        Some(requested) if requested > tip_height => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("height {requested} is above the chain tip {tip_height}"),
+            )
+                .into_response();
+        }
+        Some(requested) => requested,
+        None => tip_height,
+    };
+
+    match state.db.get_validator_set_at(height) {
         Ok(validators) => Json(validators).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -891,6 +937,39 @@ async fn search<P: Payload>(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[cfg(test)]
+mod rate_limiter_tests {
+    use super::{IpAddr, RATE_LIMIT_MAX_READ_REQUESTS, RATE_LIMIT_MAX_WRITE_REQUESTS, RateLimiter};
+
+    #[test]
+    fn write_budget_exhausting_does_not_affect_reads() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        for _ in 0..RATE_LIMIT_MAX_WRITE_REQUESTS {
+            assert!(limiter.allow(ip, true));
+        }
+        assert!(!limiter.allow(ip, true), "write budget should be exhausted");
+
+        // Reads for the same IP draw from a separate, larger budget — this
+        // is the fix for a client's own status-check polling getting
+        // starved by a submission burst it just made.
+        assert!(limiter.allow(ip, false), "read budget must be independent of the write budget");
+    }
+
+    #[test]
+    fn read_budget_is_higher_than_write_budget() {
+        let limiter = RateLimiter::new();
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        for _ in 0..RATE_LIMIT_MAX_READ_REQUESTS {
+            assert!(limiter.allow(ip, false));
+        }
+        assert!(!limiter.allow(ip, false));
+        assert!(RATE_LIMIT_MAX_READ_REQUESTS > RATE_LIMIT_MAX_WRITE_REQUESTS);
+    }
 }
 
 #[cfg(test)]

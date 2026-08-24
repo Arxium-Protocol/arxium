@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
-use xc_primitives::{AccountEntry, Address, Block, Snapshot, StakeAllocation};
+use xc_primitives::{stake_subaccount, AccountEntry, Address, Block, Snapshot, StakeAllocation};
 #[cfg(test)]
 use xc_primitives::Action;
 
@@ -321,6 +321,42 @@ impl ArxiumDb {
         Ok(Vec::new())
     }
 
+    /// Highest height with a finality certificate, if any.
+    ///
+    /// Found by seeking backwards over the `meta:finality:` prefix rather than
+    /// maintaining a separate counter — the keys are zero-padded to 20 digits
+    /// so lexicographic order is numeric order, and this is the same reverse-seek
+    /// pattern `get_validator_set_at` already uses. A counter would be one more
+    /// thing that can drift out of step with the records it summarises.
+    ///
+    /// Certificates are written as quorums complete, which is not necessarily in
+    /// height order, so this is the highest *certified* height and not
+    /// automatically a watermark below which everything is final. Callers that
+    /// need a contiguous guarantee should check the heights they care about.
+    pub fn get_finalized_height(&self) -> Result<Option<u64>, StorageError> {
+        let prefix = b"meta:finality:";
+        // u64::MAX zero-padded: seeks past every real key, so Reverse starts at
+        // the highest one that exists.
+        let seek_key = format!("meta:finality:{:020}", u64::MAX);
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(seek_key.as_bytes(), Direction::Reverse),
+        );
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let digits = &key[prefix.len()..];
+            let height = std::str::from_utf8(digits)
+                .ok()
+                .and_then(|d| d.parse::<u64>().ok())
+                .ok_or(StorageError::CorruptedMeta)?;
+            return Ok(Some(height));
+        }
+        Ok(None)
+    }
+
     /// Look up a block's height by its content hash.
     pub fn get_block_height_by_hash(&self, hash: &str) -> Result<Option<u64>, StorageError> {
         let key = format!("block_hash:{}", hash);
@@ -461,6 +497,29 @@ impl BatchWritable for Snapshot {
             entries.push((
                 format!("stake_by_validator:{}", address).into_bytes(),
                 bincode::serde::encode_to_vec(&vec![address.clone()], config)?,
+            ));
+
+            // The other half of the same fix: `apply_stake` always moves the
+            // staked amount into `stake_subaccount(validator)`'s real
+            // balance, so every allocation it creates is backed by funds a
+            // slash/unbond can actually debit. The synthesized allocation
+            // above skipped that, leaving the sub-account at its default
+            // zero balance — `circuit_staking::apply_slash` would then
+            // underflow subtracting from it (hit for real via downtime
+            // slashing, which is the first path that reaches a genesis-only
+            // validator without needing submitted evidence). Fund it here so
+            // genesis produces the same invariant `apply_stake` would:
+            // sub-account balance >= sum of active allocations against it.
+            let sub_account = stake_subaccount(address);
+            let mut sub_entry = self
+                .accounts
+                .get(&sub_account)
+                .cloned()
+                .unwrap_or(AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false });
+            sub_entry.balance += validator.stake;
+            entries.push((
+                format!("account:{}", sub_account).into_bytes(),
+                bincode::serde::encode_to_vec(&sub_entry, config)?,
             ));
         }
         let mut genesis_validators: Vec<Address> = self.validators.keys().cloned().collect();
@@ -812,5 +871,41 @@ mod explorer_index_tests {
         let allocation = db.get_stake_allocation(&addr(1), &addr(1)).unwrap().unwrap();
         assert_eq!(allocation.active_amount, 1_000_000);
         assert_eq!(db.get_stakes_by_validator(&addr(1)).unwrap(), vec![addr(1)]);
+
+        // The allocation alone isn't enough — `apply_slash` debits real
+        // balance out of `stake_subaccount(validator)`, not the allocation
+        // record. Without this, a slash against a genesis-only validator
+        // underflows a balance that was never funded (previously masked by
+        // a `saturating_sub` band-aid rather than fixed at the source).
+        let sub_account = xc_primitives::stake_subaccount(&addr(1));
+        let sub_entry = db.get_account(&sub_account).unwrap().unwrap();
+        assert_eq!(sub_entry.balance, 1_000_000);
+    }
+
+    /// Two genesis validators must each get their own funded sub-account,
+    /// not share one balance or overwrite each other's — sub-accounts are
+    /// keyed by a domain-separated hash of the validator address, so this
+    /// also guards against an indexing mistake that happened to work for a
+    /// single validator.
+    #[test]
+    fn multiple_genesis_validators_each_get_a_distinct_funded_subaccount() {
+        let db = temp_db();
+        let mut validators = std::collections::BTreeMap::new();
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000 });
+        validators.insert(addr(2), xc_primitives::ValidatorEntry { stake: 2_000_000 });
+        db.write_batch(&Snapshot {
+            height: 0,
+            chain_name: "test".into(),
+            accounts: Default::default(),
+            validators,
+            boot_nodes: vec![],
+        })
+        .unwrap();
+
+        let sub1 = xc_primitives::stake_subaccount(&addr(1));
+        let sub2 = xc_primitives::stake_subaccount(&addr(2));
+        assert_ne!(sub1, sub2);
+        assert_eq!(db.get_account(&sub1).unwrap().unwrap().balance, 1_000_000);
+        assert_eq!(db.get_account(&sub2).unwrap().unwrap().balance, 2_000_000);
     }
 }

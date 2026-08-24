@@ -6,6 +6,7 @@ members = [
     "circuits/identity-zk",
     #
     "core/primitives",
+    "core/wire",
     "core/bls",
     "core/storage",
     "core/mempool",
@@ -22,6 +23,7 @@ members = [
     #
     "scripts/send-tx",
     "scripts/admin-slash",
+    "scripts/load-test",
     #
     "examples/toy-chain",
 ]
@@ -32,6 +34,7 @@ default-members = ["arxd"]
 [workspace.dependencies]
 # internal packages
 xc-primitives = { path = "core/primitives" }
+xc-wire = { path = "core/wire" }
 xc-bls = { path = "core/bls" }
 xc-storage = { path = "core/storage" }
 xc-mempool = { path = "core/mempool" }
