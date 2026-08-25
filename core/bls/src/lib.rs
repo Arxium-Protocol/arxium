@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 //! BLS12-381 signatures (min-pk scheme: 48-byte pubkeys in G1, 96-byte
 //! signatures in G2) for block finality certificates. Role-agnostic crypto
 //! primitive — no consensus/quorum logic lives here, that's `arxd/finality`.

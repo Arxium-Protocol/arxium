@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 // Diagnostic: dumps every point where the round-robin validator set changed,
 // so a WrongProposer rejection during sync can be traced back to which
 // height a JoinValidator took effect at.

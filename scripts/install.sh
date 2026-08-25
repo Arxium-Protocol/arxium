@@ -116,7 +116,14 @@ if [ -z "$version" ]; then
     # it avoids depending on jq being present.
     version="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
         | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)"
-    [ -n "$version" ] || die "could not determine the latest release tag; pass --version vX.Y.Z"
+    [ -n "$version" ] || die "could not determine the latest release tag.
+The releases API returned nothing usable, which usually means one of:
+  - the repository is private, and anonymous requests get a 404. This
+    installer does not authenticate; fetch the tarball manually or wait
+    until the repository is public.
+  - there is no published release yet.
+  - the unauthenticated API rate limit (60/hour/IP) is exhausted.
+Pass --version vX.Y.Z to skip this lookup entirely."
 fi
 
 asset="arxd-${version}-${ASSET_ARCH}.tar.gz"
@@ -151,10 +158,22 @@ if [ "$dry_run" -eq 1 ]; then
     printf '  would download: %s/SHA256SUMS\n' "$base_url"
     printf '  would verify the archive against SHA256SUMS before unpacking\n'
 else
+    # A 404 here is ambiguous and the ambiguity matters: a private repository
+    # returns exactly the same status as a tag that doesn't exist, so naming
+    # only one of them sends the operator looking in the wrong place.
     curl -fSL --progress-bar -o "$tmp/$asset" "$base_url/$asset" \
-        || die "download failed — is ${version} a real release tag?"
+        || die "could not download ${asset}.
+GitHub returns 404 for both of these, so check both:
+  - the repository is private. Release assets on a private repo cannot be
+    fetched anonymously, and this installer does not authenticate. Until it
+    is public, copy the tarball across by hand and unpack it into
+    <base_path>/bin yourself.
+  - ${version} is not a published release tag.
+Releases: https://github.com/${REPO}/releases"
     curl -fsSL -o "$tmp/SHA256SUMS" "$base_url/SHA256SUMS" \
-        || die "release ${version} has no SHA256SUMS; refusing to install unverified"
+        || die "release ${version} has no SHA256SUMS asset; refusing to install unverified.
+If the tarball downloaded but this did not, the release was published without
+its checksum file — re-run the release workflow rather than skipping this."
 
     say "Verifying checksum"
     # Verified before the archive is ever unpacked, let alone executed.
@@ -248,12 +267,16 @@ fi
 # ------------------------------------------------------------------- systemd
 
 service_file="/etc/systemd/system/arxd.service"
+service_installed=0
 
 if [ "$have_systemd" -eq 0 ]; then
     warn "no systemd here — skipping service installation."
     echo "  Run the node in the foreground with:"
     echo "    set -a; . $env_file; set +a; $base_path/bin/arxd"
-elif ask_yn "Install the systemd service (needs sudo, writes ${service_file})?" 'y'; then
+else
+    # Generated before the prompt, not inside the yes branch: if the operator
+    # declines, the unit is still worth keeping (it already has this node's
+    # real paths baked in) and $tmp is wiped by the EXIT trap moments later.
     unit="$tmp/arxd.service"
     cat > "$unit" <<UNIT
 [Unit]
@@ -272,8 +295,8 @@ ExecStart=$base_path/bin/arxd
 Restart=always
 RestartSec=5
 # NOTE: a restart does NOT recover a chain that has stopped producing
-# blocks — the process stays healthy through a stall. See
-# Arxium_OpenItems.md §3. Alert on tip height, not on the unit.
+# blocks — the process stays healthy through a stall. Alert on the tip
+# advancing, not on this unit being active.
 
 # Hardening. arxd needs its base path and the network, nothing else.
 NoNewPrivileges=true
@@ -286,23 +309,36 @@ ReadWritePaths=$base_path
 WantedBy=multi-user.target
 UNIT
 
-    say "Installing ${service_file}"
-    if [ "$dry_run" -eq 1 ]; then
-        printf '  would sudo install -m 0644 the unit to %s\n' "$service_file"
-        printf '  would run: sudo systemctl daemon-reload\n'
-    else
-        sudo install -m 0644 "$unit" "$service_file"
-        sudo systemctl daemon-reload
-    fi
+    if ask_yn "Install the systemd service (needs sudo, writes ${service_file})?" 'y'; then
+        say "Installing ${service_file}"
+        if [ "$dry_run" -eq 1 ]; then
+            printf '  would sudo install -m 0644 the unit to %s\n' "$service_file"
+            printf '  would run: sudo systemctl daemon-reload\n'
+        else
+            sudo install -m 0644 "$unit" "$service_file"
+            sudo systemctl daemon-reload
+        fi
+        service_installed=1
 
-    if ask_yn 'Start arxd on boot?' 'y'; then
-        run sudo systemctl enable arxd
+        if ask_yn 'Start arxd on boot?' 'y'; then
+            run sudo systemctl enable arxd
+        fi
+        if ask_yn 'Start arxd now?' 'y'; then
+            run sudo systemctl start arxd
+        fi
+    else
+        kept_unit="$base_path/config/arxd.service"
+        say "Skipped installing the service."
+        if [ "$dry_run" -eq 1 ]; then
+            printf '  would keep the generated unit at %s\n' "$kept_unit"
+        else
+            cp "$unit" "$kept_unit"
+            echo "  Generated unit kept at ${kept_unit} — install it later with:"
+            echo "    sudo install -m 0644 ${kept_unit} ${service_file} && sudo systemctl daemon-reload"
+        fi
+        echo "  Or run in the foreground now:"
+        echo "    set -a; . $env_file; set +a; $base_path/bin/arxd"
     fi
-    if ask_yn 'Start arxd now?' 'y'; then
-        run sudo systemctl start arxd
-    fi
-else
-    say "Skipped the service. Unit template is in docs/runbook.md if you want it later."
 fi
 
 # ---------------------------------------------------------------------- done
@@ -315,11 +351,13 @@ $(say 'Done.')
   Config   $env_file
   Data     $base_path/data
 
-$(if [ "$have_systemd" -eq 1 ]; then cat <<'SYSTEMD'
+$(if [ "$service_installed" -eq 1 ]; then cat <<'SYSTEMD'
   Logs     journalctl -u arxd -f
   Status   systemctl status arxd
   Restart  systemctl restart arxd
 SYSTEMD
+else
+    printf '  Service  not installed — see above for how to start the node\n'
 fi)
   Health   curl -s localhost:30333/status
 

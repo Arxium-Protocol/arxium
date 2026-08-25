@@ -15,7 +15,7 @@ name = "xc-wire"
 version = "0.1.0"
 edition = "2024"
 description = "Wire types for the Arxium peer-to-peer block sync protocol"
-license = "Apache-2.0"
+license.workspace = true
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }

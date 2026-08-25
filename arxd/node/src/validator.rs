@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use rand::RngCore;

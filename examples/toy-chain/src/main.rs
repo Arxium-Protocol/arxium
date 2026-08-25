@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 //! Toy Chain: RWA (real-world-asset) sovereign chain MVP built purely on
 //! `core/` + `circuits/rwa-asset`, with no dependency on `arxd/*`. It exists
 //! to answer one question honestly: does the `core/` design (generic

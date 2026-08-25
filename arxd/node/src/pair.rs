@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 // ponytail: raw std::net HTTP client, same as `scripts/send-tx` — this CLI
 // command can't depend on that crate (it already depends on `node`), and
 // pulling in a full HTTP client for one signed POST/GET-poll loop isn't

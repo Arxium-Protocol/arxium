@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::action::{Action, SignatureError};
 use crate::address::Address;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::PathBuf;
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 // ponytail: devnet load-testing tool, same shape as scripts/send-tx (raw
 // std::net HTTP, devnet-keys.json instead of a real wallet). Single-threaded
 // pacing loop rather than a thread pool: the RPC layer's rate limiter

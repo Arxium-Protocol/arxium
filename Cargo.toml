@@ -30,6 +30,12 @@ members = [
 resolver = "2"
 default-members = ["arxd"]
 
+# Inherited by every member via `license.workspace = true`, so the LICENSE file
+# at the repository root and the metadata Cargo reports cannot disagree.
+[workspace.package]
+license = "Apache-2.0"
+repository = "https://github.com/Arxium-Protocol/Arxium"
+
 
 [workspace.dependencies]
 # internal packages

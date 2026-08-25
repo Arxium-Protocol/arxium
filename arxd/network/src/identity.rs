@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use anyhow::{Context, Result};
 use libp2p::identity::Keypair;
 use std::path::Path;

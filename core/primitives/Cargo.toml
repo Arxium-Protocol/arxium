@@ -9,8 +9,8 @@ name = "xc-primitives"
 version = "0.1.0"
 edition = "2024"
 description = "Core wire types for the Arxium chain: addresses, actions, and blocks"
-license = "Apache-2.0"
-repository = "https://github.com/Arxium-Protocol/Arxium"
+license.workspace = true
+repository.workspace = true
 keywords = ["arxium", "blockchain"]
 categories = ["cryptography::cryptocurrencies"]
 

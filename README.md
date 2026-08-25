@@ -1,156 +1,220 @@
-# Arxium Network: A Layer 0 blockchain
+# Arxium
 
-## Running a node
+A Layer 0 blockchain node, written in Rust.
+
+Arxium is a proof-of-stake chain built around **circuits** — small, isolated
+state-transition modules that validate and propose changes without writing
+them. A block's effects are computed by circuits, then committed atomically by
+the node. Account transfers, staking, real-world-asset issuance with
+compliance gating, and zero-knowledge identity credentials are each a separate
+circuit, and the chain that composes them declares its own action type rather
+than inheriting a fixed one.
+
+`arxd` is the node daemon. A single binary plays every role — validator, full
+node, or bootnode — selected by configuration, not by a separate build.
+
+> The repository is private ahead of launch. Until it is public, the install
+> script and release assets below are not reachable anonymously.
+
+## Quick start
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts/install.sh | bash
 ```
 
-Downloads the latest release (verifying it against the release's
-`SHA256SUMS` before unpacking), lays out `~/.arxium/{bin,config,data}`,
-writes an env file, prints this node's validator address, and installs a
-systemd unit. Pass `--dry-run` to see every step without touching the disk,
-or read the script first — it's one self-contained file, and
-`docs/runbook.md` documents the flags and the config format.
+Downloads the latest release and verifies it against the release's
+`SHA256SUMS` before unpacking, lays out `~/.arxium/{bin,config,data}`, writes a
+configuration file, prints this node's validator address, and generates a
+systemd unit. `--dry-run` shows every step without touching the disk.
 
-`arxd` itself stays lifecycle-agnostic: it runs in the foreground and logs
-to stdout. systemd owns restarts, journald owns logs. Building from source
-(`cargo build --release -p arxd`) is still the path on macOS and non-x86_64
-Linux, which the releases don't cover.
+Prebuilt releases target `x86_64-unknown-linux-gnu`. Everywhere else, build
+from source.
 
-## Phase 1: Core Protocol
+### Build from source
 
-Single-validator (one-node) chain: accept signed `Action`s over RPC, order
-them into blocks on a fixed schedule, apply them to account state. See
-`core/README.md`, `arxd/README.md`, and `circuits/README.md` for the
-architecture and the boundary rules between them.
+Requires a recent stable Rust toolchain, plus `clang`, `cmake` and
+`libclang-dev` for RocksDB.
 
-- **Primitives** (`core/primitives`): `Action<P>`/`Block<P>`, generic over
-  a chain-specific payload type `P` (hashing, proposer signing +
-  verification), bech32 `Address`, `Snapshot`/`AccountEntry`/
-  `ValidatorEntry`, deterministic round-robin proposer selection
-  (`expected_proposer`), ed25519 signature verification for actions. Each
-  chain defines its own payload enum (e.g. `arxd/node`'s `ActionPayload`,
-  `examples/toy-chain`'s `RwaPayload`) — there is no shared payload type.
-- **Storage** (`core/storage`): `ArxiumDb`, a RocksDB wrapper with typed
-  key encoding and a `BatchWritable` trait. Writes are atomic both
-  single-item (`write_batch`) and multi-item (`write_batches`) — a block
-  record and the account changes it caused commit together or not at all.
-  `AccountUpdates` (the write-batch shape account-touching circuits hand
-  back) lives here so any circuit can produce it without depending on
-  another circuit crate.
-- **Mempool** (`core/mempool`): `Mempool<P>`, capacity-bounded,
-  deduplicated by `(sender, nonce)`.
-- **Account circuit** (`circuits/account`): validates nonce and balance
-  for a plain sender/nonce/to/amount transfer (no `Action`/payload
-  knowledge), handles self-transfer correctly, returns proposed changes
-  without writing them.
-- **RWA asset circuit** (`circuits/rwa-asset`): `apply_issue` (self-mint
-  by the designated issuer) and `apply_compliant_transfer` (transfer
-  gated on both sender and recipient being KYC'd/allowlisted, via
-  `AccountEntry.identity_hash`) — composes with `circuits/account` for
-  the actual balance/nonce math rather than reimplementing it.
-- **Executor** (`core/executor`): verifies action signatures, dispatches
-  each action through a caller-supplied `dispatch` closure (payload →
-  circuit call is chain-specific, not hardcoded here), chains same-block
-  actions from one sender through an in-memory overlay, returns unwritten
-  updates for the caller to commit atomically. Chain-agnostic —
-  `examples/toy-chain` uses it with its own payload type and dispatch
-  table, proving the generic design holds for a chain with different
-  execution semantics than CoreChain's.
-- **CLI** (`core/cli`): the shared `--base-path`/`--port`/`--validator`/
-  `--rpc-token`/`--rpc-bind` arg struct → `NodeConfig`. Generic
-  node-operator config, no chain-specific flags — moved out of `arxd/node`
-  once nothing about it turned out to need CoreChain knowledge.
-- **Genesis** (`core/genesis`): `load_or_init_snapshot` — cache-or-parse
-  mechanics for a chain's genesis `Snapshot` (bincode cache after first
-  JSON parse). Takes the embedded genesis JSON as a parameter; each chain
-  still owns its own JSON file (e.g. `arxd/node/specs/devnet.json`).
-- **RPC** (`core/rpc`): `spawn_http_ingest<P>`, generic over the chain's
-  payload type. HTTP ingest (`POST /actions`, `GET /accounts/:address`,
-  `GET /actions/:signature`, `GET /status` for chain name/tip height/tip
-  hash) with constant-time bearer auth and per-IP rate limiting.
-  `POST /actions` rejects a bad signature or a stale/replayed nonce
-  (checked against on-chain state) before an action ever reaches the
-  mempool — insufficient-balance is still only caught at block-production
-  time, since balance can change before an action's turn. Explorer-ready
-  reads: `GET /blocks` (bounded range), `GET /blocks/:height`,
-  `GET /blocks/by-hash/:hash`, `GET /accounts/:address/actions`
-  (paginated, newest-first history), and `GET /search` (height/address/hash,
-  one endpoint so a client doesn't need to guess input type).
-- **Node** (`arxd/node`): wires the above together for CoreChain —
-  fixed-interval block production, round-robin validator turn-taking with
-  block signing, tip-block signature verification on startup (rejects a
-  corrupted/tampered tip instead of building on it), graceful shutdown
-  (ctrl-c/SIGTERM finishes the current loop iteration before exiting),
-  and CoreChain's own `ActionPayload`/dispatch table.
-- **Hardening pass**: RPC/mempool mutex locks recover from poisoning
-  instead of taking the whole node or RPC server down permanently after
-  one panic; the rate limiter's per-IP map sweeps stale entries instead of
-  growing forever; the validator signing key file is locked to `0600` on
-  every load, not just on first generation; block/account commits fsync
-  (`WriteOptions::set_sync(true)`) so the on-disk tip can't outrun durable
-  data across a hard crash.
+```sh
+cargo build --release -p arxd
+./target/release/arxd --help
+```
 
-Phase 1 has no remaining gaps of its own — the in-memory mempool isn't one:
-losing pending actions on restart is standard (Bitcoin/Ethereum included),
-and the intended recovery path is peer re-broadcast, not disk persistence.
-That makes it a Phase 2/networking capability, not something to fix here.
+## Running a node
 
-## Phase 2: Networking & Multi-Validator
+Every node joins the network, syncs, and serves RPC. Passing `--validator`
+additionally makes it produce blocks on its turn in the rotation — which
+requires its address to be in the validator set.
 
-Every item below traces back to the same root gap: a single node with no
-way to talk to any other node. Before networking, `arxd/node/specs/devnet.json`
-could declare two validators, but with no way for a second node to run and
-sync, only one validator's parity of heights could ever be produced — the
-chain advanced once and then stalled forever waiting on the other
-validator's turn. That was fixed by the P2P/gossip and block/state sync
-work below, live-verified past height 100 across two real machines. The
-validator set was static at first too (read once from the genesis snapshot,
-no join/leave mechanism) — that's now closed as well: join/leave is a
-regular action, no separate governance path or `arxd/runtime` dependency
-needed for it.
+```sh
+arxd --base-path ~/.arxium/data                  # full node
+arxd --base-path ~/.arxium/data --validator      # validator
+```
 
-- **P2P/gossip layer** (done) — `arxd/network`, generic over the chain's
-  payload type `P`. mDNS discovery on a LAN, `gossipsub` for action/block
-  propagation, and a fixed-seed `--bootnode` identity plus a chain-spec-owned
-  `Snapshot.boot_nodes` list (Polkadot-style) so a fresh node needs zero
-  flags to find the network across separate machines/networks, not just a
-  shared LAN. Nested under `arxd/` rather than `core/`, mirroring how
-  Substrate/Polkadot keep `sc-network`/networking subsystems under
-  `client/`/`node/` rather than in role-agnostic primitives.
-- **Block/state sync** (done) — `libp2p::request_response` in `arxd/network`
-  (`SyncRequest::Status`/`Blocks`, exchanged on connect and every 5s
-  thereafter). A node behind a peer's reported tip requests the gap and
-  applies each block through the same `accept_block` re-validation path
-  gossip uses — no separate execution logic, sync is just a second delivery
-  mechanism into the same acceptance path. Live-verified across two real
-  machines converging to an identical tip height and hash after a late join.
-- **Multi-validator round-robin that actually works** (done) — the devnet's
-  two genesis validators both produce on their turn because both nodes are
-  running, gossiping, and syncing, closing the stall described above.
-  Verified live past height 100 across two machines.
-- **Peer/network hardening** (done) — `connection_limits::Behaviour` caps
-  established/pending connections per peer and overall; a per-peer
-  bad-gossip counter (`arxd/network`'s `record_bad_gossip`) disconnects a
-  peer sending unambiguously-bad gossip (undecodable bytes, forged action or
-  block signatures) past a threshold, without penalizing an honest peer
-  that's just behind (stale nonce, wrong turn, parent mismatch).
-- **Dynamic validator set** (done) — `JoinValidator`/`LeaveValidator` are
-  regular `ActionPayload` variants, going through the mempool and
-  `execute_actions`/`accept_block` exactly like a transfer. A change applied
-  in block `H` takes effect at block `H + 1` (a validator can't vote itself
-  into that block's own proposer slot), and the set is stored per-height in
-  `ArxiumDb` (`get_validator_set_at`) so a syncing/replaying node always
-  computes the same round-robin proposer a live node did at the time.
-  Leaving the last validator is rejected (would stall the chain forever).
-  Stake is bookkeeping only — `expected_proposer` still ignores it.
+Configuration comes from flags or the matching `ARXD_*` environment variables,
+with flags taking precedence. The installer writes an env file that both
+systemd (`EnvironmentFile=`) and `arxd` read directly.
 
-## Not started
+| Flag | Environment | Default | Purpose |
+| --- | --- | --- | --- |
+| `--base-path` | `ARXD_BASE_PATH` | `~/.arxium` | Keys, chain database, genesis cache |
+| `--port` | `ARXD_PORT` | `30333` | HTTP RPC listener |
+| `--p2p-port` | `ARXD_P2P_PORT` | `30334` | libp2p listener (TCP + QUIC) |
+| `--validator` | `ARXD_VALIDATOR` | `false` | Produce blocks on this node's turn |
+| `--rpc-bind` | `ARXD_RPC_BIND` | `127.0.0.1` | RPC bind address |
+| `--rpc-token` | `ARXD_RPC_TOKEN` | none | Require `Authorization: Bearer <token>` |
+| `--bootnodes` | `ARXD_BOOTNODES` | chain spec | Comma-separated peer multiaddrs |
+| `--bootnode` | `ARXD_BOOTNODE` | `false` | Use the well-known seeded network identity |
 
-- **Spoke Chains** (multi-chain phase) — vocabulary decided, nothing
-  built. Free to rename before any code lands.
-- **`arxd/runtime` as a real crate** (not started) — currently just a
-  placeholder README, not a workspace member. A state-root registry,
-  cross-chain conflict resolution, and slashing — none of which the
-  now-working dynamic validator set needed.
+`arxd` runs in the foreground and logs to stdout. It does not daemonize, write
+a PID file, or restart itself — process lifecycle belongs to systemd, and logs
+to journald.
+
+### Keys
+
+A node holds up to three identities, each generated on first use and stored
+under `--base-path` with owner-only permissions.
+
+```sh
+arxd validator-key    # Ed25519 block-signing address — must be in the validator set
+arxd bls-key          # BLS finality key — register on-chain to have precommits counted
+arxd node-key         # libp2p PeerId — the network identity
+```
+
+`validator.key` is the validator's entire signing identity and has no recovery
+path. Back up `<base-path>` — `scripts/backup-node.sh` does this.
+
+An operator wallet can be authorized to submit staking actions on a
+validator's behalf without the signing key leaving the machine:
+
+```sh
+arxd pair --node <host:port> --token <rpc-token>
+```
+
+## RPC
+
+HTTP, JSON. Bearer auth and per-IP rate limiting apply when a token is set.
+`arxd` speaks plain HTTP — put a TLS-terminating proxy in front of any
+non-loopback deployment.
+
+| Endpoint | Description |
+| --- | --- |
+| `POST /actions` | Submit a signed action |
+| `GET /status` | Chain name, tip height, tip hash |
+| `GET /accounts/{address}` | Balance, nonce, identity hash |
+| `GET /accounts/{address}/stake` | Stake allocations and unbonding |
+| `GET /accounts/{address}/bls-key` | Registered BLS finality key |
+| `GET /actions/{signature}` | Status of a submitted action |
+| `GET /blocks` | Bounded range of blocks |
+| `GET /blocks/{height}` | Block by height |
+| `GET /blocks/by-hash/{hash}` | Block by hash |
+| `GET /validators` | Current validator set |
+| `GET /operators/{address}/validators` | Validators an operator may act for |
+| `GET /search` | Height, address, or hash — one endpoint, type inferred |
+| `GET /min-stake` | Minimum stake to become a validator |
+| `GET /action-fee` | Flat per-action fee |
+| `POST /pairing` | Begin operator-wallet pairing |
+| `GET /metrics` | Prometheus text format |
+
+Submissions are rejected at the boundary for a bad signature or a stale nonce,
+before reaching the mempool. Insufficient balance is caught at block
+production, since balance can change between submission and inclusion.
+
+The node serves current state and blocks it holds. It deliberately does not
+serve per-address transaction history or aggregate queries — those belong to
+an indexer reading the chain, not to the node's hot path.
+
+## Actions
+
+| Action | Effect |
+| --- | --- |
+| `Transfer` | Move balance between accounts |
+| `Stake` / `Unstake` | Delegate to a validator; unstaking unbonds over 100 blocks |
+| `JoinValidator` / `LeaveValidator` | Enter or leave the validator set |
+| `RegisterBlsKey` | Register a BLS key so precommits count toward finality |
+| `SubmitEquivocationEvidence` | Report a validator that signed two blocks at one height |
+| `VerifyIdentityCredential` | Prove a credential in zero knowledge |
+| `AuthorizeOperator` / `RevokeOperator` | Delegate action submission to another account |
+
+## Chain parameters
+
+| Parameter | Value |
+| --- | --- |
+| Denomination | 1 ARX = 1,000,000,000 IUM |
+| Block interval | 2s |
+| Slot duration | 4s |
+| Action fee | 0.001 ARX |
+| Minimum validator stake | 100,000 ARX |
+| Unbonding period | 100 blocks |
+| Finality | BLS aggregate precommits, 2/3+1 of the validator set |
+
+These are compile-time constants. Changing one is a coordinated release, not a
+runtime setting.
+
+## Architecture
+
+Three layers, with a dependency rule enforced between them: `arxd` depends on
+`core` and `circuits`; nothing in `core` may depend back into `arxd`.
+
+| Crate | Responsibility |
+| --- | --- |
+| `core/primitives` | `Action<P>`/`Block<P>` generic over a chain's payload type, addresses, proposer selection |
+| `core/storage` | RocksDB wrapper with typed keys and atomic multi-item batches |
+| `core/executor` | Signature verification, action dispatch, block acceptance |
+| `core/mempool` | Capacity-bounded pending pool, deduplicated by `(sender, nonce)` |
+| `core/rpc` | HTTP ingest and reads, generic over the payload type |
+| `core/bls` | BLS12-381 signing, verification, aggregation |
+| `core/cli`, `core/genesis`, `core/wire` | Node configuration, genesis bootstrap, wire types |
+| `circuits/account` | Balance and nonce transitions |
+| `circuits/staking` | Staking, unbonding, slashing, block rewards |
+| `circuits/rwa-asset` | Asset issuance and compliance-gated transfer |
+| `circuits/identity-zk` | Groth16 credential proofs |
+| `arxd/node` | Block production, role selection, this chain's action type and dispatch |
+| `arxd/network` | libp2p — gossip, discovery, block and state sync |
+| `arxd/finality` | Precommit signing and aggregation to a finality record |
+| `arxd/runtime` | Equivocation detection and slashing |
+
+The boundary rule is a question, answered twice. **Does this need to know what
+role the node is playing?** If yes it belongs under `arxd/`; if no it belongs
+in `core/`. Role is decided once, at startup, as a config value — never as a
+branch inside `execute_block` or the mempool. Each directory's `README.md`
+covers its own half in detail.
+
+Circuits never write. They validate a transition and return the proposed
+changes; the node commits them, so a block's record and every account it
+touched land in one atomic batch or not at all.
+
+## Documentation
+
+- [`docs/runbook.md`](docs/runbook.md) — operating a node: setup, health
+  checks, stall detection, backups, upgrades, incident playbooks
+- [`core/README.md`](core/README.md), [`arxd/README.md`](arxd/README.md),
+  [`circuits/README.md`](circuits/README.md) — layer architecture and
+  boundary rules
+- [`scripts/README.md`](scripts/README.md) — development and operations tools
+
+## Development
+
+```sh
+cargo test --workspace
+cargo clippy --workspace --all-targets
+```
+
+`examples/toy-chain` is a second chain built on the same `core` crates with a
+different payload type and execution semantics — it exists to keep the generic
+boundaries honest.
+
+## License
+
+Copyright 2026 Arxium Protocol AG. Licensed under the
+[Apache License, Version 2.0](LICENSE).
+
+Apache-2.0 is the mainstream choice for Rust layer-1 nodes (Solana, Sui) and
+for the Cosmos stack. Beyond being permissive, it carries an explicit patent
+grant and retaliation clause — which matters for a chain whose compliance and
+identity circuits are aimed at institutional users, where a patent grant is
+usually a prerequisite for participation.
+
+Every crate in the workspace inherits `license = "Apache-2.0"` from
+`[workspace.package]`, so the metadata Cargo reports and this file cannot
+drift apart.

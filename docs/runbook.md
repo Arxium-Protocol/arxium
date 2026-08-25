@@ -21,6 +21,12 @@ TLS-terminating proxy in front of libp2p.
 
 The shortest path, and the one to hand someone standing up their first node:
 
+> **Not usable yet — the repository is private.** Both this URL and the
+> release assets it downloads return 404 to anonymous requests, and the
+> installer does not authenticate. Until the repo is public, copy the
+> release tarball across by hand. The installer's own error message says
+> the same thing if you run it anyway.
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts/install.sh | bash
 ```
@@ -131,8 +137,11 @@ there, this node will never propose until a `JoinValidator` action adds it.
   hasn't written yet, `500` on a storage read error — either is worth
   investigating immediately, not retrying blindly).
 - `GET /metrics` → Prometheus text format. Key series (see `arxd/node/src/lib.rs`
-  and `produce.rs`): `arxium_tip_height` (gauge — should climb roughly every
-  `BLOCK_INTERVAL`, 2s), `arxium_blocks_produced_total` /
+  and `produce.rs`): `arxium_tip_timestamp_seconds` (gauge — **the one to
+  alert on**, see below), `arxium_tip_height` (gauge — should climb roughly
+  every `BLOCK_INTERVAL`, 2s), `arxium_is_expected_proposer` (0/1),
+  `arxium_consensus_round`, `arxium_production_skipped_not_eligible_total`,
+  `arxium_blocks_produced_total` /
   `arxium_blocks_accepted_total` / `arxium_blocks_rejected_total` (counters),
   `arxium_mempool_pending_actions` (gauge), `arxium_block_production_errors_total`,
   `arxium_rpc_requests_total` (per-endpoint, `core/rpc/src/lib.rs`).
@@ -142,6 +151,67 @@ there, this node will never propose until a `JoinValidator` action adds it.
 - Tip not advancing is the #1 symptom to watch. Cross-check against the
   validator-identity gotcha above before assuming it's a deeper bug —
   that's the single most likely cause on a freshly (re)provisioned box.
+
+### Detecting a stall
+
+**Alert on `arxium_tip_timestamp_seconds`, not on `arxium_tip_height`.**
+A stalled chain holds the height gauge at a constant value, which is
+indistinguishable from a chain nobody is transacting on unless you diff it
+over time. The tip's own timestamp makes it one expression:
+
+```promql
+time() - arxium_tip_timestamp_seconds > 120
+```
+
+A 2s block interval means 120s is ~60 missed blocks — comfortably past any
+normal `fsync` or compaction hiccup. Without a Prometheus server, the same
+check by hand:
+
+```sh
+curl -s localhost:30333/metrics | grep '^arxium_tip_timestamp_seconds'
+# compare against: date +%s
+```
+
+**Do not alert on the systemd unit.** `arxd` stays healthy through a stall —
+`systemctl status arxd` reported `active (running)` for ~17 hours during the
+original incident. `Restart=always` is not a remedy either: restarting
+against the same persisted height changes nothing. This is an
+application-liveness failure, which process supervision cannot see.
+
+**A fresh node reports `arxium_tip_timestamp_seconds 0` until it has a block
+past genesis.** Genesis carries a synthetic timestamp of 0, so the stall
+expression above fires immediately on a node that never produces. That is
+intended, not a false positive — it is exactly the validator-identity gotcha
+above, caught in seconds instead of after an hour of silence.
+
+### Why this node isn't producing
+
+Three signals, in the order worth checking:
+
+- **`arxium_is_expected_proposer`** (0/1) — whether it is currently this
+  node's turn. Pinned at 0 while the tip is stale means this node is not in
+  the rotation at all: check `GET /validators` against
+  `arxd validator-key --base-path <base_path>/data`.
+- **`arxium_production_skipped_not_eligible_total`** — climbing is normal on
+  a multi-validator chain (it is simply someone else's turn). Climbing *while
+  the tip is stale* is the stall signature.
+- **`arxium_consensus_round`** — which rotation round the current wait is in.
+  0 means the primary still holds its slot; a climbing round means slots are
+  being missed and eligibility is rotating on looking for someone alive.
+
+The log carries the same picture, rate-limited to once every 30s so it
+doesn't bury everything else:
+
+```text
+INFO not producing height 1: round 0 belongs to arx1syu…, this node is arx1wx0… (0s since the parent block)
+WARN not producing height 431: 47s since the parent block (round 11) — expected proposer is
+     arx1syu…, this node is arx1wx0…. Nothing has produced for several rotations; the chain
+     may be stalled.
+```
+
+The escalation from `INFO` to `WARN` happens once the silence passes ten
+slots, which is several full rotations — past the point where "someone
+else's turn" explains it.
 - `GET /validators` — current validator set, useful to confirm this node's
   identity is actually a member before worrying about why it isn't
   producing.

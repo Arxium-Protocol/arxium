@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 // ponytail: testing-only tool for a local devnet. Raw std::net HTTP instead of
 // pulling in an HTTP client crate; devnet-keys.json instead of a real wallet.
 use anyhow::{bail, Context, Result};

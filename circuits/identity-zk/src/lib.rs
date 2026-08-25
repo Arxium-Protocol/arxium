@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 //! Toy zk credential-proof circuit: proves knowledge of a preimage `x` such
 //! that `Poseidon(x) == credential_hash`, matching
 //! `AccountEntry.identity_hash`. Groth16 over BLS12-381 (arkworks), per the

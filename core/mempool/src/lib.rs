@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 // ponytail: testing-only admin tool for local devnet, mirroring scripts/send-tx.
 // `circuit_staking::apply_slash` is deliberately not wired to any
 // `ActionPayload` variant — unreachable from RPC/mempool by construction, not

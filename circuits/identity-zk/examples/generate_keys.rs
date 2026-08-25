@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 //! One-time devnet key generation: writes `pk.bin`/`vk.bin` next to this
 //! crate's `Cargo.toml`, checked into the repo. **Not a real trusted-setup
 //! ceremony** — see the module docs in `src/lib.rs`. Re-run only if the

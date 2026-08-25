@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 //! Wire types for the Arxium peer-to-peer block sync protocol.
 //!
 //! Shared by `arxd/network` and by external indexers, so both sides compile

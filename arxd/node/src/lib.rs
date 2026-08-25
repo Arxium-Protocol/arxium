@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 mod bootstrap;
 mod pair;
 pub mod payload;
@@ -40,6 +43,34 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// How often the "not producing" line may repeat. A skip happens every
+/// couple of seconds on a node that isn't the current proposer, so logging
+/// each one would bury everything else; the counter carries the exact
+/// count, the log only has to make the situation visible.
+pub(crate) const SKIP_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Silence beyond which a skip stops being routine. A full rotation takes
+/// `validators * SLOT_DURATION`, so several rotations with nobody producing
+/// means it isn't simply someone else's turn — that is the stall shape, and
+/// it escalates the log line from info to warn.
+pub(crate) const STALL_SUSPECT_AFTER: Duration =
+    Duration::from_secs(SLOT_DURATION.as_secs() * 10);
+
+/// Both tip gauges, always set together — three separate sites advance the
+/// tip (startup, a produced block, an accepted block) and they must not
+/// drift apart.
+///
+/// `arxium_tip_timestamp_seconds` is the one that actually detects a stall.
+/// `arxium_tip_height` holds a constant value on a stalled chain and on a
+/// merely quiet one alike, so monitoring cannot tell them apart without
+/// diffing it over time; exporting the tip's own timestamp turns that into
+/// a single expression, `now - arxium_tip_timestamp_seconds > N`. The
+/// original stall ran ~17 hours unnoticed for exactly this reason.
+pub(crate) fn record_tip(height: u64, timestamp: u64) {
+    gauge!("arxium_tip_height").set(height as f64);
+    gauge!("arxium_tip_timestamp_seconds").set(timestamp as f64);
 }
 
 pub fn run() -> Result<()> {
@@ -114,7 +145,15 @@ pub fn run() -> Result<()> {
     let metrics_handle = PrometheusBuilder::new()
         .install_recorder()
         .context("failed to install metrics recorder")?;
-    gauge!("arxium_tip_height").set(db.get_tip_height()?.unwrap_or(0) as f64);
+    // Seeded at startup so a node that comes up already stalled reports a
+    // stale tip immediately, rather than exporting nothing until the first
+    // block it never produces.
+    let startup_tip = db.get_tip_height()?.unwrap_or(0);
+    let startup_tip_timestamp = db
+        .get_block::<ActionPayload>(startup_tip)?
+        .map(|b: ChainBlock| b.timestamp)
+        .unwrap_or(0);
+    record_tip(startup_tip, startup_tip_timestamp);
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
 
@@ -259,7 +298,7 @@ pub fn run() -> Result<()> {
                         accepted.hash()
                     );
                     counter!("arxium_blocks_accepted_total").increment(1);
-                    gauge!("arxium_tip_height").set(accepted.height as f64);
+                    record_tip(accepted.height, accepted.timestamp);
                     {
                         let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
                         for action in &accepted.actions {

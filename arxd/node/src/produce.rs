@@ -1,5 +1,8 @@
+// Copyright (c) 2026 Arxium Protocol AG
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::payload::{ACTION_FEE, ActionPayload, ChainBlock, dispatch};
-use crate::{BLOCK_INTERVAL, SLOT_DURATION, now_secs};
+use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, SLOT_DURATION, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use finality::FinalityEvent;
@@ -8,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
@@ -181,6 +185,11 @@ pub fn produce_loop(
     block_tx: &tokio::sync::mpsc::UnboundedSender<ChainBlock>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
+    // Rate-limit state for the skip log below. Local because `produce_loop`
+    // owns its thread — no lock needed, and no risk of two producers sharing
+    // a window.
+    let mut last_skip_log: Option<Instant> = None;
+
     loop {
         thread::sleep(BLOCK_INTERVAL);
 
@@ -224,10 +233,53 @@ pub fn produce_loop(
                     now.saturating_sub(parent.timestamp)
                 };
                 let validators = db.get_validator_set_at(next_height)?;
+                let round = elapsed / SLOT_DURATION.as_secs().max(1);
+                gauge!("arxium_consensus_round").set(round as f64);
                 match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())
                 {
-                    Some(expected) if &expected == address => Some((address, key)),
-                    Some(_) => {
+                    Some(expected) if &expected == address => {
+                        gauge!("arxium_is_expected_proposer").set(1.0);
+                        Some((address, key))
+                    }
+                    // Skipping is normal — it's simply another validator's
+                    // turn. Skipping *forever* is the failure mode that took
+                    // ~17 hours to notice, and it used to be a bare
+                    // `continue` with nothing logged and nothing counted.
+                    //
+                    // Deliberately not a proposer-address gauge: a label
+                    // carrying an address goes stale the moment the proposer
+                    // changes and sits at 1 forever. "Is it my turn" is the
+                    // question an operator actually has, and it's a plain
+                    // 0/1 with no cardinality.
+                    Some(expected) => {
+                        gauge!("arxium_is_expected_proposer").set(0.0);
+                        counter!("arxium_production_skipped_not_eligible_total").increment(1);
+
+                        let due = last_skip_log
+                            .map(|at| at.elapsed() >= SKIP_LOG_INTERVAL)
+                            .unwrap_or(true);
+                        if due {
+                            last_skip_log = Some(Instant::now());
+                            // Every field here is one a post-hoc diagnosis
+                            // needs and cannot recover afterwards: which
+                            // height, how long the chain has been silent,
+                            // which round that put us in, who that round
+                            // belongs to, and who this node is.
+                            if elapsed >= STALL_SUSPECT_AFTER.as_secs() {
+                                warn!(
+                                    "not producing height {next_height}: {elapsed}s since the \
+                                     parent block (round {round}) — expected proposer is \
+                                     {expected}, this node is {address}. Nothing has produced \
+                                     for several rotations; the chain may be stalled."
+                                );
+                            } else {
+                                info!(
+                                    "not producing height {next_height}: round {round} belongs \
+                                     to {expected}, this node is {address} ({elapsed}s since \
+                                     the parent block)"
+                                );
+                            }
+                        }
                         drop(guard);
                         continue;
                     }
@@ -270,7 +322,7 @@ pub fn produce_loop(
                     block.hash()
                 );
                 counter!("arxium_blocks_produced_total").increment(1);
-                gauge!("arxium_tip_height").set(block.height as f64);
+                crate::record_tip(block.height, block.timestamp);
                 // Only signed blocks are meaningful to peers — an unsigned
                 // block (non-validator solo mode) has no proposer for
                 // `accept_block`'s expected-proposer check to match.
