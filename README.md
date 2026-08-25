@@ -1,5 +1,23 @@
 # Arxium Network: A Layer 0 blockchain
 
+## Running a node
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts/install.sh | bash
+```
+
+Downloads the latest release (verifying it against the release's
+`SHA256SUMS` before unpacking), lays out `~/.arxium/{bin,config,data}`,
+writes an env file, prints this node's validator address, and installs a
+systemd unit. Pass `--dry-run` to see every step without touching the disk,
+or read the script first — it's one self-contained file, and
+`docs/runbook.md` documents the flags and the config format.
+
+`arxd` itself stays lifecycle-agnostic: it runs in the foreground and logs
+to stdout. systemd owns restarts, journald owns logs. Building from source
+(`cargo build --release -p arxd`) is still the path on macOS and non-x86_64
+Linux, which the releases don't cover.
+
 ## Phase 1: Core Protocol
 
 Single-validator (one-node) chain: accept signed `Action`s over RPC, order

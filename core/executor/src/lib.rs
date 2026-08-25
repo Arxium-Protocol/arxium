@@ -2,9 +2,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::warn;
+use std::time::{SystemTime, UNIX_EPOCH};
 use xc_primitives::{
-    AccountEntry, Action, Address, Block, SignatureError, StakeAllocation, ValidatorChange,
-    eligible_proposer, expected_proposer,
+    AccountEntry, Action, Address, Block, MAX_FUTURE_DRIFT_SECS, SignatureError, StakeAllocation,
+    ValidatorChange, eligible_proposer, expected_proposer,
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, OperatorUpdates,
@@ -100,6 +101,23 @@ pub enum AcceptBlockError {
     NotNextHeight { block_height: u64, tip_height: u64 },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
     ParentMismatch { local: String, expected: String },
+    #[error(
+        "block {height} timestamp {timestamp} does not advance past its parent's {parent_timestamp}"
+    )]
+    NonMonotonicTimestamp {
+        height: u64,
+        timestamp: u64,
+        parent_timestamp: u64,
+    },
+    #[error(
+        "block {height} timestamp {timestamp} is {drift}s ahead of local clock (max {max_drift}s)"
+    )]
+    TimestampTooFarAhead {
+        height: u64,
+        timestamp: u64,
+        drift: u64,
+        max_drift: u64,
+    },
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
     #[error("failed to execute block actions: {0}")]
@@ -170,6 +188,51 @@ where
             local: parent.hash(),
             expected: block.parent_hash.clone(),
         });
+    }
+
+    // Timestamps are consensus-critical here, not just metadata: proposer
+    // eligibility below is derived from `block.timestamp - parent.timestamp`,
+    // so an unchecked timestamp lets a proposer choose its own eligibility.
+    // Both rules are skipped for the block after genesis, whose parent
+    // timestamp is a synthetic 0 rather than a real moment (see the `elapsed`
+    // comment below).
+    if parent.height > 0 {
+        // Monotonicity. Without it, a proposer can stamp a block at or before
+        // its parent and `saturating_sub` silently reports `elapsed == 0`,
+        // which is always the primary's own window — a way to take a height
+        // that had already rotated away.
+        if block.timestamp <= parent.timestamp {
+            return Err(AcceptBlockError::NonMonotonicTimestamp {
+                height: block.height,
+                timestamp: block.timestamp,
+                parent_timestamp: parent.timestamp,
+            });
+        }
+
+        // Future-drift bound. This is the one place acceptance consults the
+        // local wall clock, which is a deliberate exception to the
+        // "never wall-clock-at-receipt" rule `eligible_proposer` documents:
+        // two nodes with different clocks can briefly disagree about a block
+        // right at the boundary. That is safe here only because rejection is
+        // recoverable — the node stays behind and sync re-requests the height
+        // moments later — and because the alternative is unbounded: a
+        // timestamp years ahead poisons every descendant's `elapsed`.
+        //
+        // Only *future* drift is checked. Historical blocks replayed during
+        // sync have timestamps in the past and pass unconditionally, so
+        // catch-up never depends on how long ago the chain produced a block.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if block.timestamp > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
+            return Err(AcceptBlockError::TimestampTooFarAhead {
+                height: block.height,
+                timestamp: block.timestamp,
+                drift: block.timestamp.saturating_sub(now),
+                max_drift: MAX_FUTURE_DRIFT_SECS,
+            });
+        }
     }
 
     // The set as of `block.height` — a change made *by* this block only
@@ -797,5 +860,141 @@ mod tests {
             .unwrap();
         assert_eq!(allocation.active_amount, 200);
         assert!(allocation.unbonding.is_none());
+    }
+
+    /// Builds a single-validator chain up to height 1 and returns everything
+    /// needed to propose height 2. A one-validator set means `eligible_proposer`
+    /// always returns that validator, so these tests isolate the timestamp
+    /// rules from the proposer rule.
+    fn chain_at_height_one(
+        block1_timestamp: u64,
+    ) -> (ArxiumDb, SigningKey, Address, Block<TestPayload>) {
+        let db = temp_db();
+        let key = SigningKey::from_bytes(&[11u8; 32]);
+        let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+            .unwrap();
+
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: block1_timestamp,
+            actions: vec![],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(addr.clone(), &key);
+        let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        (db, key, addr, block1)
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    fn signed_block_at(
+        key: &SigningKey,
+        addr: &Address,
+        parent: &Block<TestPayload>,
+        timestamp: u64,
+    ) -> Block<TestPayload> {
+        let mut block = Block {
+            height: parent.height + 1,
+            parent_hash: parent.hash(),
+            timestamp,
+            actions: vec![],
+            proposer: None,
+            signature: None,
+        };
+        block.sign(addr.clone(), key);
+        block
+    }
+
+    /// A proposer must not be able to stamp a block at or before its parent.
+    /// `elapsed` is computed with `saturating_sub`, so a backwards timestamp
+    /// silently reads as `elapsed == 0` — the primary's own window — which is
+    /// a way to claim a height that had already rotated to someone else.
+    #[test]
+    fn rejects_a_timestamp_that_does_not_advance_past_the_parent() {
+        let base = now_secs() - 10;
+        let (db, key, addr, block1) = chain_at_height_one(base);
+
+        for stamp in [base, base - 1, 0] {
+            let block2 = signed_block_at(&key, &addr, &block1, stamp);
+            let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+            assert!(
+                matches!(err, AcceptBlockError::NonMonotonicTimestamp { .. }),
+                "timestamp {stamp} against parent {base} should be rejected, got {err:?}",
+            );
+        }
+
+        // One second later is the minimum acceptable step, and it works.
+        let block2 = signed_block_at(&key, &addr, &block1, base + 1);
+        assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
+    }
+
+    /// Proposer eligibility is derived from block timestamps, so an unbounded
+    /// future timestamp lets a proposer buy itself an arbitrary round *and*
+    /// poisons every descendant's `elapsed` for as long as the forgery is
+    /// ahead. Bounded by `MAX_FUTURE_DRIFT_SECS`.
+    #[test]
+    fn rejects_a_timestamp_too_far_in_the_future() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+
+        // A year ahead: the shape that used to stall the rotation indefinitely.
+        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + 31_536_000);
+        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::TimestampTooFarAhead { .. }),
+            "got {err:?}",
+        );
+
+        // Just past the bound is still rejected.
+        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
+        assert!(matches!(
+            accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err(),
+            AcceptBlockError::TimestampTooFarAhead { .. }
+        ));
+
+        // Modest skew inside the bound is accepted — an honest node with a
+        // slightly fast clock must not have its blocks refused.
+        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + 2);
+        assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
+    }
+
+    /// Only *future* drift is bounded. Blocks replayed during sync are old by
+    /// definition, and catch-up must never depend on how long ago the chain
+    /// produced them — a chain idle for a year still has to be syncable.
+    #[test]
+    fn old_blocks_replayed_during_sync_are_not_rejected_for_drift() {
+        let long_ago = now_secs() - 31_536_000;
+        let (db, key, addr, block1) = chain_at_height_one(long_ago);
+
+        let block2 = signed_block_at(&key, &addr, &block1, long_ago + 4);
+        assert!(
+            accept_block(&db, block2, 4, true, 0, dispatch).is_ok(),
+            "a year-old block must still replay during sync",
+        );
+    }
+
+    /// The block after genesis is exempt: genesis carries a synthetic
+    /// timestamp of 0 rather than a real moment, so measuring block 1 against
+    /// it is meaningless. Guards the exemption against being dropped by
+    /// someone tightening the rule later — it would make every chain
+    /// unstartable.
+    #[test]
+    fn the_block_after_genesis_is_exempt_from_the_timestamp_rules() {
+        let (_db, _key, _addr, block1) = chain_at_height_one(now_secs());
+        assert_eq!(block1.height, 1, "block 1 must be accepted over synthetic genesis");
     }
 }

@@ -17,7 +17,74 @@ reverse-proxies RPC over the private compose network; `arxd`'s RPC port is
 never published to the host. P2P (`30334`) is published directly — there's no
 TLS-terminating proxy in front of libp2p.
 
-## First-time setup (production VPS)
+## First-time setup (install script)
+
+The shortest path, and the one to hand someone standing up their first node:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts/install.sh | bash
+```
+
+To read it before running it — recommended, and the reason it's a single
+self-contained file:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts/install.sh -o install.sh
+less install.sh
+bash install.sh            # add --dry-run first to see every step, touching nothing
+```
+
+What it does: resolves the latest GitHub release (`--version vX.Y.Z` to pin
+one), downloads the binary **and `SHA256SUMS`, verifying the archive before
+unpacking it** (it refuses to install if either the checksum file or a
+matching digest is missing), lays out `<base_path>/{bin,config,data}`,
+writes `config/arxd.env`, prints this node's validator address, and
+generates + installs a systemd unit. Flags: `--base-path`, `--yes`
+(non-interactive, all defaults), `--dry-run`.
+
+Releases are `x86_64-unknown-linux-gnu` only. On anything else the script
+stops and tells you to `cargo build --release -p arxd` instead; on a Linux
+box without systemd it installs everything but the unit and prints the
+foreground command.
+
+### Configuration lives in an env file, not a TOML file
+
+`<base_path>/config/arxd.env` is read by systemd (`EnvironmentFile=`) and by
+`arxd` itself (clap `env` on every `RunArgs` field). There is no config
+parser in `arxd` and no precedence rules to learn beyond one: **a
+command-line flag beats the env file**, so a one-off run can override the
+installed config without editing it.
+
+```sh
+sudo systemctl stop arxd
+sudo -u <node-user> ~/.arxium/bin/arxd --rpc-bind 0.0.0.0    # try it
+$EDITOR ~/.arxium/config/arxd.env                            # then make it stick
+sudo systemctl restart arxd
+```
+
+`ARXD_VALIDATOR` and `ARXD_BOOTNODE` take an explicit `true`/`false` — the
+value is read, not just the key's presence, so setting one to `false`
+genuinely turns it off. `ARXD_BOOTNODES=` left blank means "use the chain
+spec's own `boot_nodes`", which is what a devnet node wants.
+
+### Check the validator address before starting
+
+The single most common silent failure is a node whose validator identity
+isn't in the chain spec's validator set: RPC comes up, P2P listens, genesis
+writes, and the tip never advances — with nothing logged. `install.sh`
+prints the address during setup for exactly this reason, and you can ask
+again at any time without starting the node:
+
+```sh
+arxd validator-key --base-path <base_path>/data
+```
+
+Cross-check it against `curl -s localhost:30333/validators`. If it isn't
+there, this node will never propose until a `JoinValidator` action adds it.
+
+## First-time setup (production VPS, Docker)
+
+
 
 1. `docker buildx build --platform linux/amd64 -t <you>/arxd:latest --push .`
    from a dev machine — a small VPS (2GB RAM) can run the binary but

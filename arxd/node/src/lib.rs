@@ -52,6 +52,13 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::ValidatorKey { base_path }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        let key = validator::load_or_generate_key(base_path)?;
+        println!("{}", Address::from_pubkey_bytes(key.verifying_key().as_bytes())?);
+        return Ok(());
+    }
+
     if let Some(Command::BlsKey { base_path, qr }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
         let (_secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
