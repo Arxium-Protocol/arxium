@@ -184,6 +184,50 @@ expression above fires immediately on a node that never produces. That is
 intended, not a false positive — it is exactly the validator-identity gotcha
 above, caught in seconds instead of after an hour of silence.
 
+### Is the chain finalizing?
+
+Producing blocks and finalizing them are separate, and a chain can do the
+first indefinitely while doing none of the second. A validator precommits only
+if it has a **registered BLS key**, which is a manual step (`arxd bls-key`
+then `register-bls-key`, step 6 of first-time setup) — genesis carries no
+keys. Nothing enforces it, so a set can be entirely healthy for block
+production and structurally unable to reach a finality quorum.
+
+```sh
+curl -s localhost:30333/finality
+```
+
+```json
+{
+  "finalized_height": null,
+  "tip_height": 4210,
+  "blocks_behind_tip": null,
+  "validators": 2,
+  "validators_with_bls_key": 0,
+  "quorum": 2,
+  "quorum_reachable": false
+}
+```
+
+A validator's BLS key is bound to its registration — `JoinValidator` carries
+it, and genesis validators declare `bls_pubkey` in the chain spec — so a set
+built either way can vote. A chain spec whose validators predate that field
+logs a warning per keyless validator at genesis and needs a `RegisterBlsKey`
+action to recover.
+
+**`quorum_reachable: false` means no amount of waiting will finalize
+anything** — fewer validators hold a BLS key than quorum requires. Fix it by
+registering keys, not by restarting anything. The same numbers are exported
+for alerting:
+
+```promql
+arxium_validators_with_bls_key < arxium_finality_quorum
+```
+
+`finalized_height` climbing but `blocks_behind_tip` growing steadily is the
+different failure: votes are being produced and are not arriving, which points
+at gossip rather than configuration.
+
 ### Why this node isn't producing
 
 Three signals, in the order worth checking:

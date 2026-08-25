@@ -25,6 +25,20 @@ pub struct AccountEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorEntry {
     pub stake: u128,
+    /// Hex-encoded BLS finality key, registered into state when genesis is
+    /// written. Genesis validators never run `JoinValidator`, so without this
+    /// they enter the set with no way to vote — a chain that produces blocks
+    /// forever and finalizes nothing. Same role as Substrate's
+    /// `session.keys` in a genesis config, or the consensus pubkey inside a
+    /// Cosmos gentx.
+    ///
+    /// Hex rather than a `BlsPublicKey` so `core/primitives` needn't depend on
+    /// `core/bls`, and so the chain spec stays hand-editable — hex is the form
+    /// `arxd bls-key` prints. `Option` because existing specs predate the
+    /// field; a genesis validator without one is reported by `GET /finality`
+    /// as unable to vote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_pubkey: Option<String>,
 }
 
 /// An in-flight partial unstake on a `StakeAllocation` — v1 allows at most

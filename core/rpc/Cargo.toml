@@ -24,3 +24,6 @@ xc-mempool = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+# Only to construct BLS types in tests — xc-storage already exposes them in
+# its public API (BlsKeyRegistration, FinalityRecord).
+xc-bls = { workspace = true }

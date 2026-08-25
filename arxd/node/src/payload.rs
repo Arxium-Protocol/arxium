@@ -32,6 +32,21 @@ fn identity_zk_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls12_381> {
 /// a floor "becoming a validator" would be free.
 pub const MIN_VALIDATOR_STAKE: u128 = 100_000 * 1_000_000_000;
 
+/// Validates BLS public-key bytes and returns them sized.
+///
+/// Four call sites need this now (`RegisterBlsKey` and `JoinValidator`, each
+/// in both the admission precheck and dispatch), and the rule is
+/// consensus-relevant: rejecting malformed or off-curve bytes here rather than
+/// at the first failed precommit verification later.
+fn validated_bls_pubkey(pubkey: &[u8]) -> anyhow::Result<[u8; 48]> {
+    blst::min_pk::PublicKey::from_bytes(pubkey)
+        .and_then(|pk| pk.validate())
+        .map_err(|_| anyhow::anyhow!("invalid BLS public key"))?;
+    pubkey
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))
+}
+
 /// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
 /// themselves. A different chain (e.g. `examples/toy-chain`) defines its
 /// own payload type and dispatch instead of adding variants here.
@@ -63,6 +78,19 @@ pub enum ActionPayload {
     JoinValidator {
         validator: Address,
         stake: u128,
+        /// The validator's BLS finality key, registered atomically with the
+        /// join. Required, not optional: a validator without one is counted
+        /// toward the finality quorum while being unable to vote, so every
+        /// such validator raises the threshold and contributes nothing to
+        /// meeting it. Enough of them and the chain produces blocks forever
+        /// while finalizing nothing, with no symptom but a warning per
+        /// dropped vote.
+        ///
+        /// Carried in the action rather than required as a prior
+        /// `RegisterBlsKey` so joining is atomic and cannot half-succeed —
+        /// this is Cosmos's `MsgCreateValidator.pubkey`. `RegisterBlsKey`
+        /// remains, for rotating a key on an existing validator.
+        bls_pubkey: Vec<u8>,
     },
     /// Removal from the validator set, routed through
     /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
@@ -199,10 +227,11 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
     }
     let operator_lookup = |validator: &Address| db.get_operator(validator);
     match &action.payload {
-        ActionPayload::JoinValidator { validator, stake } => {
+        ActionPayload::JoinValidator { validator, stake, bls_pubkey } => {
             if !is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
+            validated_bls_pubkey(bls_pubkey)?;
             let existing_active = db
                 .get_stake_allocation(&action.sender, validator)?
                 .map(|a| a.active_amount)
@@ -230,9 +259,7 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
             if !is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            blst::min_pk::PublicKey::from_bytes(pubkey)
-                .and_then(|pk| pk.validate())
-                .map_err(|_| anyhow::anyhow!("invalid BLS public key"))?;
+            validated_bls_pubkey(pubkey)?;
         }
         _ => {}
     }
@@ -321,7 +348,7 @@ fn dispatch_inner(
             )?,
             ..Default::default()
         }),
-        ActionPayload::JoinValidator { validator, stake } => {
+        ActionPayload::JoinValidator { validator, stake, bls_pubkey } => {
             if !is_authorized(&action.sender, validator, operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
@@ -346,11 +373,24 @@ fn dispatch_inner(
                 *stake,
                 current_height,
             )?;
-            let change = ValidatorChange::Join(validator.clone(), ValidatorEntry { stake: *stake });
+            // Registered in the same block as the join, so the validator is
+            // never in the set without the ability to vote.
+            let bytes = validated_bls_pubkey(bls_pubkey)?;
+            // `bls_pubkey` here is informational, like `stake`:
+            // `ValidatorSetSnapshot` persists neither, and the authoritative
+            // registration is the `bls_key` update below.
+            let change = ValidatorChange::Join(
+                validator.clone(),
+                ValidatorEntry { stake: *stake, bls_pubkey: Some(hex::encode(bytes)) },
+            );
             Ok(BlockUpdates {
                 accounts,
                 stakes,
                 validator_change: Some(change),
+                bls_key: Some(BlsKeyRegistration {
+                    address: validator.clone(),
+                    pubkey: xc_bls::BlsPublicKey(bytes),
+                }),
                 ..Default::default()
             })
         }
@@ -482,15 +522,7 @@ fn dispatch_inner(
             if !is_authorized(&action.sender, validator, operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            // Reject malformed/off-curve bytes now rather than at the first
-            // failed precommit-vote verification later.
-            blst::min_pk::PublicKey::from_bytes(pubkey)
-                .and_then(|pk| pk.validate())
-                .map_err(|_| anyhow::anyhow!("invalid BLS public key"))?;
-            let bytes: [u8; 48] = pubkey
-                .as_slice()
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))?;
+            let bytes = validated_bls_pubkey(pubkey)?;
             Ok(BlockUpdates {
                 bls_key: Some(BlsKeyRegistration {
                     address: validator.clone(),
@@ -642,6 +674,13 @@ mod tests {
         }
     }
 
+    /// A real, on-curve BLS pubkey. Arbitrary bytes will not do —
+    /// `validated_bls_pubkey` runs `blst`'s `validate()`, which is the point.
+    fn test_bls_pubkey(seed: u8) -> Vec<u8> {
+        let (_sk, pk) = xc_bls::keygen_from_seed(&[seed; 32]).expect("keygen");
+        pk.0.to_vec()
+    }
+
     #[test]
     fn leave_validator_rejected_when_sender_is_the_last_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
@@ -712,6 +751,7 @@ mod tests {
             payload: ActionPayload::JoinValidator {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
             },
         };
 
@@ -762,7 +802,11 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice.clone(), stake: 500 },
+            payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
+                stake: 500,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         let updates = dispatch(
@@ -804,6 +848,7 @@ mod tests {
             payload: ActionPayload::JoinValidator {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
             },
         };
 
@@ -837,6 +882,7 @@ mod tests {
             payload: ActionPayload::JoinValidator {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE - 1,
+                bls_pubkey: test_bls_pubkey(1),
             },
         };
 
@@ -1258,7 +1304,11 @@ mod tests {
             sender: bob,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         let err = dispatch(
@@ -1290,6 +1340,7 @@ mod tests {
             payload: ActionPayload::JoinValidator {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
             },
         };
 
@@ -1470,7 +1521,11 @@ mod tests {
             sender: bob,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         let err = dispatch(
@@ -1521,7 +1576,11 @@ mod tests {
             sender: bob,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         let err = admission_precheck(&action, &db).unwrap_err();
@@ -1541,6 +1600,7 @@ mod tests {
             payload: ActionPayload::JoinValidator {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE - 1,
+                bls_pubkey: test_bls_pubkey(1),
             },
         };
 
@@ -1575,7 +1635,11 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         admission_precheck(&action, &db).expect("self-join at the minimum stake should pass");
@@ -1597,10 +1661,112 @@ mod tests {
             sender: bob,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::JoinValidator { validator: alice, stake: MIN_VALIDATOR_STAKE },
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: test_bls_pubkey(1),
+            },
         };
 
         admission_precheck(&action, &db)
             .expect("operator authorized via AuthorizeOperator should be allowed to join");
+    }
+
+    /// A validator that cannot vote must not be able to join. Every validator
+    /// counts toward the finality quorum whether or not it holds a BLS key, so
+    /// one without a key raises the threshold while contributing nothing
+    /// toward meeting it — enough of them and the chain finalizes nothing.
+    /// This is Cosmos's `MsgCreateValidator.pubkey` being a required field.
+    #[test]
+    fn joining_with_an_invalid_bls_key_is_rejected() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(
+            alice.clone(),
+            funded(MIN_VALIDATOR_STAKE + 2_000_000),
+        )]));
+        let stake_lookup = make_stake_lookup(HashMap::new());
+
+        for (label, pubkey) in [
+            ("empty", Vec::new()),
+            ("wrong length", vec![0u8; 32]),
+            ("right length, off curve", vec![0xAAu8; 48]),
+        ] {
+            let action = Action {
+                sender: alice.clone(),
+                nonce: 0,
+                signature: None,
+                payload: ActionPayload::JoinValidator {
+                    validator: alice.clone(),
+                    stake: MIN_VALIDATOR_STAKE,
+                    bls_pubkey: pubkey,
+                },
+            };
+            let result = dispatch(
+                &action,
+                &lookup,
+                &stake_lookup,
+                &validator_masters_lookup,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &[],
+                10,
+                &|_, _| Ok::<bool, StorageError>(false),
+            );
+            assert!(
+                result.is_err(),
+                "a {label} BLS key must not get a validator into the set",
+            );
+        }
+    }
+
+    /// The join and the key registration land in the same block, so a
+    /// validator is never in the set without the means to vote — no window,
+    /// however brief, and no chance of a second step never happening.
+    #[test]
+    fn joining_registers_the_bls_key_in_the_same_block() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(
+            alice.clone(),
+            funded(MIN_VALIDATOR_STAKE + 2_000_000),
+        )]));
+        let stake_lookup = make_stake_lookup(HashMap::new());
+        let pubkey = test_bls_pubkey(42);
+
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator {
+                validator: alice.clone(),
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: pubkey.clone(),
+            },
+        };
+        let updates = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &|_, _| Ok::<bool, StorageError>(false),
+        )
+        .expect("a well-formed join must succeed");
+
+        assert!(
+            matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice),
+            "the join itself must still be applied",
+        );
+        let registration = updates
+            .bls_key
+            .expect("the BLS key must be registered by the same action");
+        assert_eq!(registration.address, alice);
+        assert_eq!(
+            registration.pubkey.0.to_vec(),
+            pubkey,
+            "the registered key must be the one the action carried",
+        );
     }
 }

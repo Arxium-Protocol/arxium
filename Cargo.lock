@@ -5056,6 +5056,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "serde_json",
+ "tracing",
  "xc-primitives",
 ]
 
@@ -5100,6 +5101,7 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing",
+ "xc-bls",
  "xc-mempool",
  "xc-primitives",
  "xc-storage",

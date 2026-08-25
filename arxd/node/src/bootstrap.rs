@@ -3,10 +3,10 @@
 
 use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 use xc_executor::{BlockUpdates, execute_actions};
 use xc_primitives::{NodeConfig, Snapshot};
-use xc_storage::ArxiumDb;
+use xc_storage::{ArxiumDb, BlsKeyRegistration};
 
 const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 
@@ -25,6 +25,36 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
             snapshot.accounts.len()
         );
         db.write_batch(&snapshot)?;
+
+        // Genesis validators never run `JoinValidator`, so their BLS keys have
+        // to be registered here or they enter the set unable to vote — the
+        // chain then produces blocks forever and finalizes nothing. Same job
+        // as `session.keys` in a Substrate genesis config.
+        for (address, entry) in &snapshot.validators {
+            let Some(hex_pubkey) = &entry.bls_pubkey else {
+                warn!(
+                    "genesis validator {address} has no bls_pubkey in the chain spec — it \
+                     cannot vote on finality, and counts toward the quorum it cannot help \
+                     meet. Register one with a RegisterBlsKey action, or add it to the spec \
+                     before launching a new chain. See GET /finality."
+                );
+                continue;
+            };
+            let bytes: [u8; 48] = hex::decode(hex_pubkey)
+                .ok()
+                .and_then(|b| b.try_into().ok())
+                .with_context(|| {
+                    format!("genesis validator {address} has a malformed bls_pubkey")
+                })?;
+            blst::min_pk::PublicKey::from_bytes(&bytes)
+                .and_then(|pk| pk.validate())
+                .map_err(|_| anyhow::anyhow!("genesis validator {address} has an invalid BLS key"))?;
+            db.write_batch(&BlsKeyRegistration {
+                address: address.clone(),
+                pubkey: xc_bls::BlsPublicKey(bytes),
+            })?;
+            info!("registered genesis BLS finality key for {address}");
+        }
     }
 
     if db.get_block::<ActionPayload>(0)?.is_none() {

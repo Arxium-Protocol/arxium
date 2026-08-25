@@ -45,7 +45,8 @@ struct Args {
     #[arg(long)]
     validator: Option<String>,
 
-    /// BLS pubkey, hex-encoded (from `arxd bls-key`). Required for "register-bls-key".
+    /// BLS pubkey, hex-encoded (from `arxd bls-key`). Required for
+    /// "join-validator" and "register-bls-key".
     #[arg(long)]
     bls_pubkey: Option<String>,
 
@@ -179,6 +180,15 @@ fn main() -> Result<()> {
         "join-validator" => ActionPayload::JoinValidator {
             validator: target_validator()?,
             stake: args.stake.context("--stake is required for join-validator")?,
+            // Required: joining without a finality key would put a validator
+            // in the set that raises the quorum threshold without being able
+            // to vote toward it.
+            bls_pubkey: hex::decode(
+                args.bls_pubkey
+                    .as_deref()
+                    .context("--bls-pubkey is required for join-validator (get it from `arxd bls-key`)")?,
+            )
+            .context("--bls-pubkey is not valid hex")?,
         },
         "leave-validator" => ActionPayload::LeaveValidator { validator: target_validator()? },
         "stake" => ActionPayload::Stake {

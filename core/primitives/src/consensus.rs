@@ -3,6 +3,22 @@
 
 use crate::Address;
 
+/// How many validators must precommit to a block before it is final: 2/3 of
+/// the set plus one, counted by head rather than weighted by stake.
+///
+/// Lives here rather than in `arxd/finality` because it is a consensus rule,
+/// not a role-specific one, and two callers need it: the subsystem that
+/// tallies precommits, and the RPC layer that reports how far the current set
+/// is from reaching it. `core/` may not depend on `arxd/`, so a copy in each
+/// would be two definitions of one rule, free to drift.
+///
+/// Not stake-weighted, deliberately: `eligible_proposer` ignores stake too, so
+/// weighting finality alone would be incoherent. Both change together or
+/// neither does.
+pub fn quorum(validator_count: usize) -> usize {
+    2 * validator_count / 3 + 1
+}
+
 /// How far ahead of the validating node's own wall clock a block's timestamp
 /// may be before the block is rejected (`xc_executor::accept_block`).
 ///

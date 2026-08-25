@@ -100,7 +100,7 @@ non-loopback deployment.
 | Endpoint | Description |
 | --- | --- |
 | `POST /actions` | Submit a signed action |
-| `GET /status` | Chain name, tip height, tip hash |
+| `GET /status` | Chain name, tip height, tip hash, finalized height |
 | `GET /accounts/{address}` | Balance, nonce, identity hash |
 | `GET /accounts/{address}/stake` | Stake allocations and unbonding |
 | `GET /accounts/{address}/bls-key` | Registered BLS finality key |
@@ -109,6 +109,7 @@ non-loopback deployment.
 | `GET /blocks/{height}` | Block by height |
 | `GET /blocks/by-hash/{hash}` | Block by hash |
 | `GET /validators` | Current validator set |
+| `GET /finality` | Finalized height, and whether the set can reach quorum |
 | `GET /operators/{address}/validators` | Validators an operator may act for |
 | `GET /search` | Height, address, or hash — one endpoint, type inferred |
 | `GET /min-stake` | Minimum stake to become a validator |
@@ -130,7 +131,7 @@ an indexer reading the chain, not to the node's hot path.
 | --- | --- |
 | `Transfer` | Move balance between accounts |
 | `Stake` / `Unstake` | Delegate to a validator; unstaking unbonds over 100 blocks |
-| `JoinValidator` / `LeaveValidator` | Enter or leave the validator set |
+| `JoinValidator` / `LeaveValidator` | Enter or leave the validator set; joining carries the BLS finality key |
 | `RegisterBlsKey` | Register a BLS key so precommits count toward finality |
 | `SubmitEquivocationEvidence` | Report a validator that signed two blocks at one height |
 | `VerifyIdentityCredential` | Prove a credential in zero knowledge |
@@ -147,6 +148,13 @@ an indexer reading the chain, not to the node's hot path.
 | Minimum validator stake | 100,000 ARX |
 | Unbonding period | 100 blocks |
 | Finality | BLS aggregate precommits, 2/3+1 of the validator set |
+
+A validator's BLS finality key is bound to its registration: `JoinValidator`
+carries it and registers it atomically, and genesis validators declare one via
+`bls_pubkey` in the chain spec. A validator counts toward the quorum whether or
+not it can vote, so one without a key would raise the threshold while
+contributing nothing to meeting it. `GET /finality` reports how much of the
+current set can actually vote, and whether that clears quorum.
 
 These are compile-time constants. Changing one is a coordinated release, not a
 runtime setting.

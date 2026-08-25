@@ -22,8 +22,8 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address};
-use xc_storage::ArxiumDb;
+use xc_primitives::{Action, Address, Block, quorum};
+use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
 /// JSON (de)serializable for the wire, `Clone` because `AppState` is cloned
@@ -380,6 +380,7 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
                 .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
                 .route("/validators", get(get_validators::<P>))
+                .route("/finality", get(get_finality::<P>))
                 .route("/operators/{address}/validators", get(get_operator_validators::<P>))
                 .route(
                     "/stake/{master}/{validator}",
@@ -617,10 +618,19 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
         }
     };
 
+    // Additive: existing consumers keep reading the three fields they know.
+    // A wallet showing confirmations needs finality from the same call it
+    // already makes, not a second round trip.
+    let finalized_height = state.db.get_finalized_height().unwrap_or_else(|err| {
+        warn!("failed to read finalized height for /status: {err}");
+        None
+    });
+
     Json(serde_json::json!({
         "chain_name": chain_name,
         "tip_height": tip_height,
         "tip_hash": tip_hash,
+        "finalized_height": finalized_height,
     }))
     .into_response()
 }
@@ -735,6 +745,86 @@ struct ValidatorSetQuery {
 /// uptime: turns proposed over turns *owed* needs the set at each historical
 /// height, and the denominator was unobtainable while this only answered for
 /// the tip.
+/// Finality status, and — when nothing is finalizing — enough to tell why.
+///
+/// A bare "latest finalized height" would report `null` both for a chain that
+/// is simply young and for one structurally unable to finalize at all, which
+/// is the failure this endpoint exists to surface: a validator only votes if
+/// it has registered a BLS key, and nothing requires one. A set can be
+/// perfectly healthy for block production and never reach quorum, with no
+/// symptom beyond a `warn!` per dropped vote. Reporting the set size, how many
+/// of them can actually vote, and the quorum those numbers imply makes that
+/// visible in one request.
+async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    let tip_height = match state.db.get_tip_height() {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            warn!("failed to read tip height: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let validators = match state.db.get_validator_set_at(tip_height) {
+        Ok(validators) => validators,
+        Err(err) => {
+            warn!("failed to read validator set at {tip_height}: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut voters = 0usize;
+    for validator in &validators {
+        match state.db.get_bls_pubkey(validator) {
+            Ok(Some(_)) => voters += 1,
+            Ok(None) => {}
+            Err(err) => {
+                warn!("failed to read BLS key for {validator}: {err}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
+
+    let finalized_height = match state.db.get_finalized_height() {
+        Ok(height) => height,
+        Err(err) => {
+            warn!("failed to read finalized height: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let record = match finalized_height {
+        Some(height) => match state.db.get_finality_record(height) {
+            Ok(record) => record,
+            Err(err) => {
+                warn!("failed to read finality record at {height}: {err}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        None => None,
+    };
+
+    let required = quorum(validators.len());
+    Json(serde_json::json!({
+        // null rather than absent: a client must be able to tell "nothing has
+        // finalized yet" from "this node is too old to have the field".
+        "finalized_height": finalized_height,
+        "finalized_hash": record.as_ref().map(|r| r.block_hash.clone()),
+        "signers": record.as_ref().map(|r| r.signers.clone()),
+        "tip_height": tip_height,
+        // How far behind the tip finality is running. Growing steadily means
+        // votes are being produced but not reaching quorum.
+        "blocks_behind_tip": finalized_height.map(|h| tip_height.saturating_sub(h)),
+        "validators": validators.len(),
+        "validators_with_bls_key": voters,
+        "quorum": required,
+        // The whole point: false means no amount of waiting will finalize
+        // anything, because not enough of the set can even vote.
+        "quorum_reachable": voters >= required,
+    }))
+    .into_response()
+}
+
 async fn get_validators<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<ValidatorSetQuery>,
@@ -852,6 +942,29 @@ struct BlockRangeQuery {
 /// Bounded window of blocks. Heights are sequential with no gaps (single
 /// proposer, no forks), so this is a per-height point-lookup loop capped at
 /// `MAX_PAGE_SIZE`, not a scan.
+/// Serializes a block with a `finalized` flag alongside its own fields.
+///
+/// Injected into the block's own JSON object rather than nesting the block
+/// under a wrapper, so this stays additive: every existing consumer keeps
+/// reading `height`, `hash`, `actions` exactly where they were, and clients
+/// that don't know about `finalized` ignore it.
+///
+/// Checked per height rather than compared against a single watermark because
+/// certificates are written as quorums complete, which is not necessarily in
+/// height order — see `ArxiumDb::get_finalized_height`. A block below the
+/// highest certified height is not automatically certified itself.
+fn block_with_finality<P: Payload>(
+    db: &ArxiumDb,
+    block: &Block<P>,
+) -> Result<serde_json::Value, StorageError> {
+    let finalized = db.get_finality_record(block.height)?.is_some();
+    let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("finalized".into(), serde_json::Value::Bool(finalized));
+    }
+    Ok(value)
+}
+
 async fn get_blocks<P: Payload>(
     State(state): State<AppState<P>>,
     Query(range): Query<BlockRangeQuery>,
@@ -860,7 +973,22 @@ async fn get_blocks<P: Payload>(
         return (StatusCode::BAD_REQUEST, "from must be <= to").into_response();
     }
     match state.db.get_block_range::<P>(range.from, range.to) {
-        Ok(blocks) => Json(blocks).into_response(),
+        // One finality lookup per block. The range is already capped, so this
+        // is bounded; a single watermark comparison would be cheaper but wrong
+        // for the reason `block_with_finality` documents.
+        Ok(blocks) => {
+            let annotated: Result<Vec<_>, _> = blocks
+                .iter()
+                .map(|block| block_with_finality(&state.db, block))
+                .collect();
+            match annotated {
+                Ok(values) => Json(values).into_response(),
+                Err(err) => {
+                    warn!("failed to read finality for block range: {err}");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
+            }
+        }
         Err(err) => {
             warn!("failed to load block range {}..={}: {err}", range.from, range.to);
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -873,7 +1001,13 @@ async fn get_block_by_height<P: Payload>(
     Path(height): Path<u64>,
 ) -> Response {
     match state.db.get_block::<P>(height) {
-        Ok(Some(block)) => Json(block).into_response(),
+        Ok(Some(block)) => match block_with_finality(&state.db, &block) {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => {
+                warn!("failed to read finality for block {height}: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             warn!("failed to load block {height}: {err}");
@@ -895,7 +1029,13 @@ async fn get_block_by_hash<P: Payload>(
         }
     };
     match state.db.get_block::<P>(height) {
-        Ok(Some(block)) => Json(block).into_response(),
+        Ok(Some(block)) => match block_with_finality(&state.db, &block) {
+            Ok(value) => Json(value).into_response(),
+            Err(err) => {
+                warn!("failed to read finality for block {height}: {err}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Ok(None) => {
             warn!("block_hash index points at missing block {height} for {hash}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1412,6 +1552,112 @@ mod tests {
             )
             .await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    /// The endpoint has to distinguish "young chain, nothing final yet" from
+    /// "this set can never finalize anything", because the second is a real
+    /// configuration failure whose only other symptom is a warn per dropped
+    /// vote. A validator set with no registered BLS keys is exactly that case
+    /// — and it is what a chain started from a genesis spec looks like, since
+    /// genesis carries no keys.
+    #[test]
+    fn finality_reports_why_a_set_cannot_reach_quorum() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let validator = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+
+            state
+                .db
+                .write_batch(&Snapshot {
+                    height: 0,
+                    chain_name: "test-chain".into(),
+                    accounts: BTreeMap::new(),
+                    validators: BTreeMap::new(),
+                    boot_nodes: Vec::new(),
+                })
+                .unwrap();
+            let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
+            state.db.write_batch(&genesis).unwrap();
+            state
+                .db
+                .write_batch(&xc_storage::ValidatorSetSnapshot {
+                    effective_height: 0,
+                    validators: vec![validator.clone()],
+                })
+                .unwrap();
+
+            let resp = get_finality::<TestPayload>(State(state.clone())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            // Null, not absent — a client must tell "nothing final yet" from
+            // "this node is too old to report finality".
+            assert!(json["finalized_height"].is_null());
+            assert_eq!(json["validators"], 1);
+            assert_eq!(json["validators_with_bls_key"], 0);
+            assert_eq!(json["quorum"], 1);
+            assert_eq!(
+                json["quorum_reachable"], false,
+                "a set with no BLS keys can never finalize, and must say so",
+            );
+
+            // Register the key and the same set becomes able to finalize.
+            state
+                .db
+                .write_batch(&xc_storage::BlsKeyRegistration {
+                    address: validator.clone(),
+                    pubkey: xc_bls::BlsPublicKey([7u8; 48]),
+                })
+                .unwrap();
+
+            let resp = get_finality::<TestPayload>(State(state.clone())).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["validators_with_bls_key"], 1);
+            assert_eq!(json["quorum_reachable"], true);
+        });
+    }
+
+    /// `finalized` is injected into the block's own JSON rather than nesting
+    /// the block under a wrapper, so every existing consumer keeps reading the
+    /// fields it already reads. This pins both halves: the flag is present and
+    /// correct, and the block's own fields are untouched.
+    #[test]
+    fn block_reads_carry_a_finalized_flag_without_reshaping_the_block() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
+            state.db.write_batch(&genesis).unwrap();
+
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(json["finalized"], false, "no certificate written yet");
+            // Still flat, still the block's own fields.
+            assert_eq!(json["height"], 0);
+            assert!(json["timestamp"].is_number());
+            assert!(json["actions"].is_array());
+
+            state
+                .db
+                .write_batch(&xc_storage::FinalityRecord {
+                    height: 0,
+                    block_hash: genesis.hash(),
+                    signers: vec![Address::from_pubkey_bytes(&[9u8; 32]).unwrap()],
+                    aggregate_signature: xc_bls::BlsSignature([3u8; 96]),
+                })
+                .unwrap();
+
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["finalized"], true);
         });
     }
 }

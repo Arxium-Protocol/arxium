@@ -15,7 +15,7 @@ use std::time::Instant;
 use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address, eligible_proposer, expected_proposer};
+use xc_primitives::{Action, Address, eligible_proposer, expected_proposer, quorum};
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
@@ -233,6 +233,24 @@ pub fn produce_loop(
                     now.saturating_sub(parent.timestamp)
                 };
                 let validators = db.get_validator_set_at(next_height)?;
+
+                // How much of the set can actually vote on finality. A
+                // validator only precommits if it has a registered BLS key,
+                // and nothing requires one — genesis carries none, and
+                // `JoinValidator` enforces a stake floor but not a key. So a
+                // set can be entirely healthy for block production and still
+                // be structurally unable to reach a finality quorum, with no
+                // symptom but a warn per dropped vote. Exported so the
+                // shortfall is alertable before it matters:
+                //   arxium_validators_with_bls_key < arxium_finality_quorum
+                let voters = validators
+                    .iter()
+                    .filter(|v| db.get_bls_pubkey(v).ok().flatten().is_some())
+                    .count();
+                gauge!("arxium_validators_total").set(validators.len() as f64);
+                gauge!("arxium_validators_with_bls_key").set(voters as f64);
+                gauge!("arxium_finality_quorum").set(quorum(validators.len()) as f64);
+
                 let round = elapsed / SLOT_DURATION.as_secs().max(1);
                 gauge!("arxium_consensus_round").set(round as f64);
                 match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())

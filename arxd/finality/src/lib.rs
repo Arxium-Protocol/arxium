@@ -9,8 +9,21 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
-use xc_primitives::{Address, Block};
+use xc_primitives::{Address, Block, quorum};
 use xc_storage::{ArxiumDb, FinalityRecord};
+
+/// How many heights of unfinalized precommit tallies to keep.
+///
+/// `tallies` is in-process and was previously pruned only when a height
+/// finalized, so any height that never reached quorum — a validator offline, a
+/// vote lost in gossip, a stray vote for a competing hash — stayed for the
+/// lifetime of the process. On a chain where quorum is unreachable at all (no
+/// registered BLS keys, see `GET /finality`) that meant *every* height
+/// accumulated forever.
+///
+/// Votes arrive within a few heights of the block they cover, so anything this
+/// far behind the highest height seen is never going to gain another vote.
+const TALLY_RETENTION_HEIGHTS: u64 = 500;
 
 /// One validator's BLS-signed vote that it also attests to `block_hash` at
 /// `height` — gossiped over `arxd/network`'s precommit topic and fed back
@@ -29,16 +42,6 @@ pub struct PrecommitVote {
 pub enum FinalityEvent<P> {
     BlockObserved(Block<P>),
     VoteObserved(PrecommitVote),
-}
-
-/// 2/3+ of the validator set, count-based — not stake-weighted.
-///
-/// ponytail: `eligible_proposer`/`get_validator_set_at` don't weight by
-/// stake anywhere today, so a stake-weighted finality quorum would be a
-/// much larger, separately-scoped change. Upgrade if/when proposer
-/// selection itself becomes stake-weighted.
-fn quorum(validator_count: usize) -> usize {
-    2 * validator_count / 3 + 1
 }
 
 /// Runs on its own thread. `bls_identity` is `Some((address, secret_key))`
@@ -60,7 +63,20 @@ pub fn spawn_finality<P>(
         // stray vote for a competing hash can't corrupt the real tally.
         let mut tallies: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> = HashMap::new();
 
+        // Highest height seen from either event kind, used as the pruning
+        // watermark below.
+        let mut highest_seen: u64 = 0;
+
         for event in events {
+            highest_seen = highest_seen.max(match &event {
+                FinalityEvent::BlockObserved(block) => block.height,
+                FinalityEvent::VoteObserved(vote) => vote.height,
+            });
+            // Bounded on every event rather than only on finalization, which
+            // is the case that may never come.
+            let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
+            tallies.retain(|height, _| *height >= cutoff);
+
             match event {
                 FinalityEvent::BlockObserved(block) => {
                     let Some((address, secret_key)) = &bls_identity else { continue };
@@ -245,5 +261,51 @@ mod tests {
         assert_eq!(vote.block_hash, expected_hash);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `tallies` used to be pruned only when a height finalized, so a chain
+    /// that never reaches quorum grew the map forever. This drives the same
+    /// shape — votes that never reach quorum, across far more heights than the
+    /// retention window — and requires the map to stay bounded.
+    #[test]
+    fn unfinalized_tallies_do_not_grow_without_bound() {
+        let mut tallies: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> =
+            HashMap::new();
+
+        // Stand in for the loop's pruning step, which is what the retention
+        // constant actually drives.
+        let mut highest_seen = 0u64;
+        for height in 0..(TALLY_RETENTION_HEIGHTS * 4) {
+            highest_seen = highest_seen.max(height);
+            let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
+            tallies.retain(|h, _| *h >= cutoff);
+            // A vote arrives for this height and never reaches quorum.
+            tallies.entry(height).or_default().entry("0xdeadbeef".into()).or_default();
+        }
+
+        assert!(
+            tallies.len() as u64 <= TALLY_RETENTION_HEIGHTS + 1,
+            "tallies grew to {} entries over {} heights — retention is not bounding it",
+            tallies.len(),
+            TALLY_RETENTION_HEIGHTS * 4,
+        );
+        // And it keeps the recent ones, rather than bounding by dropping
+        // everything.
+        assert!(
+            tallies.contains_key(&(TALLY_RETENTION_HEIGHTS * 4 - 1)),
+            "the most recent height must survive pruning",
+        );
+    }
+
+    /// Quorum moved to `core/primitives` so `core/rpc` could report it without
+    /// depending on `arxd/`. This pins the values the finality path relies on,
+    /// so a change there cannot silently alter what counts as final.
+    #[test]
+    fn quorum_matches_the_shared_consensus_rule() {
+        assert_eq!(quorum(1), 1);
+        assert_eq!(quorum(2), 2);
+        assert_eq!(quorum(3), 3);
+        assert_eq!(quorum(4), 3);
+        assert_eq!(quorum(7), 5);
     }
 }
