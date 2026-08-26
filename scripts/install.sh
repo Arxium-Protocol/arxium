@@ -20,6 +20,7 @@ version=""
 base_path="${ARXD_BASE_PATH:-$HOME/.arxium}"
 assume_yes=0
 dry_run=0
+with_monitoring=0
 
 usage() {
     cat <<'USAGE'
@@ -28,6 +29,7 @@ Usage: install.sh [options]
   --version vX.Y.Z   Install this release instead of the latest.
   --base-path DIR    Node directory (default: ~/.arxium).
   --dry-run          Print what would happen; touch nothing.
+  --with-monitoring  Install native Prometheus monitoring under systemd.
   --yes              Non-interactive: accept every default, no prompts.
   -h, --help         This text.
 USAGE
@@ -38,6 +40,7 @@ while [ $# -gt 0 ]; do
         --version) version="${2:?--version needs a tag, e.g. v0.1.0}"; shift 2 ;;
         --base-path) base_path="${2:?--base-path needs a directory}"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
+        --with-monitoring) with_monitoring=1; shift ;;
         --yes|-y) assume_yes=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -98,6 +101,13 @@ arch="$(uname -m)"
 have_systemd=0
 if [ "$os" = "Linux" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     have_systemd=1
+fi
+
+if [ "$with_monitoring" -eq 1 ]; then
+    [ "$have_systemd" -eq 1 ] || die "--with-monitoring requires Linux with systemd"
+    if [ "$(id -u)" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 || die "--with-monitoring requires sudo when not run as root"
+    fi
 fi
 
 # Releases only ship x86_64 Linux today (see .github/workflows/release.yml).
@@ -182,6 +192,29 @@ its checksum file — re-run the release workflow rather than skipping this."
     tar -xzf "$tmp/$asset" -C "$tmp"
     binary="$(find "$tmp" -name arxd -type f | head -1)"
     [ -n "$binary" ] || die "no arxd binary inside ${asset}"
+fi
+
+# Fetch monitoring from the same immutable release tag as the node binary.
+# Downloading it before laying out the node keeps an unavailable or incomplete
+# monitoring bundle from leaving a partial installation behind.
+monitoring_dir="$tmp/monitoring"
+if [ "$with_monitoring" -eq 1 ]; then
+    monitoring_base="https://raw.githubusercontent.com/${REPO}/${version}/monitoring"
+    say "Downloading the ${version} monitoring bundle"
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  would download native installer and Prometheus config from %s\n' "$monitoring_base"
+    else
+        mkdir -p "$monitoring_dir/native" "$monitoring_dir/prometheus"
+        for path in \
+            native/install-monitoring.sh \
+            native/alertmanager.yml.example \
+            prometheus/prometheus.yml \
+            prometheus/alerts.yml
+        do
+            curl -fsSL -o "$monitoring_dir/$path" "$monitoring_base/$path" \
+                || die "release ${version} does not contain a complete monitoring bundle"
+        done
+    fi
 fi
 
 # --------------------------------------------------------------- lay out dirs
@@ -338,6 +371,19 @@ UNIT
         fi
         echo "  Or run in the foreground now:"
         echo "    set -a; . $env_file; set +a; $base_path/bin/arxd"
+    fi
+fi
+
+# --------------------------------------------------------------- monitoring
+
+if [ "$with_monitoring" -eq 1 ]; then
+    say "Installing native node monitoring"
+    if [ "$dry_run" -eq 1 ]; then
+        printf '  would run the release-matched monitoring installer with root privileges\n'
+    elif [ "$(id -u)" -eq 0 ]; then
+        bash "$monitoring_dir/native/install-monitoring.sh"
+    else
+        sudo bash "$monitoring_dir/native/install-monitoring.sh"
     fi
 fi
 

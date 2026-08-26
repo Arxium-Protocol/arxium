@@ -1,0 +1,61 @@
+# Single-node rules using metrics exported by arxd.
+groups:
+  - name: arxium-node
+    rules:
+      - alert: ArxiumMetricsUnavailable
+        expr: up{job="arxium-node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Arxium node metrics are unavailable"
+          description: >
+            Prometheus has been unable to scrape arxd for one minute. Check
+            systemctl status arxd and curl http://127.0.0.1:30333/metrics.
+
+      # Alert on the tip timestamp, not height or process state. A stalled
+      # arxd process can remain active while the height no longer advances.
+      - alert: ArxiumChainStalled
+        expr: time() - arxium_tip_timestamp_seconds > 120
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node tip is stale ({{ $value | humanizeDuration }} old)"
+          description: >
+            The tip block timestamp has been more than 120 seconds behind
+            wall-clock time for one minute. Process supervision alone does
+            not detect this application-liveness failure.
+
+      - alert: ArxiumFinalityUnreachable
+        expr: arxium_validators_with_bls_key < arxium_finality_quorum
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Finality quorum is unreachable"
+          description: >
+            Fewer validators hold BLS keys than the current finality quorum
+            requires. Register the missing validator keys.
+
+      - alert: ArxiumBlocksRejected
+        expr: increase(arxium_blocks_rejected_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} block(s) rejected in the last 10 minutes"
+
+      - alert: ArxiumProductionErrors
+        expr: increase(arxium_block_production_errors_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} block production error(s) in the last 10 minutes"
+
+      - alert: ArxiumMempoolBacklog
+        expr: arxium_mempool_pending_actions > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} actions have been pending for at least 5 minutes"

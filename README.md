@@ -27,6 +27,11 @@ Downloads the latest release and verifies it against the release's
 configuration file, prints this node's validator address, and generates a
 systemd unit. `--dry-run` shows every step without touching the disk.
 
+Add `--with-monitoring` to install a release-matched native Prometheus scraper
+and alert rules under systemd. Docker is not required. The complete native,
+bring-your-own, and optional Docker paths are documented in
+[`monitoring/`](monitoring/README.md).
+
 Prebuilt releases target `x86_64-unknown-linux-gnu`. Everywhere else, build
 from source.
 
@@ -207,6 +212,8 @@ touched land in one atomic batch or not at all.
   [`circuits/README.md`](circuits/README.md) — layer architecture and
   boundary rules
 - [`scripts/README.md`](scripts/README.md) — development and operations tools
+- [`monitoring/README.md`](monitoring/README.md) - native, external, and
+  optional Docker monitoring paths
 
 ## Development
 
