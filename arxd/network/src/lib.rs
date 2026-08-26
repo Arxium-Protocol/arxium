@@ -38,6 +38,19 @@ use sync::{
 };
 use transport::{BehaviourEvent, build_swarm};
 
+/// A gossip publish can fail because nobody local is subscribed to the
+/// topic — expected on a devnet where not every peer subscribes to every
+/// topic (e.g. an indexer that only follows blocks), harmless since the
+/// message was still accepted and committed locally. Anything else is a
+/// real fault.
+fn log_publish_error(kind: &str, err: &gossipsub::PublishError) {
+    if matches!(err, gossipsub::PublishError::NoPeersSubscribedToTopic) {
+        info!("no peers subscribed to receive the gossiped {kind}, skipping");
+    } else {
+        warn!("failed to publish {kind} to gossip: {err}");
+    }
+}
+
 /// Starts this node's P2P networking on its own thread with its own tokio
 /// runtime (libp2p's swarm isn't `Send` across an existing async runtime the
 /// caller might be using). Gossiped/synced messages only get as far as
@@ -215,7 +228,7 @@ async fn run_swarm<P: Payload>(
                 match bincode::serde::encode_to_vec(&action, bincode::config::standard()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(actions_topic.clone(), bytes) {
-                            warn!("failed to publish action to gossip: {err}");
+                            log_publish_error("action", &err);
                         }
                     }
                     Err(err) => warn!("failed to encode action for gossip: {err}"),
@@ -229,7 +242,7 @@ async fn run_swarm<P: Payload>(
                 match bincode::serde::encode_to_vec(&block, bincode::config::standard()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(blocks_topic.clone(), bytes) {
-                            warn!("failed to publish block to gossip: {err}");
+                            log_publish_error("block", &err);
                         }
                     }
                     Err(err) => warn!("failed to encode block for gossip: {err}"),
@@ -243,7 +256,7 @@ async fn run_swarm<P: Payload>(
                 match bincode::serde::encode_to_vec(&vote, bincode::config::standard()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(precommits_topic.clone(), bytes) {
-                            warn!("failed to publish precommit vote to gossip: {err}");
+                            log_publish_error("precommit vote", &err);
                         }
                     }
                     Err(err) => warn!("failed to encode precommit vote for gossip: {err}"),
@@ -406,8 +419,16 @@ async fn run_swarm<P: Payload>(
                     // entirely until it reconnects or a request succeeds.
                     counter!("arxium_sync_outbound_failures_total").increment(1);
                     let failures = sync_failures.entry(peer).or_insert(0);
-                    *failures += 1;
-                    if *failures >= MAX_CONSECUTIVE_SYNC_FAILURES {
+                    if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
+                        // A peer capability, not a transient fault (e.g. the
+                        // indexer, which only serves sync inbound) — retrying
+                        // on the next STATUS_INTERVAL can't change the
+                        // outcome, so skip straight to "give up until
+                        // reconnect" instead of warn-spamming every tick
+                        // until the counter ramps up on its own.
+                        *failures = MAX_CONSECUTIVE_SYNC_FAILURES;
+                        info!("peer {peer} does not support the sync protocol, will not retry until it reconnects");
+                    } else if { *failures += 1; *failures >= MAX_CONSECUTIVE_SYNC_FAILURES } {
                         warn!(
                             "sync request to {peer} failed: {error} ({failures} consecutive failures, giving up until it reconnects)"
                         );
