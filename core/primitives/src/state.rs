@@ -122,3 +122,61 @@ pub struct Snapshot {
     #[serde(default)]
     pub boot_nodes: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `arxd keys` emits a chain-spec entry by serializing `ValidatorEntry`
+    /// itself, and `xc_genesis` parses the spec back into `Snapshot`. This
+    /// pins that round trip: an entry the command prints must be an entry the
+    /// loader accepts, with the BLS key surviving intact. A rename or a serde
+    /// attribute change on either side would produce output that looks correct
+    /// and silently registers no key.
+    #[test]
+    fn a_validator_entry_round_trips_through_the_chain_spec_format() {
+        let address = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+        let bls = "b9e633ef84a4f0a8e522992c72ffe1234607c5cb71d7faba476b80164edda056d\
+                   2efb5df47592a7206c4c2eaff5287d6";
+
+        let emitted = serde_json::to_string(&BTreeMap::from([(
+            address.clone(),
+            ValidatorEntry { stake: 100_000 * 1_000_000_000, bls_pubkey: Some(bls.into()) },
+        )]))
+        .unwrap();
+
+        let spec = format!(
+            r#"{{"height":0,"chain_name":"t","accounts":{{}},"validators":{emitted},"boot_nodes":[]}}"#
+        );
+        let snapshot: Snapshot = serde_json::from_str(&spec).expect("spec must parse");
+
+        let entry = snapshot.validators.get(&address).expect("validator must survive");
+        assert_eq!(entry.stake, 100_000 * 1_000_000_000);
+        assert_eq!(
+            entry.bls_pubkey.as_deref(),
+            Some(bls),
+            "the BLS key must survive the round trip, or genesis registers nothing",
+        );
+    }
+
+    /// Specs written before `bls_pubkey` existed must still parse — the field
+    /// is `Option` with `serde(default)` for exactly this reason. Such a
+    /// validator is reported by `GET /finality` as unable to vote rather than
+    /// crashing the node at boot.
+    #[test]
+    fn a_spec_without_bls_pubkey_still_parses() {
+        let spec = r#"{
+            "height": 0,
+            "chain_name": "t",
+            "accounts": {},
+            "validators": {
+                "arx1qgz5uv6kwzy0zx9lyup4t7chwff3rce0mfwsu2ryayr0e9dkhx7qc0wq2f": {"stake": 1000000}
+            },
+            "boot_nodes": []
+        }"#;
+        let snapshot: Snapshot = serde_json::from_str(spec).expect("legacy spec must parse");
+        let entry = snapshot.validators.values().next().unwrap();
+        assert_eq!(entry.stake, 1_000_000);
+        assert!(entry.bls_pubkey.is_none());
+    }
+}

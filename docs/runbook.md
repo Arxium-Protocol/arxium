@@ -82,7 +82,16 @@ prints the address during setup for exactly this reason, and you can ask
 again at any time without starting the node:
 
 ```sh
-arxd validator-key --base-path <base_path>/data
+arxd keys --base-path <base_path>          # address, BLS key, peer ID, spec entry
+arxd validator-key --base-path <base_path>/data   # just the address
+```
+
+To add this node to a chain spec, `arxd keys --json` emits the `validators`
+entry directly — including `bls_pubkey`, without which the validator produces
+blocks but can never vote on finality while still counting toward the quorum:
+
+```sh
+arxd keys --base-path <base_path> --json
 ```
 
 Cross-check it against `curl -s localhost:30333/validators`. If it isn't

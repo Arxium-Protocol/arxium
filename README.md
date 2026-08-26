@@ -76,10 +76,17 @@ A node holds up to three identities, each generated on first use and stored
 under `--base-path` with owner-only permissions.
 
 ```sh
+arxd keys             # all three, plus a ready-made chain-spec entry
+arxd keys --json      # just the chain-spec entry, for piping
+
 arxd validator-key    # Ed25519 block-signing address — must be in the validator set
-arxd bls-key          # BLS finality key — register on-chain to have precommits counted
+arxd bls-key          # BLS finality key
 arxd node-key         # libp2p PeerId — the network identity
 ```
+
+`arxd keys` prints the entry to paste into a chain spec's `validators` map,
+built from the same type the spec loader parses. Logs go to stderr, so
+`arxd keys --json | jq` works.
 
 `validator.key` is the validator's entire signing identity and has no recovery
 path. Back up `<base-path>` — `scripts/backup-node.sh` does this.

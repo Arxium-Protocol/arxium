@@ -15,6 +15,7 @@ keywords = ["arxium", "blockchain"]
 categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
+serde_json = { workspace = true }
 ed25519-dalek = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }

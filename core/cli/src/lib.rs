@@ -25,6 +25,32 @@ pub enum Command {
         #[arg(long, default_value_os_t = default_base_path())]
         base_path: PathBuf,
     },
+    /// Print every identity this node holds — validator address, BLS finality
+    /// key, and libp2p peer ID — plus a ready-made chain-spec entry.
+    ///
+    /// The three are otherwise three separate subcommands whose output an
+    /// operator has to assemble into JSON by hand, which is how a validator
+    /// ends up in a chain spec with a mistyped key or no `bls_pubkey` at all.
+    /// Generates any key that doesn't exist yet, same as the individual
+    /// subcommands.
+    Keys {
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+
+        /// Emit only the chain-spec entry as JSON, for piping into `jq` or
+        /// straight into a spec file.
+        #[arg(long)]
+        json: bool,
+
+        /// Self-stake to record in the chain-spec entry, in IUM. Genesis
+        /// validators bypass the `JoinValidator` minimum, but this is not
+        /// cosmetic: it materializes a real `StakeAllocation`, so it is what
+        /// the validator can be slashed against and what it unstakes on
+        /// leaving. Defaults to the same floor a runtime join must clear.
+        #[arg(long, default_value_t = 100_000 * 1_000_000_000)]
+        stake: u128,
+    },
+
     /// Load (or, on first run, generate) this node's validator signing key and
     /// print its address, without starting the node. That address has to be in
     /// the chain spec's validator set (or get added later via `JoinValidator`)

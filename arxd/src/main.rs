@@ -11,6 +11,12 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        // Diagnostics to stderr, data to stdout — the usual split, and load
+        // bearing here: the key subcommands print a value meant to be captured
+        // (`address=$(arxd validator-key ...)` in scripts/install.sh) or piped
+        // (`arxd keys --json | jq`), and every one of them also logs. On stdout
+        // those logs land inside the captured value, ANSI escapes and all.
+        .with_writer(std::io::stderr)
         .init();
     node::run()
 }

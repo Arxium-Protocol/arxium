@@ -83,6 +83,52 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Keys { base_path, json, stake }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        let data_path = base_path.join("data");
+        std::fs::create_dir_all(&data_path).context("failed to create data directory")?;
+
+        let validator_key = validator::load_or_generate_key(&data_path)?;
+        let address = Address::from_pubkey_bytes(validator_key.verifying_key().as_bytes())?;
+        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(&data_path)?;
+        let bls_hex = hex::encode(bls_pubkey.0);
+        let peer_id = network::PeerId::from(identity::load_or_generate_keypair(&data_path)?.public());
+
+        // Built from `ValidatorEntry` itself rather than hand-written JSON, so
+        // the field names cannot drift from what the spec loader expects —
+        // a mismatch here would produce output that looks right and silently
+        // fails to register a key.
+        let entry = std::collections::BTreeMap::from([(
+            address.clone(),
+            xc_primitives::ValidatorEntry { stake: *stake, bls_pubkey: Some(bls_hex.clone()) },
+        )]);
+        let entry_json = serde_json::to_string_pretty(&entry)
+            .context("failed to render the chain-spec entry")?;
+
+        if *json {
+            println!("{entry_json}");
+            return Ok(());
+        }
+
+        println!();
+        println!("  Validator address   {address}");
+        println!("  BLS finality key    {bls_hex}");
+        println!("  libp2p peer ID      {peer_id}");
+        println!();
+        println!("  Chain-spec entry — merge into \"validators\" in the genesis spec:");
+        println!();
+        for line in entry_json.lines() {
+            println!("    {line}");
+        }
+        println!();
+        println!("  The validator address must appear in the chain spec's validator set,");
+        println!("  or be added later with JoinValidator, or this node never produces a");
+        println!("  block. Without the BLS key it can produce but never vote on finality,");
+        println!("  while still counting toward the quorum it cannot help meet.");
+        println!();
+        return Ok(());
+    }
+
     if let Some(Command::ValidatorKey { base_path }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
         let key = validator::load_or_generate_key(base_path)?;
