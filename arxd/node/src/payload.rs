@@ -1019,17 +1019,16 @@ mod tests {
         )
         .unwrap();
 
+        // Whitepaper §9.3: double-sign slashes 100% of stake, so the
+        // allocation nets to zero and is removed outright (`None`) rather
+        // than left at a reduced balance.
+        assert_eq!(runtime::slash_amount(10_000), 10_000);
         let allocation = updates
             .stakes
             .allocations
             .get(&(equivocator.clone(), equivocator.clone()))
-            .unwrap()
-            .clone()
             .unwrap();
-        assert_eq!(
-            allocation.active_amount,
-            10_000 - runtime::slash_amount(10_000)
-        );
+        assert!(allocation.is_none());
         let marker = updates.evidence.expect("must write an evidence marker");
         assert_eq!(marker.height, 5);
         assert_eq!(marker.proposer, equivocator);
