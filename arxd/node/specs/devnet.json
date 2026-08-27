@@ -39,6 +39,7 @@
     }
   },
   "boot_nodes": [
-    "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWHP2Ve7tpkRQMJACbU4xmq9aDwL6gphLRHLJ3xB6nU5KA"
+    "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWFDt3EpEeE4evcAHN3tYBnRRuy2jPxmrEYuNZFrEVmFRV",
+    "/ip4/104.207.82.157/tcp/30334/p2p/12D3KooWKq9woLWZ9iy1FzzNUCEdBp6USSN8GAFBeGcqVmWh2iac"
   ]
 }
