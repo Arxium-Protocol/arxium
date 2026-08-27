@@ -85,14 +85,12 @@ pub fn run() -> Result<()> {
 
     if let Some(Command::Keys { base_path, json, stake }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        let data_path = base_path.join("data");
-        std::fs::create_dir_all(&data_path).context("failed to create data directory")?;
 
-        let validator_key = validator::load_or_generate_key(&data_path)?;
+        let validator_key = validator::load_or_generate_key(base_path)?;
         let address = Address::from_pubkey_bytes(validator_key.verifying_key().as_bytes())?;
-        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(&data_path)?;
+        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
         let bls_hex = hex::encode(bls_pubkey.0);
-        let peer_id = network::PeerId::from(identity::load_or_generate_keypair(&data_path)?.public());
+        let peer_id = network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
 
         // Built from `ValidatorEntry` itself rather than hand-written JSON, so
         // the field names cannot drift from what the spec loader expects —

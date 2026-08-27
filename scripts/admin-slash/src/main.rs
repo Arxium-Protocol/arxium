@@ -19,9 +19,11 @@ use xc_storage::ArxiumDb;
 
 #[derive(Parser)]
 struct Args {
-    /// The stopped node's --base-path (the DB lives at <base-path>/data).
+    /// The stopped node's chain data directory (e.g.
+    /// ~/.arxium/corechain/data) — not the node's --base-path, which now
+    /// holds bin/config/keys shared across chains.
     #[arg(long)]
-    base_path: PathBuf,
+    data_path: PathBuf,
 
     /// Validator address to slash (bech32).
     #[arg(long)]
@@ -47,7 +49,7 @@ fn main() -> Result<()> {
         other => bail!("unknown --reason {other:?}, expected double-sign or downtime"),
     };
 
-    let db = ArxiumDb::open(&args.base_path.join("data")).context(
+    let db = ArxiumDb::open(&args.data_path).context(
         "failed to open node DB — is the node still running? stop it first, RocksDB allows only one writer",
     )?;
     let tip_height = db.get_tip_height()?.unwrap_or(0);

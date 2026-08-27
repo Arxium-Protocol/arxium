@@ -220,12 +220,14 @@ fi
 # --------------------------------------------------------------- lay out dirs
 
 say "Creating ${base_path}"
-for dir in bin config data; do
+for dir in bin configs; do
     run mkdir -p "$base_path/$dir"
 done
-# `data/` holds validator.key and the RocksDB state. Nothing else should be
-# reading it; scripts/backup-node.sh is what gets it off-box.
-run chmod 700 "$base_path/data"
+# validator.key/network.key land directly in base_path (shared across every
+# chain this node runs); each chain gets its own <base_path>/<chain-name> data
+# dir (e.g. corechain/), created by arxd itself on first run. Nothing but arxd
+# should read base_path; scripts/backup-node.sh is what gets it off-box.
+run chmod 700 "$base_path"
 
 say "Installing binary to ${base_path}/bin/arxd"
 if [ "$dry_run" -eq 1 ]; then
@@ -242,7 +244,7 @@ fi
 # dependency in arxd. Every key is written with an explicit value, including
 # the false ones; `--validator false` works because those args are
 # ArgAction::Set (see core/cli's bool_env_vars_need_an_explicit_value test).
-env_file="$base_path/config/arxd.env"
+env_file="$base_path/configs/arxd.env"
 say "Writing ${env_file}"
 if [ "$dry_run" -eq 1 ]; then
     printf '  would write the env file (ARXD_VALIDATOR=%s, ARXD_RPC_BIND=%s)\n' "$validator" "$rpc_bind"
@@ -256,7 +258,7 @@ else
 #
 # Apply changes with: systemctl restart arxd
 
-ARXD_BASE_PATH=$base_path/data
+ARXD_BASE_PATH=$base_path
 ARXD_VALIDATOR=$validator
 ARXD_PORT=30333
 ARXD_P2P_PORT=30334
@@ -287,7 +289,7 @@ fi
 # silently — see docs/runbook.md.
 if [ "$dry_run" -eq 0 ]; then
     say "Node validator address"
-    address="$("$base_path/bin/arxd" validator-key --base-path "$base_path/data")"
+    address="$("$base_path/bin/arxd" validator-key --base-path "$base_path")"
     printf '\n    %s\n\n' "$address"
     if [ "$validator" = "true" ]; then
         echo "  This address must be in the chain spec's validator set, or be added"
@@ -360,7 +362,7 @@ UNIT
             run sudo systemctl start arxd
         fi
     else
-        kept_unit="$base_path/config/arxd.service"
+        kept_unit="$base_path/configs/arxd.service"
         say "Skipped installing the service."
         if [ "$dry_run" -eq 1 ]; then
             printf '  would keep the generated unit at %s\n' "$kept_unit"
@@ -395,7 +397,9 @@ $(say 'Done.')
 
   Binary   $base_path/bin/arxd
   Config   $env_file
-  Data     $base_path/data
+  Keys     $base_path/*.key
+  Data     $base_path/corechain/data
+  Snapshot $base_path/corechain/snapshots
 
 $(if [ "$service_installed" -eq 1 ]; then cat <<'SYSTEMD'
   Logs     journalctl -u arxd -f
@@ -407,7 +411,7 @@ else
 fi)
   Health   curl -s localhost:30333/status
 
-  Back up $base_path/data — validator.key has no recovery path if lost.
+  Back up $base_path — validator.key has no recovery path if lost.
   scripts/backup-node.sh does this; run it from cron and copy the
   tarballs off-box.
 DONE

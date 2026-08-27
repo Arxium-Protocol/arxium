@@ -1,6 +1,6 @@
 {
   "height": 0,
-  "chain_name": "arxium-devnet",
+  "chain_name": "corechain",
   "accounts": {
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
       "balance": 100000000,

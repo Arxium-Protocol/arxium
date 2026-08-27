@@ -14,8 +14,20 @@ const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 /// Returns the snapshot too, since the produce loop needs the validator set
 /// for round-robin scheduling.
 pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
-    let snapshot = xc_genesis::load_or_init_snapshot(&config.base_path, DEVNET_GENESIS_JSON)?;
-    let db = ArxiumDb::open(&config.base_path.join("data"))?;
+    // Peeking chain_name out of the embedded JSON up front (rather than
+    // waiting for load_or_init_snapshot's full Snapshot) lets us scope both
+    // the snapshot cache and the RocksDB dir under <base_path>/<chain_name>/
+    // before either is touched — bin/config/keys stay common across chains
+    // while each chain, including future spoke chains, gets its own
+    // subfolder under the same base_path.
+    let chain_name = serde_json::from_str::<serde_json::Value>(DEVNET_GENESIS_JSON)
+        .ok()
+        .and_then(|v| v.get("chain_name")?.as_str().map(str::to_string))
+        .context("embedded genesis JSON is missing chain_name")?;
+    let chain_path = config.base_path.join(&chain_name);
+
+    let snapshot = xc_genesis::load_or_init_snapshot(&chain_path, DEVNET_GENESIS_JSON)?;
+    let db = ArxiumDb::open(&chain_path.join("data"))?;
 
     if !db.is_initialized()? {
         info!(
@@ -147,7 +159,7 @@ mod tests {
 
         // Tamper with the tip block's content in place, signature unchanged —
         // this must now be caught rather than silently built on top of.
-        let db = ArxiumDb::open(&config.base_path.join("data")).unwrap();
+        let db = ArxiumDb::open(&config.base_path.join("corechain").join("data")).unwrap();
         let mut tampered: ChainBlock = db.get_block(1).unwrap().unwrap();
         tampered.timestamp += 1;
         db.write_batch(&tampered).unwrap();
