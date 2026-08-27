@@ -5,4 +5,4 @@ providers:
     folder: Arxium
     type: file
     options:
-      path: /var/lib/grafana/dashboards
+      path: ${ARXIUM_GRAFANA_DASHBOARDS_PATH}

@@ -27,9 +27,11 @@ Downloads the latest release and verifies it against the release's
 configuration file, prints this node's validator address, and generates a
 systemd unit. `--dry-run` shows every step without touching the disk.
 
-Add `--with-monitoring` to install a release-matched native Prometheus scraper
-and alert rules under systemd. Docker is not required. The complete native,
-bring-your-own, and optional Docker paths are documented in
+Add `--with-monitoring` to install release-matched native Prometheus and
+Grafana services, alert rules, and the provisioned Arxium Node dashboard under
+systemd. Native Grafana uses operator-selected credentials and public HTTPS on
+port 3000; Prometheus remains loopback-only. Docker is not required. The
+complete native, bring-your-own, and optional Docker paths are documented in
 [`monitoring/`](monitoring/README.md).
 
 Prebuilt releases target `x86_64-unknown-linux-gnu`. Everywhere else, build

@@ -29,7 +29,7 @@ Usage: install.sh [options]
   --version vX.Y.Z   Install this release instead of the latest.
   --base-path DIR    Node directory (default: ~/.arxium).
   --dry-run          Print what would happen; touch nothing.
-  --with-monitoring  Install native Prometheus monitoring under systemd.
+  --with-monitoring  Install native Prometheus and Grafana under systemd.
   --yes              Non-interactive: accept every default, no prompts.
   -h, --help         This text.
 USAGE
@@ -87,14 +87,25 @@ for tool in curl tar install; do
 done
 
 # sha256sum on Linux, shasum -a 256 on macOS. Checksum verification is not
-# optional — if neither exists we stop rather than install unverified.
+# optional, and each downloaded asset must have one exact manifest entry.
 if command -v sha256sum >/dev/null 2>&1; then
-    sha256_check() { sha256sum -c --ignore-missing "$1"; }
+    sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 elif command -v shasum >/dev/null 2>&1; then
-    sha256_check() { shasum -a 256 -c --ignore-missing "$1"; }
+    sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 else
     die "need sha256sum or shasum to verify the download; refusing to install unverified"
 fi
+
+verify_checksum() {
+    sums_file=$1
+    filename=$2
+    expected=$(awk -v filename="$filename" \
+        '$2 == filename || $2 == "*" filename { print $1 }' "$sums_file")
+    printf '%s\n' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$' \
+        || die "SHA256SUMS has no single valid checksum for ${filename}"
+    actual=$(sha256_file "$filename")
+    [ "$actual" = "$expected" ]
+}
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -110,7 +121,7 @@ if [ "$with_monitoring" -eq 1 ]; then
     fi
 fi
 
-# Releases only ship x86_64 Linux today (see .github/workflows/release.yml).
+# Releases only ship x86_64 Linux today (see .github/workflows/ci.yml).
 # Everything else can still have the directory laid out for it, but there is
 # no binary to fetch, so say that plainly instead of downloading a 404.
 if [ "$os" != "Linux" ] || [ "$arch" != "x86_64" ]; then
@@ -187,33 +198,33 @@ its checksum file — re-run the release workflow rather than skipping this."
 
     say "Verifying checksum"
     # Verified before the archive is ever unpacked, let alone executed.
-    ( cd "$tmp" && sha256_check SHA256SUMS ) || die "checksum mismatch — do not run this binary"
+    ( cd "$tmp" && verify_checksum SHA256SUMS "$asset" ) \
+        || die "checksum mismatch — do not run this binary"
 
     tar -xzf "$tmp/$asset" -C "$tmp"
     binary="$(find "$tmp" -name arxd -type f | head -1)"
     [ -n "$binary" ] || die "no arxd binary inside ${asset}"
 fi
 
-# Fetch monitoring from the same immutable release tag as the node binary.
-# Downloading it before laying out the node keeps an unavailable or incomplete
-# monitoring bundle from leaving a partial installation behind.
+# Fetch the checksum-covered monitoring archive from the same immutable release
+# as the node binary. Downloading and verifying it before laying out the node
+# keeps an unavailable or incomplete bundle from leaving a partial install.
 monitoring_dir="$tmp/monitoring"
 if [ "$with_monitoring" -eq 1 ]; then
-    monitoring_base="https://raw.githubusercontent.com/${REPO}/${version}/monitoring"
+    monitoring_asset="arxium-monitoring-${version}.tar.gz"
     say "Downloading the ${version} monitoring bundle"
     if [ "$dry_run" -eq 1 ]; then
-        printf '  would download native installer and Prometheus config from %s\n' "$monitoring_base"
+        printf '  would download: %s/%s\n' "$base_url" "$monitoring_asset"
+        printf '  would verify the monitoring archive against SHA256SUMS before unpacking\n'
     else
-        mkdir -p "$monitoring_dir/native" "$monitoring_dir/prometheus"
-        for path in \
-            native/install-monitoring.sh \
-            native/alertmanager.yml.example \
-            prometheus/prometheus.yml \
-            prometheus/alerts.yml
-        do
-            curl -fsSL -o "$monitoring_dir/$path" "$monitoring_base/$path" \
-                || die "release ${version} does not contain a complete monitoring bundle"
-        done
+        curl -fSL --progress-bar -o "$tmp/$monitoring_asset" \
+            "$base_url/$monitoring_asset" \
+            || die "release ${version} has no monitoring archive"
+        ( cd "$tmp" && verify_checksum SHA256SUMS "$monitoring_asset" ) \
+            || die "monitoring checksum mismatch — do not execute the installer"
+        tar -xzf "$tmp/$monitoring_asset" -C "$tmp"
+        [ -x "$monitoring_dir/native/install-monitoring.sh" ] \
+            || die "monitoring archive does not contain the native installer"
     fi
 fi
 
@@ -385,7 +396,8 @@ if [ "$with_monitoring" -eq 1 ]; then
     elif [ "$(id -u)" -eq 0 ]; then
         bash "$monitoring_dir/native/install-monitoring.sh"
     else
-        sudo bash "$monitoring_dir/native/install-monitoring.sh"
+        sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER,GRAFANA_ADMIN_PASSWORD,ALERTMANAGER,ALERTMANAGER_CONFIG \
+            bash "$monitoring_dir/native/install-monitoring.sh"
     fi
 fi
 

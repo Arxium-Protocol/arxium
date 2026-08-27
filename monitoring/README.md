@@ -9,7 +9,7 @@ Choose one of these paths. Docker is optional.
 
 | Path | Installs on the node | Best for |
 | --- | --- | --- |
-| [Native](#native-recommended) | Prometheus and a systemd unit | A standalone node without a container runtime |
+| [Native](#native-recommended) | Prometheus, Grafana, and systemd units | A standalone node without a container runtime |
 | [Bring your own](bring-your-own.md) | Nothing | Existing Prometheus, Grafana, or hosted monitoring |
 | [Docker Compose](#docker-compose) | Prometheus and Grafana containers | Hosts that already use Docker |
 
@@ -22,9 +22,10 @@ curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts
   | bash -s -- --with-monitoring
 ```
 
-The flag downloads monitoring files from the same release tag as the node
-binary. Prometheus and Alertmanager downloads are verified against checksums
-published by their upstream projects.
+The flag downloads a checksum-covered monitoring archive from the same release
+tag as the node binary. Prometheus, Grafana, and Alertmanager downloads are
+also verified against checksums published by their upstream projects. Native
+installation requires `nftables` for Grafana process isolation.
 
 From a repository checkout, install or update monitoring directly:
 
@@ -32,15 +33,50 @@ From a repository checkout, install or update monitoring directly:
 sudo ./monitoring/native/install-monitoring.sh
 ```
 
-Prometheus runs as an unprivileged system user, stores data under
-`/var/lib/arxium-monitoring`, and listens only on `127.0.0.1:9090`. View it
-through an SSH tunnel:
+Prometheus and Grafana run as separate unprivileged system users. Their data is
+stored under `/var/lib/arxium-monitoring`. Prometheus stays private on
+`127.0.0.1:9090`. Grafana listens publicly on port 3000 with a generated
+self-signed TLS certificate.
+
+During the first installation, the installer asks for:
+
+- the node's public IPv4 address or DNS name;
+- a Grafana username;
+- a Grafana password entered twice without echoing it.
+
+Grafana stores the password as a salted hash in its database. The temporary
+bootstrap password file is deleted, and Grafana is restarted without the
+password in its process environment. The installer prints the username and
+certificate fingerprint, but never prints the password. The generated TLS key
+and persistent Grafana encryption key are readable only by root and the Grafana
+service account. A dedicated nftables policy prevents the public Grafana process
+from reaching the node RPC port or initiating any other outbound connection;
+only established client responses and access to Prometheus on
+`127.0.0.1:9090` are allowed.
+
+Open `https://NODE_IP_OR_NAME:3000`. A self-signed certificate causes a browser
+warning until you trust it. Verify the SHA-256 fingerprint printed by the
+installer before accepting it. If the page is unreachable, allow inbound TCP
+3000 in both the host firewall and the VPS provider firewall.
+
+Prometheus remains available through an SSH tunnel:
 
 ```sh
-ssh -N -L 9090:127.0.0.1:9090 operator@node-host
+ssh -N \
+  -L 9090:127.0.0.1:9090 \
+  operator@node-host
 ```
 
-Then open `http://127.0.0.1:9090` locally.
+Then open `http://127.0.0.1:9090` for Prometheus.
+
+Rerunning the installer upgrades the monitoring binaries and provisioning but
+preserves the Grafana account, password hash, encryption key, database,
+plugins, dashboards, and Prometheus time-series data. The self-signed
+certificate is preserved until it has fewer than 30 days remaining, then it is
+rotated and its new fingerprint is printed. Non-interactive first installs must
+provide `GRAFANA_PUBLIC_HOST`, `GRAFANA_ADMIN_USER`, and
+`GRAFANA_ADMIN_PASSWORD` in the installer environment. Avoid placing the
+password in shell history.
 
 ### Alert delivery
 
@@ -75,7 +111,8 @@ readable only by root and the monitoring service account.
 sudo ./monitoring/native/uninstall-monitoring.sh
 ```
 
-The uninstaller removes services but preserves binaries, configuration, and
+The uninstaller removes the Prometheus, Grafana, and optional Alertmanager
+services but preserves binaries, credentials, configuration, dashboards, and
 time-series data until you deliberately remove their directories.
 
 ## Docker Compose
