@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
@@ -80,6 +80,7 @@ pub fn produce_block(
                 validators,
                 next_height,
                 &|h, p| db.evidence_processed(h, p),
+                &|pk: &xc_bls::BlsPublicKey| db.bls_pubkey_owner(pk),
             )
         },
     )?;
@@ -190,8 +191,15 @@ pub fn produce_loop(
     // a window.
     let mut last_skip_log: Option<Instant> = None;
 
+    // A plain `thread::sleep(BLOCK_INTERVAL)` at the top of the loop makes
+    // the real period `BLOCK_INTERVAL + work_time`, compounding every single
+    // iteration — production drifts later and later under load. Ticking off
+    // a monotonic deadline instead makes the period converge to
+    // `max(BLOCK_INTERVAL, work_time)`.
+    let mut next_tick = Instant::now();
+
     loop {
-        thread::sleep(BLOCK_INTERVAL);
+        thread::sleep(next_sleep(&mut next_tick, Instant::now(), BLOCK_INTERVAL));
 
         if shutdown.load(Ordering::Relaxed) {
             info!("shutting down");
@@ -358,6 +366,21 @@ pub fn produce_loop(
     }
 }
 
+/// Advances `*next_tick` by one `interval` and returns how long to sleep
+/// before it arrives. If the deadline already passed (the previous
+/// iteration's body took longer than `interval`), resyncs `*next_tick` to
+/// `now` instead of returning a duration that would fire a burst of
+/// immediate iterations to "catch up."
+fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Duration {
+    *next_tick += interval;
+    if *next_tick > now {
+        *next_tick - now
+    } else {
+        *next_tick = now;
+        Duration::ZERO
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +388,36 @@ mod tests {
     use std::collections::BTreeMap;
     use xc_executor::BlockUpdates;
     use xc_primitives::{AccountEntry, Snapshot};
+
+    /// On time: sleeps the full interval, deadline advances by exactly one
+    /// interval.
+    #[test]
+    fn next_sleep_waits_full_interval_when_on_schedule() {
+        let now = Instant::now();
+        let interval = Duration::from_secs(2);
+        let mut next_tick = now;
+
+        let sleep = next_sleep(&mut next_tick, now, interval);
+
+        assert_eq!(sleep, interval);
+        assert_eq!(next_tick, now + interval);
+    }
+
+    /// Body overran the interval: no negative/huge sleep, and the deadline
+    /// resyncs to `now` instead of trying to fire a catch-up burst.
+    #[test]
+    fn next_sleep_resyncs_instead_of_bursting_when_behind() {
+        let deadline_base = Instant::now();
+        let interval = Duration::from_secs(2);
+        let mut next_tick = deadline_base;
+        // Body took 5s against a 2s interval — well past the next deadline.
+        let now = deadline_base + Duration::from_secs(5);
+
+        let sleep = next_sleep(&mut next_tick, now, interval);
+
+        assert_eq!(sleep, Duration::ZERO);
+        assert_eq!(next_tick, now);
+    }
 
     #[test]
     fn produce_block_applies_transfer_and_advances_tip() {
@@ -391,6 +444,7 @@ mod tests {
                     &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
                         std::result::Result::Ok(false)
                     },
+                    &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                 )
             },
         )
@@ -527,6 +581,7 @@ mod tests {
                             &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
                                 std::result::Result::Ok(false)
                             },
+                            &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                         )
                     },
                 );

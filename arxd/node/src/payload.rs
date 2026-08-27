@@ -12,6 +12,7 @@ use xc_primitives::{
 use xc_storage::{
     AccountUpdates, ArxiumDb, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StorageError,
 };
+use xc_bls::BlsPublicKey;
 
 /// Devnet Groth16 verifying key, checked into `circuits/identity-zk` — see
 /// that crate's module docs for why it isn't from a real trusted-setup
@@ -231,7 +232,12 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
             if !is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            validated_bls_pubkey(bls_pubkey)?;
+            let bytes = validated_bls_pubkey(bls_pubkey)?;
+            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))? {
+                if &owner != validator {
+                    anyhow::bail!("BLS pubkey already registered to {owner}");
+                }
+            }
             let existing_active = db
                 .get_stake_allocation(&action.sender, validator)?
                 .map(|a| a.active_amount)
@@ -259,7 +265,12 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
             if !is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            validated_bls_pubkey(pubkey)?;
+            let bytes = validated_bls_pubkey(pubkey)?;
+            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))? {
+                if &owner != validator {
+                    anyhow::bail!("BLS pubkey already registered to {owner}");
+                }
+            }
         }
         _ => {}
     }
@@ -283,6 +294,7 @@ pub fn dispatch(
     validators: &[Address],
     current_height: u64,
     evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
+    bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
     let mut updates = dispatch_inner(
         action,
@@ -294,6 +306,7 @@ pub fn dispatch(
         validators,
         current_height,
         evidence_processed,
+        bls_pubkey_owner_lookup,
     )?;
     charge_action_fee(action, lookup, &mut updates)?;
     Ok(updates)
@@ -336,6 +349,7 @@ fn dispatch_inner(
     validators: &[Address],
     current_height: u64,
     evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
+    bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
         ActionPayload::Transfer { to, amount } => Ok(BlockUpdates {
@@ -376,6 +390,11 @@ fn dispatch_inner(
             // Registered in the same block as the join, so the validator is
             // never in the set without the ability to vote.
             let bytes = validated_bls_pubkey(bls_pubkey)?;
+            if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))? {
+                if &owner != validator {
+                    anyhow::bail!("BLS pubkey already registered to {owner}");
+                }
+            }
             // `bls_pubkey` here is informational, like `stake`:
             // `ValidatorSetSnapshot` persists neither, and the authoritative
             // registration is the `bls_key` update below.
@@ -523,6 +542,11 @@ fn dispatch_inner(
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
             let bytes = validated_bls_pubkey(pubkey)?;
+            if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))? {
+                if &owner != validator {
+                    anyhow::bail!("BLS pubkey already registered to {owner}");
+                }
+            }
             Ok(BlockUpdates {
                 bls_key: Some(BlsKeyRegistration {
                     address: validator.clone(),
@@ -632,6 +656,10 @@ mod tests {
         Ok(Vec::new())
     }
 
+    fn no_bls_owner(_pubkey: &BlsPublicKey) -> Result<Option<Address>, StorageError> {
+        Ok(None)
+    }
+
     fn make_lookup(
         accounts: HashMap<Address, AccountEntry>,
     ) -> impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError> {
@@ -701,6 +729,7 @@ mod tests {
             &[alice],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         ) {
             Err(err) => err,
             Ok(_) => panic!("expected leaving the last validator to be rejected"),
@@ -734,6 +763,7 @@ mod tests {
             &[alice.clone(), bob],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
         assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(a)) if a == alice));
@@ -765,6 +795,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -819,6 +850,7 @@ mod tests {
             &[alice.clone()],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -862,6 +894,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(
@@ -896,6 +929,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("minimum validator stake"));
@@ -927,6 +961,7 @@ mod tests {
             &[alice.clone(), bob],
             5,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -1016,6 +1051,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -1063,6 +1099,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(true),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("already processed"));
@@ -1102,6 +1139,7 @@ mod tests {
             &[alice.clone(), bob],
             5,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("already has an unbonding batch"));
@@ -1132,11 +1170,77 @@ mod tests {
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
         let registration = updates.bls_key.expect("expected a bls_key update");
         assert_eq!(registration.address, alice);
         assert_eq!(registration.pubkey.0, pubkey.0);
+    }
+
+    #[test]
+    fn register_bls_key_rejects_a_pubkey_already_held_by_a_different_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RegisterBlsKey {
+                validator: alice.clone(),
+                pubkey: pubkey.0.to_vec(),
+            },
+        };
+        let owned_by_bob = |_: &BlsPublicKey| Ok(Some(bob.clone()));
+
+        let err = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &|_, _| Ok::<bool, StorageError>(false),
+            &owned_by_bob,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn register_bls_key_allows_re_registering_your_own_already_held_pubkey() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RegisterBlsKey {
+                validator: alice.clone(),
+                pubkey: pubkey.0.to_vec(),
+            },
+        };
+        let owned_by_self = |_: &BlsPublicKey| Ok(Some(alice.clone()));
+
+        let updates = dispatch(
+            &action,
+            &lookup,
+            &stake_lookup,
+            &validator_masters_lookup,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &|_, _| Ok::<bool, StorageError>(false),
+            &owned_by_self,
+        )
+        .expect("re-registering your own key should stay a no-op success");
+        assert_eq!(updates.bls_key.expect("expected a bls_key update").address, alice);
     }
 
     #[test]
@@ -1162,6 +1266,7 @@ mod tests {
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid BLS public key"));
@@ -1209,6 +1314,7 @@ mod tests {
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
         let entry = &updates.accounts.0[&alice];
@@ -1242,6 +1348,7 @@ mod tests {
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("malformed zk proof bytes"));
@@ -1288,6 +1395,7 @@ mod tests {
             &[],
             0,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed verification"));
@@ -1320,6 +1428,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("is not authorized to manage"));
@@ -1353,6 +1462,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -1424,6 +1534,7 @@ mod tests {
             &[alice.clone(), bob.clone()],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
 
@@ -1461,6 +1572,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
         assert_eq!(
@@ -1496,6 +1608,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap();
         assert_eq!(updates.operator.authorization.get(&alice).cloned(), Some(None));
@@ -1537,6 +1650,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .unwrap_err();
         assert!(err.to_string().contains("is not authorized to manage"));
@@ -1645,6 +1759,30 @@ mod tests {
     }
 
     #[test]
+    fn admission_precheck_rejects_join_with_a_pubkey_already_held_by_a_different_validator() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = precheck_test_db(&[]);
+        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey }]).unwrap();
+        db.write_batches(&[&AccountUpdates(HashMap::from([(alice.clone(), funded(ACTION_FEE))]))])
+            .unwrap();
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: MIN_VALIDATOR_STAKE,
+                bls_pubkey: pubkey.0.to_vec(),
+            },
+        };
+
+        let err = admission_precheck(&action, &db).unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
     fn admission_precheck_accepts_authorized_operator_join() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
@@ -1710,6 +1848,7 @@ mod tests {
                 &[],
                 10,
                 &|_, _| Ok::<bool, StorageError>(false),
+                &no_bls_owner,
             );
             assert!(
                 result.is_err(),
@@ -1751,6 +1890,7 @@ mod tests {
             &[],
             10,
             &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
         )
         .expect("a well-formed join must succeed");
 

@@ -132,6 +132,30 @@ impl ArxiumDb {
         }
     }
 
+    // ponytail: linear scan over the `meta:blskey:` prefix, fine at
+    // devnet validator-set scale — add a pubkey->address reverse index if
+    // the validator set ever grows enough to make this a bottleneck.
+    /// Address already holding `pubkey`, if any — used to reject a second
+    /// validator registering the same BLS key.
+    pub fn bls_pubkey_owner(&self, pubkey: &BlsPublicKey) -> Result<Option<Address>, StorageError> {
+        let prefix = b"meta:blskey:";
+        let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (existing, _len): (BlsPublicKey, usize) = bincode::serde::decode_from_slice(&value, config)?;
+            if &existing == pubkey {
+                let address_str = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
+                let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
+                return Ok(Some(address));
+            }
+        }
+        Ok(None)
+    }
+
     /// The address currently authorized to submit `JoinValidator`/
     /// `LeaveValidator`/`RegisterBlsKey` on `validator`'s behalf, if any —
     /// set via `OperatorUpdates::authorization`, looked up by `arxd/node`'s
@@ -358,6 +382,50 @@ impl ArxiumDb {
             return Ok(Some(height));
         }
         Ok(None)
+    }
+
+    /// Every persisted precommit vote at heights >= `cutoff` — used by
+    /// `spawn_finality` on startup to reconstruct its in-memory tallies from
+    /// whatever survived a restart, since keys are zero-padded so this seek
+    /// lands exactly at `cutoff` and reads forward.
+    pub fn get_precommit_votes_from(&self, cutoff: u64) -> Result<Vec<PrecommitVoteRecord>, StorageError> {
+        let prefix = b"meta:precommit:";
+        let seek_key = format!("meta:precommit:{cutoff:020}");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (record, _len): (PrecommitVoteRecord, usize) = bincode::serde::decode_from_slice(&value, config)?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    /// Deletes every persisted precommit vote at `height` — called once that
+    /// height finalizes (superseded by its `FinalityRecord`) or ages out of
+    /// `TALLY_RETENTION_HEIGHTS`, so the DB never accumulates more than
+    /// memory already bounds.
+    pub fn delete_precommit_votes(&self, height: u64) -> Result<(), StorageError> {
+        let prefix = format!("meta:precommit:{height:020}:");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_META), key);
+        }
+        self.db.write(batch)?;
+        Ok(())
     }
 
     /// Look up a block's height by its content hash.
@@ -690,6 +758,28 @@ pub struct FinalityRecord {
     pub block_hash: String,
     pub signers: Vec<Address>,
     pub aggregate_signature: BlsSignature,
+}
+
+/// One validator's persisted precommit vote for `height`/`block_hash`, so a
+/// restart before quorum is reached doesn't lose a tally `arxd/finality`
+/// already gossiped and verified. Deleted once its height finalizes
+/// (superseded by `FinalityRecord`) or ages out of `TALLY_RETENTION_HEIGHTS`,
+/// mirroring the in-memory tally's own lifetime exactly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecommitVoteRecord {
+    pub height: u64,
+    pub block_hash: String,
+    pub voter: Address,
+    pub signature: BlsSignature,
+}
+
+impl BatchWritable for PrecommitVoteRecord {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:precommit:{:020}:{}:{}", self.height, self.block_hash, self.voter).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
 }
 
 impl BatchWritable for FinalityRecord {

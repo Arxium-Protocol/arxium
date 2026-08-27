@@ -331,6 +331,7 @@ pub fn run() -> Result<()> {
                         validators,
                         height,
                         &|h, p| db.evidence_processed(h, p),
+                        &|pk: &xc_bls::BlsPublicKey| db.bls_pubkey_owner(pk),
                     )
                 },
             ) {

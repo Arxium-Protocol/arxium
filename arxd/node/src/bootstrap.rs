@@ -92,6 +92,7 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
                     validators,
                     0,
                     &|_, _| Ok(false),
+                    &|pk: &xc_bls::BlsPublicKey| db.bls_pubkey_owner(pk),
                 )
             },
         )?;

@@ -10,7 +10,7 @@ use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 use xc_primitives::{Address, Block, quorum};
-use xc_storage::{ArxiumDb, FinalityRecord};
+use xc_storage::{ArxiumDb, FinalityRecord, PrecommitVoteRecord};
 
 /// How many heights of unfinalized precommit tallies to keep.
 ///
@@ -67,6 +67,31 @@ pub fn spawn_finality<P>(
         // watermark below.
         let mut highest_seen: u64 = 0;
 
+        // Reload whatever partial tallies survived a restart — a crash after
+        // a vote landed but before quorum used to silently drop it. Two
+        // passes: read everything persisted, find the true watermark, then
+        // keep only what's still within the retention window (mirrors the
+        // per-event pruning below, which will also delete anything stale
+        // this leaves behind).
+        match db.get_precommit_votes_from(0) {
+            Ok(records) => {
+                highest_seen = records.iter().map(|r| r.height).max().unwrap_or(0);
+                let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
+                for record in records {
+                    if record.height < cutoff {
+                        continue;
+                    }
+                    tallies
+                        .entry(record.height)
+                        .or_default()
+                        .entry(record.block_hash)
+                        .or_default()
+                        .insert(record.voter, record.signature);
+                }
+            }
+            Err(err) => warn!("finality: failed to reload persisted precommit votes: {err}"),
+        }
+
         for event in events {
             highest_seen = highest_seen.max(match &event {
                 FinalityEvent::BlockObserved(block) => block.height,
@@ -75,6 +100,11 @@ pub fn spawn_finality<P>(
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
+            for height in tallies.keys().copied().filter(|h| *h < cutoff).collect::<Vec<_>>() {
+                if let Err(err) = db.delete_precommit_votes(height) {
+                    warn!("finality: failed to prune persisted precommit votes for height {height}: {err}");
+                }
+            }
             tallies.retain(|height, _| *height >= cutoff);
 
             match event {
@@ -122,12 +152,23 @@ fn tally_vote(
         return Ok(());
     }
 
+    let vote_record = PrecommitVoteRecord {
+        height: vote.height,
+        block_hash: vote.block_hash.clone(),
+        voter: vote.voter.clone(),
+        signature: vote.signature.clone(),
+    };
+
     let signers = tallies
         .entry(vote.height)
         .or_default()
         .entry(vote.block_hash.clone())
         .or_default();
     signers.insert(vote.voter, vote.signature);
+
+    // Persisted before the quorum check so a crash between this vote and
+    // reaching quorum still leaves it recoverable on restart.
+    db.write_batches(&[&vote_record])?;
 
     if signers.len() < quorum(validators.len()) {
         return Ok(());
@@ -154,6 +195,9 @@ fn tally_vote(
         aggregate_signature,
     };
     db.write_batches(&[&record])?;
+    if let Err(err) = db.delete_precommit_votes(vote.height) {
+        warn!("finality: failed to delete persisted precommit votes for finalized height {}: {err}", vote.height);
+    }
     tallies.remove(&vote.height);
     info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
     Ok(())
@@ -236,6 +280,72 @@ mod tests {
         let record = db.get_finality_record(5).unwrap().expect("expected finality record at quorum");
         assert_eq!(record.signers.len(), 3);
         assert_eq!(record.block_hash, block_hash);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_below_quorum_vote_survives_a_simulated_restart_and_an_at_quorum_vote_deletes_it() {
+        let (db, dir) = open_test_db();
+        let addrs_and_keys: Vec<(Address, BlsSecretKey)> = (0u8..4)
+            .map(|i| {
+                let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
+                let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+                let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                (addr, sk)
+            })
+            .collect();
+        let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+
+        let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
+
+        // Below quorum (3): only 2 of 4 vote, then simulate a crash by
+        // dropping the in-memory tally entirely and reconstructing it the
+        // same way `spawn_finality` does on startup.
+        let mut tallies = HashMap::new();
+        for (addr, sk) in addrs_and_keys.iter().take(2) {
+            let vote = PrecommitVote {
+                height: 5,
+                block_hash: block_hash.clone(),
+                voter: addr.clone(),
+                signature: xc_bls::sign(sk, block_hash.as_bytes()),
+            };
+            tally_vote(&db, &mut tallies, vote).unwrap();
+        }
+        drop(tallies);
+
+        let mut reloaded: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> = HashMap::new();
+        for record in db.get_precommit_votes_from(0).unwrap() {
+            reloaded
+                .entry(record.height)
+                .or_default()
+                .entry(record.block_hash)
+                .or_default()
+                .insert(record.voter, record.signature);
+        }
+        assert_eq!(
+            reloaded.get(&5).unwrap().get(&block_hash).unwrap().len(),
+            2,
+            "both pre-crash votes should have survived via persisted records"
+        );
+
+        // The 3rd vote reaches quorum and finalizes — persisted vote records
+        // for that height are now superseded and must be deleted.
+        let (addr, sk) = &addrs_and_keys[2];
+        let vote = PrecommitVote {
+            height: 5,
+            block_hash: block_hash.clone(),
+            voter: addr.clone(),
+            signature: xc_bls::sign(sk, block_hash.as_bytes()),
+        };
+        tally_vote(&db, &mut reloaded, vote).unwrap();
+        assert!(db.get_finality_record(5).unwrap().is_some());
+        assert!(
+            db.get_precommit_votes_from(0).unwrap().is_empty(),
+            "finalized height's persisted votes must be cleaned up"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

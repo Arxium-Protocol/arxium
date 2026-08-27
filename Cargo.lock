@@ -5065,6 +5065,7 @@ name = "xc-mempool"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "serde",
  "thiserror 2.0.19",
  "xc-primitives",

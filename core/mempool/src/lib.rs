@@ -13,6 +13,11 @@ use xc_storage::{ArxiumDb, StorageError};
 // becomes a real constraint.
 const MAX_PENDING: usize = 10_000;
 
+// A count cap alone lets a mempool of a few huge actions still exhaust
+// memory well under MAX_PENDING entries. 10MB is generous for devnet-sized
+// actions; make configurable alongside MAX_PENDING if that changes.
+const MAX_PENDING_BYTES: usize = 10_000_000;
+
 #[derive(Debug, Error)]
 pub enum MempoolError {
     #[error("mempool is full")]
@@ -83,6 +88,9 @@ pub struct Mempool<P> {
     // spammed action doesn't grow the queue unboundedly — only one action
     // per sender/nonce can ever land in a block anyway.
     seen: HashSet<(Address, u64)>,
+    // Running total of every queued action's encoded size, so push/drain/purge
+    // stay O(1) instead of re-encoding the whole queue to check the cap.
+    total_bytes: usize,
 }
 
 impl<P> Default for Mempool<P> {
@@ -90,17 +98,31 @@ impl<P> Default for Mempool<P> {
         Self {
             pending: VecDeque::new(),
             seen: HashSet::new(),
+            total_bytes: 0,
         }
     }
 }
 
-impl<P> Mempool<P> {
+impl<P: Serialize> Mempool<P> {
     pub fn new() -> Self {
         Self::default()
     }
 
+    fn encoded_size(action: &Action<P>) -> usize {
+        // Same encode-for-size-or-hash pattern `core/primitives/src/block.rs`
+        // uses; encoding an in-memory value to bincode doesn't fail in
+        // practice.
+        bincode::serde::encode_to_vec(action, bincode::config::standard())
+            .expect("action encoding should never fail")
+            .len()
+    }
+
     pub fn push(&mut self, action: Action<P>) -> Result<(), MempoolError> {
         if self.pending.len() >= MAX_PENDING {
+            return Err(MempoolError::Full);
+        }
+        let size = Self::encoded_size(&action);
+        if self.total_bytes + size > MAX_PENDING_BYTES {
             return Err(MempoolError::Full);
         }
 
@@ -112,6 +134,7 @@ impl<P> Mempool<P> {
             });
         }
 
+        self.total_bytes += size;
         self.pending.push_back(action);
         Ok(())
     }
@@ -133,12 +156,17 @@ impl<P> Mempool<P> {
 
     pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
         let n = max.min(self.pending.len());
-        self.pending
+        let drained: Vec<Action<P>> = self
+            .pending
             .drain(..n)
             .inspect(|action| {
                 self.seen.remove(&(action.sender.clone(), action.nonce));
             })
-            .collect()
+            .collect();
+        for action in &drained {
+            self.total_bytes -= Self::encoded_size(action);
+        }
+        drained
     }
 
     /// Drops any queued action for `sender` whose nonce is now stale
@@ -150,14 +178,17 @@ impl<P> Mempool<P> {
     /// peer re-executing it would reject.
     pub fn purge_stale(&mut self, sender: &Address, current_nonce: u64) {
         let seen = &mut self.seen;
+        let mut removed_bytes = 0usize;
         self.pending.retain(|action| {
             if &action.sender == sender && action.nonce < current_nonce {
                 seen.remove(&(action.sender.clone(), action.nonce));
+                removed_bytes += Self::encoded_size(action);
                 false
             } else {
                 true
             }
         });
+        self.total_bytes -= removed_bytes;
     }
 }
 
@@ -176,6 +207,37 @@ mod tests {
             signature: Some(format!("sig-{nonce}")),
             payload: (),
         }
+    }
+
+    /// A handful of large actions can exhaust the byte budget long before
+    /// MAX_PENDING (10,000) entries would — proves the cap is on bytes, not
+    /// just count.
+    #[test]
+    fn push_rejects_once_the_byte_budget_is_exhausted_well_under_the_count_cap() {
+        let mut mempool: Mempool<Vec<u8>> = Mempool::new();
+        // Leaves headroom for per-action encoding overhead (address, nonce,
+        // signature, length prefix) so 10 of these comfortably fit under
+        // MAX_PENDING_BYTES (10MB) but an 11th does not.
+        let big_payload = vec![0u8; 950_000];
+
+        for nonce in 0..10 {
+            let action = Action {
+                sender: addr(1),
+                nonce,
+                signature: Some(format!("sig-{nonce}")),
+                payload: big_payload.clone(),
+            };
+            mempool.push(action).expect("well under the byte cap so far");
+        }
+
+        let overflow = Action {
+            sender: addr(1),
+            nonce: 10,
+            signature: Some("sig-10".to_string()),
+            payload: big_payload,
+        };
+        assert!(matches!(mempool.push(overflow), Err(MempoolError::Full)));
+        assert_eq!(mempool.len(), 10, "the 11th action must not have been queued");
     }
 
     #[test]
