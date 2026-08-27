@@ -1,15 +1,7 @@
 {
   "_comment": "DEVNET ONLY — well-known test seeds, matching devnet.json's genesis accounts. Never use these on anything but a local devnet.",
-  "alice": {
-    "address": "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz",
-    "ed25519_seed_hex": "0101010101010101010101010101010101010101010101010101010101010101"
-  },
   "bob": {
     "address": "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5",
     "ed25519_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202"
-  },
-  "charlie": {
-    "address": "arx1a4yj333g68pvd6hfqvufqkv4vy54jfe6t33ljd3kc9rpfty8xlgshausgl",
-    "ed25519_seed_hex": "0303030303030303030303030303030303030303030303030303030303030303"
   }
 }

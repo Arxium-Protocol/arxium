@@ -2,18 +2,8 @@
   "height": 0,
   "chain_name": "arxium-devnet",
   "accounts": {
-    "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz": {
-      "balance": 1000000000,
-      "nonce": 0,
-      "identity_hash": null
-    },
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
-      "balance": 1000000000,
-      "nonce": 0,
-      "identity_hash": null
-    },
-    "arx1a4yj333g68pvd6hfqvufqkv4vy54jfe6t33ljd3kc9rpfty8xlgshausgl": {
-      "balance": 1000000000,
+      "balance": 100000000,
       "nonce": 0,
       "identity_hash": null
     },
@@ -22,13 +12,18 @@
       "nonce": 0,
       "identity_hash": null
     },
-    "arx158g2xle8kllejmp56cselgunrxpp4yyzxae7fawgegwnz8e8zlmqr84zy7": {
-      "balance": 1000000000000000000,
+    "arx1lr006g97x8sgkmmk0t3r20959dxs62ch9vqp5jnfykpg9hhgzqws8cv6tv": {
+      "balance": 786954682000000000,
       "nonce": 0,
       "identity_hash": null
     },
-    "arx1kdcsvwkafvn8nxcrvkcsfjp9ywdxmrn6l9sxg5s2llkgh4thszgsfg8lw5": {
-      "balance": 750000000000000000,
+    "arx17qljjgrhzk2ghdeh8phc66fce3detxkv48aqu74upmlatvcchg9qq2hlcq": {
+      "balance": 786954682000000000,
+      "nonce": 0,
+      "identity_hash": null
+    },
+    "arx1s8c20gx2c9z5p756avlmsj4h0p6nw4wygntkuenuuzetdextae4suhsqm0": {
+      "balance": 786954682000000000,
       "nonce": 0,
       "identity_hash": null
     }
