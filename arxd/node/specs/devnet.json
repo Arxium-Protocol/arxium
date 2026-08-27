@@ -29,8 +29,13 @@
     }
   },
   "validators": {
-    "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
-      "stake": 1000000
+    "arx170xv78djfjpks6d8qxa8xnp72mzvyrtjcm5h80hn49h8e2c84v6srwtefh": {
+      "stake": 100000000000000,
+      "bls_pubkey": "b5ddaa3d7feecae8a72ef1cf10b692e750e8ff549c9430a4eab071385a360f1d83e43570079af0d5175e7939776ffbc7"
+    },
+    "arx1mgquqh5qd03r3nuwm7nyvkvhdk5pydrxusamw5gmn7dvjvsdeyasm6c09u": {
+      "stake": 100000000000000,
+      "bls_pubkey": "98e4be56fed50fbf2353ad63270c0ac1092bee04c31233e1c929fadd347c1c40c4a8f0b815514674bf5984b75537fa23"
     }
   },
   "boot_nodes": [
