@@ -74,8 +74,8 @@ mod tests {
     /// in for separate connections, since `run_swarm` no longer resets this
     /// map on `ConnectionEstablished`) ends up in `blocked_peers`, and a
     /// peer that stays under the cap does not.
-    #[test]
-    fn crossing_threshold_bans_peer_permanently() {
+    #[tokio::test]
+    async fn crossing_threshold_bans_peer_permanently() {
         let mut swarm = build_swarm(libp2p::identity::Keypair::generate_ed25519()).unwrap();
         let mut bad_gossip = HashMap::new();
         let peer = PeerId::random();
