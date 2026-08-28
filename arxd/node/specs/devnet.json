@@ -29,17 +29,17 @@
     }
   },
   "validators": {
-    "arx170xv78djfjpks6d8qxa8xnp72mzvyrtjcm5h80hn49h8e2c84v6srwtefh": {
+    "arx1c2xdr2sw4d6j474s4fvwj9thp2ae8p8k7nqjsy8yeczkrw5l3wnqd7ems0": {
       "stake": 100000000000000,
-      "bls_pubkey": "b5ddaa3d7feecae8a72ef1cf10b692e750e8ff549c9430a4eab071385a360f1d83e43570079af0d5175e7939776ffbc7"
+      "bls_pubkey": "958ea227966bc527bdf6a944fd7f502f5c280afdc87ff7c51e5eae987cf03ae00fd89cf0ef6c22ad8bbc3d24d72ff893"
     },
-    "arx1mgquqh5qd03r3nuwm7nyvkvhdk5pydrxusamw5gmn7dvjvsdeyasm6c09u": {
+    "arx1ry7xj359ep80qp04r6mm5n304nc57p5cadx23203432hm9n48vlsprku7z": {
       "stake": 100000000000000,
-      "bls_pubkey": "98e4be56fed50fbf2353ad63270c0ac1092bee04c31233e1c929fadd347c1c40c4a8f0b815514674bf5984b75537fa23"
+      "bls_pubkey": "a5f5caeac95d067b2b9aedc894c1644b3b9b037069bb92e9b8e3f5d1d91aa2a49ae9cd429ea8c0fd9bc6228859517d51"
     }
   },
   "boot_nodes": [
-    "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWFDt3EpEeE4evcAHN3tYBnRRuy2jPxmrEYuNZFrEVmFRV",
-    "/ip4/104.207.82.157/tcp/30334/p2p/12D3KooWKq9woLWZ9iy1FzzNUCEdBp6USSN8GAFBeGcqVmWh2iac"
+    "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWJGC5tBv8pC7XzcCay9xk91seKwfspsoda7G7mK9TaMXw",
+    "/ip4/104.207.82.157/tcp/30334/p2p/12D3KooWKinzoEvpaVmy5rr85gge9rrZxm9vjiSHXnxaUVzDYYUi"
   ]
 }
