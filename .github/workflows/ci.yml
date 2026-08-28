@@ -103,7 +103,7 @@ jobs:
         env:
           GRAFANA_PUBLIC_HOST: 127.0.0.1
           GRAFANA_ADMIN_USER: ci-admin
-          GRAFANA_ADMIN_PASSWORD: CiNativeValidation1!
+          GRAFANA_TEST_PASSWORD: CiNativeValidation1!
         run: |
           set -Eeuo pipefail
           sudo apt-get update -qq
@@ -113,8 +113,15 @@ jobs:
           }
           trap cleanup EXIT
 
-          sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER,GRAFANA_ADMIN_PASSWORD \
-            ./monitoring/native/install-monitoring.sh
+          retry_log="$(mktemp)"
+          { sleep 1; printf 'short\nshort\n%s\nDifferentPassword1!\n%s\n%s\n' \
+            "$GRAFANA_TEST_PASSWORD" "$GRAFANA_TEST_PASSWORD" "$GRAFANA_TEST_PASSWORD"; } \
+            | sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER \
+              script --quiet --return \
+                --command 'stty -echo; ./monitoring/native/install-monitoring.sh' "$retry_log"
+          grep -Fq 'Grafana password must be at least 12 characters (2 attempt(s) remaining)' "$retry_log"
+          grep -Fq 'Grafana passwords do not match (1 attempt(s) remaining)' "$retry_log"
+          rm -f "$retry_log"
 
           test -f /etc/arxium-monitoring/grafana-initialized
           test ! -e /etc/arxium-monitoring/grafana-bootstrap.env
@@ -122,7 +129,7 @@ jobs:
           curl --cacert /etc/arxium-monitoring/grafana/grafana.crt \
             -fsS https://127.0.0.1:3000/api/health >/dev/null
           curl --cacert /etc/arxium-monitoring/grafana/grafana.crt \
-            --user "${GRAFANA_ADMIN_USER}:${GRAFANA_ADMIN_PASSWORD}" \
+            --user "${GRAFANA_ADMIN_USER}:${GRAFANA_TEST_PASSWORD}" \
             -fsS 'https://127.0.0.1:3000/api/search?query=Arxium%20Node' \
             | jq -e 'any(.[]; .title == "Arxium Node")'
 
@@ -150,7 +157,7 @@ jobs:
           sudo systemctl is-active --quiet arxium-prometheus arxium-grafana
           for attempt in $(seq 1 60); do
             if curl --cacert /etc/arxium-monitoring/grafana/grafana.crt \
-              --user "${GRAFANA_ADMIN_USER}:${GRAFANA_ADMIN_PASSWORD}" \
+              --user "${GRAFANA_ADMIN_USER}:${GRAFANA_TEST_PASSWORD}" \
               -fsS https://127.0.0.1:3000/api/user >/dev/null; then
               break
             fi

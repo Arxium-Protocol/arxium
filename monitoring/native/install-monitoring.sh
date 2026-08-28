@@ -8,6 +8,7 @@ GRAFANA_VERSION="${GRAFANA_VERSION:-12.1.4}"
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/arxium-monitoring}"
 CONFIG_ROOT="${CONFIG_ROOT:-/etc/arxium-monitoring}"
 STATE_ROOT="${STATE_ROOT:-/var/lib/arxium-monitoring}"
+GRAFANA_INPUT_ATTEMPTS="${GRAFANA_INPUT_ATTEMPTS:-3}"
 
 log() { printf 'install-monitoring: %s\n' "$*"; }
 die() { printf 'install-monitoring: error: %s\n' "$*" >&2; exit 1; }
@@ -19,6 +20,9 @@ die() { printf 'install-monitoring: error: %s\n' "$*" >&2; exit 1; }
 for tool in awk cp curl cut find grep head install nft od openssl readlink systemctl tar tr useradd; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
 done
+
+[[ $GRAFANA_INPUT_ATTEMPTS =~ ^[1-9][0-9]*$ && $GRAFANA_INPUT_ATTEMPTS -le 10 ]] \
+  || die "GRAFANA_INPUT_ATTEMPTS must be between 1 and 10"
 
 if command -v sha256sum >/dev/null 2>&1; then
   sha256_file() { sha256sum "$1" | awk '{print $1}'; }
@@ -224,6 +228,34 @@ valid_dns_name() {
   done
 }
 
+valid_grafana_username() {
+  [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]]
+}
+
+validate_grafana_password() {
+  local password="$1" confirmation="$2"
+  grafana_password_error=""
+  if [[ "$password" != "$confirmation" ]]; then
+    grafana_password_error="Grafana passwords do not match"
+  elif [[ ${#password} -lt 12 ]]; then
+    grafana_password_error="Grafana password must be at least 12 characters"
+  elif [[ ! $password =~ [a-z] \
+    || ! $password =~ [A-Z] \
+    || ! $password =~ [0-9] \
+    || ! $password =~ [^A-Za-z0-9] ]]; then
+    grafana_password_error="Grafana password must include lowercase, uppercase, numeric, and special characters"
+  elif [[ $password == *[[:space:]\\\"\']* ]]; then
+    grafana_password_error="Grafana password cannot contain whitespace, backslash, or quote characters"
+  fi
+  [[ -z $grafana_password_error ]]
+}
+
+retry_message() {
+  local message="$1" attempt="$2"
+  printf 'install-monitoring: error: %s (%d attempt(s) remaining)\n' \
+    "$message" "$((GRAFANA_INPUT_ATTEMPTS - attempt))" >&2
+}
+
 if ! id prometheus >/dev/null 2>&1; then
   log "creating system user prometheus"
   useradd --system --no-create-home --shell /usr/sbin/nologin prometheus
@@ -314,7 +346,17 @@ else
   if [[ -n ${GRAFANA_PUBLIC_HOST:-} ]]; then
     grafana_public_host="$GRAFANA_PUBLIC_HOST"
   elif [[ $interactive -eq 1 ]]; then
-    read -r -p "Public IP address or DNS name for Grafana: " grafana_public_host <&3
+    for ((attempt = 1; attempt <= GRAFANA_INPUT_ATTEMPTS; attempt++)); do
+      read -r -p "Public IP address or DNS name for Grafana: " grafana_public_host <&3 \
+        || die "could not read the Grafana public host"
+      if valid_ipv4 "$grafana_public_host" || valid_dns_name "$grafana_public_host"; then
+        break
+      fi
+      if (( attempt == GRAFANA_INPUT_ATTEMPTS )); then
+        die "Grafana public host must be an IPv4 address or DNS name; no attempts remaining"
+      fi
+      retry_message "Grafana public host must be an IPv4 address or DNS name" "$attempt"
+    done
   else
     die "set GRAFANA_PUBLIC_HOST when installing without an interactive terminal"
   fi
@@ -324,34 +366,47 @@ else
   if [[ -n ${GRAFANA_ADMIN_USER:-} ]]; then
     grafana_admin_user="$GRAFANA_ADMIN_USER"
   elif [[ $interactive -eq 1 ]]; then
-    read -r -p "Grafana username [admin]: " grafana_admin_user <&3
-    grafana_admin_user="${grafana_admin_user:-admin}"
+    for ((attempt = 1; attempt <= GRAFANA_INPUT_ATTEMPTS; attempt++)); do
+      read -r -p "Grafana username [admin]: " grafana_admin_user <&3 \
+        || die "could not read the Grafana username"
+      grafana_admin_user="${grafana_admin_user:-admin}"
+      valid_grafana_username "$grafana_admin_user" && break
+      if (( attempt == GRAFANA_INPUT_ATTEMPTS )); then
+        die "Grafana username may contain only letters, digits, dot, underscore, and hyphen; no attempts remaining"
+      fi
+      retry_message "Grafana username may contain only letters, digits, dot, underscore, and hyphen" "$attempt"
+    done
   else
     die "set GRAFANA_ADMIN_USER when installing without an interactive terminal"
   fi
-  [[ $grafana_admin_user =~ ^[A-Za-z0-9._-]{1,64}$ ]] \
+  valid_grafana_username "$grafana_admin_user" \
     || die "Grafana username may contain only letters, digits, dot, underscore, and hyphen"
 
   if [[ -n ${GRAFANA_ADMIN_PASSWORD:-} ]]; then
     grafana_admin_password="$GRAFANA_ADMIN_PASSWORD"
+    grafana_password_confirm="$GRAFANA_ADMIN_PASSWORD"
   elif [[ $interactive -eq 1 ]]; then
-    read -r -s -p "Grafana password (12 characters minimum): " grafana_admin_password <&3
-    printf '\n' >&2
-    read -r -s -p "Confirm Grafana password: " grafana_password_confirm <&3
-    printf '\n' >&2
-    [[ "$grafana_admin_password" == "$grafana_password_confirm" ]] \
-      || die "Grafana passwords do not match"
+    for ((attempt = 1; attempt <= GRAFANA_INPUT_ATTEMPTS; attempt++)); do
+      read -r -s -p "Grafana password (12 characters minimum): " grafana_admin_password <&3 \
+        || die "could not read the Grafana password"
+      printf '\n' >&2
+      read -r -s -p "Confirm Grafana password: " grafana_password_confirm <&3 \
+        || die "could not read the Grafana password confirmation"
+      printf '\n' >&2
+      if validate_grafana_password "$grafana_admin_password" "$grafana_password_confirm"; then
+        break
+      fi
+      unset grafana_admin_password grafana_password_confirm
+      if (( attempt == GRAFANA_INPUT_ATTEMPTS )); then
+        die "$grafana_password_error; no attempts remaining"
+      fi
+      retry_message "$grafana_password_error" "$attempt"
+    done
   else
     die "set GRAFANA_ADMIN_PASSWORD when installing without an interactive terminal"
   fi
-  [[ ${#grafana_admin_password} -ge 12 ]] || die "Grafana password must be at least 12 characters"
-  [[ $grafana_admin_password =~ [a-z] \
-    && $grafana_admin_password =~ [A-Z] \
-    && $grafana_admin_password =~ [0-9] \
-    && $grafana_admin_password =~ [^A-Za-z0-9] ]] \
-    || die "Grafana password must include lowercase, uppercase, numeric, and special characters"
-  [[ $grafana_admin_password != *[[:space:]\\\"\']* ]] \
-    || die "Grafana password cannot contain whitespace, backslash, or quote characters"
+  validate_grafana_password "$grafana_admin_password" "$grafana_password_confirm" \
+    || die "$grafana_password_error"
 
   umask 0077
   cat > "$GRAFANA_BOOTSTRAP_ENV" <<EOF

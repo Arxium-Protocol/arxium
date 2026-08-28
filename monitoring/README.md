@@ -44,6 +44,11 @@ During the first installation, the installer asks for:
 - a Grafana username;
 - a Grafana password entered twice without echoing it.
 
+Interactive host, username, and password validation allows three attempts by
+default. Set `GRAFANA_INPUT_ATTEMPTS` to a value from 1 through 10 to change the
+limit. Invalid values supplied through environment variables fail immediately
+because an unattended installation cannot answer another prompt.
+
 Grafana stores the password as a salted hash in its database. The temporary
 bootstrap password file is deleted, and Grafana is restarted without the
 password in its process environment. The installer prints the username and

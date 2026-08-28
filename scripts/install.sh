@@ -396,7 +396,7 @@ if [ "$with_monitoring" -eq 1 ]; then
     elif [ "$(id -u)" -eq 0 ]; then
         bash "$monitoring_dir/native/install-monitoring.sh"
     else
-        sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER,GRAFANA_ADMIN_PASSWORD,ALERTMANAGER,ALERTMANAGER_CONFIG \
+        sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER,GRAFANA_ADMIN_PASSWORD,GRAFANA_INPUT_ATTEMPTS,ALERTMANAGER,ALERTMANAGER_CONFIG \
             bash "$monitoring_dir/native/install-monitoring.sh"
     fi
 fi
