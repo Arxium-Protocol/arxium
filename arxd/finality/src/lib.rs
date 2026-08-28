@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -24,6 +25,17 @@ use xc_storage::{ArxiumDb, FinalityRecord, PrecommitVoteRecord};
 /// Votes arrive within a few heights of the block they cover, so anything this
 /// far behind the highest height seen is never going to gain another vote.
 const TALLY_RETENTION_HEIGHTS: u64 = 500;
+
+/// A vote is gossiped once, when this node signs it. If that one gossip
+/// message never reaches enough peers, quorum can never be reached even
+/// though the voter is alive and its vote is sitting right here — so
+/// re-send this node's own not-yet-finalized votes on this cadence until
+/// they're gone (finalized, or pruned by `TALLY_RETENTION_HEIGHTS`).
+#[cfg(not(test))]
+const VOTE_REBROADCAST_INTERVAL: Duration = Duration::from_secs(15);
+// ponytail: short interval so the rebroadcast test doesn't sleep 15s.
+#[cfg(test)]
+const VOTE_REBROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 
 /// One validator's BLS-signed vote that it also attests to `block_hash` at
 /// `height` — gossiped over `arxd/network`'s precommit topic and fed back
@@ -63,6 +75,10 @@ pub fn spawn_finality<P>(
         // stray vote for a competing hash can't corrupt the real tally.
         let mut tallies: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> = HashMap::new();
 
+        // This node's own not-yet-finalized votes, kept so they can be
+        // re-sent on VOTE_REBROADCAST_INTERVAL — see the constant's doc.
+        let mut my_votes: HashMap<u64, PrecommitVote> = HashMap::new();
+
         // Highest height seen from either event kind, used as the pruning
         // watermark below.
         let mut highest_seen: u64 = 0;
@@ -92,7 +108,21 @@ pub fn spawn_finality<P>(
             Err(err) => warn!("finality: failed to reload persisted precommit votes: {err}"),
         }
 
-        for event in events {
+        loop {
+            let event = match events.recv_timeout(VOTE_REBROADCAST_INTERVAL) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => {
+                    for vote in my_votes.values() {
+                        if vote_tx.send(vote.clone()).is_err() {
+                            warn!("finality: vote channel closed, stopping");
+                            return;
+                        }
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+
             highest_seen = highest_seen.max(match &event {
                 FinalityEvent::BlockObserved(block) => block.height,
                 FinalityEvent::VoteObserved(vote) => vote.height,
@@ -106,6 +136,7 @@ pub fn spawn_finality<P>(
                 }
             }
             tallies.retain(|height, _| *height >= cutoff);
+            my_votes.retain(|height, _| *height >= cutoff);
 
             match event {
                 FinalityEvent::BlockObserved(block) => {
@@ -113,13 +144,14 @@ pub fn spawn_finality<P>(
                     let hash = block.hash();
                     let signature = xc_bls::sign(secret_key, hash.as_bytes());
                     let vote = PrecommitVote { height: block.height, block_hash: hash, voter: address.clone(), signature };
+                    my_votes.insert(vote.height, vote.clone());
                     if vote_tx.send(vote).is_err() {
                         warn!("finality: vote channel closed, stopping");
                         return;
                     }
                 }
                 FinalityEvent::VoteObserved(vote) => {
-                    if let Err(err) = tally_vote(&db, &mut tallies, vote) {
+                    if let Err(err) = tally_vote(&db, &mut tallies, &mut my_votes, vote) {
                         warn!("finality: failed to process precommit vote: {err}");
                     }
                 }
@@ -131,6 +163,7 @@ pub fn spawn_finality<P>(
 fn tally_vote(
     db: &ArxiumDb,
     tallies: &mut HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>>,
+    my_votes: &mut HashMap<u64, PrecommitVote>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
     if db.get_finality_record(vote.height)?.is_some() {
@@ -199,6 +232,7 @@ fn tally_vote(
         warn!("finality: failed to delete persisted precommit votes for finalized height {}: {err}", vote.height);
     }
     tallies.remove(&vote.height);
+    my_votes.remove(&vote.height);
     info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
     Ok(())
 }
@@ -255,6 +289,7 @@ mod tests {
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
         let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
 
         // 3 of 4 validators is quorum() == 3; first two votes shouldn't finalize.
         for (addr, sk) in addrs_and_keys.iter().take(2) {
@@ -264,7 +299,7 @@ mod tests {
                 voter: addr.clone(),
                 signature: xc_bls::sign(sk, block_hash.as_bytes()),
             };
-            tally_vote(&db, &mut tallies, vote).unwrap();
+            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
             assert!(db.get_finality_record(5).unwrap().is_none());
         }
 
@@ -275,7 +310,7 @@ mod tests {
             voter: addr.clone(),
             signature: xc_bls::sign(sk, block_hash.as_bytes()),
         };
-        tally_vote(&db, &mut tallies, vote).unwrap();
+        tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
 
         let record = db.get_finality_record(5).unwrap().expect("expected finality record at quorum");
         assert_eq!(record.signers.len(), 3);
@@ -305,6 +340,7 @@ mod tests {
         // dropping the in-memory tally entirely and reconstructing it the
         // same way `spawn_finality` does on startup.
         let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
@@ -312,7 +348,7 @@ mod tests {
                 voter: addr.clone(),
                 signature: xc_bls::sign(sk, block_hash.as_bytes()),
             };
-            tally_vote(&db, &mut tallies, vote).unwrap();
+            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
         }
         drop(tallies);
 
@@ -325,6 +361,7 @@ mod tests {
                 .or_default()
                 .insert(record.voter, record.signature);
         }
+        let mut reloaded_my_votes = HashMap::new();
         assert_eq!(
             reloaded.get(&5).unwrap().get(&block_hash).unwrap().len(),
             2,
@@ -340,7 +377,7 @@ mod tests {
             voter: addr.clone(),
             signature: xc_bls::sign(sk, block_hash.as_bytes()),
         };
-        tally_vote(&db, &mut reloaded, vote).unwrap();
+        tally_vote(&db, &mut reloaded, &mut reloaded_my_votes, vote).unwrap();
         assert!(db.get_finality_record(5).unwrap().is_some());
         assert!(
             db.get_precommit_votes_from(0).unwrap().is_empty(),
@@ -370,6 +407,35 @@ mod tests {
         assert_eq!(vote.voter, addr);
         assert_eq!(vote.block_hash, expected_hash);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A vote is only gossiped once, on observation. If that single message
+    /// is lost, the height must not be stuck forever — the node should keep
+    /// re-sending its own not-yet-finalized vote.
+    #[test]
+    fn spawn_finality_rebroadcasts_its_own_unfinalized_vote() {
+        let (db, dir) = open_test_db();
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[5u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[6u8; 32]).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, vote_rx) = mpsc::channel();
+        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx);
+
+        let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
+        event_tx.send(FinalityEvent::BlockObserved(block)).unwrap();
+
+        let first = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected the initial vote");
+        assert_eq!(first.height, 5);
+
+        // No further events arrive, but the interval (shortened for tests)
+        // should fire a resend of the same vote without any new input.
+        let resent = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a rebroadcast");
+        assert_eq!(resent.height, first.height);
+        assert_eq!(resent.signature, first.signature);
+
+        drop(event_tx);
         std::fs::remove_dir_all(&dir).ok();
     }
 

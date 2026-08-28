@@ -1000,4 +1000,198 @@ mod tests {
         let (_db, _key, _addr, block1) = chain_at_height_one(now_secs());
         assert_eq!(block1.height, 1, "block 1 must be accepted over synthetic genesis");
     }
+
+    /// Builds a two-validator chain at height 1 and returns both keys,
+    /// sorted by address (the order `eligible_proposer` itself sorts into).
+    /// Block 1's primary is whichever sorts to index `1 % 2 == 1`.
+    fn two_validator_chain_at_height_one() -> (
+        ArxiumDb,
+        [(SigningKey, Address); 2],
+        Block<TestPayload>,
+    ) {
+        let db = temp_db();
+        let key_a = SigningKey::from_bytes(&[21u8; 32]);
+        let addr_a = Address::from_pubkey_bytes(key_a.verifying_key().as_bytes()).unwrap();
+        let key_b = SigningKey::from_bytes(&[22u8; 32]);
+        let addr_b = Address::from_pubkey_bytes(key_b.verifying_key().as_bytes()).unwrap();
+        let mut sorted = [(key_a, addr_a), (key_b, addr_b)];
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![sorted[0].1.clone(), sorted[1].1.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+            .unwrap();
+
+        // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
+        let (key1, addr1) = sorted[1].clone();
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: now_secs(),
+            actions: vec![],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(addr1, &key1);
+        let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        (db, sorted, block1)
+    }
+
+    /// The non-primary validator signing at the primary's window (elapsed
+    /// well under one slot) must be rejected even though its own signature
+    /// is perfectly valid — a valid signature from the wrong signer is
+    /// exactly the case `WrongProposer` exists to catch; without this check
+    /// any validator could produce any height regardless of round-robin
+    /// order.
+    #[test]
+    fn a_valid_signature_from_the_wrong_proposer_is_rejected() {
+        let (db, sorted, block1) = two_validator_chain_at_height_one();
+        // height 2 % 2 == 0: sorted[0] is primary, sorted[1] is not.
+        let (key1, addr1) = sorted[1].clone();
+
+        // One second later: nowhere near a full slot (4s), so the primary
+        // (sorted[0]) is still the only eligible proposer.
+        let block2 = signed_block_at(&key1, &addr1, &block1, block1.timestamp + 1);
+        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::WrongProposer { .. }),
+            "non-primary signing during the primary's window should be rejected, got {err:?}",
+        );
+    }
+
+    /// A validator's own claimed timestamp is what drives its eligibility —
+    /// a non-primary validator legitimately becomes eligible once its
+    /// stamped `elapsed` crosses a full slot, bounded by
+    /// `MAX_FUTURE_DRIFT_SECS`. This is documented, accepted risk
+    /// (`eligible_proposer`'s doc comment: "does not fully prevent a
+    /// proposer from nudging itself a round or two forward"), not a bug —
+    /// this test pins the bound so a future change can't silently widen it.
+    #[test]
+    fn a_backup_proposer_becomes_eligible_once_its_claimed_elapsed_crosses_a_slot() {
+        let (db, sorted, block1) = two_validator_chain_at_height_one();
+        // height 2 % 2 == 0: sorted[0] is primary; one full slot of claimed
+        // elapsed advances the offset to sorted[1].
+        let (key1, addr1) = sorted[1].clone();
+
+        // 5s claimed elapsed against a 4s slot: one full round advances
+        // eligibility onto sorted[1], and this is within
+        // MAX_FUTURE_DRIFT_SECS (30s) of "now", so drift-rejection doesn't
+        // interfere.
+        let block2 = signed_block_at(&key1, &addr1, &block1, block1.timestamp + 5);
+        assert!(
+            accept_block(&db, block2, 4, false, 0, dispatch).is_ok(),
+            "non-primary should be accepted once its own timestamp shows a full slot elapsed",
+        );
+    }
+
+    /// A block whose `parent_hash` doesn't match the local tip's actual hash
+    /// must be rejected outright — accepting it would fork local history from
+    /// whatever the proposer claims came before, rather than what's actually
+    /// stored.
+    #[test]
+    fn a_parent_hash_that_does_not_match_the_local_tip_is_rejected() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+
+        let mut block2 = Block {
+            height: 2,
+            parent_hash: "not the real parent hash".to_string(),
+            timestamp: block1.timestamp + 1,
+            actions: vec![],
+            proposer: None,
+            signature: None,
+        };
+        block2.sign(addr, &key);
+        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::ParentMismatch { .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// A block that skips ahead of (or repeats) the local tip must be
+    /// rejected — accepting anything but `tip_height + 1` would let a
+    /// proposer's claimed height diverge from the chain's actual linear
+    /// order.
+    #[test]
+    fn a_block_that_does_not_extend_the_tip_by_exactly_one_is_rejected() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+
+        for bad_height in [1u64, 3, 100] {
+            let mut block2 = Block {
+                height: bad_height,
+                parent_hash: block1.hash(),
+                timestamp: block1.timestamp + 1,
+                actions: vec![],
+                proposer: None,
+                signature: None,
+            };
+            block2.sign(addr.clone(), &key);
+            let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+            assert!(
+                matches!(err, AcceptBlockError::NotNextHeight { .. }),
+                "height {bad_height} against tip 1 should be rejected, got {err:?}",
+            );
+        }
+    }
+
+    /// A proposer's block hash commits to its full claimed action list. If an
+    /// action in that list fails to apply locally (here: a corrupted
+    /// signature) `execute_actions` silently drops it rather than erroring,
+    /// so `accept_block` must separately compare claimed vs. applied counts
+    /// and reject the whole block on a mismatch — storing a trimmed action
+    /// list would make this node's block hash disagree with every peer's
+    /// forever after. This is the doc comment's "no partial credit" rule.
+    #[test]
+    fn a_block_claiming_an_action_that_fails_to_apply_is_rejected_entirely() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[31u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let bob = Address::from_pubkey_bytes(&[32u8; 32]).unwrap();
+
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![alice.clone()],
+        })
+        .unwrap();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        db.write_batches(&[
+            &AccountUpdates(HashMap::from([(
+                alice.clone(),
+                AccountEntry {
+                    balance: 1000,
+                    nonce: 0,
+                    identity_hash: None,
+                    zk_identity_verified: false,
+                },
+            )])),
+            &genesis,
+        ])
+        .unwrap();
+
+        // One valid transfer, plus one action whose signature is corrupted
+        // after signing — `execute_actions` drops it via `verify_signature`,
+        // so claimed (2) will not equal applied (1).
+        let mut forged = signed_transfer(&alice_key, &alice, 1, &bob, 10);
+        forged.signature = Some("00".repeat(64));
+
+        let mut block1 = Block {
+            height: 1,
+            parent_hash: genesis.hash(),
+            timestamp: 1,
+            actions: vec![signed_transfer(&alice_key, &alice, 0, &bob, 40), forged],
+            proposer: None,
+            signature: None,
+        };
+        block1.sign(alice, &alice_key);
+
+        let err = accept_block(&db, block1, 4, false, 0, dispatch).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
+            "got {err:?}",
+        );
+    }
 }

@@ -10,10 +10,11 @@ use xc_storage::{ArxiumDb, BlsKeyRegistration};
 
 const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 
-/// Opens storage and, on a fresh chain, writes the genesis snapshot and block 0.
-/// Returns the snapshot too, since the produce loop needs the validator set
-/// for round-robin scheduling.
-pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
+/// Where this node's RocksDB lives under `base_path` — `<base_path>/<chain_name>/data`.
+/// Pulled out of `bootstrap` so callers that only need the data dir (e.g. the
+/// `Snapshot` command) don't have to duplicate the chain-name lookup, or open
+/// the DB through `bootstrap`'s genesis-writing path just to find it.
+pub(crate) fn chain_data_path(base_path: &std::path::Path) -> Result<std::path::PathBuf> {
     // Peeking chain_name out of the embedded JSON up front (rather than
     // waiting for load_or_init_snapshot's full Snapshot) lets us scope both
     // the snapshot cache and the RocksDB dir under <base_path>/<chain_name>/
@@ -24,10 +25,21 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         .ok()
         .and_then(|v| v.get("chain_name")?.as_str().map(str::to_string))
         .context("embedded genesis JSON is missing chain_name")?;
-    let chain_path = config.base_path.join(&chain_name);
+    Ok(base_path.join(&chain_name).join("data"))
+}
+
+/// Opens storage and, on a fresh chain, writes the genesis snapshot and block 0.
+/// Returns the snapshot too, since the produce loop needs the validator set
+/// for round-robin scheduling.
+pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
+    let data_path = chain_data_path(&config.base_path)?;
+    let chain_path = data_path
+        .parent()
+        .expect("chain_data_path always returns <base_path>/<chain_name>/data")
+        .to_path_buf();
 
     let snapshot = xc_genesis::load_or_init_snapshot(&chain_path, DEVNET_GENESIS_JSON)?;
-    let db = ArxiumDb::open(&chain_path.join("data"))?;
+    let db = ArxiumDb::open(&data_path)?;
 
     if !db.is_initialized()? {
         info!(

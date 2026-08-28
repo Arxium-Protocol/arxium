@@ -105,6 +105,24 @@ validator's behalf without the signing key leaving the machine:
 arxd pair --node <host:port> --token <rpc-token>
 ```
 
+### Bootstrapping from a snapshot
+
+A new node normally joins by syncing every block from genesis
+(`SyncRequest::Blocks`), which gets slower the longer the chain has run. An
+existing node can export a checkpoint of its chain data instead:
+
+```sh
+arxd snapshot --base-path ~/.arxium --output ./corechain-snapshot
+```
+
+A new node then uses a copy of that directory as its data dir (`<base-path>/corechain/data`)
+and starts already at that snapshot's tip height, with nothing to replay.
+
+This is a trust-the-source shortcut, not a verified state sync: blocks carry
+no state root, so a receiving node has no way to check a snapshot against
+what the network actually finalized. Only use one from an operator you
+already trust — the same bar as trusting any other out-of-band chain data.
+
 ## RPC
 
 HTTP, JSON. Bearer auth and per-IP rate limiting apply when a token is set.

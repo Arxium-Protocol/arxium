@@ -203,6 +203,18 @@ pub fn run() -> Result<()> {
         return pair::run(base_path, node, token.as_deref(), *revoke);
     }
 
+    if let Some(Command::Snapshot { base_path, output }) = &cli.command {
+        let data_path = bootstrap::chain_data_path(base_path)?;
+        let db = xc_storage::ArxiumDb::open(&data_path)
+            .with_context(|| format!("failed to open chain data at {}", data_path.display()))?;
+        db.export_checkpoint(output).with_context(|| {
+            format!("failed to write checkpoint to {} (must not already exist)", output.display())
+        })?;
+        let tip = db.get_tip_height()?.unwrap_or(0);
+        println!("wrote checkpoint at tip height {tip} to {}", output.display());
+        return Ok(());
+    }
+
     let config = cli.run.into_config();
     info!("{:?}", config);
 

@@ -102,6 +102,22 @@ pub enum Command {
         #[arg(long)]
         revoke: bool,
     },
+    /// Writes a consistent copy of this node's chain data to `output`, for
+    /// bootstrapping a new node without replaying every block from genesis —
+    /// point the new node's `--base-path` at a copy of `output` instead.
+    ///
+    /// Trust-the-source only: the chain has no state root a receiving node
+    /// could check a snapshot against, so this proves nothing about whether
+    /// the data matches what the network actually finalized. Only use a
+    /// snapshot from an operator you already trust, the same way you'd trust
+    /// any other out-of-band chain data.
+    Snapshot {
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+        /// Destination directory. Must not already exist.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Args, Clone, Debug)]

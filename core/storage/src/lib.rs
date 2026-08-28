@@ -88,6 +88,27 @@ impl ArxiumDb {
         self.db.cf_handle(name).expect("column family created in ArxiumDb::open")
     }
 
+    /// Writes a consistent, point-in-time copy of the whole database to
+    /// `path` (which must not already exist) using RocksDB's native
+    /// checkpoint mechanism — hardlinks for existing SST files plus a small
+    /// copy of in-memory state, so it's cheap regardless of chain history
+    /// size. The result is a standalone, directly-openable `ArxiumDb`
+    /// directory: bootstrapping a new node from one means pointing its data
+    /// dir at a copy of this output instead of replaying every block from
+    /// genesis.
+    ///
+    /// ponytail: this is a trust-the-source bootstrap shortcut, not a
+    /// consensus-verified state sync — `Block` carries no state root a new
+    /// node could check a snapshot against, so nothing here proves the
+    /// snapshot matches what the network actually finalized. Upgrade path:
+    /// add a state root to the block header, then a downloading node can
+    /// verify a snapshot against a finalized block instead of trusting
+    /// whoever handed it the directory.
+    pub fn export_checkpoint(&self, path: &Path) -> Result<(), StorageError> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.db.get_cf(self.cf(cf_for_key(key)), key).map_err(StorageError::Rocks)
     }
@@ -1000,5 +1021,57 @@ mod explorer_index_tests {
         assert_ne!(sub1, sub2);
         assert_eq!(db.get_account(&sub1).unwrap().unwrap().balance, 1_000_000);
         assert_eq!(db.get_account(&sub2).unwrap().unwrap().balance, 2_000_000);
+    }
+
+    /// The checkpoint output must be a standalone, independently-openable
+    /// `ArxiumDb` holding exactly what was committed at checkpoint time — the
+    /// entire point of `export_checkpoint` is that a new node can use it as
+    /// its data dir in place of replaying from genesis.
+    #[test]
+    fn exported_checkpoint_reopens_with_identical_data() {
+        let db = temp_db();
+        db.write_batch(&block(0, vec![])).unwrap();
+        db.write_batch(&block(1, vec![])).unwrap();
+        let mut validators = std::collections::BTreeMap::new();
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 500, bls_pubkey: None });
+        db.write_batch(&Snapshot {
+            height: 0,
+            chain_name: "test".into(),
+            accounts: Default::default(),
+            validators,
+            boot_nodes: vec![],
+        })
+        .unwrap();
+
+        let checkpoint_path = std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
+        db.export_checkpoint(&checkpoint_path).unwrap();
+
+        let reopened = ArxiumDb::open(&checkpoint_path).unwrap();
+        assert_eq!(reopened.get_tip_height().unwrap(), Some(1));
+        assert_eq!(reopened.get_block::<()>(0).unwrap().unwrap().height, 0);
+        assert_eq!(
+            reopened.get_stake_allocation(&addr(1), &addr(1)).unwrap().unwrap().active_amount,
+            500
+        );
+
+        // The two are independent copies from this point on — writing to one
+        // must not affect the other.
+        db.write_batch(&block(2, vec![])).unwrap();
+        assert_eq!(reopened.get_tip_height().unwrap(), Some(1));
+    }
+
+    /// `export_checkpoint` refuses to overwrite an existing path — this
+    /// mirrors RocksDB's own checkpoint semantics (it errors rather than
+    /// merging into a directory that already has content) rather than
+    /// silently corrupting or losing whatever was already there.
+    #[test]
+    fn export_checkpoint_fails_if_the_destination_already_exists() {
+        let db = temp_db();
+        db.write_batch(&block(0, vec![])).unwrap();
+
+        let checkpoint_path = std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
+        db.export_checkpoint(&checkpoint_path).unwrap();
+
+        assert!(db.export_checkpoint(&checkpoint_path).is_err());
     }
 }
