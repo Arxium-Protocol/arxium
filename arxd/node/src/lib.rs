@@ -19,7 +19,7 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use finality::{FinalityEvent, PrecommitVote, spawn_finality};
 use network::{identity, spawn_p2p_node};
@@ -37,6 +37,53 @@ const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
 // rotation becomes eligible to stand in — double BLOCK_INTERVAL so one
 // missed tick from ordinary network jitter doesn't trigger a takeover.
 const SLOT_DURATION: Duration = Duration::from_secs(BLOCK_INTERVAL.as_secs() * 2);
+
+/// A block strictly behind our tip (`block_height < tip_height`) is an
+/// ordinary, expected race — already applied via the other delivery path
+/// (gossip vs. sync) while this one was in flight — not evidence of
+/// anything wrong. Logging it at `warn!` for every block in a sync page was
+/// a major contributor to a 40GB-of-syslog incident: keep everything else
+/// (ahead of tip, parent mismatch, bad signature, equivocation-shaped
+/// `block_height == tip_height`) at `warn!`, since those are the shapes
+/// worth an operator's attention.
+fn is_routine_reject(err: &xc_executor::AcceptBlockError) -> bool {
+    matches!(
+        err,
+        xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height }
+            if block_height < tip_height
+    )
+}
+
+#[cfg(test)]
+mod reject_severity_tests {
+    use super::is_routine_reject;
+    use xc_executor::AcceptBlockError;
+
+    #[test]
+    fn behind_tip_is_routine() {
+        let err = AcceptBlockError::NotNextHeight { block_height: 10, tip_height: 20 };
+        assert!(is_routine_reject(&err));
+    }
+
+    #[test]
+    fn equal_to_tip_is_not_routine() {
+        // Competing block at an already-committed height — equivocation-shaped.
+        let err = AcceptBlockError::NotNextHeight { block_height: 20, tip_height: 20 };
+        assert!(!is_routine_reject(&err));
+    }
+
+    #[test]
+    fn ahead_of_tip_is_not_routine() {
+        let err = AcceptBlockError::NotNextHeight { block_height: 30, tip_height: 20 };
+        assert!(!is_routine_reject(&err));
+    }
+
+    #[test]
+    fn parent_mismatch_is_not_routine() {
+        let err = AcceptBlockError::ParentMismatch { local: "a".into(), expected: "b".into() };
+        assert!(!is_routine_reject(&err));
+    }
+}
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -336,12 +383,27 @@ pub fn run() -> Result<()> {
                 },
             ) {
                 Ok(accepted) => {
-                    info!(
-                        "accepted gossiped block {} with {} action(s), hash={}",
-                        accepted.height,
-                        accepted.actions.len(),
-                        accepted.hash()
-                    );
+                    // During sync catch-up this fires once per block in a
+                    // page (up to 100) — logging each at info level is what
+                    // produced tens of thousands of lines during a large
+                    // catch-up. The caller logs one summary per page instead;
+                    // live gossip acceptance (naturally bounded by block
+                    // production rate) still gets its own info line.
+                    if sync {
+                        debug!(
+                            "accepted synced block {} with {} action(s), hash={}",
+                            accepted.height,
+                            accepted.actions.len(),
+                            accepted.hash()
+                        );
+                    } else {
+                        info!(
+                            "accepted gossiped block {} with {} action(s), hash={}",
+                            accepted.height,
+                            accepted.actions.len(),
+                            accepted.hash()
+                        );
+                    }
                     counter!("arxium_blocks_accepted_total").increment(1);
                     record_tip(accepted.height, accepted.timestamp);
                     {
@@ -354,19 +416,25 @@ pub fn run() -> Result<()> {
                     false
                 }
                 Err(err) => {
-                    warn!("rejected gossiped block: {err}");
                     counter!("arxium_blocks_rejected_total").increment(1);
-                    // Competing block for the height we already committed —
-                    // not just "behind" — is the one shape that's worth
-                    // handing to the runtime subsystem to check for
-                    // equivocation.
-                    if let xc_executor::AcceptBlockError::NotNextHeight {
-                        block_height,
-                        tip_height,
-                    } = &err
-                    {
-                        if block_height == tip_height {
-                            let _ = runtime_tx.send(RuntimeEvent::BlockObserved(candidate));
+                    // A block strictly behind our tip is an ordinary,
+                    // expected race — already applied via the other delivery
+                    // path (gossip vs. sync) while this one was in flight —
+                    // not evidence of anything wrong, so it doesn't deserve
+                    // warn. Competing block for the height we already
+                    // committed (`block_height == tip_height`) is the one
+                    // shape worth both a warn and handing to the runtime
+                    // subsystem to check for equivocation; anything else
+                    // (ahead of tip, parent mismatch, bad signature, etc.)
+                    // stays at warn too.
+                    if is_routine_reject(&err) {
+                        debug!("rejected gossiped block: {err}");
+                    } else {
+                        warn!("rejected gossiped block: {err}");
+                        if let xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height } = &err {
+                            if block_height == tip_height {
+                                let _ = runtime_tx.send(RuntimeEvent::BlockObserved(candidate));
+                            }
                         }
                     }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))

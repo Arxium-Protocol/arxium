@@ -33,7 +33,7 @@ use discovery::{dial_bootnodes, dial_discovered};
 use gossip::{ACTIONS_TOPIC, BLOCKS_TOPIC, PRECOMMITS_TOPIC, record_bad_gossip};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
-    local_tip_height,
+    advance_stuck_tip, local_tip_height,
     send_sync_request,
 };
 use transport::{BehaviourEvent, build_swarm};
@@ -589,6 +589,8 @@ async fn run_swarm<P: Payload>(
                                 // is nothing to lose by amortizing the fsync
                                 // over the page: a crash before `flush_wal`
                                 // just means re-fetching this page from a peer.
+                                let tip_before = local_tip_height(&db);
+                                let page_len = blocks.len();
                                 for block in blocks {
                                     if on_block(block, true) {
                                         record_bad_gossip(
@@ -606,19 +608,31 @@ async fn run_swarm<P: Payload>(
                                     warn!("failed to flush WAL after sync page: {err}");
                                 }
                                 let local_tip = local_tip_height(&db);
-                                match stuck_tip {
-                                    Some((height, rounds)) if height == local_tip => {
-                                        let rounds = rounds + 1;
-                                        stuck_tip = Some((height, rounds));
-                                        if rounds == MAX_CONSECUTIVE_SYNC_FAILURES {
-                                            error!(
-                                                "local tip stuck at {local_tip} after {rounds} sync rounds — peer {peer} keeps serving a block this node rejects (state has diverged; no automatic reorg/rollback exists, needs manual intervention)"
-                                            );
-                                        }
+                                info!("synced page of {page_len} block(s) from {peer}: tip {tip_before} -> {local_tip}");
+                                let (next_stuck_tip, stuck_rounds) = advance_stuck_tip(stuck_tip, local_tip);
+                                stuck_tip = next_stuck_tip;
+                                // Past the cap this peer keeps re-serving a
+                                // page whose blocks we can never accept — a
+                                // genuine divergence, not transient lag —
+                                // so stop retrying it instead of looping
+                                // request/response forever with zero backoff
+                                // (this used to only log once at exactly
+                                // `stuck_rounds == MAX_CONSECUTIVE_SYNC_FAILURES`
+                                // and then keep spinning, which is what ran a
+                                // 40GB disk out of space in production).
+                                // Reusing `sync_failures` here means the
+                                // periodic `STATUS_INTERVAL` tick already
+                                // knows to skip this peer, and a fresh
+                                // `ConnectionEstablished` or a success clears
+                                // it exactly like any other sync failure.
+                                if stuck_rounds >= MAX_CONSECUTIVE_SYNC_FAILURES {
+                                    if stuck_rounds == MAX_CONSECUTIVE_SYNC_FAILURES {
+                                        error!(
+                                            "local tip stuck at {local_tip} after {stuck_rounds} sync rounds — peer {peer} keeps serving a block this node rejects (state has diverged; no automatic reorg/rollback exists, needs manual intervention); giving up on {peer} until it reconnects or another peer reports progress"
+                                        );
                                     }
-                                    _ => stuck_tip = Some((local_tip, 0)),
-                                }
-                                if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
+                                    sync_failures.insert(peer, MAX_CONSECUTIVE_SYNC_FAILURES);
+                                } else if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
                                     send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
                                         from: local_tip + 1,
                                     });
