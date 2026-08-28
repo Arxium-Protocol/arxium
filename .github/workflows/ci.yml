@@ -113,7 +113,15 @@ jobs:
           }
           trap cleanup EXIT
 
-          retry_log="$(mktemp)"
+          # root (via sudo below) writes to this file through `script`, so it
+          # has to be root-owned from creation: /tmp is sticky+world-writable,
+          # and the kernel's fs.protected_regular hardening (on by default on
+          # Ubuntu 24.04) refuses to open a regular file there for writing
+          # when its owner is neither the directory owner nor the opener —
+          # even for root — so a runner-owned file from a plain `mktemp`
+          # fails with "Permission denied" the moment `script` tries to open it.
+          retry_log="$(sudo mktemp)"
+          sudo chmod 644 "$retry_log"
           { sleep 1; printf 'short\nshort\n%s\nDifferentPassword1!\n%s\n%s\n' \
             "$GRAFANA_TEST_PASSWORD" "$GRAFANA_TEST_PASSWORD" "$GRAFANA_TEST_PASSWORD"; } \
             | sudo --preserve-env=GRAFANA_PUBLIC_HOST,GRAFANA_ADMIN_USER \
@@ -121,7 +129,7 @@ jobs:
                 --command 'stty -echo; ./monitoring/native/install-monitoring.sh' "$retry_log"
           grep -Fq 'Grafana password must be at least 12 characters (2 attempt(s) remaining)' "$retry_log"
           grep -Fq 'Grafana passwords do not match (1 attempt(s) remaining)' "$retry_log"
-          rm -f "$retry_log"
+          sudo rm -f "$retry_log"
 
           test -f /etc/arxium-monitoring/grafana-initialized
           test ! -e /etc/arxium-monitoring/grafana-bootstrap.env
