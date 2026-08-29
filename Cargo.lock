@@ -838,6 +838,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "thiserror 2.0.19",
+ "xc-circuit",
  "xc-primitives",
  "xc-storage",
 ]
@@ -863,6 +864,7 @@ version = "0.1.0"
 dependencies = [
  "circuit-account",
  "thiserror 2.0.19",
+ "xc-circuit",
  "xc-primitives",
  "xc-storage",
 ]
@@ -873,6 +875,7 @@ version = "0.1.0"
 dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.19",
+ "xc-circuit",
  "xc-primitives",
  "xc-storage",
 ]
@@ -3012,6 +3015,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xc-bls",
+ "xc-circuit",
  "xc-cli",
  "xc-executor",
  "xc-genesis",
@@ -5025,6 +5029,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "xc-circuit"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "xc-bls",
+ "xc-primitives",
+]
+
+[[package]]
 name = "xc-cli"
 version = "0.1.0"
 dependencies = [
@@ -5120,6 +5133,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.19",
  "xc-bls",
+ "xc-circuit",
  "xc-primitives",
 ]
 

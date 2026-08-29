@@ -13,3 +13,4 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 xc-primitives = { path = "../primitives" }
 xc-bls = { path = "../bls" }
+xc-circuit = { path = "../circuit" }

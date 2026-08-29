@@ -8,4 +8,5 @@ license.workspace = true
 thiserror = { workspace = true }
 xc-storage = { workspace = true }
 xc-primitives = { workspace = true }
+xc-circuit = { workspace = true }
 circuit-account = { workspace = true }

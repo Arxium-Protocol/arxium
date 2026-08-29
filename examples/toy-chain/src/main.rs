@@ -25,7 +25,7 @@ use tracing::info;
 use xc_executor::{BlockUpdates, execute_actions};
 use xc_mempool::Mempool;
 use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, ValidatorChange};
-use xc_storage::{AccountUpdates, ArxiumDb, StorageError};
+use xc_storage::{AccountUpdates, ArxiumDb, BlockView};
 
 const CHAIN_NAME: &str = "toychain-rwa-devnet";
 
@@ -43,15 +43,15 @@ type RwaBlock = Block<RwaPayload>;
 
 fn dispatch(
     action: &RwaAction,
-    lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    view: &BlockView<'_>,
     issuer: &Address,
 ) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
     let updates = match &action.payload {
         RwaPayload::Issue { amount } => {
-            circuit_rwa_asset::apply_issue(lookup, issuer, &action.sender, action.nonce, *amount)?
+            circuit_rwa_asset::apply_issue(view, issuer, &action.sender, action.nonce, *amount)?
         }
         RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
-            lookup,
+            view,
             &action.sender,
             action.nonce,
             to,
@@ -94,8 +94,8 @@ fn produce_block(
         actions,
         &[],
         BlockUpdates::default(),
-        |action, lookup, _stake_lookup, _validator_masters_lookup, _operator_lookup, _operator_validators_lookup, _validators| {
-            let (accounts, validator_change) = dispatch(action, lookup, issuer)?;
+        |action, view, _operator_lookup, _operator_validators_lookup, _validators| {
+            let (accounts, validator_change) = dispatch(action, view, issuer)?;
             Ok(BlockUpdates {
                 accounts,
                 validator_change,
@@ -173,8 +173,8 @@ fn main() -> Result<()> {
             genesis.actions.clone(),
             &[],
             BlockUpdates::default(),
-            |action, lookup, _stake_lookup, _validator_masters_lookup, _operator_lookup, _operator_validators_lookup, _validators| {
-                let (accounts, validator_change) = dispatch(action, lookup, &issuer)?;
+            |action, view, _operator_lookup, _operator_validators_lookup, _validators| {
+                let (accounts, validator_change) = dispatch(action, view, &issuer)?;
                 Ok(BlockUpdates {
                     accounts,
                     validator_change,

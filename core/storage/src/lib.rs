@@ -10,6 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
+use xc_circuit::{AccountKey, BlsKeyKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{CF_ACCOUNTS, CF_BLOCKS, CF_META, CF_VALIDATORS};
 use xc_primitives::{stake_subaccount, AccountEntry, Address, Block, Snapshot, StakeAllocation};
 #[cfg(test)]
 use xc_primitives::Action;
@@ -33,10 +35,6 @@ pub enum StorageError {
     CorruptedMeta,
 }
 
-const CF_META: &str = "meta";
-const CF_BLOCKS: &str = "blocks";
-const CF_ACCOUNTS: &str = "accounts";
-const CF_VALIDATORS: &str = "validators";
 const COLUMN_FAMILIES: [&str; 4] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS];
 
 /// Which column family a key belongs in, derived from its prefix rather than
@@ -113,7 +111,24 @@ impl ArxiumDb {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
         self.db.get_cf(self.cf(cf_for_key(key)), key).map_err(StorageError::Rocks)
     }
+}
 
+impl KvRead for ArxiumDb {
+    type Error = StorageError;
+
+    fn get<K: KeySpec>(&self, key: &K) -> Result<Option<K::Value>, StorageError> {
+        match self.get(&key.encode())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (value, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl ArxiumDb {
     /// Get the current tip height from the DB.
     pub fn get_tip_height(&self) -> Result<Option<u64>, StorageError> {
         match self.get(b"meta:tip_height")? {
@@ -143,15 +158,7 @@ impl ArxiumDb {
     /// `BlsKeyRegistration`, looked up by `arxd/finality` when tallying
     /// precommit votes and verifying the resulting aggregate signature.
     pub fn get_bls_pubkey(&self, address: &Address) -> Result<Option<BlsPublicKey>, StorageError> {
-        let key = format!("meta:blskey:{address}");
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (pubkey, _) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(Some(pubkey))
-            }
-            None => Ok(None),
-        }
+        KvRead::get(self, &BlsKeyKey(address))
     }
 
     // ponytail: linear scan over the `meta:blskey:` prefix, fine at
@@ -336,15 +343,7 @@ impl ArxiumDb {
 
     /// Get the account state from the DB
     pub fn get_account(&self, address: &Address) -> Result<Option<AccountEntry>, StorageError> {
-        let key = format!("account:{}", address);
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (account, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(Some(account))
-            }
-            None => Ok(None),
-        }
+        KvRead::get(self, &AccountKey(address))
     }
 
     /// Get the block from the DB. `P` is the chain-specific action payload
@@ -514,30 +513,14 @@ impl ArxiumDb {
         master: &Address,
         validator: &Address,
     ) -> Result<Option<StakeAllocation>, StorageError> {
-        let key = format!("stake:{}:{}", master, validator);
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (allocation, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(Some(allocation))
-            }
-            None => Ok(None),
-        }
+        KvRead::get(self, &StakeKey { master, validator })
     }
 
     /// Masters currently staking to `validator`. One-master-per-validator is
     /// an enforced invariant, not just an assumption — callers should treat
     /// a `len() > 1` result as a bug, not a valid multi-delegator state.
     pub fn get_stakes_by_validator(&self, validator: &Address) -> Result<Vec<Address>, StorageError> {
-        let key = format!("stake_by_validator:{}", validator);
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (masters, _len) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(masters)
-            }
-            None => Ok(Vec::new()),
-        }
+        Ok(KvRead::get(self, &StakeByValidatorKey(validator))?.unwrap_or_default())
     }
 
     /// All of `master`'s stake allocations, one per validator staked to.
@@ -607,7 +590,7 @@ impl BatchWritable for Snapshot {
             ),
         ];
         for (address, account) in &self.accounts {
-            let key = format!("account:{}", address).into_bytes();
+            let key = AccountKey(address).encode();
             let value = bincode::serde::encode_to_vec(account, config)?;
             entries.push((key, value));
         }
@@ -630,11 +613,11 @@ impl BatchWritable for Snapshot {
                 updated_at: self.height,
             };
             entries.push((
-                format!("stake:{}:{}", address, address).into_bytes(),
+                StakeKey { master: address, validator: address }.encode(),
                 bincode::serde::encode_to_vec(&allocation, config)?,
             ));
             entries.push((
-                format!("stake_by_validator:{}", address).into_bytes(),
+                StakeByValidatorKey(address).encode(),
                 bincode::serde::encode_to_vec(&vec![address.clone()], config)?,
             ));
 
@@ -657,7 +640,7 @@ impl BatchWritable for Snapshot {
                 .unwrap_or(AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false });
             sub_entry.balance += validator.stake;
             entries.push((
-                format!("account:{}", sub_account).into_bytes(),
+                AccountKey(&sub_account).encode(),
                 bincode::serde::encode_to_vec(&sub_entry, config)?,
             ));
         }
@@ -756,7 +739,7 @@ pub struct BlsKeyRegistration {
 
 impl BatchWritable for BlsKeyRegistration {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        let key = format!("meta:blskey:{}", self.address).into_bytes();
+        let key = BlsKeyKey(&self.address).encode();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
         Ok(vec![(key, value)])
@@ -870,7 +853,7 @@ impl BatchWritable for AccountUpdates {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         for (address, entry) in &self.0 {
-            let key = format!("account:{}", address).into_bytes();
+            let key = AccountKey(address).encode();
             let value = bincode::serde::encode_to_vec(entry, config)?;
             entries.push((key, value));
         }
@@ -896,14 +879,14 @@ impl BatchWritable for StakeUpdates {
         let mut entries = Vec::new();
         for ((master, validator), allocation) in &self.allocations {
             if let Some(allocation) = allocation {
-                let key = format!("stake:{}:{}", master, validator).into_bytes();
+                let key = StakeKey { master, validator }.encode();
                 let value = bincode::serde::encode_to_vec(allocation, config)?;
                 entries.push((key, value));
             }
         }
         for (validator, masters) in &self.validator_index {
             if !masters.is_empty() {
-                let key = format!("stake_by_validator:{}", validator).into_bytes();
+                let key = StakeByValidatorKey(validator).encode();
                 let value = bincode::serde::encode_to_vec(masters, config)?;
                 entries.push((key, value));
             }
@@ -915,15 +898,88 @@ impl BatchWritable for StakeUpdates {
         let mut deletes = Vec::new();
         for ((master, validator), allocation) in &self.allocations {
             if allocation.is_none() {
-                deletes.push(format!("stake:{}:{}", master, validator).into_bytes());
+                deletes.push(StakeKey { master, validator }.encode());
             }
         }
         for (validator, masters) in &self.validator_index {
             if masters.is_empty() {
-                deletes.push(format!("stake_by_validator:{}", validator).into_bytes());
+                deletes.push(StakeByValidatorKey(validator).encode());
             }
         }
         Ok(deletes)
+    }
+}
+
+/// Read view for in-progress block execution: checks not-yet-committed
+/// updates from earlier actions in the same block before falling through to
+/// `db`. Lets circuits (`circuits/staking`, `circuits/account`, ...) see a
+/// single `&dyn KvRead` regardless of whether a key was just written this
+/// block or needs to come from disk, replacing what used to be several
+/// hand-rolled "check the overlay map, else hit the db" closures per key
+/// namespace.
+pub struct BlockView<'a> {
+    db: &'a ArxiumDb,
+    entries: HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl<'a> BlockView<'a> {
+    pub fn new(db: &'a ArxiumDb) -> Self {
+        Self { db, entries: HashMap::new() }
+    }
+
+    pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+        self.entries.insert(key.encode(), Some(bytes));
+        Ok(())
+    }
+
+    pub fn delete<K: KeySpec>(&mut self, key: &K) {
+        self.entries.insert(key.encode(), None);
+    }
+
+    /// Folds a batch of account changes into the view — every entry is an
+    /// upsert, accounts are never deleted.
+    pub fn apply_accounts(&mut self, updates: &AccountUpdates) -> Result<(), StorageError> {
+        for (address, entry) in &updates.0 {
+            self.put(&AccountKey(address), entry)?;
+        }
+        Ok(())
+    }
+
+    /// Folds a batch of stake changes into the view — `None`/empty entries
+    /// (see `StakeUpdates` docs) become deletes, same rule `batch_entries`/
+    /// `batch_deletes` use for the on-disk write.
+    pub fn apply_stakes(&mut self, updates: &StakeUpdates) -> Result<(), StorageError> {
+        for ((master, validator), allocation) in &updates.allocations {
+            match allocation {
+                Some(allocation) => self.put(&StakeKey { master, validator }, allocation)?,
+                None => self.delete(&StakeKey { master, validator }),
+            }
+        }
+        for (validator, masters) in &updates.validator_index {
+            if masters.is_empty() {
+                self.delete(&StakeByValidatorKey(validator));
+            } else {
+                self.put(&StakeByValidatorKey(validator), masters)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl KvRead for BlockView<'_> {
+    type Error = StorageError;
+
+    fn get<K: KeySpec>(&self, key: &K) -> Result<Option<K::Value>, StorageError> {
+        match self.entries.get(&key.encode()) {
+            Some(None) => Ok(None),
+            Some(Some(bytes)) => {
+                let config = bincode::config::standard();
+                let (value, _len) = bincode::serde::decode_from_slice(bytes, config)?;
+                Ok(Some(value))
+            }
+            None => KvRead::get(self.db, key),
+        }
     }
 }
 

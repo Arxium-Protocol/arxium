@@ -8,6 +8,7 @@ members = [
     "core/primitives",
     "core/wire",
     "core/bls",
+    "core/circuit",
     "core/storage",
     "core/mempool",
     "core/executor",
@@ -42,6 +43,7 @@ repository = "https://github.com/Arxium-Protocol/Arxium"
 xc-primitives = { path = "core/primitives" }
 xc-wire = { path = "core/wire" }
 xc-bls = { path = "core/bls" }
+xc-circuit = { path = "core/circuit" }
 xc-storage = { path = "core/storage" }
 xc-mempool = { path = "core/mempool" }
 

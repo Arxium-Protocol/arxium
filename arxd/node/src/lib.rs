@@ -379,12 +379,10 @@ pub fn run() -> Result<()> {
                 SLOT_DURATION.as_secs(),
                 sync,
                 payload::ACTION_FEE,
-                |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
+                |action, view, operator_lookup, operator_validators_lookup, validators| {
                     dispatch(
                         action,
-                        lookup,
-                        stake_lookup,
-                        validator_masters_lookup,
+                        view,
                         operator_lookup,
                         operator_validators_lookup,
                         validators,

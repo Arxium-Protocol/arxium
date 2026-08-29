@@ -6,13 +6,15 @@ use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use xc_executor::BlockUpdates;
-use xc_primitives::{
-    AccountEntry, Action, Address, StakeAllocation, ValidatorChange, ValidatorEntry,
-};
+use xc_primitives::{Action, Address, ValidatorChange, ValidatorEntry};
+#[cfg(test)]
+use xc_primitives::{AccountEntry, StakeAllocation};
 use xc_storage::{
-    AccountUpdates, ArxiumDb, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StorageError,
+    AccountUpdates, ArxiumDb, BlockView, BlsKeyRegistration, EvidenceMarker, OperatorUpdates,
+    StorageError,
 };
 use xc_bls::BlsPublicKey;
+use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
 
 /// Devnet Groth16 verifying key, checked into `circuits/identity-zk` — see
 /// that crate's module docs for why it isn't from a real trusted-setup
@@ -286,9 +288,7 @@ pub const ACTION_FEE: u128 = 1_000_000;
 
 pub fn dispatch(
     action: &ChainAction,
-    lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-    validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+    view: &BlockView<'_>,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
@@ -298,9 +298,7 @@ pub fn dispatch(
 ) -> anyhow::Result<BlockUpdates> {
     let mut updates = dispatch_inner(
         action,
-        lookup,
-        stake_lookup,
-        validator_masters_lookup,
+        view,
         operator_lookup,
         operator_validators_lookup,
         validators,
@@ -308,24 +306,24 @@ pub fn dispatch(
         evidence_processed,
         bls_pubkey_owner_lookup,
     )?;
-    charge_action_fee(action, lookup, &mut updates)?;
+    charge_action_fee(action, view, &mut updates)?;
     Ok(updates)
 }
 
 /// Debits `ACTION_FEE` from `action.sender`'s balance on top of whatever
 /// `dispatch_inner` already did. Reuses the sender's entry from `updates` if
 /// the action already produced one (preserving whatever nonce/balance
-/// change it made), otherwise fetches it fresh via `lookup` — so an action
+/// change it made), otherwise fetches it fresh via `view` — so an action
 /// that never touches its own sender's account (e.g. `RegisterBlsKey`)
 /// still pays.
 fn charge_action_fee(
     action: &ChainAction,
-    lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+    view: &BlockView<'_>,
     updates: &mut BlockUpdates,
 ) -> anyhow::Result<()> {
     let mut entry = match updates.accounts.0.get(&action.sender) {
         Some(entry) => entry.clone(),
-        None => lookup(&action.sender)?.ok_or_else(|| {
+        None => view.get(&AccountKey(&action.sender))?.ok_or_else(|| {
             anyhow::anyhow!(
                 "{} has no account to charge the action fee against",
                 action.sender
@@ -341,9 +339,7 @@ fn charge_action_fee(
 
 fn dispatch_inner(
     action: &ChainAction,
-    lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-    validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+    view: &BlockView<'_>,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
@@ -354,7 +350,7 @@ fn dispatch_inner(
     match &action.payload {
         ActionPayload::Transfer { to, amount } => Ok(BlockUpdates {
             accounts: circuit_account::apply_transfer(
-                lookup,
+                view,
                 &action.sender,
                 action.nonce,
                 to,
@@ -369,7 +365,8 @@ fn dispatch_inner(
             // The floor is on total self-stake, not this call's delta — a
             // validator already at/above it topping up further shouldn't be
             // re-charged the whole minimum again.
-            let existing_active = stake_lookup(&action.sender, validator)?
+            let existing_active = view
+                .get(&StakeKey { master: &action.sender, validator })?
                 .map(|a| a.active_amount)
                 .unwrap_or(0);
             if existing_active + *stake < MIN_VALIDATOR_STAKE {
@@ -378,9 +375,7 @@ fn dispatch_inner(
                 );
             }
             let (accounts, stakes) = circuit_staking::apply_stake(
-                lookup,
-                stake_lookup,
-                validator_masters_lookup,
+                view,
                 &action.sender,
                 action.nonce,
                 validator,
@@ -433,21 +428,23 @@ fn dispatch_inner(
             // whichever address actually funded it — using `action.sender`
             // here would either find no allocation at all or, worse, silently
             // touch the wrong one.
-            let master = validator_masters_lookup(validator)?
+            let master = view
+                .get(&StakeByValidatorKey(validator))?
+                .unwrap_or_default()
                 .into_iter()
                 .next()
                 .unwrap_or_else(|| action.sender.clone());
-            let self_stake = stake_lookup(&master, validator)?
+            let self_stake = view
+                .get(&StakeKey { master: &master, validator })?
                 .ok_or_else(|| anyhow::anyhow!("{master} has no stake in {validator} to unstake"))?;
             // The master's own nonce, not `action.sender`'s — this action's
             // own replay protection already happened at admission (keyed on
             // `action.sender`'s nonce); `apply_unstake`'s nonce check is
             // master-account bookkeeping, meaningless against a different
             // account's counter when `master != action.sender`.
-            let master_nonce = lookup(&master)?.map(|entry| entry.nonce).unwrap_or(0);
+            let master_nonce = view.get(&AccountKey(&master))?.map(|entry| entry.nonce).unwrap_or(0);
             let (accounts, stakes) = circuit_staking::apply_unstake(
-                lookup,
-                stake_lookup,
+                view,
                 &master,
                 master_nonce,
                 validator,
@@ -463,9 +460,7 @@ fn dispatch_inner(
         }
         ActionPayload::Stake { validator, amount } => {
             let (accounts, stakes) = circuit_staking::apply_stake(
-                lookup,
-                stake_lookup,
-                validator_masters_lookup,
+                view,
                 &action.sender,
                 action.nonce,
                 validator,
@@ -480,8 +475,7 @@ fn dispatch_inner(
         }
         ActionPayload::Unstake { validator, amount } => {
             let (accounts, stakes) = circuit_staking::apply_unstake(
-                lookup,
-                stake_lookup,
+                view,
                 &action.sender,
                 action.nonce,
                 validator,
@@ -508,20 +502,20 @@ fn dispatch_inner(
                 );
             }
 
-            let masters = validator_masters_lookup(&equivocator)?;
+            let masters = view.get(&StakeByValidatorKey(&equivocator))?.unwrap_or_default();
             let master = masters.first().cloned().ok_or_else(|| {
                 anyhow::anyhow!("{equivocator} has no stake to slash for equivocation")
             })?;
-            let allocation = stake_lookup(&master, &equivocator)?.ok_or_else(|| {
-                anyhow::anyhow!("{equivocator} has no active stake allocation to slash")
-            })?;
+            let allocation = view
+                .get(&StakeKey { master: &master, validator: &equivocator })?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{equivocator} has no active stake allocation to slash")
+                })?;
             let total = allocation.active_amount
                 + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
 
             let (accounts, stakes) = circuit_staking::apply_slash(
-                lookup,
-                stake_lookup,
-                validator_masters_lookup,
+                view,
                 &equivocator,
                 runtime::slash_amount(total),
                 circuit_staking::SlashReason::DoubleSign,
@@ -556,7 +550,8 @@ fn dispatch_inner(
             })
         }
         ActionPayload::VerifyIdentityCredential { proof } => {
-            let entry = lookup(&action.sender)?
+            let entry = view
+                .get(&AccountKey(&action.sender))?
                 .ok_or_else(|| anyhow::anyhow!("account {} not found", action.sender))?;
             let hash_hex = entry
                 .identity_hash
@@ -633,19 +628,34 @@ mod tests {
     use xc_storage::ValidatorSetSnapshot;
     use std::collections::HashMap;
 
-    fn lookup(_addr: &Address) -> Result<Option<AccountEntry>, StorageError> {
-        Ok(None)
+    fn temp_db() -> ArxiumDb {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-payload-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        ArxiumDb::open(&dir).expect("open test db")
     }
 
-    fn stake_lookup(
-        _master: &Address,
-        _validator: &Address,
-    ) -> Result<Option<StakeAllocation>, StorageError> {
-        Ok(None)
-    }
-
-    fn validator_masters_lookup(_validator: &Address) -> Result<Vec<Address>, StorageError> {
-        Ok(Vec::new())
+    /// Builds a `BlockView` pre-populated via `put` so tests never touch
+    /// `db` for real — same shape the closure-based mocks used to provide,
+    /// just behind `KvRead` instead of `&dyn Fn`.
+    fn seeded_view<'a>(
+        db: &'a ArxiumDb,
+        accounts: HashMap<Address, AccountEntry>,
+        stakes: HashMap<(Address, Address), StakeAllocation>,
+    ) -> BlockView<'a> {
+        let mut view = BlockView::new(db);
+        for (addr, entry) in accounts {
+            view.put(&AccountKey(&addr), &entry).unwrap();
+        }
+        for ((master, validator), allocation) in stakes {
+            view.put(&StakeKey { master: &master, validator: &validator }, &allocation)
+                .unwrap();
+        }
+        view
     }
 
     fn operator_lookup(_validator: &Address) -> Result<Option<Address>, StorageError> {
@@ -658,22 +668,6 @@ mod tests {
 
     fn no_bls_owner(_pubkey: &BlsPublicKey) -> Result<Option<Address>, StorageError> {
         Ok(None)
-    }
-
-    fn make_lookup(
-        accounts: HashMap<Address, AccountEntry>,
-    ) -> impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError> {
-        move |addr| Ok(accounts.get(addr).cloned())
-    }
-
-    fn make_stake_lookup(
-        allocations: HashMap<(Address, Address), StakeAllocation>,
-    ) -> impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError> {
-        move |master, validator| {
-            Ok(allocations
-                .get(&(master.clone(), validator.clone()))
-                .cloned())
-        }
     }
 
     fn make_operator_lookup(
@@ -712,6 +706,8 @@ mod tests {
     #[test]
     fn leave_validator_rejected_when_sender_is_the_last_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -721,9 +717,7 @@ mod tests {
 
         let err = match dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice],
@@ -741,11 +735,12 @@ mod tests {
     fn leave_validator_succeeds_when_others_remain() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (alice.clone(), alice.clone()),
-            self_allocation(&alice, 2_000),
-        )]));
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([((alice.clone(), alice.clone()), self_allocation(&alice, 2_000))]),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -755,9 +750,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice.clone(), bob],
@@ -772,8 +765,12 @@ mod tests {
     #[test]
     fn join_validator_debits_sender_and_credits_own_subaccount() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -787,9 +784,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -824,11 +819,15 @@ mod tests {
     #[test]
     fn second_join_tops_up_rather_than_double_charging() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(2_000_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (alice.clone(), alice.clone()),
-            self_allocation(&alice, MIN_VALIDATOR_STAKE),
-        )]));
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(2_000_000))]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, MIN_VALIDATOR_STAKE),
+            )]),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -842,9 +841,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice.clone()],
@@ -871,8 +868,8 @@ mod tests {
     #[test]
     fn join_validator_rejected_with_insufficient_balance() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(100))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(100))]), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -886,9 +883,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -906,8 +901,8 @@ mod tests {
     #[test]
     fn join_validator_rejected_below_minimum_stake() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(10_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(10_000))]), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -921,9 +916,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -939,11 +932,15 @@ mod tests {
     fn leave_validator_starts_unbonding_rather_than_instant_return() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (alice.clone(), alice.clone()),
-            self_allocation(&alice, MIN_VALIDATOR_STAKE),
-        )]));
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, MIN_VALIDATOR_STAKE),
+            )]),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -953,9 +950,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice.clone(), bob],
@@ -1019,18 +1014,20 @@ mod tests {
         let block_b = signed_chain_block(&key, 5, 200);
 
         let sub_account = circuit_staking::stake_subaccount(&equivocator);
-        let lookup = make_lookup(HashMap::from([
-            (sub_account, funded(10_000)),
-            (equivocator.clone(), funded(ACTION_FEE)),
-        ]));
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (equivocator.clone(), equivocator.clone()),
-            self_allocation(&equivocator, 10_000),
-        )]));
-        let equivocator_for_masters = equivocator.clone();
-        let validator_masters_lookup = move |_v: &Address| -> Result<Vec<Address>, StorageError> {
-            Ok(vec![equivocator_for_masters.clone()])
-        };
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (sub_account, funded(10_000)),
+                (equivocator.clone(), funded(ACTION_FEE)),
+            ]),
+            HashMap::from([(
+                (equivocator.clone(), equivocator.clone()),
+                self_allocation(&equivocator, 10_000),
+            )]),
+        );
+        view.put(&StakeByValidatorKey(&equivocator), &vec![equivocator.clone()])
+            .unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -1043,9 +1040,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1077,8 +1072,8 @@ mod tests {
         let block_a = signed_chain_block(&key, 5, 100);
         let block_b = signed_chain_block(&key, 5, 200);
 
-        let lookup = make_lookup(HashMap::new());
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -1091,9 +1086,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1109,7 +1102,6 @@ mod tests {
     fn leave_validator_rejected_while_already_unbonding() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::new());
         // Active portion left nonzero (e.g. a prior manual partial Unstake)
         // so the `amount == 0` guard in apply_unstake doesn't fire first —
         // this test is specifically about the AlreadyUnbonding rejection.
@@ -1118,10 +1110,12 @@ mod tests {
             amount: 700,
             unlock_at_height: 100,
         });
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (alice.clone(), alice.clone()),
-            allocation,
-        )]));
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::new(),
+            HashMap::from([((alice.clone(), alice.clone()), allocation)]),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1131,9 +1125,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice.clone(), bob],
@@ -1149,7 +1141,8 @@ mod tests {
     fn register_bls_key_accepts_a_valid_pubkey() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1162,9 +1155,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1183,7 +1174,8 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1197,9 +1189,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1215,7 +1205,8 @@ mod tests {
     fn register_bls_key_allows_re_registering_your_own_already_held_pubkey() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(ACTION_FEE))]));
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1229,9 +1220,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1246,6 +1235,8 @@ mod tests {
     #[test]
     fn register_bls_key_rejects_malformed_bytes() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1258,9 +1249,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1294,8 +1283,8 @@ mod tests {
 
         let mut account = funded(ACTION_FEE);
         account.identity_hash = Some(hex::encode(hash_bytes));
-        let lookup = make_lookup(HashMap::from([(alice.clone(), account)]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
 
         let action = Action {
             sender: alice.clone(),
@@ -1306,9 +1295,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1326,8 +1313,8 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let mut account = funded(0);
         account.identity_hash = Some(hex::encode([0u8; 32]));
-        let lookup = make_lookup(HashMap::from([(alice.clone(), account)]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
 
         let action = Action {
             sender: alice,
@@ -1340,9 +1327,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1375,8 +1360,8 @@ mod tests {
 
         let mut account = funded(0);
         account.identity_hash = Some(hex::encode(wrong_hash_bytes));
-        let lookup = make_lookup(HashMap::from([(alice.clone(), account)]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
 
         let action = Action {
             sender: alice,
@@ -1387,9 +1372,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1405,8 +1388,8 @@ mod tests {
     fn join_validator_rejected_when_sender_not_authorized_for_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(bob.clone(), funded(5_000))]), HashMap::new());
         let action = Action {
             sender: bob,
             nonce: 0,
@@ -1420,9 +1403,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1438,8 +1419,12 @@ mod tests {
     fn authorized_operator_can_join_validator_on_behalf_of_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::new(),
+        );
         let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
         let action = Action {
             sender: bob.clone(),
@@ -1454,9 +1439,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1488,8 +1471,8 @@ mod tests {
     /// Regression test for a fund-lock found in review: operator A stakes
     /// for validator V, V revokes A and authorizes B instead — B (now
     /// authorized to trigger leaving) must not be assumed to be the funder.
-    /// The unstake has to resolve to A's actual allocation via
-    /// `validator_masters_lookup`, not `(action.sender, validator)`, or the
+    /// The unstake has to resolve to A's actual allocation via the
+    /// `StakeByValidatorKey` index, not `(action.sender, validator)`, or the
     /// stake becomes permanently unreachable (no code path ever finds it
     /// again).
     #[test]
@@ -1498,21 +1481,23 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap(); // revoked ex-operator, real funder
         let charlie = Address::from_pubkey_bytes(&[3u8; 32]).unwrap(); // newly authorized operator
 
-        let lookup = make_lookup(HashMap::from([(charlie.clone(), funded(ACTION_FEE))]));
-        let stake_lookup = make_stake_lookup(HashMap::from([(
-            (bob.clone(), alice.clone()),
-            StakeAllocation {
-                master: bob.clone(),
-                validator: alice.clone(),
-                active_amount: MIN_VALIDATOR_STAKE,
-                unbonding: None,
-                created_at: 0,
-                updated_at: 0,
-            },
-        )]));
-        let validator_masters_lookup = |v: &Address| {
-            Ok(if *v == alice { vec![bob.clone()] } else { Vec::new() })
-        };
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(charlie.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(
+                (bob.clone(), alice.clone()),
+                StakeAllocation {
+                    master: bob.clone(),
+                    validator: alice.clone(),
+                    active_amount: MIN_VALIDATOR_STAKE,
+                    unbonding: None,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )]),
+        );
+        view.put(&StakeByValidatorKey(&alice), &vec![bob.clone()]).unwrap();
         // Current state after revoke-then-reauthorize: charlie, not bob, is
         // now alice's authorized operator.
         let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), charlie.clone())]));
@@ -1526,9 +1511,7 @@ mod tests {
 
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[alice.clone(), bob.clone()],
@@ -1554,7 +1537,8 @@ mod tests {
     fn authorize_operator_then_revoke_updates_forward_and_reverse_index() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(alice.clone(), funded(2 * ACTION_FEE))]));
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(2 * ACTION_FEE))]), HashMap::new());
         let authorize = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -1564,9 +1548,7 @@ mod tests {
 
         let updates = dispatch(
             &authorize,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1600,9 +1582,7 @@ mod tests {
         };
         let updates = dispatch(
             &revoke,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup_after,
             &operator_validators_lookup_after,
             &[],
@@ -1625,8 +1605,8 @@ mod tests {
     fn revoked_operator_can_no_longer_join_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(bob.clone(), funded(5_000))]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(bob.clone(), funded(5_000))]), HashMap::new());
         // No entry for alice: same state as after a `RevokeOperator`.
         let operator_lookup = make_operator_lookup(HashMap::new());
         let action = Action {
@@ -1642,9 +1622,7 @@ mod tests {
 
         let err = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],
@@ -1656,9 +1634,9 @@ mod tests {
         assert!(err.to_string().contains("is not authorized to manage"));
     }
 
-    // admission_precheck runs against a real ArxiumDb (unlike the closure-based
-    // dispatch tests above) since it's meant to run at RPC/gossip admission
-    // time, before a block-execution context exists.
+    // admission_precheck runs against a real ArxiumDb (unlike the
+    // view-based dispatch tests above) since it's meant to run at
+    // RPC/gossip admission time, before a block-execution context exists.
     fn precheck_test_db(validators: &[Address]) -> ArxiumDb {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1817,11 +1795,12 @@ mod tests {
     #[test]
     fn joining_with_an_invalid_bls_key_is_rejected() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(
-            alice.clone(),
-            funded(MIN_VALIDATOR_STAKE + 2_000_000),
-        )]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::new(),
+        );
 
         for (label, pubkey) in [
             ("empty", Vec::new()),
@@ -1840,9 +1819,7 @@ mod tests {
             };
             let result = dispatch(
                 &action,
-                &lookup,
-                &stake_lookup,
-                &validator_masters_lookup,
+                &view,
                 &operator_lookup,
                 &operator_validators_lookup,
                 &[],
@@ -1863,11 +1840,12 @@ mod tests {
     #[test]
     fn joining_registers_the_bls_key_in_the_same_block() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let lookup = make_lookup(HashMap::from([(
-            alice.clone(),
-            funded(MIN_VALIDATOR_STAKE + 2_000_000),
-        )]));
-        let stake_lookup = make_stake_lookup(HashMap::new());
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::new(),
+        );
         let pubkey = test_bls_pubkey(42);
 
         let action = Action {
@@ -1882,9 +1860,7 @@ mod tests {
         };
         let updates = dispatch(
             &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
+            &view,
             &operator_lookup,
             &operator_validators_lookup,
             &[],

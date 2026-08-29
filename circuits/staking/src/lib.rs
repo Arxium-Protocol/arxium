@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
+use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_primitives::{AccountEntry, Address, StakeAllocation, Unbonding};
 use xc_storage::{AccountUpdates, StakeUpdates, StorageError};
 
@@ -92,25 +93,25 @@ fn default_account() -> AccountEntry {
 /// split it once collected). The other fee share was already burned when
 /// each action was dispatched (sender debited, nobody credited); this
 /// function only ever adds, never re-debits the sender.
-pub fn apply_block_reward(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
+    view: &V,
     proposer: &Address,
     fees_collected: u128,
 ) -> Result<AccountUpdates, StorageError> {
     let pool_account = reward_pool_account();
     let treasury = treasury_account();
 
-    let mut pool_entry = accounts(&pool_account)?.unwrap_or_else(default_account);
+    let mut pool_entry = view.get(&AccountKey(&pool_account))?.unwrap_or_else(default_account);
     let block_reward = REWARD_PER_BLOCK.min(pool_entry.balance);
     pool_entry.balance -= block_reward;
 
     let proposer_fee_share = fees_collected * FEE_PROPOSER_BPS / 10_000;
     let treasury_fee_share = fees_collected * FEE_TREASURY_BPS / 10_000;
 
-    let mut proposer_entry = accounts(proposer)?.unwrap_or_else(default_account);
+    let mut proposer_entry = view.get(&AccountKey(proposer))?.unwrap_or_else(default_account);
     proposer_entry.balance += block_reward + proposer_fee_share;
 
-    let mut treasury_entry = accounts(&treasury)?.unwrap_or_else(default_account);
+    let mut treasury_entry = view.get(&AccountKey(&treasury))?.unwrap_or_else(default_account);
     treasury_entry.balance += treasury_fee_share;
 
     let mut updates = HashMap::new();
@@ -125,10 +126,8 @@ pub fn apply_block_reward(
 /// and rejects topping up while an unbonding batch is in flight (must fully
 /// resolve first — avoids ambiguous "topping up while partially unbonding"
 /// semantics).
-pub fn apply_stake(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    allocation: impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-    validator_masters: impl Fn(&Address) -> Result<Vec<Address>, StorageError>,
+pub fn apply_stake<V: KvRead<Error = StorageError>>(
+    view: &V,
     master: &Address,
     nonce: u64,
     validator: &Address,
@@ -139,7 +138,7 @@ pub fn apply_stake(
         return Err(StakingError::ZeroAmount);
     }
 
-    let mut master_entry = accounts(master)?.unwrap_or_else(default_account);
+    let mut master_entry = view.get(&AccountKey(master))?.unwrap_or_else(default_account);
     if nonce != master_entry.nonce {
         return Err(StakingError::InvalidNonce { master: master.clone(), expected: master_entry.nonce, got: nonce });
     }
@@ -151,12 +150,12 @@ pub fn apply_stake(
         });
     }
 
-    let masters = validator_masters(validator)?;
+    let masters = view.get(&StakeByValidatorKey(validator))?.unwrap_or_default();
     if masters.iter().any(|m| m != master) {
         return Err(StakingError::ValidatorHasOtherMaster { validator: validator.clone() });
     }
 
-    let existing = allocation(master, validator)?;
+    let existing = view.get(&StakeKey { master, validator })?;
     if let Some(existing) = &existing {
         if existing.unbonding.is_some() {
             return Err(StakingError::AlreadyUnbonding { master: master.clone(), validator: validator.clone() });
@@ -170,7 +169,7 @@ pub fn apply_stake(
     }
 
     let sub_account = stake_subaccount(validator);
-    let mut sub_entry = accounts(&sub_account)?.unwrap_or_else(default_account);
+    let mut sub_entry = view.get(&AccountKey(&sub_account))?.unwrap_or_else(default_account);
 
     master_entry.balance -= amount;
     master_entry.nonce += 1;
@@ -207,9 +206,8 @@ pub fn apply_stake(
 /// batch. Coins stay in the sub-account during the unbonding window — that's
 /// what makes them slashable while unbonding. v1 allows at most one
 /// unbonding batch in flight per `(master, validator)` pair.
-pub fn apply_unstake(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    allocation: impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
+pub fn apply_unstake<V: KvRead<Error = StorageError>>(
+    view: &V,
     master: &Address,
     nonce: u64,
     validator: &Address,
@@ -220,12 +218,12 @@ pub fn apply_unstake(
         return Err(StakingError::ZeroAmount);
     }
 
-    let mut master_entry = accounts(master)?.unwrap_or_else(default_account);
+    let mut master_entry = view.get(&AccountKey(master))?.unwrap_or_else(default_account);
     if nonce != master_entry.nonce {
         return Err(StakingError::InvalidNonce { master: master.clone(), expected: master_entry.nonce, got: nonce });
     }
 
-    let mut existing = allocation(master, validator)?
+    let mut existing = view.get(&StakeKey { master, validator })?
         .ok_or_else(|| StakingError::NoActiveAllocation { master: master.clone(), validator: validator.clone() })?;
     if existing.unbonding.is_some() {
         return Err(StakingError::AlreadyUnbonding { master: master.clone(), validator: validator.clone() });
@@ -259,21 +257,19 @@ pub fn apply_unstake(
 /// funds must stay slashable while unbonding. Not wired to any
 /// `ActionPayload` variant: unreachable from RPC/mempool by construction,
 /// meant for direct/test callers until a fault detector exists.
-pub fn apply_slash(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    allocation: impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-    validator_masters: impl Fn(&Address) -> Result<Vec<Address>, StorageError>,
+pub fn apply_slash<V: KvRead<Error = StorageError>>(
+    view: &V,
     validator: &Address,
     amount: u128,
     _reason: SlashReason,
     now_height: u64,
 ) -> Result<(AccountUpdates, StakeUpdates), StakingError> {
-    let masters = validator_masters(validator)?;
+    let masters = view.get(&StakeByValidatorKey(validator))?.unwrap_or_default();
     let master = masters
         .first()
         .cloned()
         .ok_or_else(|| StakingError::NoStakeForValidator { validator: validator.clone() })?;
-    let mut existing = allocation(&master, validator)?
+    let mut existing = view.get(&StakeKey { master: &master, validator })?
         .ok_or_else(|| StakingError::NoStakeForValidator { validator: validator.clone() })?;
 
     let total = existing.active_amount + existing.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
@@ -293,7 +289,7 @@ pub fn apply_slash(
     existing.updated_at = now_height;
 
     let sub_account = stake_subaccount(validator);
-    let mut sub_entry = accounts(&sub_account)?.unwrap_or_else(default_account);
+    let mut sub_entry = view.get(&AccountKey(&sub_account))?.unwrap_or_else(default_account);
     // ponytail: saturating, not `-=`. A well-formed allocation (created via
     // `apply_stake`) always has sub-account balance >= active_amount, so this
     // never actually clamps on that path. Genesis validators are the
@@ -329,10 +325,8 @@ pub fn apply_slash(
 /// proof. No-ops (rather than erroring) if the primary has nothing staked
 /// left to slash — a missed slot from an already-exiting validator isn't a
 /// block-production failure.
-pub fn apply_downtime_slash(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-    allocation: impl Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-    validator_masters: impl Fn(&Address) -> Result<Vec<Address>, StorageError>,
+pub fn apply_downtime_slash<V: KvRead<Error = StorageError>>(
+    view: &V,
     primary: &Address,
     actual_proposer: &Address,
     now_height: u64,
@@ -340,11 +334,11 @@ pub fn apply_downtime_slash(
     if primary == actual_proposer {
         return Ok(Default::default());
     }
-    let masters = validator_masters(primary)?;
+    let masters = view.get(&StakeByValidatorKey(primary))?.unwrap_or_default();
     let Some(master) = masters.first() else {
         return Ok(Default::default());
     };
-    let Some(existing) = allocation(master, primary)? else {
+    let Some(existing) = view.get(&StakeKey { master, validator: primary })? else {
         return Ok(Default::default());
     };
     let total = existing.active_amount + existing.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
@@ -353,7 +347,7 @@ pub fn apply_downtime_slash(
         return Ok(Default::default());
     }
 
-    match apply_slash(accounts, allocation, validator_masters, primary, amount, SlashReason::Downtime, now_height) {
+    match apply_slash(view, primary, amount, SlashReason::Downtime, now_height) {
         Ok(result) => Ok(result),
         Err(StakingError::Storage(err)) => Err(err),
         Err(_) => Ok(Default::default()),
@@ -365,8 +359,8 @@ pub fn apply_downtime_slash(
 /// caller (`unlock_at_height <= current height`) — this is a pure fold,
 /// not a lookup, so multiple due allocations sharing a master accumulate
 /// correctly in one call.
-pub fn resolve_due_unbonding(
-    accounts: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
+    view: &V,
     due: Vec<StakeAllocation>,
 ) -> Result<(AccountUpdates, StakeUpdates), StorageError> {
     let mut overlay: HashMap<Address, AccountEntry> = HashMap::new();
@@ -379,7 +373,7 @@ pub fn resolve_due_unbonding(
 
         let mut master_entry = match overlay.get(&allocation.master) {
             Some(entry) => entry.clone(),
-            None => accounts(&allocation.master)?.unwrap_or_else(default_account),
+            None => view.get(&AccountKey(&allocation.master))?.unwrap_or_else(default_account),
         };
         master_entry.balance += unbonding.amount;
         overlay.insert(allocation.master.clone(), master_entry);
@@ -387,7 +381,7 @@ pub fn resolve_due_unbonding(
         let sub_account = stake_subaccount(&allocation.validator);
         let mut sub_entry = match overlay.get(&sub_account) {
             Some(entry) => entry.clone(),
-            None => accounts(&sub_account)?.unwrap_or_else(default_account),
+            None => view.get(&AccountKey(&sub_account))?.unwrap_or_else(default_account),
         };
         sub_entry.balance -= unbonding.amount;
         overlay.insert(sub_account, sub_entry);
@@ -448,9 +442,7 @@ mod tests {
         write_balance(&db, &master, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -478,9 +470,7 @@ mod tests {
         write_balance(&db, &bob, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &alice,
             0,
             &validator,
@@ -491,9 +481,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let err = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &bob,
             0,
             &validator,
@@ -512,9 +500,7 @@ mod tests {
         write_balance(&db, &master, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -525,8 +511,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let (accounts, stakes) = apply_unstake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
+            &db,
             &master,
             1,
             &validator,
@@ -555,9 +540,7 @@ mod tests {
         write_balance(&db, &master, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -568,8 +551,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let (accounts, stakes) = apply_unstake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
+            &db,
             &master,
             1,
             &validator,
@@ -580,8 +562,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let err = apply_unstake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
+            &db,
             &master,
             2,
             &validator,
@@ -600,9 +581,7 @@ mod tests {
         write_balance(&db, &master, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -612,8 +591,7 @@ mod tests {
         .unwrap();
         commit(&db, accounts, stakes);
         let (accounts, stakes) = apply_unstake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
+            &db,
             &master,
             1,
             &validator,
@@ -625,9 +603,7 @@ mod tests {
         // 300 active, 200 unbonding.
 
         let (accounts, stakes) = apply_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &validator,
             350,
             SlashReason::DoubleSign,
@@ -651,9 +627,7 @@ mod tests {
         write_balance(&db, &master, 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -664,9 +638,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let (accounts, stakes) = apply_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &validator,
             500,
             SlashReason::Downtime,
@@ -693,9 +665,7 @@ mod tests {
         assert_eq!(supply(&db), 1000);
 
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -707,8 +677,7 @@ mod tests {
         assert_eq!(supply(&db), 1000, "stake must not mint or burn");
 
         let (accounts, stakes) = apply_unstake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
+            &db,
             &master,
             1,
             &validator,
@@ -720,9 +689,7 @@ mod tests {
         assert_eq!(supply(&db), 1000, "unstake request alone must not move funds yet");
 
         let (accounts, stakes) = apply_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &validator,
             150,
             SlashReason::DoubleSign,
@@ -733,7 +700,7 @@ mod tests {
         assert_eq!(supply(&db), 850, "slash burns — supply must drop by exactly the slashed amount");
 
         let due = db.get_allocations_with_unbonding_due(2 + UNBONDING_BLOCKS).unwrap();
-        let (accounts, stakes) = resolve_due_unbonding(|a| db.get_account(a), due).unwrap();
+        let (accounts, stakes) = resolve_due_unbonding(&db, due).unwrap();
         commit(&db, accounts, stakes);
         assert_eq!(supply(&db), 850, "unbonding resolution moves funds within the same supply");
         assert_eq!(db.get_account(&master).unwrap().unwrap().balance, 400 + 200);
@@ -753,7 +720,7 @@ mod tests {
         let pool_before = supply(&db);
 
         // 10 actions at 1_000_000 IUM fee each == 10_000_000 collected.
-        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 10_000_000).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 10_000_000).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -786,7 +753,7 @@ mod tests {
         let proposer = addr(9);
         write_balance(&db, &reward_pool_account(), 1_000_000); // far less than REWARD_PER_BLOCK
 
-        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 0).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 0).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -797,7 +764,7 @@ mod tests {
         assert_eq!(db.get_account(&reward_pool_account()).unwrap().unwrap().balance, 0);
 
         // Pool empty: further blocks mint nothing further, forever.
-        let updates = apply_block_reward(|a| db.get_account(a), &proposer, 0).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 0).unwrap();
         db.write_batch(&updates).unwrap();
         assert_eq!(db.get_account(&proposer).unwrap().unwrap().balance, 1_000_000);
     }
@@ -810,9 +777,7 @@ mod tests {
         write_balance(&db, &master, MAX_DELEGATION_PER_VALIDATOR + 1);
 
         let err = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -824,9 +789,7 @@ mod tests {
 
         // Right at the cap still succeeds.
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -850,9 +813,7 @@ mod tests {
         db.write_batch(&AccountUpdates(updates)).unwrap();
 
         let err = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             1,
             &validator,
@@ -870,9 +831,7 @@ mod tests {
         let validator = addr(2);
         write_balance(&db, &master, 1000);
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &validator,
@@ -883,9 +842,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let (accounts, stakes) = apply_downtime_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &validator,
             &validator,
             2,
@@ -905,9 +862,7 @@ mod tests {
         let actual = addr(3);
         write_balance(&db, &master, 1_000_000_000);
         let (accounts, stakes) = apply_stake(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &master,
             0,
             &primary,
@@ -918,9 +873,7 @@ mod tests {
         commit(&db, accounts, stakes);
 
         let (accounts, stakes) = apply_downtime_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &primary,
             &actual,
             2,
@@ -942,9 +895,7 @@ mod tests {
         let actual = addr(3);
 
         let (accounts, stakes) = apply_downtime_slash(
-            |a| db.get_account(a),
-            |m, v| db.get_stake_allocation(m, v),
-            |v| db.get_stakes_by_validator(v),
+            &db,
             &primary,
             &actual,
             2,

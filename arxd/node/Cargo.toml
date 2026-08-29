@@ -23,6 +23,7 @@ xc-primitives = { workspace = true }
 xc-bls = { workspace = true }
 blst = { workspace = true }
 xc-storage = { workspace = true }
+xc-circuit = { workspace = true }
 xc-executor = { workspace = true }
 xc-mempool = { workspace = true }
 xc-cli = { workspace = true }

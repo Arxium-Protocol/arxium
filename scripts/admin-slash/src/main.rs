@@ -15,7 +15,7 @@ use circuit_staking::{SlashReason, apply_slash};
 use clap::Parser;
 use std::path::PathBuf;
 use xc_primitives::Address;
-use xc_storage::ArxiumDb;
+use xc_storage::{ArxiumDb, BlockView};
 
 #[derive(Parser)]
 struct Args {
@@ -57,15 +57,8 @@ fn main() -> Result<()> {
     let sub_account = circuit_staking::stake_subaccount(&validator);
     let before = db.get_account(&sub_account)?.map(|a| a.balance).unwrap_or(0);
 
-    let (accounts, stakes) = apply_slash(
-        |a| db.get_account(a),
-        |m, v| db.get_stake_allocation(m, v),
-        |v| db.get_stakes_by_validator(v),
-        &validator,
-        args.amount,
-        reason,
-        tip_height,
-    )?;
+    let view = BlockView::new(&db);
+    let (accounts, stakes) = apply_slash(&view, &validator, args.amount, reason, tip_height)?;
     db.write_batches(&[&accounts, &stakes])?;
 
     let after = db.get_account(&sub_account)?.map(|a| a.balance).unwrap_or(0);

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use circuit_account::{AccountError, apply_transfer};
 use thiserror::Error;
+use xc_circuit::{AccountKey, KvRead};
 use xc_primitives::{AccountEntry, Address};
 use xc_storage::{AccountUpdates, StorageError};
 
@@ -28,8 +29,8 @@ pub enum RwaError {
 
 /// Mints `amount` into the issuer's own balance. `sender` must equal
 /// `issuer` — issuance is self-minting, not a transfer of existing supply.
-pub fn apply_issue(
-    lookup: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+pub fn apply_issue<V: KvRead<Error = StorageError>>(
+    view: &V,
     issuer: &Address,
     sender: &Address,
     nonce: u64,
@@ -42,7 +43,7 @@ pub fn apply_issue(
         });
     }
 
-    let mut entry = lookup(sender)?.unwrap_or(AccountEntry {
+    let mut entry = view.get(&AccountKey(sender))?.unwrap_or(AccountEntry {
         balance: 0,
         nonce: 0,
         identity_hash: None,
@@ -70,28 +71,28 @@ pub fn apply_issue(
 /// The actual balance/nonce math is delegated to `circuit_account::apply_transfer`
 /// once compliance is confirmed — proves circuits compose rather than each
 /// reimplementing transfer math.
-pub fn apply_compliant_transfer(
-    lookup: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
+    view: &V,
     sender: &Address,
     nonce: u64,
     to: &Address,
     amount: u128,
 ) -> Result<AccountUpdates, RwaError> {
-    let sender_entry = lookup(sender)?;
+    let sender_entry = view.get(&AccountKey(sender))?;
     if !sender_entry.is_some_and(|e| e.identity_hash.is_some()) {
         return Err(RwaError::NotCompliant {
             address: sender.clone(),
         });
     }
 
-    let to_entry = lookup(to)?;
+    let to_entry = view.get(&AccountKey(to))?;
     if !to_entry.is_some_and(|e| e.identity_hash.is_some()) {
         return Err(RwaError::NotCompliant {
             address: to.clone(),
         });
     }
 
-    Ok(apply_transfer(lookup, sender, nonce, to, amount)?)
+    Ok(apply_transfer(view, sender, nonce, to, amount)?)
 }
 
 #[cfg(test)]
@@ -124,10 +125,10 @@ mod tests {
         let issuer = addr(1);
         let other = addr(2);
 
-        let updates = apply_issue(|a| db.get_account(a), &issuer, &issuer, 0, 1000).unwrap();
+        let updates = apply_issue(&db, &issuer, &issuer, 0, 1000).unwrap();
         assert_eq!(updates.0[&issuer].balance, 1000);
 
-        let err = match apply_issue(|a| db.get_account(a), &issuer, &other, 0, 1000) {
+        let err = match apply_issue(&db, &issuer, &other, 0, 1000) {
             Err(err) => err,
             Ok(_) => panic!("expected NotIssuer error"),
         };
@@ -173,7 +174,7 @@ mod tests {
         .unwrap();
 
         let updates = apply_compliant_transfer(
-            |a| db.get_account(a),
+            &db,
             &kyc_sender,
             0,
             &kyc_recipient,
@@ -182,7 +183,7 @@ mod tests {
         .unwrap();
         assert_eq!(updates.0[&kyc_recipient].balance, 40);
 
-        let err = match apply_compliant_transfer(|a| db.get_account(a), &kyc_sender, 1, &non_kyc, 10)
+        let err = match apply_compliant_transfer(&db, &kyc_sender, 1, &non_kyc, 10)
         {
             Err(err) => err,
             Ok(_) => panic!("expected NotCompliant error"),

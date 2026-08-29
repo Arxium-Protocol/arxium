@@ -3,10 +3,58 @@
 
 use crate::payload::{ActionPayload, ChainBlock, dispatch};
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use tracing::{info, warn};
 use xc_executor::{BlockUpdates, execute_actions};
-use xc_primitives::{NodeConfig, Snapshot};
+use xc_primitives::{Address, NodeConfig, Snapshot, ValidatorEntry};
 use xc_storage::{ArxiumDb, BlsKeyRegistration};
+
+/// Genesis validators never run `JoinValidator`, so their BLS keys have to be
+/// registered here or they enter the set unable to vote — the chain then
+/// produces blocks forever and finalizes nothing. Same job as `session.keys`
+/// in a Substrate genesis config.
+fn register_genesis_bls_keys(
+    db: &ArxiumDb,
+    validators: &BTreeMap<Address, ValidatorEntry>,
+) -> Result<()> {
+    for (address, entry) in validators {
+        let Some(hex_pubkey) = &entry.bls_pubkey else {
+            warn!(
+                "genesis validator {address} has no bls_pubkey in the chain spec — it \
+                 cannot vote on finality, and counts toward the quorum it cannot help \
+                 meet. Register one with a RegisterBlsKey action, or add it to the spec \
+                 before launching a new chain. See GET /finality."
+            );
+            continue;
+        };
+        let bytes: [u8; 48] = hex::decode(hex_pubkey)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .with_context(|| format!("genesis validator {address} has a malformed bls_pubkey"))?;
+        blst::min_pk::PublicKey::from_bytes(&bytes)
+            .and_then(|pk| pk.validate())
+            .map_err(|_| anyhow::anyhow!("genesis validator {address} has an invalid BLS key"))?;
+        // `RegisterBlsKey`/`JoinValidator` both reject a pubkey already owned
+        // by another validator (`bls_pubkey_owner_lookup` in `payload.rs`) —
+        // genesis writes keys directly, bypassing that path, so it needs the
+        // same check or two chain-spec entries could silently share a
+        // signing key.
+        if let Some(owner) = db.bls_pubkey_owner(&xc_bls::BlsPublicKey(bytes))?
+            && &owner != address
+        {
+            anyhow::bail!(
+                "genesis validator {address} has the same bls_pubkey as {owner} — \
+                 each validator needs its own finality signing key"
+            );
+        }
+        db.write_batch(&BlsKeyRegistration {
+            address: address.clone(),
+            pubkey: xc_bls::BlsPublicKey(bytes),
+        })?;
+        info!("registered genesis BLS finality key for {address}");
+    }
+    Ok(())
+}
 
 const DEVNET_GENESIS_JSON: &str = include_str!("../specs/devnet.json");
 
@@ -49,36 +97,7 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
             snapshot.accounts.len()
         );
         db.write_batch(&snapshot)?;
-
-        // Genesis validators never run `JoinValidator`, so their BLS keys have
-        // to be registered here or they enter the set unable to vote — the
-        // chain then produces blocks forever and finalizes nothing. Same job
-        // as `session.keys` in a Substrate genesis config.
-        for (address, entry) in &snapshot.validators {
-            let Some(hex_pubkey) = &entry.bls_pubkey else {
-                warn!(
-                    "genesis validator {address} has no bls_pubkey in the chain spec — it \
-                     cannot vote on finality, and counts toward the quorum it cannot help \
-                     meet. Register one with a RegisterBlsKey action, or add it to the spec \
-                     before launching a new chain. See GET /finality."
-                );
-                continue;
-            };
-            let bytes: [u8; 48] = hex::decode(hex_pubkey)
-                .ok()
-                .and_then(|b| b.try_into().ok())
-                .with_context(|| {
-                    format!("genesis validator {address} has a malformed bls_pubkey")
-                })?;
-            blst::min_pk::PublicKey::from_bytes(&bytes)
-                .and_then(|pk| pk.validate())
-                .map_err(|_| anyhow::anyhow!("genesis validator {address} has an invalid BLS key"))?;
-            db.write_batch(&BlsKeyRegistration {
-                address: address.clone(),
-                pubkey: xc_bls::BlsPublicKey(bytes),
-            })?;
-            info!("registered genesis BLS finality key for {address}");
-        }
+        register_genesis_bls_keys(&db, &snapshot.validators)?;
     }
 
     if db.get_block::<ActionPayload>(0)?.is_none() {
@@ -98,12 +117,10 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
             genesis_block.actions.clone(),
             &[],
             BlockUpdates::default(),
-            |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
+            |action, view, operator_lookup, operator_validators_lookup, validators| {
                 dispatch(
                     action,
-                    lookup,
-                    stake_lookup,
-                    validator_masters_lookup,
+                    view,
                     operator_lookup,
                     operator_validators_lookup,
                     validators,
@@ -157,6 +174,39 @@ mod tests {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
         }
+    }
+
+    #[test]
+    fn genesis_rejects_two_validators_sharing_a_bls_pubkey() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-genesis-bls-dup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = ArxiumDb::open(&dir).unwrap();
+
+        let ikm = [7u8; 32];
+        let sk = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
+        let pubkey_hex = hex::encode(sk.sk_to_pk().to_bytes());
+
+        let addr_a = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let addr_b = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let mut validators = BTreeMap::new();
+        validators.insert(
+            addr_a,
+            ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex.clone()) },
+        );
+        validators.insert(addr_b, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex) });
+
+        let err = register_genesis_bls_keys(&db, &validators).unwrap_err();
+        assert!(
+            err.to_string().contains("same bls_pubkey"),
+            "expected a same-bls_pubkey rejection, got {err:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

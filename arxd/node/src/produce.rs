@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
+use xc_circuit::{AccountKey, StakeByValidatorKey, StakeKey};
 use xc_primitives::{Action, Address, eligible_proposer, expected_proposer, quorum};
-use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
+use xc_storage::{ArxiumDb, BatchWritable, BlockView, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
 /// The stored block only lists the actions that were actually applied — see
@@ -69,12 +70,10 @@ pub fn produce_block(
         actions,
         &validators,
         seed,
-        |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
+        |action, view, operator_lookup, operator_validators_lookup, validators| {
             dispatch(
                 action,
-                lookup,
-                stake_lookup,
-                validator_masters_lookup,
+                view,
                 operator_lookup,
                 operator_validators_lookup,
                 validators,
@@ -90,12 +89,26 @@ pub fn produce_block(
     // validator would never see its own reward pool debited/credited.
     if let Some((address, _)) = proposer {
         let fees_collected = applied.len() as u128 * ACTION_FEE;
-        let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
-            Some(entry) => std::result::Result::Ok(Some(entry.clone())),
-            None => db.get_account(addr),
-        };
-        let reward_updates =
-            circuit_staking::apply_block_reward(account_lookup, address, fees_collected)?;
+        let mut view = BlockView::new(db);
+        for (addr, entry) in &account_updates.0 {
+            view.put(&AccountKey(addr), entry)?;
+        }
+        for ((master, validator), allocation) in &stake_updates.allocations {
+            match allocation {
+                Some(allocation) => {
+                    view.put(&StakeKey { master, validator }, allocation)?;
+                }
+                None => view.delete(&StakeKey { master, validator }),
+            }
+        }
+        for (validator, masters) in &stake_updates.validator_index {
+            view.put(&StakeByValidatorKey(validator), masters)?;
+        }
+
+        let reward_updates = circuit_staking::apply_block_reward(&view, address, fees_collected)?;
+        for (addr, entry) in &reward_updates.0 {
+            view.put(&AccountKey(addr), entry)?;
+        }
         account_updates.0.extend(reward_updates.0);
 
         // §7.3 downtime slash — same rule `accept_block` applies to a
@@ -103,28 +116,8 @@ pub fn produce_block(
         // wasn't the one who actually produced it, burn a small automatic
         // slash from their stake.
         if let Some(primary) = expected_proposer(&validators, next_height) {
-            let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
-                Some(entry) => std::result::Result::Ok(Some(entry.clone())),
-                None => db.get_account(addr),
-            };
-            let allocation_lookup = |m: &Address, v: &Address| {
-                match stake_updates.allocations.get(&(m.clone(), v.clone())) {
-                    Some(a) => std::result::Result::Ok(a.clone()),
-                    None => db.get_stake_allocation(m, v),
-                }
-            };
-            let masters_lookup = |v: &Address| match stake_updates.validator_index.get(v) {
-                Some(m) => std::result::Result::Ok(m.clone()),
-                None => db.get_stakes_by_validator(v),
-            };
-            let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
-                account_lookup,
-                allocation_lookup,
-                masters_lookup,
-                &primary,
-                address,
-                next_height,
-            )?;
+            let (downtime_accounts, downtime_stakes) =
+                circuit_staking::apply_downtime_slash(&view, &primary, address, next_height)?;
             account_updates.0.extend(downtime_accounts.0);
             stake_updates.allocations.extend(downtime_stakes.allocations);
             stake_updates.validator_index.extend(downtime_stakes.validator_index);
@@ -445,12 +438,10 @@ mod tests {
             genesis.actions.clone(),
             &[],
             BlockUpdates::default(),
-            |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, validators| {
+            |action, view, operator_lookup, operator_validators_lookup, validators| {
                 dispatch(
                     action,
-                    lookup,
-                    stake_lookup,
-                    validator_masters_lookup,
+                    view,
                     operator_lookup,
                     operator_validators_lookup,
                     validators,
@@ -588,9 +579,9 @@ mod tests {
                     SLOT_DURATION.as_secs(),
                     false,
                     ACTION_FEE,
-                    |action, lookup, stake_lookup, validator_masters_lookup, operator_lookup, operator_validators_lookup, vals| {
+                    |action, view, operator_lookup, operator_validators_lookup, vals| {
                         dispatch(
-                            action, lookup, stake_lookup, validator_masters_lookup, operator_lookup,
+                            action, view, operator_lookup,
                             operator_validators_lookup, vals, height,
                             &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
                                 std::result::Result::Ok(false)

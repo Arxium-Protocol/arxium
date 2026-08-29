@@ -7,12 +7,12 @@ use thiserror::Error;
 use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xc_primitives::{
-    AccountEntry, Action, Address, Block, MAX_FUTURE_DRIFT_SECS, SignatureError, StakeAllocation,
-    ValidatorChange, eligible_proposer, expected_proposer,
+    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, SignatureError, ValidatorChange,
+    eligible_proposer, expected_proposer,
 };
 use xc_storage::{
-    AccountUpdates, ArxiumDb, BatchWritable, BlsKeyRegistration, EvidenceMarker, OperatorUpdates,
-    StakeUpdates, StorageError, ValidatorSetSnapshot,
+    AccountUpdates, ArxiumDb, BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker,
+    OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
 };
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -43,8 +43,7 @@ pub struct BlockUpdates {
 /// hitting "already unbonding".
 pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpdates, StorageError> {
     let due = db.get_allocations_with_unbonding_due(height)?;
-    let (accounts, stakes) =
-        circuit_staking::resolve_due_unbonding(|addr| db.get_account(addr), due)?;
+    let (accounts, stakes) = circuit_staking::resolve_due_unbonding(db, due)?;
     Ok(BlockUpdates {
         accounts,
         validator_change: None,
@@ -169,9 +168,7 @@ pub fn accept_block<P>(
     fee_per_action: u128,
     dispatch: impl Fn(
         &Action<P>,
-        &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-        &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        &BlockView<'_>,
         &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
@@ -303,40 +300,20 @@ where
     // unsigned block never reaches this point.
     let proposer = block.proposer.as_ref().expect("signed block always has a proposer");
     let fees_collected = applied.len() as u128 * fee_per_action;
-    let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
-        Some(entry) => Ok(Some(entry.clone())),
-        None => db.get_account(addr),
-    };
-    let reward_updates = circuit_staking::apply_block_reward(account_lookup, proposer, fees_collected)?;
-    account_updates.0.extend(reward_updates.0);
+    let mut view = BlockView::new(db);
+    view.apply_accounts(&account_updates)?;
+    view.apply_stakes(&stake_updates)?;
+    let reward_updates = circuit_staking::apply_block_reward(&view, proposer, fees_collected)?;
+    account_updates.0.extend(reward_updates.0.clone());
+    view.apply_accounts(&reward_updates)?;
 
     // §7.3 downtime slash: if the height's primary round-robin proposer
     // wasn't who actually produced it, they missed their slot — burn a
     // small automatic slash. No evidence needed, every node agrees from
     // the same stored block.
     if let Some(primary) = expected_proposer(&validators, block.height) {
-        let account_lookup = |addr: &Address| match account_updates.0.get(addr) {
-            Some(entry) => Ok(Some(entry.clone())),
-            None => db.get_account(addr),
-        };
-        let allocation_lookup = |m: &Address, v: &Address| {
-            match stake_updates.allocations.get(&(m.clone(), v.clone())) {
-                Some(a) => Ok(a.clone()),
-                None => db.get_stake_allocation(m, v),
-            }
-        };
-        let masters_lookup = |v: &Address| match stake_updates.validator_index.get(v) {
-            Some(m) => Ok(m.clone()),
-            None => db.get_stakes_by_validator(v),
-        };
-        let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
-            account_lookup,
-            allocation_lookup,
-            masters_lookup,
-            &primary,
-            proposer,
-            block.height,
-        )?;
+        let (downtime_accounts, downtime_stakes) =
+            circuit_staking::apply_downtime_slash(&view, &primary, proposer, block.height)?;
         account_updates.0.extend(downtime_accounts.0);
         stake_updates.allocations.extend(downtime_stakes.allocations);
         stake_updates.validator_index.extend(downtime_stakes.validator_index);
@@ -413,9 +390,7 @@ pub fn execute_actions<P>(
     seed: BlockUpdates,
     dispatch: impl Fn(
         &Action<P>,
-        &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-        &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-        &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        &BlockView<'_>,
         &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
@@ -448,27 +423,19 @@ where
     let mut operator_overlay = seed.operator.authorization;
     let mut operator_index_overlay = seed.operator.operator_index;
 
+    let mut view = BlockView::new(db);
+    view.apply_accounts(&AccountUpdates(overlay.clone()))?;
+    view.apply_stakes(&StakeUpdates {
+        allocations: stake_overlay.clone(),
+        validator_index: validator_index_overlay.clone(),
+    })?;
+
     for action in actions {
         if let Err(err) = action.verify_signature() {
             warn!("dropping action from {}: {err}", action.sender);
             continue;
         }
 
-        let lookup = |addr: &Address| match overlay.get(addr) {
-            Some(entry) => Ok(Some(entry).cloned()),
-            None => db.get_account(addr),
-        };
-        let stake_lookup = |master: &Address, validator: &Address| match stake_overlay
-            .get(&(master.clone(), validator.clone()))
-        {
-            Some(entry) => Ok(Clone::clone(entry)),
-            None => db.get_stake_allocation(master, validator),
-        };
-        let validator_masters_lookup =
-            |validator: &Address| match validator_index_overlay.get(validator) {
-                Some(masters) => Ok(Clone::clone(masters)),
-                None => db.get_stakes_by_validator(validator),
-            };
         let operator_lookup = |validator: &Address| match operator_overlay.get(validator) {
             Some(operator) => Ok(Clone::clone(operator)),
             None => db.get_operator(validator),
@@ -479,20 +446,14 @@ where
                 None => db.get_validators_for_operator(operator),
             };
 
-        match dispatch(
-            &action,
-            &lookup,
-            &stake_lookup,
-            &validator_masters_lookup,
-            &operator_lookup,
-            &operator_validators_lookup,
-            validators,
-        ) {
+        match dispatch(&action, &view, &operator_lookup, &operator_validators_lookup, validators) {
             Ok(updates) => {
-                overlay.extend(updates.accounts.0);
+                overlay.extend(updates.accounts.0.clone());
+                view.apply_accounts(&updates.accounts)?;
                 validator_changes.extend(updates.validator_change);
-                stake_overlay.extend(updates.stakes.allocations);
-                validator_index_overlay.extend(updates.stakes.validator_index);
+                stake_overlay.extend(updates.stakes.allocations.clone());
+                validator_index_overlay.extend(updates.stakes.validator_index.clone());
+                view.apply_stakes(&updates.stakes)?;
                 evidence_markers.extend(updates.evidence);
                 bls_keys.extend(updates.bls_key);
                 operator_overlay.extend(updates.operator.authorization);
@@ -527,6 +488,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
+    use xc_primitives::{AccountEntry, StakeAllocation};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
@@ -537,9 +499,7 @@ mod tests {
 
     fn dispatch(
         action: &Action<TestPayload>,
-        lookup: &dyn Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
-        stake_lookup: &dyn Fn(&Address, &Address) -> Result<Option<StakeAllocation>, StorageError>,
-        validator_masters_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        view: &BlockView<'_>,
         _operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
         _operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         _validators: &[Address],
@@ -547,9 +507,7 @@ mod tests {
         match &action.payload {
             TestPayload::Stake { validator, amount } => {
                 let (accounts, stakes) = circuit_staking::apply_stake(
-                    lookup,
-                    stake_lookup,
-                    validator_masters_lookup,
+                    view,
                     &action.sender,
                     action.nonce,
                     validator,
@@ -563,7 +521,7 @@ mod tests {
                 })
             }
             TestPayload::Transfer { to, amount } => Ok(BlockUpdates {
-                accounts: apply_transfer(lookup, &action.sender, action.nonce, to, *amount)?,
+                accounts: apply_transfer(view, &action.sender, action.nonce, to, *amount)?,
                 ..Default::default()
             }),
             TestPayload::Join => Ok(BlockUpdates {
@@ -934,7 +892,7 @@ mod tests {
         // No actions, but the block reward still touches state (see
         // `signed_block_at`'s comment) — the root must account for it.
         let reward_updates =
-            circuit_staking::apply_block_reward(|a| db.get_account(a), &addr, 0).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr, 0).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
@@ -967,7 +925,7 @@ mod tests {
         // `addr` regardless — the root must include that overlay too, or a
         // block that should be accepted fails its own StateRootMismatch check.
         let reward_updates =
-            circuit_staking::apply_block_reward(|a| db.get_account(a), addr, 0).unwrap();
+            circuit_staking::apply_block_reward(db, addr, 0).unwrap();
         let mut block = Block {
             height: parent.height + 1,
             parent_hash: parent.hash(),
@@ -1087,7 +1045,7 @@ mod tests {
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
         let (key1, addr1) = sorted[1].clone();
         let reward_updates =
-            circuit_staking::apply_block_reward(|a| db.get_account(a), &addr1, 0).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr1, 0).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),

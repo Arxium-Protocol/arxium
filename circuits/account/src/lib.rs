@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
+use xc_circuit::{AccountKey, KvRead};
 use xc_primitives::{AccountEntry, Address};
 use xc_storage::{AccountUpdates, StorageError};
 
@@ -32,15 +33,16 @@ pub enum AccountError {
 /// so any chain's payload shape can route into this without this crate
 /// knowing about it. `lookup` resolves an address to its current account
 /// state; the caller controls where that comes from (DB, or DB overlaid
-/// with not-yet-committed changes from earlier actions in the same block).
-pub fn apply_transfer(
-    lookup: impl Fn(&Address) -> Result<Option<AccountEntry>, StorageError>,
+/// with not-yet-committed changes from earlier actions in the same block —
+/// see `xc_storage::BlockView`).
+pub fn apply_transfer<V: KvRead<Error = StorageError>>(
+    view: &V,
     sender: &Address,
     nonce: u64,
     to: &Address,
     amount: u128,
 ) -> Result<AccountUpdates, AccountError> {
-    let mut sender_entry = lookup(sender)?.unwrap_or(AccountEntry {
+    let mut sender_entry = view.get(&AccountKey(sender))?.unwrap_or(AccountEntry {
         balance: 0,
         nonce: 0,
         identity_hash: None,
@@ -72,7 +74,7 @@ pub fn apply_transfer(
         return Ok(AccountUpdates(updates));
     }
 
-    let mut receiver_entry = lookup(to)?.unwrap_or(AccountEntry {
+    let mut receiver_entry = view.get(&AccountKey(to))?.unwrap_or(AccountEntry {
         balance: 0,
         nonce: 0,
         identity_hash: None,
@@ -132,7 +134,7 @@ mod tests {
         )])))
         .unwrap();
 
-        let updates = apply_transfer(|addr| db.get_account(addr), &sender, 0, &sender, 30).unwrap();
+        let updates = apply_transfer(&db, &sender, 0, &sender, 30).unwrap();
         let entry = &updates.0[&sender];
         assert_eq!(entry.balance, 100, "self-transfer must not mint balance");
         assert_eq!(entry.nonce, 1, "self-transfer must still bump nonce");
