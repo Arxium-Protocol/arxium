@@ -18,6 +18,11 @@ pub struct Block<P> {
     /// genesis block, and for blocks produced by a non-validator solo node.
     pub proposer: Option<Address>,
     pub signature: Option<String>,
+    /// Root of the full account/validator/stake state *after* this block's
+    /// actions apply — see `xc_storage::ArxiumDb::compute_state_root`. Lets
+    /// a node verify a full state snapshot against what the chain actually
+    /// finalized, instead of trusting the source.
+    pub state_root: String,
 }
 
 /// What actually gets signed: everything but the signature itself (it can't
@@ -29,6 +34,7 @@ struct BlockSigningPayload<'a, P> {
     timestamp: u64,
     actions: &'a [Action<P>],
     proposer: &'a Address,
+    state_root: &'a str,
 }
 
 impl<P: Serialize> Block<P> {
@@ -41,6 +47,8 @@ impl<P: Serialize> Block<P> {
             actions: Vec::new(),
             proposer: None,
             signature: None,
+            state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
         }
     }
 
@@ -60,6 +68,7 @@ impl<P: Serialize> Block<P> {
             timestamp: self.timestamp,
             actions: &self.actions,
             proposer,
+            state_root: &self.state_root,
         };
         bincode::serde::encode_to_vec(&payload, bincode::config::standard())
             .expect("signing payload encoding should never fail")

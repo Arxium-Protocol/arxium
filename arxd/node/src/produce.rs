@@ -131,6 +131,27 @@ pub fn produce_block(
         }
     }
 
+    let snapshot = if validator_changes.is_empty() {
+        None
+    } else {
+        Some(ValidatorSetSnapshot {
+            effective_height: next_height + 1,
+            validators: xc_executor::apply_validator_changes(validators, &validator_changes),
+        })
+    };
+
+    // The root a validator on the receiving end will independently
+    // recompute from the same overlay before accepting this block — must be
+    // known before signing, since the signature covers it.
+    let state_root_overlay: Vec<&dyn BatchWritable> = {
+        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        if let Some(snapshot) = &snapshot {
+            overlay.push(snapshot);
+        }
+        overlay
+    };
+    let state_root = db.compute_state_root(&state_root_overlay)?;
+
     let mut new_block = ChainBlock {
         height: next_height,
         parent_hash: parent.hash(),
@@ -138,6 +159,7 @@ pub fn produce_block(
         actions: applied,
         proposer: None,
         signature: None,
+        state_root,
     };
     if let Some((address, key)) = proposer {
         new_block.sign(address.clone(), key);
@@ -148,14 +170,6 @@ pub fn produce_block(
     // change — a crash here must never leave these disagreeing (e.g. nonces
     // bumped with no block on record for it, or vice versa).
     let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
-    let snapshot = if validator_changes.is_empty() {
-        None
-    } else {
-        Some(ValidatorSetSnapshot {
-            effective_height: next_height + 1,
-            validators: xc_executor::apply_validator_changes(validators, &validator_changes),
-        })
-    };
     if let Some(snapshot) = &snapshot {
         writables.push(snapshot);
     }

@@ -4,7 +4,8 @@
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -285,6 +286,52 @@ impl ArxiumDb {
     pub fn flush_wal(&self) -> Result<(), StorageError> {
         self.db.flush_wal(true)?;
         Ok(())
+    }
+
+    /// Root committing to the full current account and validator/stake
+    /// state — balances, nonces, stake allocations, and the validator set —
+    /// so a snapshot recipient can recompute it from a full state dump and
+    /// check it against a block's `state_root` instead of trusting the
+    /// source, the gap called out in `Arxium_OpenItems.md`.
+    ///
+    /// `overlay` lets a caller ask "what would the root be *after* these
+    /// pending writes land" without committing them first — both a proposer
+    /// (deciding what to sign) and a validator (checking a peer's claim
+    /// before writing anything) need the post-block root before the block
+    /// itself is durable.
+    ///
+    /// ponytail: rehashes the full account+validator state on every block —
+    /// O(state size), not O(block size). Fine at devnet scale; an
+    /// incremental Merkle structure is the upgrade path if state size ever
+    /// makes this the bottleneck. Deliberately excludes BLS-key
+    /// registrations, evidence markers, and operator authorizations — those
+    /// aren't balance-bearing and can be folded in later if a real
+    /// light-client use case needs them covered too.
+    pub fn compute_state_root(&self, overlay: &[&dyn BatchWritable]) -> Result<String, StorageError> {
+        let mut state: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for cf_name in [CF_ACCOUNTS, CF_VALIDATORS] {
+            for item in self.db.iterator_cf(self.cf(cf_name), IteratorMode::Start) {
+                let (key, value) = item?;
+                state.insert(key.to_vec(), value.to_vec());
+            }
+        }
+        for writable in overlay {
+            for (key, value) in writable.batch_entries()? {
+                state.insert(key, value);
+            }
+            for key in writable.batch_deletes()? {
+                state.remove(&key);
+            }
+        }
+
+        let mut hasher = Sha256::new();
+        for (key, value) in &state {
+            hasher.update((key.len() as u64).to_le_bytes());
+            hasher.update(key);
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+        Ok(format!("0x{}", hex::encode(hasher.finalize())))
     }
 
     /// Get the account state from the DB
@@ -920,6 +967,7 @@ mod explorer_index_tests {
             actions,
             proposer: None,
             signature: None,
+            state_root: String::new(),
         }
     }
 

@@ -87,7 +87,12 @@ pub(crate) fn bootstrap(config: &NodeConfig) -> Result<(ArxiumDb, Snapshot)> {
         // against local tip's hash, so genesis must hash identically
         // everywhere or block 1 from any peer fails the parent-hash check
         // before it's even out of the gate.
-        let genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
+        let mut genesis_block: ChainBlock = xc_primitives::Block::genesis(0);
+        // Genesis has no actions of its own, but its accounts and validator
+        // set (written above, from the chain spec) are the state a snapshot
+        // recipient must be able to verify from height 0 — same root rule as
+        // every later block, just with an empty overlay.
+        genesis_block.state_root = db.compute_state_root(&[])?;
         let (_, genesis_updates, _, _, _, _, _) = execute_actions(
             &db,
             genesis_block.actions.clone(),

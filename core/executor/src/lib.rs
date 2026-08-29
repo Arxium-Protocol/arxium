@@ -133,6 +133,12 @@ pub enum AcceptBlockError {
         claimed: usize,
         executed: usize,
     },
+    #[error("block {height} claimed state root {claimed}, locally computed {expected} — proposer's state disagrees with ours")]
+    StateRootMismatch {
+        height: u64,
+        expected: String,
+        claimed: String,
+    },
 }
 
 /// Validates a block received from a peer — proposer signature, that the
@@ -344,6 +350,25 @@ where
             validators: apply_validator_changes(validators, &validator_changes),
         })
     };
+
+    // A proposer's claimed post-block state must match what re-executing its
+    // actions locally actually produces — same principle as `ActionMismatch`
+    // above, applied to state instead of the action list.
+    let state_root_overlay: Vec<&dyn BatchWritable> = {
+        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        if let Some(snapshot) = &new_validator_set {
+            overlay.push(snapshot);
+        }
+        overlay
+    };
+    let expected_state_root = db.compute_state_root(&state_root_overlay)?;
+    if block.state_root != expected_state_root {
+        return Err(AcceptBlockError::StateRootMismatch {
+            height: block.height,
+            expected: expected_state_root,
+            claimed: block.state_root.clone(),
+        });
+    }
 
     let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
     if let Some(snapshot) = &new_validator_set {
@@ -591,6 +616,27 @@ mod tests {
         action
     }
 
+    /// Signs `block` (with a placeholder root), learns the real post-block
+    /// state root from `accept_block`'s own `StateRootMismatch` rejection,
+    /// then re-signs and resubmits with it. Avoids duplicating
+    /// `accept_block`'s exact overlay/root computation inside every test
+    /// whose block carries actions that actually change state.
+    fn accept_block_computing_root(
+        db: &ArxiumDb,
+        mut block: Block<TestPayload>,
+        proposer: &Address,
+        key: &SigningKey,
+    ) -> Result<Block<TestPayload>, AcceptBlockError> {
+        block.sign(proposer.clone(), key);
+        if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
+            accept_block(db, block.clone(), 4, false, 0, dispatch)
+        {
+            block.state_root = expected;
+            block.sign(proposer.clone(), key);
+        }
+        accept_block(db, block, 4, false, 0, dispatch)
+    }
+
     fn signed_join(key: &SigningKey, sender: &Address, nonce: u64) -> Action<TestPayload> {
         let mut action = Action {
             sender: sender.clone(),
@@ -620,17 +666,17 @@ mod tests {
         db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
             .unwrap();
 
-        let mut block1 = Block {
+        let block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
             timestamp: 1,
             actions: vec![signed_join(&bob_key, &bob, 0)],
             proposer: None,
             signature: None,
+            state_root: String::new(),
         };
-        block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
         assert_eq!(accepted.actions.len(), 1, "join action must be applied");
 
         // Block 1 itself is still decided by the pre-join set.
@@ -745,17 +791,17 @@ mod tests {
         ])
         .unwrap();
 
-        let mut block1 = Block {
+        let block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
             timestamp: 1,
             actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 400)],
             proposer: None,
             signature: None,
+            state_root: String::new(),
         };
-        block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
         assert_eq!(accepted.actions.len(), 1, "stake action must be applied");
 
         // Never disagree: if the block landed, the stake it caused landed
@@ -832,7 +878,7 @@ mod tests {
         )])))
         .unwrap();
 
-        let mut block1 = Block {
+        let block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
             timestamp: 1,
@@ -841,10 +887,10 @@ mod tests {
             actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 200)],
             proposer: None,
             signature: None,
+            state_root: String::new(),
         };
-        block1.sign(alice.clone(), &alice_key);
 
-        let accepted = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
         assert_eq!(
             accepted.actions.len(),
             1,
@@ -885,6 +931,10 @@ mod tests {
         db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
             .unwrap();
 
+        // No actions, but the block reward still touches state (see
+        // `signed_block_at`'s comment) — the root must account for it.
+        let reward_updates =
+            circuit_staking::apply_block_reward(|a| db.get_account(a), &addr, 0).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
@@ -892,6 +942,7 @@ mod tests {
             actions: vec![],
             proposer: None,
             signature: None,
+            state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr.clone(), &key);
         let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
@@ -906,11 +957,17 @@ mod tests {
     }
 
     fn signed_block_at(
+        db: &ArxiumDb,
         key: &SigningKey,
         addr: &Address,
         parent: &Block<TestPayload>,
         timestamp: u64,
     ) -> Block<TestPayload> {
+        // No actions, but `accept_block` still applies a block reward to
+        // `addr` regardless — the root must include that overlay too, or a
+        // block that should be accepted fails its own StateRootMismatch check.
+        let reward_updates =
+            circuit_staking::apply_block_reward(|a| db.get_account(a), addr, 0).unwrap();
         let mut block = Block {
             height: parent.height + 1,
             parent_hash: parent.hash(),
@@ -918,6 +975,7 @@ mod tests {
             actions: vec![],
             proposer: None,
             signature: None,
+            state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block.sign(addr.clone(), key);
         block
@@ -933,7 +991,7 @@ mod tests {
         let (db, key, addr, block1) = chain_at_height_one(base);
 
         for stamp in [base, base - 1, 0] {
-            let block2 = signed_block_at(&key, &addr, &block1, stamp);
+            let block2 = signed_block_at(&db, &key, &addr, &block1, stamp);
             let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NonMonotonicTimestamp { .. }),
@@ -942,7 +1000,7 @@ mod tests {
         }
 
         // One second later is the minimum acceptable step, and it works.
-        let block2 = signed_block_at(&key, &addr, &block1, base + 1);
+        let block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
         assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
     }
 
@@ -955,7 +1013,7 @@ mod tests {
         let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
 
         // A year ahead: the shape that used to stall the rotation indefinitely.
-        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + 31_536_000);
+        let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 31_536_000);
         let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::TimestampTooFarAhead { .. }),
@@ -963,7 +1021,7 @@ mod tests {
         );
 
         // Just past the bound is still rejected.
-        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
+        let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
         assert!(matches!(
             accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err(),
             AcceptBlockError::TimestampTooFarAhead { .. }
@@ -971,7 +1029,7 @@ mod tests {
 
         // Modest skew inside the bound is accepted — an honest node with a
         // slightly fast clock must not have its blocks refused.
-        let block2 = signed_block_at(&key, &addr, &block1, now_secs() + 2);
+        let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 2);
         assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
     }
 
@@ -983,7 +1041,7 @@ mod tests {
         let long_ago = now_secs() - 31_536_000;
         let (db, key, addr, block1) = chain_at_height_one(long_ago);
 
-        let block2 = signed_block_at(&key, &addr, &block1, long_ago + 4);
+        let block2 = signed_block_at(&db, &key, &addr, &block1, long_ago + 4);
         assert!(
             accept_block(&db, block2, 4, true, 0, dispatch).is_ok(),
             "a year-old block must still replay during sync",
@@ -1028,6 +1086,8 @@ mod tests {
 
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
         let (key1, addr1) = sorted[1].clone();
+        let reward_updates =
+            circuit_staking::apply_block_reward(|a| db.get_account(a), &addr1, 0).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
@@ -1035,6 +1095,7 @@ mod tests {
             actions: vec![],
             proposer: None,
             signature: None,
+            state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr1, &key1);
         let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
@@ -1055,7 +1116,7 @@ mod tests {
 
         // One second later: nowhere near a full slot (4s), so the primary
         // (sorted[0]) is still the only eligible proposer.
-        let block2 = signed_block_at(&key1, &addr1, &block1, block1.timestamp + 1);
+        let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 1);
         let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::WrongProposer { .. }),
@@ -1081,7 +1142,7 @@ mod tests {
         // eligibility onto sorted[1], and this is within
         // MAX_FUTURE_DRIFT_SECS (30s) of "now", so drift-rejection doesn't
         // interfere.
-        let block2 = signed_block_at(&key1, &addr1, &block1, block1.timestamp + 5);
+        let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 5);
         assert!(
             accept_block(&db, block2, 4, false, 0, dispatch).is_ok(),
             "non-primary should be accepted once its own timestamp shows a full slot elapsed",
@@ -1103,6 +1164,7 @@ mod tests {
             actions: vec![],
             proposer: None,
             signature: None,
+            state_root: String::new(),
         };
         block2.sign(addr, &key);
         let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
@@ -1128,6 +1190,7 @@ mod tests {
                 actions: vec![],
                 proposer: None,
                 signature: None,
+                state_root: String::new(),
             };
             block2.sign(addr.clone(), &key);
             let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
@@ -1185,6 +1248,7 @@ mod tests {
             actions: vec![signed_transfer(&alice_key, &alice, 0, &bob, 40), forged],
             proposer: None,
             signature: None,
+            state_root: String::new(),
         };
         block1.sign(alice, &alice_key);
 

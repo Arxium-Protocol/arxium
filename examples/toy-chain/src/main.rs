@@ -111,6 +111,10 @@ fn produce_block(
         actions: applied,
         proposer: None,
         signature: None,
+        // toy-chain doesn't implement state-root verification — it exists to
+        // exercise `core`'s generic boundaries, not to be a second real chain.
+        state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+            .to_string(),
     };
     db.write_batches(&[&updates, &block])?;
     Ok(block)
