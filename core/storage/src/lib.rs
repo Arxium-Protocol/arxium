@@ -41,7 +41,7 @@ const COLUMN_FAMILIES: [&str; 4] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATO
 /// tracked separately at each call site — one place to keep in sync with the
 /// `format!("prefix:...")` calls below instead of every `get`/`put` call
 /// needing its own CF argument.
-fn cf_for_key(key: &[u8]) -> &'static str {
+pub fn cf_for_key(key: &[u8]) -> &'static str {
     if key.starts_with(b"account:") {
         CF_ACCOUNTS
     } else if key.starts_with(b"block:") || key.starts_with(b"block_hash:") || key.starts_with(b"action:") {
@@ -283,6 +283,38 @@ impl ArxiumDb {
         }
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(sync);
+        self.db.write_opt(batch, &opts)?;
+        Ok(())
+    }
+
+    /// Dumps every `(column_family, key, value)` triple currently on disk —
+    /// used by the genesis-artifact generator to snapshot a freshly-written
+    /// scratch DB into a raw artifact, rather than re-deriving keys/values
+    /// from `Snapshot` a second time and risking the two encodings drifting
+    /// apart.
+    pub fn export_all_entries(&self) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, StorageError> {
+        let mut entries = Vec::new();
+        for cf_name in COLUMN_FAMILIES {
+            for item in self.db.iterator_cf(self.cf(cf_name), IteratorMode::Start) {
+                let (key, value) = item?;
+                entries.push((cf_name.to_string(), key.to_vec(), value.to_vec()));
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Loads pre-tagged `(column_family, key, value)` triples as a single
+    /// atomic batch — the counterpart to `export_all_entries`, used by
+    /// `bootstrap` to load a genesis artifact directly instead of replaying
+    /// `Snapshot`/BLS-registration/genesis-block construction on every first
+    /// boot.
+    pub fn write_raw_entries(&self, entries: &[(String, Vec<u8>, Vec<u8>)]) -> Result<(), StorageError> {
+        let mut batch = WriteBatch::default();
+        for (cf_name, key, value) in entries {
+            batch.put_cf(self.cf(cf_name), key, value);
+        }
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
         self.db.write_opt(batch, &opts)?;
         Ok(())
     }
