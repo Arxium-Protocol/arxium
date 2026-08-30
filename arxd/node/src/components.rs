@@ -62,7 +62,7 @@ fn state_root_bytes(state_root: &str) -> Result<[u8; 32]> {
 /// chain, tip verification, identity/mempool setup. No network, no RPC, no
 /// metrics recorder, no spawned threads. Safe to call from a subcommand.
 pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeComponents<R>> {
-    let spec_json = xc_chain_spec::resolve_chain_spec(&config.chain, &crate::specs::CORECHAIN_PRESETS)?;
+    let spec_json = xc_chain_spec::resolve_chain_spec(&config.chain, R::presets())?;
     let chain_spec = ChainSpec::parse(&spec_json)?;
 
     let data_path = chain_data_path(&config.base_path, chain_spec.chain_name());
@@ -290,7 +290,7 @@ mod tests {
         let plain = new_partial::<CoreChainRuntime>(&plain_config).unwrap();
         drop(plain.db);
 
-        let devnet_spec = include_str!("../specs/devnet.json");
+        let devnet_spec = include_str!("../../runtime/specs/devnet.json");
         let raw = genesis::derive_raw(devnet_spec).unwrap();
         let raw_spec = ChainSpec::Raw(raw);
         let raw_json = serde_json::to_string(&raw_spec).unwrap();

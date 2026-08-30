@@ -70,7 +70,7 @@ struct Args {
 fn keys_file() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../arxd/node/specs/devnet-keys.json"
+        "/../../arxd/runtime/specs/devnet-keys.json"
     );
     let raw = std::fs::read_to_string(path).expect("read devnet-keys.json");
     serde_json::from_str(&raw).expect("parse devnet-keys.json")

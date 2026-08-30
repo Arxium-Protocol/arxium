@@ -13,5 +13,6 @@ xc-storage = { workspace = true }
 xc-executor = { workspace = true }
 runtime-api = { workspace = true }
 xc-evidence = { workspace = true }
+xc-chain-spec = { workspace = true }
 node = { workspace = true }
 circuit-rwa-asset = { workspace = true }

@@ -61,6 +61,12 @@ struct ToyRuntime;
 impl ChainRuntime for ToyRuntime {
     type Payload = RwaPayload;
 
+    /// No official toy-chain network to embed — `--chain
+    /// examples/toy-chain/specs/toy-chain-dev.json` only.
+    fn presets() -> &'static xc_chain_spec::presets::PresetRegistry {
+        &xc_chain_spec::presets::PresetRegistry::EMPTY
+    }
+
     fn action_fee() -> u128 {
         0
     }

@@ -14,12 +14,14 @@
 mod account;
 mod consensus;
 mod identity;
+mod specs;
 mod staking;
 
 pub use staking::MIN_VALIDATOR_STAKE;
 
 use serde::{Deserialize, Serialize};
 use xc_bls::BlsPublicKey;
+use xc_chain_spec::presets::PresetRegistry;
 use xc_circuit::{AccountKey, KvRead};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address};
@@ -169,6 +171,10 @@ pub struct CoreChainRuntime;
 
 impl runtime_api::ChainRuntime for CoreChainRuntime {
     type Payload = ActionPayload;
+
+    fn presets() -> &'static PresetRegistry {
+        &specs::CORECHAIN_PRESETS
+    }
 
     fn action_fee() -> u128 {
         ACTION_FEE

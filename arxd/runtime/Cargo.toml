@@ -17,6 +17,7 @@ xc-bls = { workspace = true }
 blst = { workspace = true }
 xc-evidence = { workspace = true }
 runtime-api = { workspace = true }
+xc-chain-spec = { workspace = true }
 
 circuit-account = { workspace = true }
 circuit-staking = { workspace = true }
@@ -28,3 +29,4 @@ ark-serialize = { workspace = true }
 [dev-dependencies]
 ark-std = { workspace = true }
 ed25519-dalek = { workspace = true }
+genesis = { workspace = true }

@@ -15,11 +15,11 @@ use xc_chain_spec::presets::PresetRegistry;
 /// CoreChain's presets, embedded independently of `arxd/node` — this crate
 /// must build and produce a chain spec with zero dependency on the node
 /// binary, the same way `toy-chain` proves `xc-chain-spec` has no dependency
-/// on CoreChain. Kept in sync with `arxd/node/src/specs.rs` by hand; the two
+/// on CoreChain. Kept in sync with `arxd/runtime/src/specs.rs` by hand; the two
 /// crates deliberately don't share a dependency edge.
 static CORECHAIN_PRESETS: PresetRegistry = PresetRegistry::new(&[
-    ("devnet", include_str!("../../node/specs/devnet.json")),
-    ("local", include_str!("../../node/specs/local.json")),
+    ("devnet", include_str!("../../runtime/specs/devnet.json")),
+    ("local", include_str!("../../runtime/specs/local.json")),
 ]);
 
 #[derive(Parser)]

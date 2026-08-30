@@ -8,7 +8,7 @@ use std::path::Path;
 const KEY_FILE: &str = "network.key";
 
 /// DEVNET ONLY — well-known network identity seed, matching the pattern of
-/// `arxd/node/specs/devnet-keys.json`'s validator seeds. A node started with
+/// `arxd/runtime/specs/devnet-keys.json`'s validator seeds. A node started with
 /// `--bootnode` writes this seed to its `network.key` instead of generating
 /// one at random, so its PeerId (and therefore its multiaddr) is fixed and
 /// can be hardcoded as everyone else's default `--bootnodes` value. Never

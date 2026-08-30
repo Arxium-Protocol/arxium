@@ -19,6 +19,7 @@
 
 use xc_evidence::EquivocationEvidence;
 use serde::{Serialize, de::DeserializeOwned};
+use xc_chain_spec::presets::PresetRegistry;
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
@@ -26,6 +27,14 @@ use xc_storage::{ArxiumDb, BlockView, StorageError};
 pub trait ChainRuntime: Send + Sync + 'static {
     /// Fills in `P` in `Action<P>` / `Block<P>`.
     type Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static;
+
+    /// This chain's built-in genesis presets (`--chain devnet` etc). CoreChain
+    /// returns its `devnet`/`local` presets; a Spoke Chain with no official
+    /// network of its own returns `&PresetRegistry::EMPTY` — `--chain <path>`
+    /// still works either way. Keeps `arxd/node` free of any specific chain's
+    /// genesis data: it resolves `--chain` through whatever `R::presets()`
+    /// hands it, never a hardcoded registry.
+    fn presets() -> &'static PresetRegistry;
 
     /// Flat fee charged per action, in base units.
     fn action_fee() -> u128;

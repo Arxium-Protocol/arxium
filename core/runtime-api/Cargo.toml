@@ -12,3 +12,4 @@ xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-executor = { workspace = true }
 xc-evidence = { workspace = true }
+xc-chain-spec = { workspace = true }

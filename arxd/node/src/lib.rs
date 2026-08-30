@@ -4,7 +4,6 @@
 mod components;
 mod pair;
 mod produce;
-mod specs;
 mod validator;
 
 use crate::components::new_partial;
@@ -592,12 +591,12 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
     if let Some(Command::ChainInfo { chain, list }) = &cli.command {
         if *list {
-            for name in specs::CORECHAIN_PRESETS.names() {
+            for name in R::presets().names() {
                 println!("{name}");
             }
             return Ok(());
         }
-        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, R::presets())?;
         let chain_spec = genesis::ChainSpec::parse(&spec_json)?;
         match &chain_spec {
             genesis::ChainSpec::Plain(snapshot) => {
@@ -633,7 +632,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
     }
 
     if let Some(Command::ChainSpec { chain }) = &cli.command {
-        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, R::presets())?;
         println!("{spec_json}");
         return Ok(());
     }
