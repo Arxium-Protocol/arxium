@@ -115,15 +115,18 @@ pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
 /// - **internal consistency**: every entry's `cf` must match what
 ///   `cf_for_key` derives from its own key, and every `meta:blskey:*` entry
 ///   must hold a well-formed, non-reused BLS pubkey.
-/// - **state_root**: after installing, the state actually reached must equal
-///   `raw.state_root` — a mismatch means the entries do not encode what the
-///   generator claimed, or this binary's encoders have diverged from the
+/// - **state_root**: on a fresh install, the state actually reached must
+///   equal `raw.state_root` — a mismatch means the entries do not encode what
+///   the generator claimed, or this binary's encoders have diverged from the
 ///   generator's. This is the check that closes the "foreign artifact for the
 ///   wrong chain" failure mode: a raw spec is validated against *itself*,
 ///   fatally, not just checked for well-formedness. Recomputed from the
 ///   installed accounts/validators tables via `compute_state_root`, not read
 ///   back from the entries' own `block:0` value — that value was written by
 ///   the same (possibly tampered) entry set it's supposed to be checking.
+///   Only checked on install: once the chain has produced blocks, the
+///   current state root has moved on from genesis by design, and on-disk
+///   integrity from here on is `new_partial`'s tip-signature check, not this.
 pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
     if raw.format_version != RAW_FORMAT_VERSION {
         bail!(
@@ -136,18 +139,18 @@ pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
 
     if !db.is_initialized()? {
         db.write_raw_entries(&artifact_entries(raw))?;
+
+        let installed_root = db.compute_state_root(&[])?;
+        if installed_root != raw.state_root {
+            bail!(
+                "raw chain spec declares state_root {}, but the state actually installed hashes to {} \
+                 — refusing to boot on a chain spec that does not describe its own contents",
+                raw.state_root,
+                installed_root,
+            );
+        }
     }
     db.get_block::<()>(0)?.context("raw chain spec installed but block 0 is missing from its entries")?;
-
-    let installed_root = db.compute_state_root(&[])?;
-    if installed_root != raw.state_root {
-        bail!(
-            "raw chain spec declares state_root {}, but the state actually installed hashes to {} \
-             — refusing to boot on a chain spec that does not describe its own contents",
-            raw.state_root,
-            installed_root,
-        );
-    }
     Ok(())
 }
 
@@ -315,6 +318,31 @@ mod tests {
         let (db, dir) = scratch_db();
         let err = write_raw(&db, &raw).unwrap_err();
         assert!(err.to_string().contains("state_root"), "expected a state_root mismatch error, got {err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `write_raw` must stay callable on every reboot, not just the first —
+    /// the state-root check only means anything against a fresh install
+    /// (which is what `raw.state_root` describes); once blocks have moved
+    /// the root away from genesis, re-checking it on every boot would brick
+    /// the node the moment any balance changes. Regression test for exactly
+    /// that: the check used to run unconditionally, outside the
+    /// `is_initialized` guard.
+    #[test]
+    fn raw_spec_boots_again_after_state_changes() {
+        let raw = derive_raw(SPEC).unwrap();
+        let (db, dir) = scratch_db();
+        write_raw(&db, &raw).unwrap();
+
+        let address = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+        let mut updates = AccountUpdates::default();
+        updates.0.insert(
+            address,
+            xc_primitives::AccountEntry { balance: 1_000, nonce: 0, identity_hash: None, zk_identity_verified: false },
+        );
+        db.write_batch(&updates).unwrap();
+
+        write_raw(&db, &raw).expect("reboot on a chain that has since produced state must not be rejected");
         std::fs::remove_dir_all(&dir).ok();
     }
 
