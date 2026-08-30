@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod components;
-mod pair;
 mod produce;
 mod validator;
 
 use crate::components::new_partial;
-use runtime_api::ChainRuntime;
+use xc_runtime_api::ChainRuntime;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -332,14 +331,17 @@ fn spawn_subsystems<R: ChainRuntime>(
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
                     R::dispatch(
                         action,
-                        view,
-                        &db,
-                        operator_lookup,
-                        operator_validators_lookup,
-                        validators,
-                        height,
+                        &xc_runtime_api::DispatchCtx {
+                            view,
+                            db: &db,
+                            operator_lookup,
+                            operator_validators_lookup,
+                            validators,
+                            height,
+                        },
                     )
                 },
+                R::on_block_sealed,
             ) {
                 Ok(accepted) => {
                     // During sync catch-up this fires once per block in a
@@ -547,8 +549,17 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         revoke,
     }) = &cli.command
     {
+        // The pairing session this command creates lives only in this node
+        // process's memory (see core/rpc's PairingStore) — printed up front
+        // so a mismatch against whatever node the app's backend actually
+        // talks to (NODE_RPC_URL) is obvious immediately, not after a
+        // confusing "expired" report from the app minutes later.
+        println!("Connecting to node at {node}{}", if token.is_some() { " (with token)" } else { "" });
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        return pair::run(base_path, node, token.as_deref(), *revoke);
+        let key = validator::load_or_generate_key(base_path)?;
+        let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
+            .context("validator key produced an invalid address")?;
+        return R::pair(&key.to_bytes(), &sender, node, token.as_deref(), *revoke);
     }
 
     if let Some(Command::Snapshot {

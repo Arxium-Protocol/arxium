@@ -1,5 +1,5 @@
 [package]
-name = "node"
+name = "arxd-node"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -33,6 +33,11 @@ xc-rpc = { workspace = true }
 network = { workspace = true }
 xc-evidence = { workspace = true }
 finality = { workspace = true }
-runtime = { workspace = true }
-runtime-api = { workspace = true }
-circuit-staking = { workspace = true }
+xc-runtime-api = { workspace = true }
+
+[dev-dependencies]
+# arxd-node is generic over ChainRuntime and must never depend on
+# CoreChain's concrete arxd-runtime in production code (that coupling is
+# what let a toy-chain node inherit a `pair` subcommand it couldn't
+# decode) — tests still exercise the concrete CoreChainRuntime.
+arxd-runtime = { workspace = true }

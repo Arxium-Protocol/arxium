@@ -6,18 +6,18 @@ use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use finality::FinalityEvent;
 use metrics::{counter, gauge};
-use runtime_api::ChainRuntime;
+use xc_runtime_api::ChainRuntime;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
+use xc_runtime_api::DispatchCtx;
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
-use xc_circuit::{AccountKey, StakeByValidatorKey, StakeKey};
-use xc_primitives::{Action, Address, Block, eligible_proposer, expected_proposer, quorum};
-use xc_storage::{ArxiumDb, BatchWritable, BlockView, ValidatorSetSnapshot};
+use xc_primitives::{Action, Address, Block, eligible_proposer, quorum};
+use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
 /// The stored block only lists the actions that were actually applied — see
@@ -73,54 +73,30 @@ pub fn produce_block<R: ChainRuntime>(
         |action, view, operator_lookup, operator_validators_lookup, validators| {
             R::dispatch(
                 action,
-                view,
-                db,
-                operator_lookup,
-                operator_validators_lookup,
-                validators,
-                next_height,
+                &DispatchCtx {
+                    view,
+                    db,
+                    operator_lookup,
+                    operator_validators_lookup,
+                    validators,
+                    height: next_height,
+                },
             )
         },
     )?;
 
-    // Same block-reward split `accept_block` applies to a gossiped block —
-    // a locally-produced block must pay itself the same way, or a solo
+    // Same whole-block economics `accept_block` applies to a gossiped block
+    // — a locally-produced block must pay itself the same way, or a solo
     // validator would never see its own reward pool debited/credited.
     if let Some((address, _)) = proposer {
         let fees_collected = applied.len() as u128 * R::action_fee();
-        let mut view = BlockView::new(db);
-        for (addr, entry) in &account_updates.0 {
-            view.put(&AccountKey(addr), entry)?;
-        }
-        for ((master, validator), allocation) in &stake_updates.allocations {
-            match allocation {
-                Some(allocation) => {
-                    view.put(&StakeKey { master, validator }, allocation)?;
-                }
-                None => view.delete(&StakeKey { master, validator }),
-            }
-        }
-        for (validator, masters) in &stake_updates.validator_index {
-            view.put(&StakeByValidatorKey(validator), masters)?;
-        }
-
-        let reward_updates = circuit_staking::apply_block_reward(&view, address, fees_collected)?;
-        for (addr, entry) in &reward_updates.0 {
-            view.put(&AccountKey(addr), entry)?;
-        }
-        account_updates.0.extend(reward_updates.0);
-
-        // §7.3 downtime slash — same rule `accept_block` applies to a
-        // gossiped block: if the height's primary round-robin proposer
-        // wasn't the one who actually produced it, burn a small automatic
-        // slash from their stake.
-        if let Some(primary) = expected_proposer(&validators, next_height) {
-            let (downtime_accounts, downtime_stakes) =
-                circuit_staking::apply_downtime_slash(&view, &primary, address, next_height)?;
-            account_updates.0.extend(downtime_accounts.0);
-            stake_updates.allocations.extend(downtime_stakes.allocations);
-            stake_updates.validator_index.extend(downtime_stakes.validator_index);
-        }
+        let mut view = xc_storage::BlockView::new(db);
+        view.apply_accounts(&account_updates)?;
+        view.apply_stakes(&stake_updates)?;
+        let sealed_updates = R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
+        account_updates.0.extend(sealed_updates.accounts.0);
+        stake_updates.allocations.extend(sealed_updates.stakes.allocations);
+        stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
     }
 
     let snapshot = if validator_changes.is_empty() {
@@ -391,10 +367,10 @@ fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Dura
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use runtime::{ACTION_FEE, ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
+    use arxd_runtime::{ACTION_FEE, ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
     use std::collections::BTreeMap;
     use xc_executor::BlockUpdates;
-    use xc_primitives::{AccountEntry, Snapshot};
+    use xc_primitives::{AccountEntry, Snapshot, expected_proposer};
 
     /// On time: sleeps the full interval, deadline advances by exactly one
     /// interval.
@@ -496,7 +472,7 @@ mod tests {
         assert_eq!(block.height, 1);
         assert_eq!(
             db.get_account(&alice).unwrap().unwrap().balance,
-            2_000_000 - 400 - runtime::ACTION_FEE
+            2_000_000 - 400 - arxd_runtime::ACTION_FEE
         );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
 
@@ -589,6 +565,7 @@ mod tests {
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                         )
                     },
+                    <CoreChainRuntime as ChainRuntime>::on_block_sealed,
                 );
                 assert!(
                     result.is_ok(),

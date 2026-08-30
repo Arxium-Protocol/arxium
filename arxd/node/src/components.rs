@@ -4,7 +4,7 @@
 use crate::validator;
 use anyhow::{Context, Result};
 use genesis::ChainSpec;
-use runtime_api::ChainRuntime;
+use xc_runtime_api::ChainRuntime;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use xc_mempool::Mempool;
@@ -142,7 +142,7 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::{ChainBlock, CoreChainRuntime};
+    use arxd_runtime::{ChainBlock, CoreChainRuntime};
     use crate::produce::produce_block;
     use ed25519_dalek::SigningKey;
 

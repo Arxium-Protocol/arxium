@@ -15,11 +15,11 @@
 //! there, same shared chain-spec path CoreChain's `devnet`/`local` presets use.
 
 use anyhow::Result;
-use runtime_api::ChainRuntime;
+use xc_runtime_api::ChainRuntime;
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address, ValidatorChange};
-use xc_storage::{AccountUpdates, ArxiumDb, BlockView, StorageError};
+use xc_storage::{AccountUpdates, ArxiumDb, BlockView};
 
 /// The RWA chain's own action set — distinct from CoreChain's `ActionPayload`
 /// in `arxd/runtime`, proving payloads are chain-specific rather than one
@@ -79,22 +79,27 @@ impl ChainRuntime for ToyRuntime {
         Ok(())
     }
 
-    fn dispatch(
-        action: &RwaAction,
-        view: &BlockView<'_>,
-        _db: &ArxiumDb,
-        _operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
-        _operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
-        _validators: &[Address],
-        _current_height: u64,
-    ) -> anyhow::Result<BlockUpdates> {
+    fn dispatch(action: &RwaAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
         let issuer = Address::parse(ISSUER).expect("ISSUER is a valid address");
-        let (accounts, validator_change) = dispatch(action, view, &issuer)?;
+        let (accounts, validator_change) = dispatch(action, ctx.view, &issuer)?;
         Ok(BlockUpdates {
             accounts,
             validator_change,
             ..Default::default()
         })
+    }
+
+    // toy-chain has no block-level economics of its own (no reward pool, no
+    // downtime slash) — CoreChain's are not something a Spoke Chain opts
+    // into by default.
+    fn on_block_sealed(
+        _view: &BlockView<'_>,
+        _proposer: &Address,
+        _fees_collected: u128,
+        _validators: &[Address],
+        _height: u64,
+    ) -> anyhow::Result<BlockUpdates> {
+        Ok(BlockUpdates::default())
     }
 
     // toy-chain has no evidence-reporting action — it exists to exercise
@@ -109,5 +114,5 @@ impl ChainRuntime for ToyRuntime {
 }
 
 fn main() -> Result<()> {
-    node::run::<ToyRuntime>()
+    arxd_node::run::<ToyRuntime>()
 }

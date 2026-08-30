@@ -11,8 +11,8 @@ serde = { workspace = true, features = ["derive"] }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-executor = { workspace = true }
-runtime-api = { workspace = true }
+xc-runtime-api = { workspace = true }
 xc-evidence = { workspace = true }
 xc-chain-spec = { workspace = true }
-node = { workspace = true }
+arxd-node = { workspace = true }
 circuit-rwa-asset = { workspace = true }

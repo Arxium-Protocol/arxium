@@ -9,5 +9,5 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
-node = { path = "node" }
-runtime = { workspace = true }
+arxd-node = { path = "node" }
+arxd-runtime = { workspace = true }

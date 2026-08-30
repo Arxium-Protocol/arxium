@@ -14,6 +14,7 @@
 mod account;
 mod consensus;
 mod identity;
+mod pair;
 mod specs;
 mod staking;
 
@@ -165,11 +166,11 @@ pub enum ActionPayload {
 pub type ChainAction = Action<ActionPayload>;
 pub type ChainBlock = xc_primitives::Block<ActionPayload>;
 
-/// CoreChain's `ChainRuntime` implementation — see `runtime_api::ChainRuntime`
+/// CoreChain's `ChainRuntime` implementation — see `xc_runtime_api::ChainRuntime`
 /// for what this makes `arxd/node` generic over.
 pub struct CoreChainRuntime;
 
-impl runtime_api::ChainRuntime for CoreChainRuntime {
+impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
     type Payload = ActionPayload;
 
     fn presets() -> &'static PresetRegistry {
@@ -188,25 +189,44 @@ impl runtime_api::ChainRuntime for CoreChainRuntime {
         admission_precheck(action, db)
     }
 
-    fn dispatch(
-        action: &ChainAction,
-        view: &BlockView<'_>,
-        db: &ArxiumDb,
-        operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
-        operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
-        validators: &[Address],
-        current_height: u64,
-    ) -> anyhow::Result<BlockUpdates> {
+    fn dispatch(action: &ChainAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
         dispatch(
             action,
-            view,
-            operator_lookup,
-            operator_validators_lookup,
-            validators,
-            current_height,
-            &|h, p| db.evidence_processed(h, p),
-            &|pk: &BlsPublicKey| db.bls_pubkey_owner(pk),
+            ctx.view,
+            ctx.operator_lookup,
+            ctx.operator_validators_lookup,
+            ctx.validators,
+            ctx.height,
+            &|h, p| ctx.db.evidence_processed(h, p),
+            &|pk: &BlsPublicKey| ctx.db.bls_pubkey_owner(pk),
         )
+    }
+
+    /// Whole-block economics: reward split plus §7.3 downtime slash. Moved
+    /// here (from what used to be hardcoded in `arxd/node/src/produce.rs`
+    /// and `xc_executor::accept_block`) so a chain without CoreChain's
+    /// staking model — e.g. `toy-chain` — never has these applied to its
+    /// state root.
+    fn on_block_sealed(
+        view: &BlockView<'_>,
+        proposer: &Address,
+        fees_collected: u128,
+        validators: &[Address],
+        height: u64,
+    ) -> anyhow::Result<BlockUpdates> {
+        let reward_updates = circuit_staking::apply_block_reward(view, proposer, fees_collected)?;
+        let mut updates = BlockUpdates {
+            accounts: reward_updates,
+            ..Default::default()
+        };
+        if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
+            let (downtime_accounts, downtime_stakes) =
+                circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
+            updates.accounts.0.extend(downtime_accounts.0);
+            updates.stakes.allocations.extend(downtime_stakes.allocations);
+            updates.stakes.validator_index.extend(downtime_stakes.validator_index);
+        }
+        Ok(updates)
     }
 
     fn build_evidence_action(
@@ -223,6 +243,10 @@ impl runtime_api::ChainRuntime for CoreChainRuntime {
                 block_b: Box::new(evidence.block_b),
             },
         })
+    }
+
+    fn pair(seed: &[u8; 32], sender: &Address, node: &str, token: Option<&str>, revoke: bool) -> anyhow::Result<()> {
+        pair::run(seed, sender, node, token, revoke)
     }
 }
 

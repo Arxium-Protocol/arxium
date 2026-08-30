@@ -8,7 +8,7 @@ use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xc_primitives::{
     Action, Address, Block, MAX_FUTURE_DRIFT_SECS, SignatureError, ValidatorChange,
-    eligible_proposer, expected_proposer,
+    eligible_proposer,
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker,
@@ -138,6 +138,8 @@ pub enum AcceptBlockError {
         expected: String,
         claimed: String,
     },
+    #[error("on_block_sealed failed: {0}")]
+    BlockSealed(String),
 }
 
 /// Validates a block received from a peer — proposer signature, that the
@@ -158,8 +160,13 @@ pub enum AcceptBlockError {
 /// `ACTION_FEE`, 0 for a chain with none) — this crate doesn't know the fee
 /// amount itself (that's chain-specific, charged inside `dispatch`), only
 /// how many actions applied. `applied.len() * fee_per_action` is handed to
-/// `circuit_staking::apply_block_reward` to split between the block
-/// proposer and treasury.
+/// `on_block_sealed` as `fees_collected`.
+///
+/// `on_block_sealed` runs once, after every action in the block has
+/// dispatched — this is where whole-block economics (reward split, downtime
+/// slash) live, so this crate stays agnostic to whether a chain has any:
+/// `ChainRuntime::on_block_sealed` is CoreChain's `circuit_staking` reward/
+/// slash calls; a chain with none returns `BlockUpdates::default()`.
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
@@ -173,6 +180,7 @@ pub fn accept_block<P>(
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
+    on_block_sealed: impl Fn(&BlockView<'_>, &Address, u128, &[Address], u64) -> anyhow::Result<BlockUpdates>,
 ) -> Result<Block<P>, AcceptBlockError>
 where
     P: Serialize + DeserializeOwned + Clone,
@@ -303,21 +311,11 @@ where
     let mut view = BlockView::new(db);
     view.apply_accounts(&account_updates)?;
     view.apply_stakes(&stake_updates)?;
-    let reward_updates = circuit_staking::apply_block_reward(&view, proposer, fees_collected)?;
-    account_updates.0.extend(reward_updates.0.clone());
-    view.apply_accounts(&reward_updates)?;
-
-    // §7.3 downtime slash: if the height's primary round-robin proposer
-    // wasn't who actually produced it, they missed their slot — burn a
-    // small automatic slash. No evidence needed, every node agrees from
-    // the same stored block.
-    if let Some(primary) = expected_proposer(&validators, block.height) {
-        let (downtime_accounts, downtime_stakes) =
-            circuit_staking::apply_downtime_slash(&view, &primary, proposer, block.height)?;
-        account_updates.0.extend(downtime_accounts.0);
-        stake_updates.allocations.extend(downtime_stakes.allocations);
-        stake_updates.validator_index.extend(downtime_stakes.validator_index);
-    }
+    let sealed_updates = on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
+        .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
+    account_updates.0.extend(sealed_updates.accounts.0);
+    stake_updates.allocations.extend(sealed_updates.stakes.allocations);
+    stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
 
     let new_validator_set = if validator_changes.is_empty() {
         None
@@ -488,7 +486,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
-    use xc_primitives::{AccountEntry, StakeAllocation};
+    use xc_primitives::{AccountEntry, StakeAllocation, expected_proposer};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
@@ -532,6 +530,32 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Replicates the reward/downtime-slash behavior `accept_block` used to
+    /// hardcode, now that it's a caller-supplied callback — kept here so the
+    /// pre-existing test assertions (reward pool credited, downtime slashed)
+    /// don't change meaning.
+    fn seal(
+        view: &BlockView<'_>,
+        proposer: &Address,
+        fees_collected: u128,
+        validators: &[Address],
+        height: u64,
+    ) -> anyhow::Result<BlockUpdates> {
+        let reward_updates = circuit_staking::apply_block_reward(view, proposer, fees_collected)?;
+        let mut updates = BlockUpdates {
+            accounts: reward_updates,
+            ..Default::default()
+        };
+        if let Some(primary) = expected_proposer(validators, height) {
+            let (downtime_accounts, downtime_stakes) =
+                circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
+            updates.accounts.0.extend(downtime_accounts.0);
+            updates.stakes.allocations.extend(downtime_stakes.allocations);
+            updates.stakes.validator_index.extend(downtime_stakes.validator_index);
+        }
+        Ok(updates)
     }
 
     fn temp_db() -> ArxiumDb {
@@ -587,12 +611,12 @@ mod tests {
     ) -> Result<Block<TestPayload>, AcceptBlockError> {
         block.sign(proposer.clone(), key);
         if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
-            accept_block(db, block.clone(), 4, false, 0, dispatch)
+            accept_block(db, block.clone(), 4, false, 0, dispatch, seal)
         {
             block.state_root = expected;
             block.sign(proposer.clone(), key);
         }
-        accept_block(db, block, 4, false, 0, dispatch)
+        accept_block(db, block, 4, false, 0, dispatch, seal)
     }
 
     fn signed_join(key: &SigningKey, sender: &Address, nonce: u64) -> Action<TestPayload> {
@@ -903,7 +927,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr.clone(), &key);
-        let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        let block1 = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap();
         (db, key, addr, block1)
     }
 
@@ -950,7 +974,7 @@ mod tests {
 
         for stamp in [base, base - 1, 0] {
             let block2 = signed_block_at(&db, &key, &addr, &block1, stamp);
-            let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+            let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NonMonotonicTimestamp { .. }),
                 "timestamp {stamp} against parent {base} should be rejected, got {err:?}",
@@ -959,7 +983,7 @@ mod tests {
 
         // One second later is the minimum acceptable step, and it works.
         let block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
-        assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
+        assert!(accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok());
     }
 
     /// Proposer eligibility is derived from block timestamps, so an unbounded
@@ -972,7 +996,7 @@ mod tests {
 
         // A year ahead: the shape that used to stall the rotation indefinitely.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 31_536_000);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::TimestampTooFarAhead { .. }),
             "got {err:?}",
@@ -981,14 +1005,14 @@ mod tests {
         // Just past the bound is still rejected.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
         assert!(matches!(
-            accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err(),
+            accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err(),
             AcceptBlockError::TimestampTooFarAhead { .. }
         ));
 
         // Modest skew inside the bound is accepted — an honest node with a
         // slightly fast clock must not have its blocks refused.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 2);
-        assert!(accept_block(&db, block2, 4, false, 0, dispatch).is_ok());
+        assert!(accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok());
     }
 
     /// Only *future* drift is bounded. Blocks replayed during sync are old by
@@ -1001,7 +1025,7 @@ mod tests {
 
         let block2 = signed_block_at(&db, &key, &addr, &block1, long_ago + 4);
         assert!(
-            accept_block(&db, block2, 4, true, 0, dispatch).is_ok(),
+            accept_block(&db, block2, 4, true, 0, dispatch, seal).is_ok(),
             "a year-old block must still replay during sync",
         );
     }
@@ -1056,7 +1080,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr1, &key1);
-        let block1 = accept_block(&db, block1, 4, false, 0, dispatch).unwrap();
+        let block1 = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap();
         (db, sorted, block1)
     }
 
@@ -1075,7 +1099,7 @@ mod tests {
         // One second later: nowhere near a full slot (4s), so the primary
         // (sorted[0]) is still the only eligible proposer.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 1);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::WrongProposer { .. }),
             "non-primary signing during the primary's window should be rejected, got {err:?}",
@@ -1102,7 +1126,7 @@ mod tests {
         // interfere.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 5);
         assert!(
-            accept_block(&db, block2, 4, false, 0, dispatch).is_ok(),
+            accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok(),
             "non-primary should be accepted once its own timestamp shows a full slot elapsed",
         );
     }
@@ -1125,7 +1149,7 @@ mod tests {
             state_root: String::new(),
         };
         block2.sign(addr, &key);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ParentMismatch { .. }),
             "got {err:?}",
@@ -1151,7 +1175,7 @@ mod tests {
                 state_root: String::new(),
             };
             block2.sign(addr.clone(), &key);
-            let err = accept_block(&db, block2, 4, false, 0, dispatch).unwrap_err();
+            let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NotNextHeight { .. }),
                 "height {bad_height} against tip 1 should be rejected, got {err:?}",
@@ -1210,7 +1234,7 @@ mod tests {
         };
         block1.sign(alice, &alice_key);
 
-        let err = accept_block(&db, block1, 4, false, 0, dispatch).unwrap_err();
+        let err = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
             "got {err:?}",

@@ -24,6 +24,27 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
+/// Everything `ChainRuntime::dispatch` needs about the block it's executing
+/// into. One struct instead of a flat parameter list so a future field
+/// (another lookup, another piece of block context) is a non-breaking
+/// addition for every Spoke Chain implementor instead of a signature change.
+///
+/// `operator_lookup`/`operator_validators_lookup` stay as fields rather than
+/// being dropped in favor of `db` directly: they're overlay-aware (checking
+/// this block's not-yet-committed `AuthorizeOperator`/`RevokeOperator`
+/// changes before falling through to `db`), the same guarantee
+/// `view`/`AccountUpdates`/`StakeUpdates` give same-block actions elsewhere
+/// in this executor. A `db`-only lookup would silently stop seeing an
+/// operator grant made earlier in the same block.
+pub struct DispatchCtx<'a> {
+    pub view: &'a BlockView<'a>,
+    pub db: &'a ArxiumDb,
+    pub operator_lookup: &'a dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+    pub operator_validators_lookup: &'a dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+    pub validators: &'a [Address],
+    pub height: u64,
+}
+
 pub trait ChainRuntime: Send + Sync + 'static {
     /// Fills in `P` in `Action<P>` / `Block<P>`.
     type Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static;
@@ -48,18 +69,23 @@ pub trait ChainRuntime: Send + Sync + 'static {
     /// silently dropped at dispatch.
     fn admission_precheck(action: &Action<Self::Payload>, db: &ArxiumDb) -> anyhow::Result<()>;
 
-    /// The state transition. Takes `db` directly rather than pre-baked
-    /// lookup closures, so a generic node never needs to know what a given
-    /// runtime looks up (e.g. CoreChain's evidence/BLS-owner checks).
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch(
-        action: &Action<Self::Payload>,
+    /// The state transition. Takes `ctx.db` directly rather than pre-baked
+    /// lookup closures for everything, so a generic node never needs to know
+    /// what a given runtime looks up (e.g. CoreChain's evidence/BLS-owner
+    /// checks).
+    fn dispatch(action: &Action<Self::Payload>, ctx: &DispatchCtx<'_>) -> anyhow::Result<BlockUpdates>;
+
+    /// Runs once per block, after every action in it has been dispatched.
+    /// This is where a chain applies whole-block economics — block rewards,
+    /// downtime slashing — that aren't tied to any single action. CoreChain
+    /// moves its `circuit_staking` reward/slash calls here; a chain with no
+    /// block-level economics (e.g. `toy-chain`) returns `BlockUpdates::default()`.
+    fn on_block_sealed(
         view: &BlockView<'_>,
-        db: &ArxiumDb,
-        operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
-        operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        proposer: &Address,
+        fees_collected: u128,
         validators: &[Address],
-        current_height: u64,
+        height: u64,
     ) -> anyhow::Result<BlockUpdates>;
 
     /// Builds the action that reports an equivocation, or `None` if this
@@ -73,4 +99,22 @@ pub trait ChainRuntime: Send + Sync + 'static {
         sender: &Address,
         nonce: u64,
     ) -> Option<Action<Self::Payload>>;
+
+    /// Implements `arxd pair` / `arxd pair --revoke`: signs and submits this
+    /// chain's operator-authorization action over HTTP. `seed`/`sender` are
+    /// the validator's already-loaded signing key material (chain-agnostic,
+    /// loaded by `arxd-node`). Defaults to unsupported — `pair` builds a
+    /// chain-specific action (CoreChain's `AuthorizeOperator`/
+    /// `RevokeOperator`), so a Spoke Chain with no equivalent action just
+    /// doesn't get the subcommand rather than POSTing a payload its own
+    /// runtime can't decode.
+    fn pair(
+        _seed: &[u8; 32],
+        _sender: &Address,
+        _node: &str,
+        _token: Option<&str>,
+        _revoke: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this chain does not support `pair`")
+    }
 }

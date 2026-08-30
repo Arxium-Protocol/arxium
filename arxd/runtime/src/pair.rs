@@ -13,8 +13,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use xc_primitives::Address;
 
-use runtime::{ActionPayload, ChainAction};
-use crate::validator;
+use crate::{ActionPayload, ChainAction};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 // Mirrors the RPC server's own `PAIRING_TTL` (`core/rpc`) — no point
@@ -139,21 +138,15 @@ fn sign_and_submit(
     Ok(())
 }
 
-/// Implements `arxd pair` / `arxd pair --revoke` — see `Command::Pair`'s doc
-/// comment for the full flow. The validator's signing key is loaded
-/// in-process (`validator::load_or_generate_key`) and never serialized or
-/// transmitted anywhere; only the resulting signed `AuthorizeOperator` /
-/// `RevokeOperator` action is sent over the wire.
-pub fn run(base_path: &std::path::Path, node: &str, token: Option<&str>, revoke: bool) -> Result<()> {
-    // The pairing session this command creates lives only in this node
-    // process's memory (see core/rpc's PairingStore) — printed up front so
-    // a mismatch against whatever node the app's backend actually talks to
-    // (NODE_RPC_URL) is obvious immediately, not after a confusing "expired"
-    // report from the app minutes later.
-    println!("Connecting to node at {node}{}", if token.is_some() { " (with token)" } else { "" });
-    let key = validator::load_or_generate_key(base_path)?;
-    let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
-        .context("validator key produced an invalid address")?;
+/// Implements `ChainRuntime::pair` for CoreChain — see `Command::Pair`'s doc
+/// comment for the full flow. `seed` is the validator's already-loaded
+/// signing seed (`arxd-node`'s `validator::load_or_generate_key`, chain-
+/// agnostic key material); never serialized or transmitted anywhere — only
+/// the resulting signed `AuthorizeOperator`/`RevokeOperator` action is sent
+/// over the wire.
+pub fn run(seed: &[u8; 32], sender: &Address, node: &str, token: Option<&str>, revoke: bool) -> Result<()> {
+    let key = SigningKey::from_bytes(seed);
+    let sender = sender.clone();
 
     if revoke {
         sign_and_submit(node, token, &key, sender, ActionPayload::RevokeOperator)?;

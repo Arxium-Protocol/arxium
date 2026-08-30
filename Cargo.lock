@@ -378,10 +378,73 @@ name = "arxd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "node",
- "runtime",
+ "arxd-node",
+ "arxd-runtime",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "arxd-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arxd-runtime",
+ "clap",
+ "ed25519-dalek 3.0.0",
+ "finality",
+ "genesis",
+ "hex",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "network",
+ "qrcode",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "xc-bls",
+ "xc-chain-spec",
+ "xc-circuit",
+ "xc-cli",
+ "xc-evidence",
+ "xc-executor",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-rpc",
+ "xc-runtime-api",
+ "xc-storage",
+]
+
+[[package]]
+name = "arxd-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-bls12-381",
+ "ark-serialize",
+ "ark-std",
+ "blst",
+ "circuit-account",
+ "circuit-identity-zk",
+ "circuit-staking",
+ "ed25519-dalek 3.0.0",
+ "genesis",
+ "hex",
+ "qrcode",
+ "serde",
+ "serde_json",
+ "xc-bls",
+ "xc-chain-spec",
+ "xc-circuit",
+ "xc-evidence",
+ "xc-executor",
+ "xc-primitives",
+ "xc-runtime-api",
+ "xc-storage",
 ]
 
 [[package]]
@@ -2708,11 +2771,11 @@ name = "load-test"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arxd-node",
+ "arxd-runtime",
  "clap",
  "ed25519-dalek 3.0.0",
  "hex",
- "node",
- "runtime",
  "serde_json",
  "xc-primitives",
 ]
@@ -3004,42 +3067,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "circuit-staking",
- "clap",
- "ed25519-dalek 3.0.0",
- "finality",
- "genesis",
- "hex",
- "metrics",
- "metrics-exporter-prometheus",
- "network",
- "qrcode",
- "rand 0.9.5",
- "runtime",
- "runtime-api",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "xc-bls",
- "xc-chain-spec",
- "xc-circuit",
- "xc-cli",
- "xc-evidence",
- "xc-executor",
- "xc-mempool",
- "xc-primitives",
- "xc-rpc",
- "xc-storage",
 ]
 
 [[package]]
@@ -3737,45 +3764,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ark-bls12-381",
- "ark-serialize",
- "ark-std",
- "blst",
- "circuit-account",
- "circuit-identity-zk",
- "circuit-staking",
- "ed25519-dalek 3.0.0",
- "genesis",
- "hex",
- "runtime-api",
- "serde",
- "xc-bls",
- "xc-chain-spec",
- "xc-circuit",
- "xc-evidence",
- "xc-executor",
- "xc-primitives",
- "xc-storage",
-]
-
-[[package]]
-name = "runtime-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "xc-chain-spec",
- "xc-evidence",
- "xc-executor",
- "xc-primitives",
- "xc-storage",
-]
-
-[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3911,12 +3899,12 @@ name = "send-tx"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arxd-node",
+ "arxd-runtime",
  "circuit-staking",
  "clap",
  "ed25519-dalek 3.0.0",
  "hex",
- "node",
- "runtime",
  "serde_json",
  "xc-primitives",
 ]
@@ -4462,14 +4450,14 @@ name = "toy-chain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arxd-node",
  "circuit-rwa-asset",
- "node",
- "runtime-api",
  "serde",
  "xc-chain-spec",
  "xc-evidence",
  "xc-executor",
  "xc-primitives",
+ "xc-runtime-api",
  "xc-storage",
 ]
 
@@ -5184,6 +5172,19 @@ dependencies = [
  "tracing",
  "xc-bls",
  "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "xc-runtime-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "xc-chain-spec",
+ "xc-evidence",
+ "xc-executor",
  "xc-primitives",
  "xc-storage",
 ]
