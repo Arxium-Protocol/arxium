@@ -18,7 +18,7 @@ members = [
     #
     "arxd/node",
     "arxd/network",
-    "arxd/runtime",
+    "arxd/evidence",
     "arxd/finality",
     "arxd/genesis",
     "arxd/spec-builder",
@@ -59,7 +59,7 @@ xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
 node = { path = "arxd/node" }
 network = { path = "arxd/network" }
-runtime = { path = "arxd/runtime" }
+evidence = { path = "arxd/evidence" }
 finality = { path = "arxd/finality" }
 genesis = { path = "arxd/genesis" }
 spec-builder = { path = "arxd/spec-builder" }

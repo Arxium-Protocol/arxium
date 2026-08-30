@@ -212,7 +212,7 @@ Three layers, with a dependency rule enforced between them: `arxd` depends on
 | `arxd/node` | Block production, role selection, this chain's action type and dispatch |
 | `arxd/network` | libp2p — gossip, discovery, block and state sync |
 | `arxd/finality` | Precommit signing and aggregation to a finality record |
-| `arxd/runtime` | Equivocation detection and slashing |
+| `arxd/evidence` | Equivocation detection and slashing |
 
 The boundary rule is a question, answered twice. **Does this need to know what
 role the node is playing?** If yes it belongs under `arxd/`; if no it belongs

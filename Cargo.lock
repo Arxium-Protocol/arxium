@@ -1411,6 +1411,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "evidence"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 3.0.0",
+ "serde",
+ "thiserror 2.0.19",
+ "tracing",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "fastbloom"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3018,6 +3031,7 @@ dependencies = [
  "circuit-staking",
  "clap",
  "ed25519-dalek 3.0.0",
+ "evidence",
  "finality",
  "genesis",
  "hex",
@@ -3026,7 +3040,6 @@ dependencies = [
  "network",
  "qrcode",
  "rand 0.9.5",
- "runtime",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3736,19 +3749,6 @@ dependencies = [
  "nix",
  "thiserror 1.0.69",
  "tokio",
-]
-
-[[package]]
-name = "runtime"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek 3.0.0",
- "serde",
- "thiserror 2.0.19",
- "tracing",
- "xc-mempool",
- "xc-primitives",
- "xc-storage",
 ]
 
 [[package]]

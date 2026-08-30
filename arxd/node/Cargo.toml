@@ -32,7 +32,7 @@ xc-chain-spec = { workspace = true }
 genesis = { workspace = true }
 xc-rpc = { workspace = true }
 network = { workspace = true }
-runtime = { workspace = true }
+evidence = { workspace = true }
 finality = { workspace = true }
 circuit-account = { workspace = true }
 circuit-staking = { workspace = true }

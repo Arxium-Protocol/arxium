@@ -22,13 +22,15 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
+use evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use finality::{FinalityEvent, PrecommitVote, spawn_finality};
 use network::{identity, spawn_p2p_node};
-use runtime::{EquivocationEvidence, RuntimeEvent, spawn_runtime};
 use xc_cli::{Cli, Command};
 use xc_executor::accept_block;
+use xc_mempool::Mempool;
 use xc_primitives::{Action, Address};
 use xc_rpc::spawn_http_ingest;
+use xc_storage::ArxiumDb;
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
 const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
@@ -61,26 +63,38 @@ mod reject_severity_tests {
 
     #[test]
     fn behind_tip_is_routine() {
-        let err = AcceptBlockError::NotNextHeight { block_height: 10, tip_height: 20 };
+        let err = AcceptBlockError::NotNextHeight {
+            block_height: 10,
+            tip_height: 20,
+        };
         assert!(is_routine_reject(&err));
     }
 
     #[test]
     fn equal_to_tip_is_not_routine() {
         // Competing block at an already-committed height — equivocation-shaped.
-        let err = AcceptBlockError::NotNextHeight { block_height: 20, tip_height: 20 };
+        let err = AcceptBlockError::NotNextHeight {
+            block_height: 20,
+            tip_height: 20,
+        };
         assert!(!is_routine_reject(&err));
     }
 
     #[test]
     fn ahead_of_tip_is_not_routine() {
-        let err = AcceptBlockError::NotNextHeight { block_height: 30, tip_height: 20 };
+        let err = AcceptBlockError::NotNextHeight {
+            block_height: 30,
+            tip_height: 20,
+        };
         assert!(!is_routine_reject(&err));
     }
 
     #[test]
     fn parent_mismatch_is_not_routine() {
-        let err = AcceptBlockError::ParentMismatch { local: "a".into(), expected: "b".into() };
+        let err = AcceptBlockError::ParentMismatch {
+            local: "a".into(),
+            expected: "b".into(),
+        };
         assert!(!is_routine_reject(&err));
     }
 }
@@ -102,8 +116,7 @@ pub(crate) const SKIP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 /// `validators * SLOT_DURATION`, so several rotations with nobody producing
 /// means it isn't simply someone else's turn — that is the stall shape, and
 /// it escalates the log line from info to warn.
-pub(crate) const STALL_SUSPECT_AFTER: Duration =
-    Duration::from_secs(SLOT_DURATION.as_secs() * 10);
+pub(crate) const STALL_SUSPECT_AFTER: Duration = Duration::from_secs(SLOT_DURATION.as_secs() * 10);
 
 /// Both tip gauges, always set together — three separate sites advance the
 /// tip (startup, a produced block, an accepted block) and they must not
@@ -122,7 +135,7 @@ pub(crate) fn record_tip(height: u64, timestamp: u64) {
 
 /// Wraps a spawned subsystem thread so a panic inside it is fatal to the
 /// whole node instead of silently vanishing — previously a panicking
-/// runtime/finality/bridge thread just stopped and the node kept running
+/// evidence/finality/bridge thread just stopped and the node kept running
 /// with that subsystem dead, with nothing in the logs to say why block
 /// production or finalization had quietly stalled.
 ///
@@ -147,186 +160,43 @@ fn spawn_supervised(name: &'static str, handle: thread::JoinHandle<()>) {
     });
 }
 
-pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Everything `spawn_subsystems` builds that `run()` still needs afterward:
+/// the closures/receivers `spawn_p2p_node` consumes, and the shared state
+/// `produce::produce_loop` reads.
+struct SubsystemHandles {
+    bootnodes: Vec<String>,
+    chain_lock: Arc<Mutex<()>>,
+    finality_event_tx: std_mpsc::Sender<FinalityEvent<ActionPayload>>,
+    block_tx: tokio::sync::mpsc::UnboundedSender<ChainBlock>,
+    block_rx: tokio::sync::mpsc::UnboundedReceiver<ChainBlock>,
+    gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<ActionPayload>>,
+    precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
+    on_block: Box<dyn Fn(ChainBlock, bool) -> bool + Send>,
+    on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
+    payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload>,
+    shutdown: Arc<AtomicBool>,
+}
 
-    if let Some(Command::NodeKey { base_path }) = &cli.command {
-        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        let keypair = identity::load_or_generate_keypair(base_path)?;
-        println!("{}", network::PeerId::from(keypair.public()));
-        return Ok(());
-    }
-
-    if let Some(Command::Keys { base_path, json, stake }) = &cli.command {
-        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-
-        let validator_key = validator::load_or_generate_key(base_path)?;
-        let address = Address::from_pubkey_bytes(validator_key.verifying_key().as_bytes())?;
-        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
-        let bls_hex = hex::encode(bls_pubkey.0);
-        let peer_id = network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
-
-        // Built from `ValidatorEntry` itself rather than hand-written JSON, so
-        // the field names cannot drift from what the spec loader expects —
-        // a mismatch here would produce output that looks right and silently
-        // fails to register a key.
-        let entry = std::collections::BTreeMap::from([(
-            address.clone(),
-            xc_primitives::ValidatorEntry { stake: *stake, bls_pubkey: Some(bls_hex.clone()) },
-        )]);
-        let entry_json = serde_json::to_string_pretty(&entry)
-            .context("failed to render the chain-spec entry")?;
-
-        if *json {
-            println!("{entry_json}");
-            return Ok(());
-        }
-
-        println!();
-        println!("  Validator address   {address}");
-        println!("  BLS finality key    {bls_hex}");
-        println!("  libp2p peer ID      {peer_id}");
-        println!();
-        println!("  Chain-spec entry — merge into \"validators\" in the genesis spec:");
-        println!();
-        for line in entry_json.lines() {
-            println!("    {line}");
-        }
-        println!();
-        println!("  The validator address must appear in the chain spec's validator set,");
-        println!("  or be added later with JoinValidator, or this node never produces a");
-        println!("  block. Without the BLS key it can produce but never vote on finality,");
-        println!("  while still counting toward the quorum it cannot help meet.");
-        println!();
-        return Ok(());
-    }
-
-    if let Some(Command::ValidatorKey { base_path }) = &cli.command {
-        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        let key = validator::load_or_generate_key(base_path)?;
-        println!("{}", Address::from_pubkey_bytes(key.verifying_key().as_bytes())?);
-        return Ok(());
-    }
-
-    if let Some(Command::BlsKey { base_path, qr }) = &cli.command {
-        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        let (_secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
-        let hex_pubkey = hex::encode(pubkey.0);
-        println!("{hex_pubkey}");
-        if *qr {
-            let code = qrcode::QrCode::new(&hex_pubkey).context("failed to render BLS pubkey as a QR code")?;
-            let image = code
-                .render::<qrcode::render::unicode::Dense1x2>()
-                .dark_color(qrcode::render::unicode::Dense1x2::Light)
-                .light_color(qrcode::render::unicode::Dense1x2::Dark)
-                .build();
-            println!("{image}");
-        }
-        return Ok(());
-    }
-
-    if let Some(Command::Pair { base_path, node, token, revoke }) = &cli.command {
-        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        return pair::run(base_path, node, token.as_deref(), *revoke);
-    }
-
-    if let Some(Command::Snapshot { base_path, chain, output }) = &cli.command {
-        // Read-only, so goes through `new_partial` like the running node
-        // does rather than opening the DB by hand — same tip-signature
-        // verification, same genesis-write-on-first-run behavior, so a
-        // snapshot taken from data nothing else has ever booted still works.
-        // `is_validator: false` (the default below) means no key material
-        // gets generated just to export a checkpoint.
-        let config = xc_primitives::NodeConfig {
-            base_path: base_path.clone(),
-            chain: chain.clone(),
-            port: 0,
-            p2p_port: 0,
-            bootnodes: Vec::new(),
-            is_bootnode: false,
-            is_validator: false,
-            rpc_token: None,
-            rpc_bind: "127.0.0.1".to_string(),
-        };
-        let components = new_partial(&config)?;
-        components.db.export_checkpoint(output).with_context(|| {
-            format!("failed to write checkpoint to {} (must not already exist)", output.display())
-        })?;
-        let tip = components.db.get_tip_height()?.unwrap_or(0);
-        println!("wrote checkpoint at tip height {tip} to {}", output.display());
-        return Ok(());
-    }
-
-    if let Some(Command::ChainInfo { chain, list }) = &cli.command {
-        if *list {
-            for name in specs::CORECHAIN_PRESETS.names() {
-                println!("{name}");
-            }
-            return Ok(());
-        }
-        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
-        let chain_spec = genesis::ChainSpec::parse(&spec_json)?;
-        match &chain_spec {
-            genesis::ChainSpec::Plain(snapshot) => {
-                snapshot.validate().context("chain spec failed validation")?;
-                println!("format:         plain");
-                println!("chain name:     {}", snapshot.chain_name);
-                // ponytail: genesis hash needs the state actually reached at
-                // genesis, which means opening a DB — skipped for a plain
-                // spec so `chain-info` stays a zero-RocksDB preview; use
-                // `arx-spec-builder inspect` for the real hash.
-                println!("genesis hash:   <derive with `arx-spec-builder inspect`, or boot the node>");
-                println!("validators:     {}", snapshot.validators.len());
-                println!("accounts:       {}", snapshot.accounts.len());
-                println!("boot nodes:     {}", snapshot.boot_nodes.len());
-            }
-            genesis::ChainSpec::Raw(raw) => {
-                println!("format:         raw (format_version {})", raw.format_version);
-                println!("chain name:     {}", raw.chain_name);
-                println!("genesis hash:   {}", raw.state_root);
-                println!("source spec:    {}", raw.source_spec_hash);
-                println!("boot nodes:     {}", raw.boot_nodes.len());
-                println!("entries:        {}", raw.entries.len());
-            }
-        }
-        return Ok(());
-    }
-
-    if let Some(Command::ChainSpec { chain }) = &cli.command {
-        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
-        println!("{spec_json}");
-        return Ok(());
-    }
-
-    let config = cli.run.into_config();
-    info!("{:?}", config);
-
-    let components::NodeComponents { db, chain_name, boot_nodes, genesis_hash, identity, bls_identity, mempool } =
-        new_partial(&config)?;
-    let chain_id = hex::encode(genesis_hash);
-    info!("booted chain={chain_name} genesis={chain_id}");
-
-    // Installs the global recorder the `counter!`/`gauge!` calls below write
-    // to; the handle is just a read side onto the same data, handed to the
-    // RPC server so `GET /metrics` can render it.
-    let metrics_handle = PrometheusBuilder::new()
-        .install_recorder()
-        .context("failed to install metrics recorder")?;
-    // Seeded at startup so a node that comes up already stalled reports a
-    // stale tip immediately, rather than exporting nothing until the first
-    // block it never produces.
-    let startup_tip = db.get_tip_height()?.unwrap_or(0);
-    let startup_tip_timestamp = db
-        .get_block::<ActionPayload>(startup_tip)?
-        .map(|b: ChainBlock| b.timestamp)
-        .unwrap_or(0);
-    record_tip(startup_tip, startup_tip_timestamp);
-
-    // The runtime subsystem's own message-passing seam: `on_block` below
+/// Spawns every subsystem thread (evidence watcher, finality, the
+/// precommit-vote bridge, RPC ingest, the ctrl-c watcher) and wires the
+/// channels/closures between them. Everything `spawn_p2p_node` and
+/// `produce::produce_loop` need afterward comes back in `SubsystemHandles`;
+/// network spawning and the produce loop itself stay in `run()` since they
+/// aren't "subsystems" spawned here so much as `run()`'s own next steps.
+fn spawn_subsystems(
+    config: &xc_primitives::NodeConfig,
+    db: &ArxiumDb,
+    mempool: &Arc<Mutex<Mempool<ActionPayload>>>,
+    identity: &Option<(Address, ed25519_dalek::SigningKey)>,
+    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
+    boot_nodes: &[String],
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> Result<SubsystemHandles> {
+    // The evidence subsystem's own message-passing seam: `on_block` below
     // sends it competing-block sightings, it decides whether that's real
     // equivocation and (if this node has a validator key) reports it —
     // this thread never calls into slashing logic directly.
-    let (runtime_tx, runtime_rx) = std_mpsc::channel();
+    let (evidence_tx, evidence_rx) = std_mpsc::channel();
     let build_evidence_action = identity.as_ref().map(|(address, key)| {
         let address = address.clone();
         let key = key.clone();
@@ -352,7 +222,15 @@ pub fn run() -> Result<()> {
             action
         }
     });
-    spawn_supervised("runtime", spawn_runtime(db.clone(), mempool.clone(), runtime_rx, build_evidence_action));
+    spawn_supervised(
+        "evidence",
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            evidence_rx,
+            build_evidence_action,
+        ),
+    );
 
     // Finality subsystem's own message-passing seam: locally observed
     // blocks and peer precommit votes both funnel in as `FinalityEvent`s;
@@ -361,11 +239,19 @@ pub fn run() -> Result<()> {
     let (finality_event_tx, finality_event_rx) =
         std_mpsc::channel::<FinalityEvent<ActionPayload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
-    spawn_supervised("finality", spawn_finality(db.clone(), bls_identity, finality_event_rx, finality_vote_tx));
+    spawn_supervised(
+        "finality",
+        spawn_finality(
+            db.clone(),
+            bls_identity,
+            finality_event_rx,
+            finality_vote_tx,
+        ),
+    );
 
     let (precommit_tx, precommit_rx) = tokio::sync::mpsc::unbounded_channel::<PrecommitVote>();
     // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
-    // network layer's tokio channel — same shape as `runtime`/`gossip_tx`
+    // network layer's tokio channel — same shape as `evidence`/`gossip_tx`
     // bridging elsewhere in this file.
     spawn_supervised(
         "precommit_bridge",
@@ -378,19 +264,18 @@ pub fn run() -> Result<()> {
         }),
     );
 
-    let on_precommit_vote = {
+    let on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send> = {
         let finality_event_tx = finality_event_tx.clone();
-        move |vote: PrecommitVote| {
+        Box::new(move |vote: PrecommitVote| {
             let _ = finality_event_tx.send(FinalityEvent::VoteObserved(vote));
-        }
+        })
     };
 
     // Shared between RPC submission and gossip receipt so a `JoinValidator`/
     // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
     // `dispatch` gets rejected here instead, immediately and with a real
     // reason — see `payload::admission_precheck`'s doc comment.
-    let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> =
-        Arc::new(admission_precheck);
+    let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> = Arc::new(admission_precheck);
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
@@ -418,13 +303,13 @@ pub fn run() -> Result<()> {
     // unambiguously forged, never just an honest peer relaying something
     // out of order (wrong turn, stale height, etc.) — so the network layer
     // can penalize the sending peer for exactly that case and no other.
-    let on_block = {
+    let on_block: Box<dyn Fn(ChainBlock, bool) -> bool + Send> = {
         let db = db.clone();
         let chain_lock = chain_lock.clone();
-        let runtime_tx = runtime_tx.clone();
+        let evidence_tx = evidence_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
         let mempool = mempool.clone();
-        move |block: ChainBlock, sync: bool| -> bool {
+        Box::new(move |block: ChainBlock, sync: bool| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
             let candidate = block.clone();
@@ -488,7 +373,7 @@ pub fn run() -> Result<()> {
                     // not evidence of anything wrong, so it doesn't deserve
                     // warn. Competing block for the height we already
                     // committed (`block_height == tip_height`) is the one
-                    // shape worth both a warn and handing to the runtime
+                    // shape worth both a warn and handing to the evidence watcher
                     // subsystem to check for equivocation; anything else
                     // (ahead of tip, parent mismatch, bad signature, etc.)
                     // stays at warn too.
@@ -496,44 +381,30 @@ pub fn run() -> Result<()> {
                         debug!("rejected gossiped block: {err}");
                     } else {
                         warn!("rejected gossiped block: {err}");
-                        if let xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height } = &err {
+                        if let xc_executor::AcceptBlockError::NotNextHeight {
+                            block_height,
+                            tip_height,
+                        } = &err
+                        {
                             if block_height == tip_height {
-                                let _ = runtime_tx.send(RuntimeEvent::BlockObserved(candidate));
+                                let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
                             }
                         }
                     }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }
             }
-        }
+        })
     };
 
     // An explicit --bootnodes always wins; otherwise fall back to the chain
     // spec's own boot_nodes list (devnet.json) — so a fresh node needs zero
     // flags to join.
     let bootnodes = if config.bootnodes.is_empty() {
-        &boot_nodes
+        boot_nodes.to_vec()
     } else {
-        &config.bootnodes
+        config.bootnodes.clone()
     };
-
-    // Every node joins the network, not just validators — the libp2p
-    // identity is separate from the validator signing key above.
-    spawn_p2p_node(
-        &config.base_path,
-        config.p2p_port,
-        bootnodes,
-        config.is_bootnode,
-        &chain_id,
-        mempool.clone(),
-        db.clone(),
-        gossip_rx,
-        block_rx,
-        precommit_rx,
-        on_block,
-        on_precommit_vote,
-        Some(payload_precheck.clone()),
-    )?;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -553,6 +424,280 @@ pub fn run() -> Result<()> {
             }),
         );
     }
+
+    Ok(SubsystemHandles {
+        bootnodes,
+        chain_lock,
+        finality_event_tx,
+        block_tx,
+        block_rx,
+        gossip_rx,
+        precommit_rx,
+        on_block,
+        on_precommit_vote,
+        payload_precheck,
+        shutdown,
+    })
+}
+
+pub fn run() -> Result<()> {
+    let cli = Cli::parse();
+
+    if let Some(Command::NodeKey { base_path }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        let keypair = identity::load_or_generate_keypair(base_path)?;
+        println!("{}", network::PeerId::from(keypair.public()));
+        return Ok(());
+    }
+
+    if let Some(Command::Keys {
+        base_path,
+        json,
+        stake,
+    }) = &cli.command
+    {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+
+        let validator_key = validator::load_or_generate_key(base_path)?;
+        let address = Address::from_pubkey_bytes(validator_key.verifying_key().as_bytes())?;
+        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
+        let bls_hex = hex::encode(bls_pubkey.0);
+        let peer_id =
+            network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
+
+        // Built from `ValidatorEntry` itself rather than hand-written JSON, so
+        // the field names cannot drift from what the spec loader expects —
+        // a mismatch here would produce output that looks right and silently
+        // fails to register a key.
+        let entry = std::collections::BTreeMap::from([(
+            address.clone(),
+            xc_primitives::ValidatorEntry {
+                stake: *stake,
+                bls_pubkey: Some(bls_hex.clone()),
+            },
+        )]);
+        let entry_json = serde_json::to_string_pretty(&entry)
+            .context("failed to render the chain-spec entry")?;
+
+        if *json {
+            println!("{entry_json}");
+            return Ok(());
+        }
+
+        println!();
+        println!("  Validator address   {address}");
+        println!("  BLS finality key    {bls_hex}");
+        println!("  libp2p peer ID      {peer_id}");
+        println!();
+        println!("  Chain-spec entry — merge into \"validators\" in the genesis spec:");
+        println!();
+        for line in entry_json.lines() {
+            println!("    {line}");
+        }
+        println!();
+        println!("  The validator address must appear in the chain spec's validator set,");
+        println!("  or be added later with JoinValidator, or this node never produces a");
+        println!("  block. Without the BLS key it can produce but never vote on finality,");
+        println!("  while still counting toward the quorum it cannot help meet.");
+        println!();
+        return Ok(());
+    }
+
+    if let Some(Command::ValidatorKey { base_path }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        let key = validator::load_or_generate_key(base_path)?;
+        println!(
+            "{}",
+            Address::from_pubkey_bytes(key.verifying_key().as_bytes())?
+        );
+        return Ok(());
+    }
+
+    if let Some(Command::BlsKey { base_path, qr }) = &cli.command {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        let (_secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
+        let hex_pubkey = hex::encode(pubkey.0);
+        println!("{hex_pubkey}");
+        if *qr {
+            let code = qrcode::QrCode::new(&hex_pubkey)
+                .context("failed to render BLS pubkey as a QR code")?;
+            let image = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build();
+            println!("{image}");
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::Pair {
+        base_path,
+        node,
+        token,
+        revoke,
+    }) = &cli.command
+    {
+        std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
+        return pair::run(base_path, node, token.as_deref(), *revoke);
+    }
+
+    if let Some(Command::Snapshot {
+        base_path,
+        chain,
+        output,
+    }) = &cli.command
+    {
+        // Read-only, so goes through `new_partial` like the running node
+        // does rather than opening the DB by hand — same tip-signature
+        // verification, same genesis-write-on-first-run behavior, so a
+        // snapshot taken from data nothing else has ever booted still works.
+        // `is_validator: false` (the default below) means no key material
+        // gets generated just to export a checkpoint.
+        let config = xc_primitives::NodeConfig {
+            base_path: base_path.clone(),
+            chain: chain.clone(),
+            port: 0,
+            p2p_port: 0,
+            bootnodes: Vec::new(),
+            is_bootnode: false,
+            is_validator: false,
+            rpc_token: None,
+            rpc_bind: "127.0.0.1".to_string(),
+        };
+        let components = new_partial(&config)?;
+        components.db.export_checkpoint(output).with_context(|| {
+            format!(
+                "failed to write checkpoint to {} (must not already exist)",
+                output.display()
+            )
+        })?;
+        let tip = components.db.get_tip_height()?.unwrap_or(0);
+        println!(
+            "wrote checkpoint at tip height {tip} to {}",
+            output.display()
+        );
+        return Ok(());
+    }
+
+    if let Some(Command::ChainInfo { chain, list }) = &cli.command {
+        if *list {
+            for name in specs::CORECHAIN_PRESETS.names() {
+                println!("{name}");
+            }
+            return Ok(());
+        }
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        let chain_spec = genesis::ChainSpec::parse(&spec_json)?;
+        match &chain_spec {
+            genesis::ChainSpec::Plain(snapshot) => {
+                snapshot
+                    .validate()
+                    .context("chain spec failed validation")?;
+                println!("format:         plain");
+                println!("chain name:     {}", snapshot.chain_name);
+                // ponytail: genesis hash needs the state actually reached at
+                // genesis, which means opening a DB — skipped for a plain
+                // spec so `chain-info` stays a zero-RocksDB preview; use
+                // `arx-spec-builder inspect` for the real hash.
+                println!(
+                    "genesis hash:   <derive with `arx-spec-builder inspect`, or boot the node>"
+                );
+                println!("validators:     {}", snapshot.validators.len());
+                println!("accounts:       {}", snapshot.accounts.len());
+                println!("boot nodes:     {}", snapshot.boot_nodes.len());
+            }
+            genesis::ChainSpec::Raw(raw) => {
+                println!(
+                    "format:         raw (format_version {})",
+                    raw.format_version
+                );
+                println!("chain name:     {}", raw.chain_name);
+                println!("genesis hash:   {}", raw.state_root);
+                println!("source spec:    {}", raw.source_spec_hash);
+                println!("boot nodes:     {}", raw.boot_nodes.len());
+                println!("entries:        {}", raw.entries.len());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::ChainSpec { chain }) = &cli.command {
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        println!("{spec_json}");
+        return Ok(());
+    }
+
+    let config = cli.run.into_config();
+    info!("{:?}", config);
+
+    let components::NodeComponents {
+        db,
+        chain_name,
+        boot_nodes,
+        genesis_hash,
+        identity,
+        bls_identity,
+        mempool,
+    } = new_partial(&config)?;
+    let chain_id = hex::encode(genesis_hash);
+    info!("booted chain={chain_name} genesis={chain_id}");
+
+    // Installs the global recorder the `counter!`/`gauge!` calls below write
+    // to; the handle is just a read side onto the same data, handed to the
+    // RPC server so `GET /metrics` can render it.
+    let metrics_handle = PrometheusBuilder::new()
+        .install_recorder()
+        .context("failed to install metrics recorder")?;
+    // Seeded at startup so a node that comes up already stalled reports a
+    // stale tip immediately, rather than exporting nothing until the first
+    // block it never produces.
+    let startup_tip = db.get_tip_height()?.unwrap_or(0);
+    let startup_tip_timestamp = db
+        .get_block::<ActionPayload>(startup_tip)?
+        .map(|b: ChainBlock| b.timestamp)
+        .unwrap_or(0);
+    record_tip(startup_tip, startup_tip_timestamp);
+
+    let SubsystemHandles {
+        bootnodes,
+        chain_lock,
+        finality_event_tx,
+        block_tx,
+        block_rx,
+        gossip_rx,
+        precommit_rx,
+        on_block,
+        on_precommit_vote,
+        payload_precheck,
+        shutdown,
+    } = spawn_subsystems(
+        &config,
+        &db,
+        &mempool,
+        &identity,
+        bls_identity,
+        &boot_nodes,
+        metrics_handle,
+    )?;
+
+    // Every node joins the network, not just validators — the libp2p
+    // identity is separate from the validator signing key above.
+    spawn_p2p_node(
+        &config.base_path,
+        config.p2p_port,
+        &bootnodes,
+        config.is_bootnode,
+        &chain_id,
+        mempool.clone(),
+        db.clone(),
+        gossip_rx,
+        block_rx,
+        precommit_rx,
+        on_block,
+        on_precommit_vote,
+        Some(payload_precheck.clone()),
+    )?;
 
     produce::produce_loop(
         &db,

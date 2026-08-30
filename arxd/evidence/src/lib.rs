@@ -32,7 +32,7 @@ pub struct EquivocationEvidence<P> {
 }
 
 #[derive(Debug, Error)]
-pub enum RuntimeError {
+pub enum EvidenceError {
     #[error("blocks are at different heights ({0} vs {1}), not equivocation")]
     HeightMismatch(u64, u64),
     #[error("blocks have different proposers, not equivocation")]
@@ -49,30 +49,30 @@ pub enum RuntimeError {
 /// validator's address.
 pub fn verify_equivocation<P: Serialize>(
     evidence: &EquivocationEvidence<P>,
-) -> Result<Address, RuntimeError> {
+) -> Result<Address, EvidenceError> {
     let a = &evidence.block_a;
     let b = &evidence.block_b;
     if a.height != b.height {
-        return Err(RuntimeError::HeightMismatch(a.height, b.height));
+        return Err(EvidenceError::HeightMismatch(a.height, b.height));
     }
     let proposer_a = a.proposer.clone().ok_or(SignatureError::Missing)?;
     let proposer_b = b.proposer.clone().ok_or(SignatureError::Missing)?;
     if proposer_a != proposer_b {
-        return Err(RuntimeError::ProposerMismatch);
+        return Err(EvidenceError::ProposerMismatch);
     }
     if a.hash() == b.hash() {
-        return Err(RuntimeError::SameBlock);
+        return Err(EvidenceError::SameBlock);
     }
     a.verify_proposer_signature()?;
     b.verify_proposer_signature()?;
     Ok(proposer_a)
 }
 
-/// Fed to `spawn_runtime` whenever `arxd/node` sees a block competing for an
+/// Fed to `spawn_evidence_watcher` whenever `arxd/node` sees a block competing for an
 /// already-committed height — the one signal this subsystem reacts to today.
 /// A single-variant enum so more event kinds (downtime signals,
 /// unbonding-due ticks) have an obvious place to land later.
-pub enum RuntimeEvent<P> {
+pub enum EvidenceEvent<P> {
     BlockObserved(Block<P>),
 }
 
@@ -84,10 +84,10 @@ pub enum RuntimeEvent<P> {
 /// no async I/O (just DB reads and a channel recv), so a dedicated tokio
 /// runtime here would be needless machinery. Unlike `spawn_p2p_node`/
 /// `spawn_http_ingest`, which do real async I/O and need one.
-pub fn spawn_runtime<P, F>(
+pub fn spawn_evidence_watcher<P, F>(
     db: ArxiumDb,
     mempool: Arc<Mutex<Mempool<P>>>,
-    events: Receiver<RuntimeEvent<P>>,
+    events: Receiver<EvidenceEvent<P>>,
     build_evidence_action: Option<F>,
 ) -> thread::JoinHandle<()>
 where
@@ -96,12 +96,12 @@ where
 {
     thread::spawn(move || {
         for event in events {
-            let RuntimeEvent::BlockObserved(block) = event;
+            let EvidenceEvent::BlockObserved(block) = event;
             let existing: Option<Block<P>> = match db.get_block(block.height) {
                 Ok(existing) => existing,
                 Err(err) => {
                     warn!(
-                        "runtime: failed to read stored block at height {}: {err}",
+                        "evidence: failed to read stored block at height {}: {err}",
                         block.height
                     );
                     continue;
@@ -116,7 +116,7 @@ where
             let proposer = match verify_equivocation(&evidence) {
                 Ok(proposer) => proposer,
                 Err(err) => {
-                    warn!("runtime: rejected equivocation evidence: {err}");
+                    warn!("evidence: rejected equivocation evidence: {err}");
                     continue;
                 }
             };
@@ -124,20 +124,20 @@ where
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(err) => {
-                    warn!("runtime: failed dedup check for {proposer}: {err}");
+                    warn!("evidence: failed dedup check for {proposer}: {err}");
                     continue;
                 }
             }
 
             let Some(build_evidence_action) = &build_evidence_action else {
-                warn!("runtime: observed equivocation by {proposer}, no local validator key to report it");
+                warn!("evidence: observed equivocation by {proposer}, no local validator key to report it");
                 continue;
             };
             let action = build_evidence_action(evidence);
             let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
             match guard.push(action) {
-                Ok(()) => info!("runtime: submitted equivocation evidence against {proposer}"),
-                Err(err) => warn!("runtime: failed to submit equivocation evidence for {proposer}: {err}"),
+                Ok(()) => info!("evidence: submitted equivocation evidence against {proposer}"),
+                Err(err) => warn!("evidence: failed to submit equivocation evidence for {proposer}: {err}"),
             }
         }
     })
@@ -173,7 +173,7 @@ mod tests {
         let block_b = block_a.clone();
 
         let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
-        assert!(matches!(err, RuntimeError::SameBlock));
+        assert!(matches!(err, EvidenceError::SameBlock));
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         let block_b = signed_block(&key_b, 5, 200);
 
         let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
-        assert!(matches!(err, RuntimeError::ProposerMismatch));
+        assert!(matches!(err, EvidenceError::ProposerMismatch));
     }
 
     #[test]
@@ -194,7 +194,7 @@ mod tests {
         let block_b = signed_block(&key, 6, 200);
 
         let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
-        assert!(matches!(err, RuntimeError::HeightMismatch(5, 6)));
+        assert!(matches!(err, EvidenceError::HeightMismatch(5, 6)));
     }
 
     #[test]
@@ -206,18 +206,18 @@ mod tests {
         block_a.timestamp += 1;
 
         let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
-        assert!(matches!(err, RuntimeError::Signature(_)));
+        assert!(matches!(err, EvidenceError::Signature(_)));
     }
 
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real
     /// competing gossiped block, minus the libp2p transport: stored block at
     /// the tip, a `BlockObserved` for a second block signed by the same
-    /// proposer at that height, and confirms `spawn_runtime` both detects
+    /// proposer at that height, and confirms `spawn_evidence_watcher` both detects
     /// the equivocation and submits a signed report into the mempool.
     #[test]
-    fn spawn_runtime_reports_observed_equivocation_into_mempool() {
+    fn spawn_evidence_watcher_reports_observed_equivocation_into_mempool() {
         let dir = std::env::temp_dir().join(format!(
-            "arxium-test-spawn-runtime-{}-{}",
+            "arxium-test-spawn-evidence-watcher-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -241,9 +241,9 @@ mod tests {
             signature: None,
             payload: (),
         });
-        spawn_runtime(db.clone(), mempool.clone(), rx, build_evidence_action);
+        spawn_evidence_watcher(db.clone(), mempool.clone(), rx, build_evidence_action);
 
-        tx.send(RuntimeEvent::BlockObserved(competing)).unwrap();
+        tx.send(EvidenceEvent::BlockObserved(competing)).unwrap();
         drop(tx);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -251,14 +251,14 @@ mod tests {
             if !mempool.lock().unwrap().is_empty() {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "runtime never submitted evidence action");
+            assert!(std::time::Instant::now() < deadline, "evidence watcher never submitted evidence action");
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let reported = mempool.lock().unwrap().drain_pending(1);
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].sender, addr);
-        assert!(db.evidence_processed(5, &addr).unwrap_or(false) == false, "dedup marker is written by dispatch/apply_slash, not by the runtime subsystem itself");
+        assert!(db.evidence_processed(5, &addr).unwrap_or(false) == false, "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
 
         std::fs::remove_dir_all(&dir).ok();
     }
