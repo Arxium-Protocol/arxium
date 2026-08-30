@@ -16,18 +16,31 @@ use crate::transport::Behaviour;
 pub trait Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {}
 impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload for P {}
 
+/// Topic names are suffixed with the chain's genesis hash (short hex, passed
+/// in by the caller) rather than fixed strings, so two nodes booted from
+/// different genesis specs land on different gossipsub topics and simply
+/// never see each other's messages — instead of connecting at the libp2p
+/// layer (identity has nothing to do with which chain a node runs) and only
+/// then rejecting every gossiped block/action/vote one at a time.
+
 /// One pub/sub topic for actions — gossip is just another untrusted entry
 /// point into the mempool, no more trusted than a stranger hitting RPC.
-pub(crate) const ACTIONS_TOPIC: &str = "arxium/actions/v1";
+pub(crate) fn actions_topic(chain_id: &str) -> String {
+    format!("arxium/actions/v1/{chain_id}")
+}
 /// One pub/sub topic for blocks. Validation (signature, expected proposer,
 /// parent hash) happens in the caller-supplied `on_block` callback — this
 /// crate doesn't know how to execute a chain's actions, only how to move
 /// bytes between peers.
-pub(crate) const BLOCKS_TOPIC: &str = "arxium/blocks/v1";
+pub(crate) fn blocks_topic(chain_id: &str) -> String {
+    format!("arxium/blocks/v1/{chain_id}")
+}
 /// One pub/sub topic for BLS precommit votes (`finality::PrecommitVote`) —
 /// same "gossip is just another untrusted entry point" rule as actions;
 /// signature/voter/quorum validation happens in `arxd/finality`, not here.
-pub(crate) const PRECOMMITS_TOPIC: &str = "arxium/precommits/v1";
+pub(crate) fn precommits_topic(chain_id: &str) -> String {
+    format!("arxium/precommits/v1/{chain_id}")
+}
 
 /// A peer sending this many unambiguously-bad gossip messages (undecodable
 /// bytes, forged signatures) in a row gets banned — see `record_bad_gossip`.

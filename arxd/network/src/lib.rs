@@ -30,7 +30,7 @@ use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
 
 use discovery::{dial_bootnodes, dial_discovered};
-use gossip::{ACTIONS_TOPIC, BLOCKS_TOPIC, PRECOMMITS_TOPIC, record_bad_gossip};
+use gossip::{actions_topic, blocks_topic, precommits_topic, record_bad_gossip};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
     advance_stuck_tip, local_tip_height,
@@ -65,6 +65,12 @@ pub fn spawn_p2p_node<P: Payload>(
     listen_port: u16,
     bootnodes: &[String],
     is_bootnode: bool,
+    // Short hex identifier for the chain this node runs (e.g. the genesis
+    // hash) — gossip topic names are suffixed with this, so nodes on
+    // different chains never subscribe to each other's topics in the first
+    // place. Any two callers who want to gossip with each other must pass
+    // the same string.
+    chain_id: &str,
     mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
     gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
@@ -102,6 +108,7 @@ pub fn spawn_p2p_node<P: Payload>(
         .collect::<Result<Vec<_>>>()?;
 
     let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
+    let chain_id = chain_id.to_string();
 
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -116,7 +123,7 @@ pub fn spawn_p2p_node<P: Payload>(
         };
 
         runtime.block_on(run_swarm(
-            keypair, listen_port, bootnodes, mempool, db, gossip_rx, block_rx, precommit_rx,
+            keypair, listen_port, bootnodes, &chain_id, mempool, db, gossip_rx, block_rx, precommit_rx,
             on_block, on_precommit_vote, payload_precheck, ready_tx,
         ));
     });
@@ -132,6 +139,7 @@ async fn run_swarm<P: Payload>(
     keypair: libp2p::identity::Keypair,
     listen_port: u16,
     bootnodes: Vec<Multiaddr>,
+    chain_id: &str,
     mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
     mut gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
@@ -150,8 +158,8 @@ async fn run_swarm<P: Payload>(
         }
     };
 
-    let actions_topic = gossipsub::IdentTopic::new(ACTIONS_TOPIC);
-    let blocks_topic = gossipsub::IdentTopic::new(BLOCKS_TOPIC);
+    let actions_topic = gossipsub::IdentTopic::new(actions_topic(chain_id));
+    let blocks_topic = gossipsub::IdentTopic::new(blocks_topic(chain_id));
     if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&actions_topic) {
         let _ = ready_tx.send(Err(err.into()));
         return;
@@ -160,7 +168,7 @@ async fn run_swarm<P: Payload>(
         let _ = ready_tx.send(Err(err.into()));
         return;
     }
-    let precommits_topic = gossipsub::IdentTopic::new(PRECOMMITS_TOPIC);
+    let precommits_topic = gossipsub::IdentTopic::new(precommits_topic(chain_id));
     if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&precommits_topic) {
         let _ = ready_tx.send(Err(err.into()));
         return;
@@ -669,8 +677,8 @@ mod tests {
         let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
 
         let peer_id = spawn_p2p_node(
-            &base_path, 0, &[], false, mempool, db, gossip_rx, block_rx, precommit_rx, |_, _| false,
-            |_| {}, None,
+            &base_path, 0, &[], false, "test-chain", mempool, db, gossip_rx, block_rx, precommit_rx,
+            |_, _| false, |_| {}, None,
         )
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());
