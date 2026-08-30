@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use node::payload::{ActionPayload, ChainAction};
+use runtime::{ActionPayload, ChainAction};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;

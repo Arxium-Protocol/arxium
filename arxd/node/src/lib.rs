@@ -3,13 +3,12 @@
 
 mod components;
 mod pair;
-pub mod payload;
 mod produce;
 mod specs;
 mod validator;
 
 use crate::components::new_partial;
-use crate::payload::{ActionPayload, ChainBlock, admission_precheck, dispatch};
+use runtime::{ActionPayload, ChainBlock, admission_precheck, dispatch};
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -274,7 +273,7 @@ fn spawn_subsystems(
     // Shared between RPC submission and gossip receipt so a `JoinValidator`/
     // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
     // `dispatch` gets rejected here instead, immediately and with a real
-    // reason — see `payload::admission_precheck`'s doc comment.
+    // reason — see `runtime::admission_precheck`'s doc comment.
     let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> = Arc::new(admission_precheck);
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -287,8 +286,8 @@ fn spawn_subsystems(
         Some(gossip_tx),
         metrics_handle,
         Some(payload_precheck.clone()),
-        Some(payload::MIN_VALIDATOR_STAKE),
-        Some(payload::ACTION_FEE),
+        Some(runtime::MIN_VALIDATOR_STAKE),
+        Some(runtime::ACTION_FEE),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -318,7 +317,7 @@ fn spawn_subsystems(
                 block,
                 SLOT_DURATION.as_secs(),
                 sync,
-                payload::ACTION_FEE,
+                runtime::ACTION_FEE,
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
                     dispatch(
                         action,

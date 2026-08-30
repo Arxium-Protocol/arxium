@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::payload::ActionPayload;
+use runtime::ActionPayload;
 use crate::validator;
 use anyhow::{Context, Result};
 use genesis::ChainSpec;
@@ -131,7 +131,7 @@ pub(crate) fn new_partial(config: &NodeConfig) -> Result<NodeComponents> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::payload::ChainBlock;
+    use runtime::ChainBlock;
     use crate::produce::produce_block;
     use ed25519_dalek::SigningKey;
 

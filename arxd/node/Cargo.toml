@@ -22,7 +22,6 @@ qrcode = { version = "0.14", default-features = false }
 
 xc-primitives = { workspace = true }
 xc-bls = { workspace = true }
-blst = { workspace = true }
 xc-storage = { workspace = true }
 xc-circuit = { workspace = true }
 xc-executor = { workspace = true }
@@ -34,11 +33,5 @@ xc-rpc = { workspace = true }
 network = { workspace = true }
 evidence = { workspace = true }
 finality = { workspace = true }
-circuit-account = { workspace = true }
+runtime = { workspace = true }
 circuit-staking = { workspace = true }
-circuit-identity-zk = { workspace = true }
-ark-bls12-381 = { workspace = true }
-ark-serialize = { workspace = true }
-
-[dev-dependencies]
-ark-std = { workspace = true }

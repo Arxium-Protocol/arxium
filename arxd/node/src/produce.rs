@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::payload::{ACTION_FEE, ActionPayload, ChainBlock, dispatch};
+use runtime::{ACTION_FEE, ActionPayload, ChainBlock, dispatch};
 use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, SLOT_DURATION, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
@@ -496,7 +496,7 @@ mod tests {
         assert_eq!(block.height, 1);
         assert_eq!(
             db.get_account(&alice).unwrap().unwrap().balance,
-            2_000_000 - 400 - crate::payload::ACTION_FEE
+            2_000_000 - 400 - runtime::ACTION_FEE
         );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
 

@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use node::payload::ActionPayload;
+use runtime::ActionPayload;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;

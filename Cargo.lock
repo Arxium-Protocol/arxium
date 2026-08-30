@@ -2724,6 +2724,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "node",
+ "runtime",
  "serde_json",
  "xc-primitives",
 ]
@@ -3022,12 +3023,6 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "ark-bls12-381",
- "ark-serialize",
- "ark-std",
- "blst",
- "circuit-account",
- "circuit-identity-zk",
  "circuit-staking",
  "clap",
  "ed25519-dalek 3.0.0",
@@ -3040,6 +3035,7 @@ dependencies = [
  "network",
  "qrcode",
  "rand 0.9.5",
+ "runtime",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3752,6 +3748,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ark-bls12-381",
+ "ark-serialize",
+ "ark-std",
+ "blst",
+ "circuit-account",
+ "circuit-identity-zk",
+ "circuit-staking",
+ "ed25519-dalek 3.0.0",
+ "evidence",
+ "hex",
+ "serde",
+ "xc-bls",
+ "xc-circuit",
+ "xc-executor",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3892,6 +3911,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "hex",
  "node",
+ "runtime",
  "serde_json",
  "xc-primitives",
 ]

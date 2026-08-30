@@ -28,6 +28,10 @@ use ark_std::rand::RngCore;
 
 pub use ark_groth16::{Proof, ProvingKey, VerifyingKey};
 
+/// Devnet Groth16 verifying key, checked into this crate — see the module
+/// docs above for why it isn't from a real trusted-setup ceremony.
+pub const VK_BYTES: &[u8] = include_bytes!("../vk.bin");
+
 const RATE: usize = 2;
 const CAPACITY: usize = 1;
 const FULL_ROUNDS: usize = 8;

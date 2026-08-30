@@ -13,7 +13,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use xc_primitives::Address;
 
-use crate::payload::{ActionPayload, ChainAction};
+use runtime::{ActionPayload, ChainAction};
 use crate::validator;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);

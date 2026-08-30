@@ -1,0 +1,29 @@
+[package]
+name = "runtime"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
+
+xc-primitives = { workspace = true }
+xc-storage = { workspace = true }
+xc-circuit = { workspace = true }
+xc-executor = { workspace = true }
+xc-bls = { workspace = true }
+blst = { workspace = true }
+evidence = { workspace = true }
+
+circuit-account = { workspace = true }
+circuit-staking = { workspace = true }
+circuit-identity-zk = { workspace = true }
+
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+
+[dev-dependencies]
+ark-std = { workspace = true }
+ed25519-dalek = { workspace = true }
