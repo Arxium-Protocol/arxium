@@ -140,6 +140,47 @@ there, this node will never propose until a `JoinValidator` action adds it.
    `AuthorizeOperator` action. `--revoke` removes the current operator
    without needing to scan anything.
 
+## Running a custom chain
+
+`arxd`'s only built-in presets are `devnet` and `local` (`arxd chain-info
+--list`) — CoreChain's own networks, embedded via `include_str!` so a
+downloaded binary runs with no files on disk. Everything else, including a
+staging net or a brand-new Spoke Chain, is `--chain <path-to-json>`, which
+needs no rebuild:
+
+```
+arxd keys --json > validator-entry.json
+arxd chain-spec --chain devnet > my-net.json    # edit validators/accounts
+arxd chain-info --chain ./my-net.json           # inspect before committing
+arxd --chain ./my-net.json                      # run — no rebuild anywhere
+```
+
+A preset name is always resolved before falling back to a file path (an
+operator's own `staging` spec file resolves fine — it's just never confused
+for a preset unless something is actually registered under that name).
+
+### Distributing a chain as a raw spec
+
+A plain spec (`my-net.json` above) is the human-authored source of truth, but
+every node that boots it re-derives genesis state independently — fine for a
+handful of nodes, wasteful for distributing a network to hundreds of them, and
+it leaves nothing to eyeball-verify against a published state root before
+booting. `arx-spec-builder` converts a plain spec into a self-contained raw
+one — the exact encoded storage entries, plus the state root a node must
+reach after installing them:
+
+```
+arx-spec-builder build --chain ./my-net.json --raw --output my-net-raw.json
+arx-spec-builder inspect --chain my-net-raw.json   # chain name, state root, entry count
+arxd --chain ./my-net-raw.json                     # boots identically to the plain spec
+```
+
+A plain and raw spec for the same chain produce the same genesis hash (used
+as the gossip-topic suffix), so nodes booted from either representation
+interoperate on the same network. A raw spec is validated against its own
+declared `state_root` at boot — installing it and reaching a different root
+is a fatal error, not a silent divergence.
+
 ## Health checks
 
 - `GET /status` → `{chain_name, tip_height, tip_hash}` (`503` if genesis

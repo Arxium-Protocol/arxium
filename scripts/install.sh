@@ -270,6 +270,7 @@ else
 # Apply changes with: systemctl restart arxd
 
 ARXD_BASE_PATH=$base_path
+ARXD_CHAIN=devnet
 ARXD_VALIDATOR=$validator
 ARXD_PORT=30333
 ARXD_P2P_PORT=30334

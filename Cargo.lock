@@ -1615,6 +1615,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "genesis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blst",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tracing",
+ "xc-bls",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3002,6 +3019,7 @@ dependencies = [
  "clap",
  "ed25519-dalek 3.0.0",
  "finality",
+ "genesis",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
@@ -3011,14 +3029,15 @@ dependencies = [
  "runtime",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "xc-bls",
+ "xc-chain-spec",
  "xc-circuit",
  "xc-cli",
  "xc-executor",
- "xc-genesis",
  "xc-mempool",
  "xc-primitives",
  "xc-rpc",
@@ -4096,6 +4115,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spec-builder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "genesis",
+ "serde_json",
+ "xc-chain-spec",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4413,6 +4443,7 @@ dependencies = [
  "serde",
  "tracing",
  "tracing-subscriber",
+ "xc-chain-spec",
  "xc-executor",
  "xc-mempool",
  "xc-primitives",
@@ -5029,6 +5060,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xc-chain-spec"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "serde_json",
+ "tracing",
+ "xc-primitives",
+]
+
+[[package]]
 name = "xc-circuit"
 version = "0.1.0"
 dependencies = [
@@ -5063,17 +5105,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "xc-genesis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "serde_json",
- "tracing",
- "xc-primitives",
-]
-
-[[package]]
 name = "xc-mempool"
 version = "0.1.0"
 dependencies = [
@@ -5089,6 +5120,7 @@ dependencies = [
 name = "xc-primitives"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bech32",
  "bincode",
  "ed25519-dalek 3.0.0",

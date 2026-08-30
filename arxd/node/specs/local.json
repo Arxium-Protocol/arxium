@@ -1,0 +1,14 @@
+{
+  "genesis_format": "plain",
+  "height": 0,
+  "chain_name": "localchain",
+  "accounts": {
+    "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
+      "balance": 1000000000000000000,
+      "nonce": 0,
+      "identity_hash": null
+    }
+  },
+  "validators": {},
+  "boot_nodes": []
+}

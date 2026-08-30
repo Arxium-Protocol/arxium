@@ -13,13 +13,15 @@ members = [
     "core/mempool",
     "core/executor",
     "core/cli",
-    "core/genesis",
+    "core/chain-spec",
     "core/rpc",
     #
     "arxd/node",
     "arxd/network",
     "arxd/runtime",
     "arxd/finality",
+    "arxd/genesis",
+    "arxd/spec-builder",
     "arxd",
     #
     "scripts/send-tx",
@@ -53,12 +55,14 @@ circuit-staking = { path = "circuits/staking" }
 circuit-identity-zk = { path = "circuits/identity-zk" }
 xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
-xc-genesis = { path = "core/genesis" }
+xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
 node = { path = "arxd/node" }
 network = { path = "arxd/network" }
 runtime = { path = "arxd/runtime" }
 finality = { path = "arxd/finality" }
+genesis = { path = "arxd/genesis" }
+spec-builder = { path = "arxd/spec-builder" }
 
 # external packages
 clap = { version = "4.4", features = ["derive", "env"] }

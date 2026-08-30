@@ -114,13 +114,51 @@ pub struct Snapshot {
     pub chain_name: String,
     pub accounts: BTreeMap<Address, AccountEntry>,
     pub validators: BTreeMap<Address, ValidatorEntry>,
-    /// Peer multiaddrs new nodes dial on startup to join this chain, same
-    /// role as a Polkadot chain-spec's `bootNodes` — part of the chain
-    /// identity, not a per-run CLI concern. `--bootnodes` on the command
-    /// line overrides this list entirely when given; empty here means rely
-    /// on mDNS or an explicit CLI override.
+    /// Peer multiaddrs new nodes dial on startup to join this chain — part
+    /// of the chain identity, not a per-run CLI concern. `--bootnodes` on
+    /// the command line overrides this list entirely when given; empty here
+    /// means rely on mDNS or an explicit CLI override.
     #[serde(default)]
     pub boot_nodes: Vec<String>,
+}
+
+impl Snapshot {
+    /// Checks a freshly-parsed spec is fit to become a chain's genesis,
+    /// before anything is written to disk or a DB is opened. Every failure
+    /// case here would otherwise surface much later — as a bad directory
+    /// name, a silently-wrong `meta:height`, or a BLS key rejected only
+    /// after the DB is already open and the snapshot cached.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.chain_name.is_empty() {
+            anyhow::bail!("chain spec has an empty chain_name");
+        }
+        if self.chain_name.contains('/') || self.chain_name.contains(std::path::MAIN_SEPARATOR) {
+            anyhow::bail!(
+                "chain spec chain_name {:?} must not contain a path separator — it becomes a directory name",
+                self.chain_name
+            );
+        }
+        if self.height != 0 {
+            anyhow::bail!("chain spec height must be 0 for a genesis spec, got {}", self.height);
+        }
+        for addr in self.boot_nodes.iter() {
+            if addr.trim().is_empty() {
+                anyhow::bail!("chain spec boot_nodes contains a blank entry");
+            }
+        }
+        for (address, entry) in &self.validators {
+            if let Some(hex_pubkey) = &entry.bls_pubkey
+                && hex_pubkey.len() != 96
+            {
+                anyhow::bail!(
+                    "chain spec validator {address} has a malformed bls_pubkey {:?} — expected 96 hex chars, got {}",
+                    hex_pubkey,
+                    hex_pubkey.len()
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -128,7 +166,7 @@ mod tests {
     use super::*;
 
     /// `arxd keys` emits a chain-spec entry by serializing `ValidatorEntry`
-    /// itself, and `xc_genesis` parses the spec back into `Snapshot`. This
+    /// itself, and `genesis`/`xc_chain_spec` parse the spec back into `Snapshot`. This
     /// pins that round trip: an entry the command prints must be an entry the
     /// loader accepts, with the BLS key surviving intact. A rename or a serde
     /// attribute change on either side would produce output that looks correct

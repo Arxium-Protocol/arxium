@@ -4,9 +4,9 @@ The concrete node daemon. This is where `core/`'s role-agnostic building
 blocks get assembled into an actual running Arxium node, and where
 everything that _does_ need to know what the node is doing lives.
 
-`arxd` follows the `<chain>d` daemon naming convention (like `geckod`,
-`polkadotd`-style binaries). It is a single binary that can play any chain
-role — there is no separate binary per role.
+`arxd` follows the `<chain>d` daemon naming convention (like `geckod`-style
+binaries). It is a single binary that can play any chain role — there is no
+separate binary per role.
 
 ## What lives here
 

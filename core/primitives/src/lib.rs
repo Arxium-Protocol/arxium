@@ -22,6 +22,14 @@ pub use state::{
 #[derive(Debug)]
 pub struct NodeConfig {
     pub base_path: PathBuf,
+    /// Chain to run: a built-in preset name (`devnet`, `local`) or a path to
+    /// a JSON chain spec — resolved against the running binary's own
+    /// `xc_chain_spec::presets::PresetRegistry` by `xc_chain_spec::resolve_chain_spec`.
+    /// Kept as a plain string rather than a pre-parsed enum: telling a
+    /// preset name from a file path needs the registry in hand (a preset
+    /// name must be checked against the registry before ever falling back to
+    /// a same-named file), and `xc-primitives` never depends on `xc-chain-spec`.
+    pub chain: String,
     pub port: u16,
     /// Port for the P2P (libp2p) listener — TCP and QUIC. Separate from
     /// `port` (the RPC listener) since they're independent services.

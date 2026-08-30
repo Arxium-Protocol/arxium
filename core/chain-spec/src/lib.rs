@@ -5,6 +5,11 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use xc_primitives::Snapshot;
 
+pub mod presets;
+pub mod source;
+
+pub use source::resolve_chain_spec;
+
 /// Loads the genesis `Snapshot` from a per-node bincode cache, or parses
 /// `embedded_json` (the chain's own bundled genesis JSON, typically
 /// `include_str!`'d by the caller) and writes the cache on first boot.
@@ -47,6 +52,7 @@ pub fn load_or_init_snapshot(base_path: &Path, embedded_json: &str) -> Result<Sn
     {
         let snapshot: Snapshot =
             serde_json::from_str(embedded_json).context("failed to parse embedded genesis JSON")?;
+        snapshot.validate().context("genesis spec failed validation")?;
 
         if let Some(parent) = snapshot_path.parent() {
             std::fs::create_dir_all(parent).context("failed to create snapshots directory")?;
@@ -100,6 +106,21 @@ mod tests {
         let reloaded = load_or_init_snapshot(&dir, SPEC).expect("cache must be usable now");
         assert_eq!(reloaded.chain_name, "test-chain");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A genesis spec at any height other than 0 is a config error — without
+    /// `Snapshot::validate()` it would be silently written as `meta:height`.
+    #[test]
+    fn genesis_with_nonzero_height_is_rejected() {
+        let spec = r#"{"height":1,"chain_name":"t","accounts":{},"validators":{},"boot_nodes":[]}"#;
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-genesis-nonzero-height-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let err = load_or_init_snapshot(&dir, spec).unwrap_err();
+        assert!(format!("{err:#}").contains("height"), "expected a height error, got {err:?}");
+        assert!(!dir.join("snapshots").join("snapshot-0.bin").exists(), "must not write the cache");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,23 @@
+{
+  "height": 0,
+  "chain_name": "toychain-rwa-devnet",
+  "accounts": {
+    "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz": {
+      "balance": 0,
+      "nonce": 0,
+      "identity_hash": "kyc-issuer"
+    },
+    "arx1qgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqr7xm69": {
+      "balance": 0,
+      "nonce": 0,
+      "identity_hash": "kyc-recipient"
+    },
+    "arx1qvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxqcrqvpsxvlpv8": {
+      "balance": 0,
+      "nonce": 0,
+      "identity_hash": null
+    }
+  },
+  "validators": {},
+  "boot_nodes": []
+}

@@ -15,19 +15,25 @@
 //! compliance check, dropped rather than applied) — no RPC, no networking,
 //! no CLI.
 
-use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use xc_executor::{BlockUpdates, execute_actions};
 use xc_mempool::Mempool;
-use xc_primitives::{AccountEntry, Action, Address, Block, Snapshot, ValidatorChange};
+use xc_primitives::{Action, Address, Block, ValidatorChange};
 use xc_storage::{AccountUpdates, ArxiumDb, BlockView};
 
-const CHAIN_NAME: &str = "toychain-rwa-devnet";
+/// toy-chain's own preset registry — proof that `PresetRegistry` works for a
+/// second, differently-shaped chain with zero dependency on `arxd/node` or
+/// any of CoreChain's genesis data. The three fixed genesis accounts below
+/// (issuer, KYC'd recipient, non-KYC'd recipient) live in
+/// `specs/toy-chain-dev.json`, not hand-rolled here — same shared
+/// chain-spec path CoreChain's `devnet`/`local` presets use.
+static TOY_CHAIN_PRESETS: xc_chain_spec::presets::PresetRegistry =
+    xc_chain_spec::presets::PresetRegistry::new(&[("dev", include_str!("../specs/toy-chain-dev.json"))]);
 
 /// The RWA chain's own action set — distinct from CoreChain's `ActionPayload`
 /// in `arxd/node`, proving payloads are chain-specific rather than one
@@ -131,41 +137,11 @@ fn main() -> Result<()> {
     let kyc_recipient = Address::from_pubkey_bytes(&[2u8; 32])?;
     let non_kyc_recipient = Address::from_pubkey_bytes(&[3u8; 32])?;
 
-    let mut accounts = BTreeMap::new();
-    accounts.insert(
-        issuer.clone(),
-        AccountEntry {
-            balance: 0,
-            nonce: 0,
-            identity_hash: Some("kyc-issuer".into()),
-            zk_identity_verified: false,
-        },
-    );
-    accounts.insert(
-        kyc_recipient.clone(),
-        AccountEntry {
-            balance: 0,
-            nonce: 0,
-            identity_hash: Some("kyc-recipient".into()),
-            zk_identity_verified: false,
-        },
-    );
-    accounts.insert(
-        non_kyc_recipient.clone(),
-        AccountEntry {
-            balance: 0,
-            nonce: 0,
-            identity_hash: None,
-            zk_identity_verified: false,
-        },
-    );
-    db.write_batch(&Snapshot {
-        height: 0,
-        chain_name: CHAIN_NAME.into(),
-        accounts,
-        validators: BTreeMap::new(),
-        boot_nodes: Vec::new(),
-    })?;
+    let spec_json = xc_chain_spec::resolve_chain_spec("dev", &TOY_CHAIN_PRESETS)
+        .context("failed to resolve toy-chain genesis spec")?;
+    let snapshot =
+        xc_chain_spec::load_or_init_snapshot(&dir, &spec_json).context("failed to load toy-chain genesis spec")?;
+    db.write_batch(&snapshot)?;
     let genesis: RwaBlock = Block::genesis(now());
     db.write_batches(&[
         &execute_actions(

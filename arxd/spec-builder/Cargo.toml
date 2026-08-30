@@ -1,0 +1,16 @@
+[package]
+name = "spec-builder"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "arx-spec-builder"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+xc-chain-spec = { workspace = true }
+genesis = { workspace = true }

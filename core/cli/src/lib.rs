@@ -114,9 +114,35 @@ pub enum Command {
     Snapshot {
         #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
         base_path: PathBuf,
+        /// Same meaning as `arxd --chain`: a preset name or a path to a JSON
+        /// chain spec. Must match the chain the data at `base_path` was
+        /// actually booted with, or this looks in the wrong chain's data
+        /// directory and finds nothing.
+        #[arg(long, env = "ARXD_CHAIN", default_value = "devnet")]
+        chain: String,
         /// Destination directory. Must not already exist.
         #[arg(long)]
         output: PathBuf,
+    },
+    /// Prints a summary of a chain spec — name, genesis hash, validator and
+    /// account counts, boot nodes — without starting a node. `--list` prints
+    /// the available built-in preset names instead and ignores `--chain`.
+    ChainInfo {
+        /// A built-in preset name (`devnet`, `local`) or a path to a JSON
+        /// chain spec.
+        #[arg(long, env = "ARXD_CHAIN", default_value = "devnet")]
+        chain: String,
+        /// List available preset names and exit.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Prints the raw, resolved chain-spec JSON to stdout — a preset name
+    /// resolves to the spec text it's built from, a file path is echoed back
+    /// after confirming it parses. Meant for piping to a file as a starting
+    /// point for a custom chain: `arxd chain-spec --chain devnet > mine.json`.
+    ChainSpec {
+        #[arg(long, env = "ARXD_CHAIN", default_value = "devnet")]
+        chain: String,
     },
 }
 
@@ -124,6 +150,12 @@ pub enum Command {
 pub struct RunArgs {
     #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
     pub base_path: PathBuf,
+
+    /// Chain to run: a built-in preset name (`devnet`, `local`) or a path to
+    /// a JSON chain spec. `arxd chain-info --list` prints the available
+    /// presets.
+    #[arg(long, env = "ARXD_CHAIN", default_value = "devnet")]
+    pub chain: String,
 
     #[arg(long, env = "ARXD_PORT", default_value_t = 30333)]
     pub port: u16,
@@ -135,8 +167,7 @@ pub struct RunArgs {
     /// Explicit peer multiaddrs to dial on startup (e.g.
     /// /ip4/1.2.3.4/tcp/30334/p2p/12D3Koo...), comma-separated. Discovery
     /// beyond same-LAN mDNS. If empty, falls back to the chain spec's
-    /// `boot_nodes` list (e.g. `devnet.json`) — same role as a Polkadot
-    /// chain-spec's `bootNodes`.
+    /// `boot_nodes` list (e.g. `devnet.json`).
     #[arg(long, env = "ARXD_BOOTNODES", value_delimiter = ',')]
     pub bootnodes: Vec<String>,
 
@@ -175,6 +206,7 @@ impl RunArgs {
     pub fn into_config(self) -> NodeConfig {
         NodeConfig {
             base_path: self.base_path,
+            chain: self.chain,
             port: self.port,
             p2p_port: self.p2p_port,
             // Empties are dropped here, at the one place NodeConfig is built,

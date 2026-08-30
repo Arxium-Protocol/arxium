@@ -1,4 +1,5 @@
 {
+  "genesis_format": "plain",
   "height": 0,
   "chain_name": "corechain",
   "accounts": {

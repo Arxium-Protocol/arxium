@@ -1,13 +1,14 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-mod bootstrap;
+mod components;
 mod pair;
 pub mod payload;
 mod produce;
+mod specs;
 mod validator;
 
-use crate::bootstrap::bootstrap;
+use crate::components::new_partial;
 use crate::payload::{ActionPayload, ChainBlock, admission_precheck, dispatch};
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -19,14 +20,13 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use finality::{FinalityEvent, PrecommitVote, spawn_finality};
 use network::{identity, spawn_p2p_node};
 use runtime::{EquivocationEvidence, RuntimeEvent, spawn_runtime};
 use xc_cli::{Cli, Command};
 use xc_executor::accept_block;
-use xc_mempool::Mempool;
 use xc_primitives::{Action, Address};
 use xc_rpc::spawn_http_ingest;
 
@@ -120,6 +120,33 @@ pub(crate) fn record_tip(height: u64, timestamp: u64) {
     gauge!("arxium_tip_timestamp_seconds").set(timestamp as f64);
 }
 
+/// Wraps a spawned subsystem thread so a panic inside it is fatal to the
+/// whole node instead of silently vanishing — previously a panicking
+/// runtime/finality/bridge thread just stopped and the node kept running
+/// with that subsystem dead, with nothing in the logs to say why block
+/// production or finalization had quietly stalled.
+///
+/// A plain (non-panicking) return is logged and counted but not fatal: the
+/// ctrl-c watcher and the precommit bridge both return normally as part of
+/// an ordinary shutdown, once the channels they depend on start closing.
+fn spawn_supervised(name: &'static str, handle: thread::JoinHandle<()>) {
+    thread::spawn(move || match handle.join() {
+        Ok(()) => {
+            debug!("subsystem '{name}' thread exited");
+        }
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            error!("subsystem '{name}' thread panicked: {msg}");
+            counter!("arxium_subsystem_exit_total", "subsystem" => name).increment(1);
+            std::process::exit(1);
+        }
+    });
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -203,44 +230,81 @@ pub fn run() -> Result<()> {
         return pair::run(base_path, node, token.as_deref(), *revoke);
     }
 
-    if let Some(Command::Snapshot { base_path, output }) = &cli.command {
-        let data_path = bootstrap::chain_data_path(base_path)?;
-        let db = xc_storage::ArxiumDb::open(&data_path)
-            .with_context(|| format!("failed to open chain data at {}", data_path.display()))?;
-        db.export_checkpoint(output).with_context(|| {
+    if let Some(Command::Snapshot { base_path, chain, output }) = &cli.command {
+        // Read-only, so goes through `new_partial` like the running node
+        // does rather than opening the DB by hand — same tip-signature
+        // verification, same genesis-write-on-first-run behavior, so a
+        // snapshot taken from data nothing else has ever booted still works.
+        // `is_validator: false` (the default below) means no key material
+        // gets generated just to export a checkpoint.
+        let config = xc_primitives::NodeConfig {
+            base_path: base_path.clone(),
+            chain: chain.clone(),
+            port: 0,
+            p2p_port: 0,
+            bootnodes: Vec::new(),
+            is_bootnode: false,
+            is_validator: false,
+            rpc_token: None,
+            rpc_bind: "127.0.0.1".to_string(),
+        };
+        let components = new_partial(&config)?;
+        components.db.export_checkpoint(output).with_context(|| {
             format!("failed to write checkpoint to {} (must not already exist)", output.display())
         })?;
-        let tip = db.get_tip_height()?.unwrap_or(0);
+        let tip = components.db.get_tip_height()?.unwrap_or(0);
         println!("wrote checkpoint at tip height {tip} to {}", output.display());
+        return Ok(());
+    }
+
+    if let Some(Command::ChainInfo { chain, list }) = &cli.command {
+        if *list {
+            for name in specs::CORECHAIN_PRESETS.names() {
+                println!("{name}");
+            }
+            return Ok(());
+        }
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        let chain_spec = genesis::ChainSpec::parse(&spec_json)?;
+        match &chain_spec {
+            genesis::ChainSpec::Plain(snapshot) => {
+                snapshot.validate().context("chain spec failed validation")?;
+                println!("format:         plain");
+                println!("chain name:     {}", snapshot.chain_name);
+                // ponytail: genesis hash needs the state actually reached at
+                // genesis, which means opening a DB — skipped for a plain
+                // spec so `chain-info` stays a zero-RocksDB preview; use
+                // `arx-spec-builder inspect` for the real hash.
+                println!("genesis hash:   <derive with `arx-spec-builder inspect`, or boot the node>");
+                println!("validators:     {}", snapshot.validators.len());
+                println!("accounts:       {}", snapshot.accounts.len());
+                println!("boot nodes:     {}", snapshot.boot_nodes.len());
+            }
+            genesis::ChainSpec::Raw(raw) => {
+                println!("format:         raw (format_version {})", raw.format_version);
+                println!("chain name:     {}", raw.chain_name);
+                println!("genesis hash:   {}", raw.state_root);
+                println!("source spec:    {}", raw.source_spec_hash);
+                println!("boot nodes:     {}", raw.boot_nodes.len());
+                println!("entries:        {}", raw.entries.len());
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(Command::ChainSpec { chain }) = &cli.command {
+        let spec_json = xc_chain_spec::resolve_chain_spec(chain, &specs::CORECHAIN_PRESETS)?;
+        println!("{spec_json}");
         return Ok(());
     }
 
     let config = cli.run.into_config();
     info!("{:?}", config);
 
-    let (db, snapshot) = bootstrap(&config)?;
-
-    // Some((address, key)) if this node produces signed blocks on its turn;
-    // None means it never produces — it only accepts blocks from peers.
-    let identity = if config.is_validator {
-        let key = validator::load_or_generate_key(&config.base_path)?;
-        let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes())?;
-        Some((address, key))
-    } else {
-        None
-    };
-
-    // Same address as the Ed25519 identity above — a validator's BLS key is
-    // only meaningful once its pubkey is registered on-chain via a
-    // `RegisterBlsKey` action (`arxd/node/src/payload.rs`), which is an
-    // operator step, not automated here.
-    let bls_identity = identity
-        .as_ref()
-        .map(|(address, _)| -> Result<(Address, xc_bls::BlsSecretKey)> {
-            let (bls_key, _pubkey) = validator::load_or_generate_bls_key(&config.base_path)?;
-            Ok((address.clone(), bls_key))
-        })
-        .transpose()?;
+    let components::NodeComponents { db, chain_name, boot_nodes, genesis_hash, identity, bls_identity, mempool } =
+        new_partial(&config)?;
+    let chain_id = hex::encode(genesis_hash);
+    info!("booted chain={chain_name} genesis={chain_id}");
 
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the
@@ -257,8 +321,6 @@ pub fn run() -> Result<()> {
         .map(|b: ChainBlock| b.timestamp)
         .unwrap_or(0);
     record_tip(startup_tip, startup_tip_timestamp);
-
-    let mempool = Arc::new(Mutex::new(Mempool::new()));
 
     // The runtime subsystem's own message-passing seam: `on_block` below
     // sends it competing-block sightings, it decides whether that's real
@@ -290,12 +352,7 @@ pub fn run() -> Result<()> {
             action
         }
     });
-    spawn_runtime(
-        db.clone(),
-        mempool.clone(),
-        runtime_rx,
-        build_evidence_action,
-    );
+    spawn_supervised("runtime", spawn_runtime(db.clone(), mempool.clone(), runtime_rx, build_evidence_action));
 
     // Finality subsystem's own message-passing seam: locally observed
     // blocks and peer precommit votes both funnel in as `FinalityEvent`s;
@@ -304,24 +361,22 @@ pub fn run() -> Result<()> {
     let (finality_event_tx, finality_event_rx) =
         std_mpsc::channel::<FinalityEvent<ActionPayload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
-    spawn_finality(
-        db.clone(),
-        bls_identity,
-        finality_event_rx,
-        finality_vote_tx,
-    );
+    spawn_supervised("finality", spawn_finality(db.clone(), bls_identity, finality_event_rx, finality_vote_tx));
 
     let (precommit_tx, precommit_rx) = tokio::sync::mpsc::unbounded_channel::<PrecommitVote>();
     // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
     // network layer's tokio channel — same shape as `runtime`/`gossip_tx`
     // bridging elsewhere in this file.
-    thread::spawn(move || {
-        for vote in finality_vote_rx {
-            if precommit_tx.send(vote).is_err() {
-                break;
+    spawn_supervised(
+        "precommit_bridge",
+        thread::spawn(move || {
+            for vote in finality_vote_rx {
+                if precommit_tx.send(vote).is_err() {
+                    break;
+                }
             }
-        }
-    });
+        }),
+    );
 
     let on_precommit_vote = {
         let finality_event_tx = finality_event_tx.clone();
@@ -454,10 +509,10 @@ pub fn run() -> Result<()> {
     };
 
     // An explicit --bootnodes always wins; otherwise fall back to the chain
-    // spec's own boot_nodes list (devnet.json), same role as a Polkadot
-    // chain-spec's bootNodes — so a fresh node needs zero flags to join.
+    // spec's own boot_nodes list (devnet.json) — so a fresh node needs zero
+    // flags to join.
     let bootnodes = if config.bootnodes.is_empty() {
-        &snapshot.boot_nodes
+        &boot_nodes
     } else {
         &config.bootnodes
     };
@@ -469,6 +524,7 @@ pub fn run() -> Result<()> {
         config.p2p_port,
         bootnodes,
         config.is_bootnode,
+        &chain_id,
         mempool.clone(),
         db.clone(),
         gossip_rx,
@@ -482,17 +538,20 @@ pub fn run() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = shutdown.clone();
-        thread::spawn(move || {
-            // ponytail: dedicated runtime just to await ctrl_c; the block-production
-            // loop stays plain sync.
-            if let Ok(runtime) = tokio::runtime::Runtime::new() {
-                runtime.block_on(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                });
-                info!("shutdown signal received, exiting after current block");
-                shutdown.store(true, Ordering::Relaxed);
-            }
-        });
+        spawn_supervised(
+            "ctrl_c_watcher",
+            thread::spawn(move || {
+                // ponytail: dedicated runtime just to await ctrl_c; the block-production
+                // loop stays plain sync.
+                if let Ok(runtime) = tokio::runtime::Runtime::new() {
+                    runtime.block_on(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    });
+                    info!("shutdown signal received, exiting after current block");
+                    shutdown.store(true, Ordering::Relaxed);
+                }
+            }),
+        );
     }
 
     produce::produce_loop(

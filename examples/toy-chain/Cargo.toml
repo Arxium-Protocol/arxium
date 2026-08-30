@@ -17,4 +17,5 @@ xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-mempool = { workspace = true }
 xc-executor = { workspace = true }
+xc-chain-spec = { workspace = true }
 circuit-rwa-asset = { workspace = true }

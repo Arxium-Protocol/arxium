@@ -14,6 +14,7 @@ tracing-subscriber = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
@@ -27,7 +28,8 @@ xc-circuit = { workspace = true }
 xc-executor = { workspace = true }
 xc-mempool = { workspace = true }
 xc-cli = { workspace = true }
-xc-genesis = { workspace = true }
+xc-chain-spec = { workspace = true }
+genesis = { workspace = true }
 xc-rpc = { workspace = true }
 network = { workspace = true }
 runtime = { workspace = true }
