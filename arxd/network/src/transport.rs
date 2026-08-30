@@ -8,7 +8,7 @@ use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{PeerId, StreamProtocol, gossipsub, mdns, noise, tcp, yamux};
 
-use crate::sync::SYNC_PROTOCOL;
+use crate::sync::sync_protocol;
 
 /// gossipsub's own default (`65536` bytes) is close enough to this chain's
 /// worst-case block size (100 actions/block, and the larger action variants
@@ -43,8 +43,13 @@ pub(crate) struct Behaviour {
     pub(crate) blocked_peers: allow_block_list::Behaviour<BlockedPeers>,
 }
 
-pub(crate) fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<Behaviour>> {
+pub(crate) fn build_swarm(
+    keypair: libp2p::identity::Keypair,
+    chain_id: &str,
+) -> Result<libp2p::Swarm<Behaviour>> {
     let local_peer_id = PeerId::from(keypair.public());
+    let sync_protocol = StreamProtocol::try_from_owned(sync_protocol(chain_id))
+        .map_err(|e| anyhow::anyhow!("invalid chain id for sync protocol: {e}"))?;
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -64,7 +69,7 @@ pub(crate) fn build_swarm(keypair: libp2p::identity::Keypair) -> Result<libp2p::
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
             let sync = cbor::Behaviour::new(
-                [(StreamProtocol::new(SYNC_PROTOCOL), ProtocolSupport::Full)],
+                [(sync_protocol, ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
             // ponytail: fixed caps sized for a devnet's handful of peers;

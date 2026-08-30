@@ -150,7 +150,7 @@ async fn run_swarm<P: Payload>(
     payload_precheck: Option<PayloadPrecheck<P>>,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
-    let mut swarm = match build_swarm(keypair) {
+    let mut swarm = match build_swarm(keypair, chain_id) {
         Ok(swarm) => swarm,
         Err(err) => {
             let _ = ready_tx.send(Err(err));

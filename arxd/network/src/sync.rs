@@ -17,7 +17,7 @@ use crate::transport::Behaviour;
 /// The shapes themselves live in `xc-wire` so external consumers compile
 /// against the same definitions instead of copying them; see that crate for the
 /// variant-compatibility rules.
-pub(crate) use xc_wire::SYNC_PROTOCOL;
+pub(crate) use xc_wire::sync_protocol;
 /// How often a connected peer is re-asked for its tip, to catch a peer
 /// falling behind mid-connection (not just "was offline, just reconnected") —
 /// e.g. a gossiped block silently dropped rather than erroring, which the

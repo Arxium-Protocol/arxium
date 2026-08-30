@@ -24,9 +24,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// libp2p protocol name. Bumped only for a change that is *not* backwards
+/// libp2p protocol name, chain-scoped so two nodes on different chains can't
+/// open a sync stream and exchange blocks that fail verification — the same
+/// isolation gossip topics already get (see `arxd/network/src/gossip.rs`).
+/// Bumped (the `/1` segment) only for a change that is *not* backwards
 /// compatible under the rules above.
-pub const SYNC_PROTOCOL: &str = "/arxium/sync/1";
+pub fn sync_protocol(chain_id: &str) -> String {
+    format!("/arxium/sync/1/{chain_id}")
+}
 
 /// Incremented whenever a variant is appended, so peers can tell each other
 /// apart within one `SYNC_PROTOCOL` generation.
