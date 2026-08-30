@@ -66,7 +66,8 @@ pub fn spawn_finality<P>(
     bls_identity: Option<(Address, BlsSecretKey)>,
     events: Receiver<FinalityEvent<P>>,
     vote_tx: Sender<PrecommitVote>,
-) where
+) -> thread::JoinHandle<()>
+where
     P: Serialize + DeserializeOwned + Send + 'static,
 {
     thread::spawn(move || {
@@ -157,7 +158,7 @@ pub fn spawn_finality<P>(
                 }
             }
         }
-    });
+    })
 }
 
 fn tally_vote(

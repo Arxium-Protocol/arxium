@@ -89,7 +89,8 @@ pub fn spawn_runtime<P, F>(
     mempool: Arc<Mutex<Mempool<P>>>,
     events: Receiver<RuntimeEvent<P>>,
     build_evidence_action: Option<F>,
-) where
+) -> thread::JoinHandle<()>
+where
     P: Serialize + DeserializeOwned + Send + 'static,
     F: Fn(EquivocationEvidence<P>) -> Action<P> + Send + 'static,
 {
@@ -139,7 +140,7 @@ pub fn spawn_runtime<P, F>(
                 Err(err) => warn!("runtime: failed to submit equivocation evidence for {proposer}: {err}"),
             }
         }
-    });
+    })
 }
 
 #[cfg(test)]
