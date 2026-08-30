@@ -140,7 +140,7 @@ fn main() -> Result<()> {
     let spec_json = xc_chain_spec::resolve_chain_spec("dev", &TOY_CHAIN_PRESETS)
         .context("failed to resolve toy-chain genesis spec")?;
     let snapshot =
-        xc_chain_spec::load_or_init_snapshot(&dir, &spec_json).context("failed to load toy-chain genesis spec")?;
+        xc_chain_spec::parse_snapshot(&spec_json).context("failed to load toy-chain genesis spec")?;
     db.write_batch(&snapshot)?;
     let genesis: RwaBlock = Block::genesis(now());
     db.write_batches(&[

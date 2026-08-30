@@ -14,7 +14,7 @@
 //! producing a distributable raw-KV chain spec. `toy-chain` never needs any of
 //! that (no validators, no raw distribution), so folding it into
 //! `xc-chain-spec` would hand every `xc-chain-spec` consumer a RocksDB + BLS
-//! dependency purely to call `load_or_init_snapshot`. `arxd/node` and
+//! dependency purely to call `parse_snapshot`. `arxd/node` and
 //! `arx-spec-builder` both depend on this crate directly instead.
 
 pub mod chain_spec;
