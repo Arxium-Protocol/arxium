@@ -12,6 +12,6 @@ xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-executor = { workspace = true }
 runtime-api = { workspace = true }
-evidence = { workspace = true }
+xc-evidence = { workspace = true }
 node = { workspace = true }
 circuit-rwa-asset = { workspace = true }

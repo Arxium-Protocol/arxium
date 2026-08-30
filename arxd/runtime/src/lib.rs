@@ -107,10 +107,10 @@ pub enum ActionPayload {
         amount: u128,
     },
     /// Proof that a validator signed two different blocks at the same
-    /// height — normally built and submitted by `evidence::spawn_evidence_watcher`
+    /// height — normally built and submitted by `xc_evidence::spawn_evidence_watcher`
     /// when it observes a competing block, never hand-crafted by an
     /// ordinary user. Anyone *could* submit one given the two blocks, but
-    /// `evidence::verify_equivocation` is what actually gates the slash, not
+    /// `xc_evidence::verify_equivocation` is what actually gates the slash, not
     /// who submitted it — so that's fine.
     SubmitEquivocationEvidence {
         block_a: Box<ChainBlock>,
@@ -204,7 +204,7 @@ impl runtime_api::ChainRuntime for CoreChainRuntime {
     }
 
     fn build_evidence_action(
-        evidence: evidence::EquivocationEvidence<ActionPayload>,
+        evidence: xc_evidence::EquivocationEvidence<ActionPayload>,
         sender: &Address,
         nonce: u64,
     ) -> Option<ChainAction> {

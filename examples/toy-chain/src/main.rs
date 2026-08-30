@@ -94,7 +94,7 @@ impl ChainRuntime for ToyRuntime {
     // toy-chain has no evidence-reporting action — it exists to exercise
     // `core`'s generic boundaries, not to be a second real chain.
     fn build_evidence_action(
-        _evidence: evidence::EquivocationEvidence<RwaPayload>,
+        _evidence: xc_evidence::EquivocationEvidence<RwaPayload>,
         _sender: &Address,
         _nonce: u64,
     ) -> Option<RwaAction> {

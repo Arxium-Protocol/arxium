@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
-use evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
+use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use finality::{FinalityEvent, PrecommitVote, spawn_finality};
 use network::{identity, spawn_p2p_node};
 use xc_cli::{Cli, Command};

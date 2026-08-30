@@ -16,11 +16,11 @@ members = [
     "core/chain-spec",
     "core/rpc",
     "core/runtime-api",
+    "core/evidence",
     #
     "arxd/node",
     "arxd/runtime",
     "arxd/network",
-    "arxd/evidence",
     "arxd/finality",
     "arxd/genesis",
     "arxd/spec-builder",
@@ -60,10 +60,10 @@ xc-cli = { path = "core/cli" }
 xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
 runtime-api = { path = "core/runtime-api" }
+xc-evidence = { path = "core/evidence" }
 node = { path = "arxd/node" }
 runtime = { path = "arxd/runtime" }
 network = { path = "arxd/network" }
-evidence = { path = "arxd/evidence" }
 finality = { path = "arxd/finality" }
 genesis = { path = "arxd/genesis" }
 spec-builder = { path = "arxd/spec-builder" }

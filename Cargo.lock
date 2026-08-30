@@ -1412,19 +1412,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "evidence"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek 3.0.0",
- "serde",
- "thiserror 2.0.19",
- "tracing",
- "xc-mempool",
- "xc-primitives",
- "xc-storage",
-]
-
-[[package]]
 name = "fastbloom"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3027,7 +3014,6 @@ dependencies = [
  "circuit-staking",
  "clap",
  "ed25519-dalek 3.0.0",
- "evidence",
  "finality",
  "genesis",
  "hex",
@@ -3048,6 +3034,7 @@ dependencies = [
  "xc-chain-spec",
  "xc-circuit",
  "xc-cli",
+ "xc-evidence",
  "xc-executor",
  "xc-mempool",
  "xc-primitives",
@@ -3762,12 +3749,12 @@ dependencies = [
  "circuit-identity-zk",
  "circuit-staking",
  "ed25519-dalek 3.0.0",
- "evidence",
  "hex",
  "runtime-api",
  "serde",
  "xc-bls",
  "xc-circuit",
+ "xc-evidence",
  "xc-executor",
  "xc-primitives",
  "xc-storage",
@@ -3778,8 +3765,8 @@ name = "runtime-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "evidence",
  "serde",
+ "xc-evidence",
  "xc-executor",
  "xc-primitives",
  "xc-storage",
@@ -4473,10 +4460,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "circuit-rwa-asset",
- "evidence",
  "node",
  "runtime-api",
  "serde",
+ "xc-evidence",
  "xc-executor",
  "xc-primitives",
  "xc-storage",
@@ -5116,6 +5103,19 @@ dependencies = [
  "clap",
  "dirs",
  "xc-primitives",
+]
+
+[[package]]
+name = "xc-evidence"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 3.0.0",
+ "serde",
+ "thiserror 2.0.19",
+ "tracing",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
 ]
 
 [[package]]

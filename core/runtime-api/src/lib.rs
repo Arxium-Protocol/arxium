@@ -17,7 +17,7 @@
 //! depend on `xc-primitives` — putting the trait there would be a dependency
 //! cycle.
 
-use evidence::EquivocationEvidence;
+use xc_evidence::EquivocationEvidence;
 use serde::{Serialize, de::DeserializeOwned};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address};

@@ -31,7 +31,7 @@ xc-chain-spec = { workspace = true }
 genesis = { workspace = true }
 xc-rpc = { workspace = true }
 network = { workspace = true }
-evidence = { workspace = true }
+xc-evidence = { workspace = true }
 finality = { workspace = true }
 runtime = { workspace = true }
 runtime-api = { workspace = true }

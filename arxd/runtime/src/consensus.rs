@@ -26,10 +26,10 @@ pub(crate) fn validated_bls_pubkey(pubkey: &[u8]) -> anyhow::Result<[u8; 48]> {
 }
 
 /// Proof that a validator signed two different blocks at the same
-/// height — normally built and submitted by `evidence::spawn_evidence_watcher`
+/// height — normally built and submitted by `xc_evidence::spawn_evidence_watcher`
 /// when it observes a competing block, never hand-crafted by an
 /// ordinary user. Anyone *could* submit one given the two blocks, but
-/// `evidence::verify_equivocation` is what actually gates the slash, not
+/// `xc_evidence::verify_equivocation` is what actually gates the slash, not
 /// who submitted it — so that's fine.
 pub(crate) fn submit_equivocation_evidence(
     view: &BlockView<'_>,
@@ -38,11 +38,11 @@ pub(crate) fn submit_equivocation_evidence(
     evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    let evidence = evidence::EquivocationEvidence {
+    let evidence = xc_evidence::EquivocationEvidence {
         block_a: block_a.clone(),
         block_b: block_b.clone(),
     };
-    let equivocator = evidence::verify_equivocation(&evidence)
+    let equivocator = xc_evidence::verify_equivocation(&evidence)
         .map_err(|err| anyhow::anyhow!("invalid equivocation evidence: {err}"))?;
     if evidence_processed(block_a.height, &equivocator)? {
         anyhow::bail!(
@@ -64,7 +64,7 @@ pub(crate) fn submit_equivocation_evidence(
     let (accounts, stakes) = circuit_staking::apply_slash(
         view,
         &equivocator,
-        evidence::slash_amount(total),
+        xc_evidence::slash_amount(total),
         circuit_staking::SlashReason::DoubleSign,
         current_height,
     )?;
@@ -175,7 +175,7 @@ mod tests {
         // Whitepaper §9.3: double-sign slashes 100% of stake, so the
         // allocation nets to zero and is removed outright (`None`) rather
         // than left at a reduced balance.
-        assert_eq!(evidence::slash_amount(10_000), 10_000);
+        assert_eq!(xc_evidence::slash_amount(10_000), 10_000);
         let allocation = updates
             .stakes
             .allocations

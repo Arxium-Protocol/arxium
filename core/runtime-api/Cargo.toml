@@ -11,4 +11,4 @@ serde = { workspace = true, features = ["derive"] }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-executor = { workspace = true }
-evidence = { workspace = true }
+xc-evidence = { workspace = true }
