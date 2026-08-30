@@ -1,4 +1,5 @@
 {
+  "genesis_format": "plain",
   "height": 0,
   "chain_name": "toychain-rwa-devnet",
   "accounts": {
@@ -18,6 +19,11 @@
       "identity_hash": null
     }
   },
-  "validators": {},
+  "validators": {
+    "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
+      "stake": 1,
+      "bls_pubkey": "ac80a5e08c712d5f08f0306ad743f7d8c215d982489b84a1d6ba805733d94c006e8938f9089a75db3ffa135af33bc69a"
+    }
+  },
   "boot_nodes": []
 }

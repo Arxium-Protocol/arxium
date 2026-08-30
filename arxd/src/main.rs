@@ -18,5 +18,5 @@ fn main() -> Result<()> {
         // those logs land inside the captured value, ANSI escapes and all.
         .with_writer(std::io::stderr)
         .init();
-    node::run()
+    node::run::<runtime::CoreChainRuntime>()
 }

@@ -34,4 +34,5 @@ network = { workspace = true }
 evidence = { workspace = true }
 finality = { workspace = true }
 runtime = { workspace = true }
+runtime-api = { workspace = true }
 circuit-staking = { workspace = true }

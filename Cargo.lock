@@ -379,6 +379,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "node",
+ "runtime",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3036,6 +3037,7 @@ dependencies = [
  "qrcode",
  "rand 0.9.5",
  "runtime",
+ "runtime-api",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3762,9 +3764,22 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "evidence",
  "hex",
+ "runtime-api",
  "serde",
  "xc-bls",
  "xc-circuit",
+ "xc-executor",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "runtime-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "evidence",
+ "serde",
  "xc-executor",
  "xc-primitives",
  "xc-storage",
@@ -4458,14 +4473,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "circuit-rwa-asset",
- "ed25519-dalek 3.0.0",
- "hex",
+ "evidence",
+ "node",
+ "runtime-api",
  "serde",
- "tracing",
- "tracing-subscriber",
- "xc-chain-spec",
  "xc-executor",
- "xc-mempool",
  "xc-primitives",
  "xc-storage",
 ]

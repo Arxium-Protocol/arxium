@@ -1,12 +1,12 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use runtime::{ACTION_FEE, ActionPayload, ChainBlock, dispatch};
 use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, SLOT_DURATION, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use finality::FinalityEvent;
 use metrics::{counter, gauge};
+use runtime_api::ChainRuntime;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
 use xc_circuit::{AccountKey, StakeByValidatorKey, StakeKey};
-use xc_primitives::{Action, Address, eligible_proposer, expected_proposer, quorum};
+use xc_primitives::{Action, Address, Block, eligible_proposer, expected_proposer, quorum};
 use xc_storage::{ArxiumDb, BatchWritable, BlockView, ValidatorSetSnapshot};
 
 /// Build, execute, and store the next block using whatever actions are provided.
@@ -27,15 +27,15 @@ use xc_storage::{ArxiumDb, BatchWritable, BlockView, ValidatorSetSnapshot};
 /// turn it is to produce — the block gets signed. `produce_loop` never
 /// calls this with `None` (a non-validator node doesn't produce at all);
 /// unsigned blocks remain reachable here only from tests.
-pub fn produce_block(
+pub fn produce_block<R: ChainRuntime>(
     db: &ArxiumDb,
-    actions: Vec<Action<ActionPayload>>,
+    actions: Vec<Action<R::Payload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
-) -> Result<ChainBlock> {
+) -> Result<Block<R::Payload>> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let next_height = tip_height + 1;
-    let parent: ChainBlock = db
+    let parent: Block<R::Payload> = db
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height is set");
 
@@ -71,15 +71,14 @@ pub fn produce_block(
         &validators,
         seed,
         |action, view, operator_lookup, operator_validators_lookup, validators| {
-            dispatch(
+            R::dispatch(
                 action,
                 view,
+                db,
                 operator_lookup,
                 operator_validators_lookup,
                 validators,
                 next_height,
-                &|h, p| db.evidence_processed(h, p),
-                &|pk: &xc_bls::BlsPublicKey| db.bls_pubkey_owner(pk),
             )
         },
     )?;
@@ -88,7 +87,7 @@ pub fn produce_block(
     // a locally-produced block must pay itself the same way, or a solo
     // validator would never see its own reward pool debited/credited.
     if let Some((address, _)) = proposer {
-        let fees_collected = applied.len() as u128 * ACTION_FEE;
+        let fees_collected = applied.len() as u128 * R::action_fee();
         let mut view = BlockView::new(db);
         for (addr, entry) in &account_updates.0 {
             view.put(&AccountKey(addr), entry)?;
@@ -145,7 +144,7 @@ pub fn produce_block(
     };
     let state_root = db.compute_state_root(&state_root_overlay)?;
 
-    let mut new_block = ChainBlock {
+    let mut new_block = Block {
         height: next_height,
         parent_hash: parent.hash(),
         timestamp,
@@ -184,13 +183,13 @@ pub fn produce_block(
 /// never produces — it only accepts blocks gossiped/synced from peers (see
 /// `accept_block`). Runs until `shutdown` is set, e.g. by the ctrl_c handler
 /// spawned in `run`.
-pub fn produce_loop(
+pub fn produce_loop<R: ChainRuntime>(
     db: &ArxiumDb,
-    mempool: &Arc<Mutex<Mempool<ActionPayload>>>,
+    mempool: &Arc<Mutex<Mempool<R::Payload>>>,
     identity: Option<(Address, SigningKey)>,
     chain_lock: &Arc<Mutex<()>>,
-    finality_event_tx: &std_mpsc::Sender<FinalityEvent<ActionPayload>>,
-    block_tx: &tokio::sync::mpsc::UnboundedSender<ChainBlock>,
+    finality_event_tx: &std_mpsc::Sender<FinalityEvent<R::Payload>>,
+    block_tx: &tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
     shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
     // Rate-limit state for the skip log below. Local because `produce_loop`
@@ -236,7 +235,7 @@ pub fn produce_loop(
             Some((address, key)) => {
                 let tip_height = db.get_tip_height()?.unwrap_or(0);
                 let next_height = tip_height + 1;
-                let parent: ChainBlock = db
+                let parent: Block<R::Payload> = db
                     .get_block(tip_height)?
                     .expect("tip block must exist if tip_height is set");
                 // Genesis's timestamp is a synthetic 0, not a real
@@ -346,7 +345,7 @@ pub fn produce_loop(
         // A bad action (forged signature, stale nonce) is skipped by execute_actions
         // and never reaches here; an Err means block-level bookkeeping itself failed
         // (e.g. storage), which is unexpected and logged rather than propagated.
-        match produce_block(db, pending, now, proposer) {
+        match produce_block::<R>(db, pending, now, proposer) {
             std::result::Result::Ok(block) => {
                 info!(
                     "produced block {} with {} action(s), hash={}",
@@ -392,6 +391,7 @@ fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Dura
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use runtime::{ACTION_FEE, ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
     use std::collections::BTreeMap;
     use xc_executor::BlockUpdates;
     use xc_primitives::{AccountEntry, Snapshot};
@@ -491,7 +491,7 @@ mod tests {
         let signature = alice_key.sign(&transfer.signing_bytes());
         transfer.signature = Some(hex::encode(signature.to_bytes()));
 
-        let block = produce_block(&db, vec![transfer], 1, None).unwrap();
+        let block = produce_block::<CoreChainRuntime>(&db, vec![transfer], 1, None).unwrap();
 
         assert_eq!(block.height, 1);
         assert_eq!(
@@ -551,7 +551,7 @@ mod tests {
             let primary_1 = expected_proposer(&validators, 1).unwrap();
             let key_1 = if primary_1 == addr_a { &key_a } else { &key_b };
             let block1 =
-                produce_block(&db, vec![], now_secs() - elapsed, Some((&primary_1, key_1)))
+                produce_block::<CoreChainRuntime>(&db, vec![], now_secs() - elapsed, Some((&primary_1, key_1)))
                     .unwrap();
 
             // Exactly the decision `produce_loop` makes before producing.
@@ -560,7 +560,7 @@ mod tests {
             covered.insert(eligible.clone());
             let key_2 = if eligible == addr_a { &key_a } else { &key_b };
             let block2 =
-                produce_block(&db, vec![], now_secs(), Some((&eligible, key_2))).unwrap();
+                produce_block::<CoreChainRuntime>(&db, vec![], now_secs(), Some((&eligible, key_2))).unwrap();
 
             // Re-validate on a fresh chain holding the same history, the way a
             // peer receiving these over gossip would.
@@ -630,10 +630,10 @@ mod tests {
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
 
-        let block1 = produce_block(&db, vec![], 1_000_000, Some((&addr, &key))).unwrap();
+        let block1 = produce_block::<CoreChainRuntime>(&db, vec![], 1_000_000, Some((&addr, &key))).unwrap();
 
         // Clock jumps backwards, and then stands still.
-        let block2 = produce_block(&db, vec![], 500_000, Some((&addr, &key))).unwrap();
+        let block2 = produce_block::<CoreChainRuntime>(&db, vec![], 500_000, Some((&addr, &key))).unwrap();
         assert!(
             block2.timestamp > block1.timestamp,
             "backwards clock produced a non-monotonic block: {} after {}",
@@ -641,7 +641,7 @@ mod tests {
             block1.timestamp,
         );
 
-        let block3 = produce_block(&db, vec![], block2.timestamp, Some((&addr, &key))).unwrap();
+        let block3 = produce_block::<CoreChainRuntime>(&db, vec![], block2.timestamp, Some((&addr, &key))).unwrap();
         assert!(block3.timestamp > block2.timestamp, "a stalled clock must still advance");
 
         let _ = std::fs::remove_dir_all(&dir);

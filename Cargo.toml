@@ -15,6 +15,7 @@ members = [
     "core/cli",
     "core/chain-spec",
     "core/rpc",
+    "core/runtime-api",
     #
     "arxd/node",
     "arxd/runtime",
@@ -58,6 +59,7 @@ xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
 xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
+runtime-api = { path = "core/runtime-api" }
 node = { path = "arxd/node" }
 runtime = { path = "arxd/runtime" }
 network = { path = "arxd/network" }

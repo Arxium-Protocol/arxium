@@ -163,6 +163,63 @@ pub enum ActionPayload {
 pub type ChainAction = Action<ActionPayload>;
 pub type ChainBlock = xc_primitives::Block<ActionPayload>;
 
+/// CoreChain's `ChainRuntime` implementation — see `runtime_api::ChainRuntime`
+/// for what this makes `arxd/node` generic over.
+pub struct CoreChainRuntime;
+
+impl runtime_api::ChainRuntime for CoreChainRuntime {
+    type Payload = ActionPayload;
+
+    fn action_fee() -> u128 {
+        ACTION_FEE
+    }
+
+    fn min_validator_stake() -> Option<u128> {
+        Some(MIN_VALIDATOR_STAKE)
+    }
+
+    fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result<()> {
+        admission_precheck(action, db)
+    }
+
+    fn dispatch(
+        action: &ChainAction,
+        view: &BlockView<'_>,
+        db: &ArxiumDb,
+        operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+        operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
+        validators: &[Address],
+        current_height: u64,
+    ) -> anyhow::Result<BlockUpdates> {
+        dispatch(
+            action,
+            view,
+            operator_lookup,
+            operator_validators_lookup,
+            validators,
+            current_height,
+            &|h, p| db.evidence_processed(h, p),
+            &|pk: &BlsPublicKey| db.bls_pubkey_owner(pk),
+        )
+    }
+
+    fn build_evidence_action(
+        evidence: evidence::EquivocationEvidence<ActionPayload>,
+        sender: &Address,
+        nonce: u64,
+    ) -> Option<ChainAction> {
+        Some(Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload: ActionPayload::SubmitEquivocationEvidence {
+                block_a: Box::new(evidence.block_a),
+                block_b: Box::new(evidence.block_b),
+            },
+        })
+    }
+}
+
 /// Cheap pre-check for the payload variants whose `dispatch` rejection
 /// reason (bad `is_authorized`, below `MIN_VALIDATOR_STAKE`, not a current
 /// validator) previously only surfaced during block production — the

@@ -1,5 +1,5 @@
 [package]
-name = "toy-chain"
+name = "runtime-api"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -11,7 +11,4 @@ serde = { workspace = true, features = ["derive"] }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-executor = { workspace = true }
-runtime-api = { workspace = true }
 evidence = { workspace = true }
-node = { workspace = true }
-circuit-rwa-asset = { workspace = true }

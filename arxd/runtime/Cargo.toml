@@ -16,6 +16,7 @@ xc-executor = { workspace = true }
 xc-bls = { workspace = true }
 blst = { workspace = true }
 evidence = { workspace = true }
+runtime-api = { workspace = true }
 
 circuit-account = { workspace = true }
 circuit-staking = { workspace = true }

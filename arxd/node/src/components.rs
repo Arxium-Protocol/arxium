@@ -1,10 +1,11 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use runtime::ActionPayload;
 use crate::validator;
 use anyhow::{Context, Result};
 use genesis::ChainSpec;
+use runtime_api::ChainRuntime;
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use xc_mempool::Mempool;
 use xc_primitives::{Address, NodeConfig};
@@ -17,7 +18,7 @@ use xc_storage::ArxiumDb;
 /// and so skipped the tip-signature check `new_partial` performs; anything
 /// read-only must be able to get a validated handle without spawning a P2P
 /// swarm.
-pub(crate) struct NodeComponents {
+pub(crate) struct NodeComponents<R: ChainRuntime> {
     pub db: ArxiumDb,
     pub chain_name: String,
     pub boot_nodes: Vec<String>,
@@ -36,7 +37,8 @@ pub(crate) struct NodeComponents {
     pub genesis_hash: [u8; 32],
     pub identity: Option<(Address, ed25519_dalek::SigningKey)>,
     pub bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
-    pub mempool: Arc<Mutex<Mempool<ActionPayload>>>,
+    pub mempool: Arc<Mutex<Mempool<R::Payload>>>,
+    _runtime: PhantomData<R>,
 }
 
 /// Where this node's RocksDB lives under `base_path` — `<base_path>/<chain_name>/data`.
@@ -59,7 +61,7 @@ fn state_root_bytes(state_root: &str) -> Result<[u8; 32]> {
 /// Read-only construction: genesis load, DB open, genesis write on a fresh
 /// chain, tip verification, identity/mempool setup. No network, no RPC, no
 /// metrics recorder, no spawned threads. Safe to call from a subcommand.
-pub(crate) fn new_partial(config: &NodeConfig) -> Result<NodeComponents> {
+pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeComponents<R>> {
     let spec_json = xc_chain_spec::resolve_chain_spec(&config.chain, &crate::specs::CORECHAIN_PRESETS)?;
     let chain_spec = ChainSpec::parse(&spec_json)?;
 
@@ -88,7 +90,7 @@ pub(crate) fn new_partial(config: &NodeConfig) -> Result<NodeComponents> {
     // a signed block whose signature no longer verifies means something is
     // wrong with this node's storage, not with the chain going forward.
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    if let Some(tip_block) = db.get_block::<ActionPayload>(tip_height)?
+    if let Some(tip_block) = db.get_block::<R::Payload>(tip_height)?
         && tip_block.signature.is_some()
     {
         tip_block
@@ -125,13 +127,22 @@ pub(crate) fn new_partial(config: &NodeConfig) -> Result<NodeComponents> {
 
     let mempool = Arc::new(Mutex::new(Mempool::new()));
 
-    Ok(NodeComponents { db, chain_name, boot_nodes, genesis_hash, identity, bls_identity, mempool })
+    Ok(NodeComponents {
+        db,
+        chain_name,
+        boot_nodes,
+        genesis_hash,
+        identity,
+        bls_identity,
+        mempool,
+        _runtime: PhantomData,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use runtime::ChainBlock;
+    use runtime::{ChainBlock, CoreChainRuntime};
     use crate::produce::produce_block;
     use ed25519_dalek::SigningKey;
 
@@ -162,17 +173,17 @@ mod tests {
         let config = test_config();
 
         // First boot: writes genesis (unsigned, so nothing to verify yet).
-        let components = new_partial(&config).unwrap();
+        let components = new_partial::<CoreChainRuntime>(&config).unwrap();
         let db = components.db;
 
         // Produce and sign block 1, same as a real validator would.
         let key = SigningKey::from_bytes(&[5u8; 32]);
         let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        produce_block(&db, Vec::new(), 1, Some((&address, &key))).unwrap();
+        produce_block::<CoreChainRuntime>(&db, Vec::new(), 1, Some((&address, &key))).unwrap();
         drop(db);
 
         // Re-opening with an untampered signed tip must succeed.
-        new_partial(&config).unwrap();
+        new_partial::<CoreChainRuntime>(&config).unwrap();
 
         // Tamper with the tip block's content in place, signature unchanged —
         // this must now be caught rather than silently built on top of.
@@ -183,7 +194,7 @@ mod tests {
         drop(db);
 
         assert!(
-            new_partial(&config).is_err(),
+            new_partial::<CoreChainRuntime>(&config).is_err(),
             "new_partial must reject a tip block whose signature no longer verifies"
         );
 
@@ -199,11 +210,11 @@ mod tests {
     fn new_partial_is_reusable_across_calls() {
         let config = test_config();
 
-        let first = new_partial(&config).unwrap();
+        let first = new_partial::<CoreChainRuntime>(&config).unwrap();
         assert_eq!(first.chain_name, "corechain");
         drop(first.db);
 
-        let second = new_partial(&config).unwrap();
+        let second = new_partial::<CoreChainRuntime>(&config).unwrap();
         assert_eq!(second.chain_name, "corechain");
         assert_eq!(second.genesis_hash, first.genesis_hash);
         assert_eq!(second.db.get_tip_height().unwrap().unwrap_or(0), 0);
@@ -240,7 +251,7 @@ mod tests {
             rpc_bind: "127.0.0.1".to_string(),
         };
 
-        assert!(new_partial(&config).is_err(), "an invalid genesis spec must be rejected");
+        assert!(new_partial::<CoreChainRuntime>(&config).is_err(), "an invalid genesis spec must be rejected");
         assert!(!base_path.join("validator.key").exists(), "must not generate a key on a failed boot");
 
         std::fs::remove_dir_all(&base_path).ok();
@@ -263,7 +274,7 @@ mod tests {
 
         // Must still boot normally off `--chain devnet`, ignoring the file
         // entirely — no code path reads it any more.
-        let components = new_partial(&config).unwrap();
+        let components = new_partial::<CoreChainRuntime>(&config).unwrap();
         assert_eq!(components.chain_name, "corechain");
 
         std::fs::remove_dir_all(&config.base_path).ok();
@@ -276,7 +287,7 @@ mod tests {
     #[test]
     fn plain_and_raw_devnet_produce_the_same_genesis_hash() {
         let plain_config = test_config();
-        let plain = new_partial(&plain_config).unwrap();
+        let plain = new_partial::<CoreChainRuntime>(&plain_config).unwrap();
         drop(plain.db);
 
         let devnet_spec = include_str!("../specs/devnet.json");
@@ -294,7 +305,7 @@ mod tests {
         std::fs::write(&spec_path, &raw_json).unwrap();
 
         let raw_config = NodeConfig { base_path: raw_dir.clone(), chain: spec_path.to_string_lossy().into_owned(), ..test_config() };
-        let raw_components = new_partial(&raw_config).unwrap();
+        let raw_components = new_partial::<CoreChainRuntime>(&raw_config).unwrap();
 
         assert_eq!(raw_components.genesis_hash, plain.genesis_hash);
 

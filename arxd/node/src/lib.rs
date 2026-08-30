@@ -8,7 +8,7 @@ mod specs;
 mod validator;
 
 use crate::components::new_partial;
-use runtime::{ActionPayload, ChainBlock, admission_precheck, dispatch};
+use runtime_api::ChainRuntime;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -27,7 +27,7 @@ use network::{identity, spawn_p2p_node};
 use xc_cli::{Cli, Command};
 use xc_executor::accept_block;
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address};
+use xc_primitives::{Action, Address, Block};
 use xc_rpc::spawn_http_ingest;
 use xc_storage::ArxiumDb;
 
@@ -162,17 +162,17 @@ fn spawn_supervised(name: &'static str, handle: thread::JoinHandle<()>) {
 /// Everything `spawn_subsystems` builds that `run()` still needs afterward:
 /// the closures/receivers `spawn_p2p_node` consumes, and the shared state
 /// `produce::produce_loop` reads.
-struct SubsystemHandles {
+struct SubsystemHandles<R: ChainRuntime> {
     bootnodes: Vec<String>,
     chain_lock: Arc<Mutex<()>>,
-    finality_event_tx: std_mpsc::Sender<FinalityEvent<ActionPayload>>,
-    block_tx: tokio::sync::mpsc::UnboundedSender<ChainBlock>,
-    block_rx: tokio::sync::mpsc::UnboundedReceiver<ChainBlock>,
-    gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<ActionPayload>>,
+    finality_event_tx: std_mpsc::Sender<FinalityEvent<R::Payload>>,
+    block_tx: tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
+    block_rx: tokio::sync::mpsc::UnboundedReceiver<Block<R::Payload>>,
+    gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>,
     precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
-    on_block: Box<dyn Fn(ChainBlock, bool) -> bool + Send>,
+    on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
-    payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload>,
+    payload_precheck: xc_mempool::PayloadPrecheck<R::Payload>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -182,44 +182,56 @@ struct SubsystemHandles {
 /// `produce::produce_loop` need afterward comes back in `SubsystemHandles`;
 /// network spawning and the produce loop itself stay in `run()` since they
 /// aren't "subsystems" spawned here so much as `run()`'s own next steps.
-fn spawn_subsystems(
+fn spawn_subsystems<R: ChainRuntime>(
     config: &xc_primitives::NodeConfig,
     db: &ArxiumDb,
-    mempool: &Arc<Mutex<Mempool<ActionPayload>>>,
+    mempool: &Arc<Mutex<Mempool<R::Payload>>>,
     identity: &Option<(Address, ed25519_dalek::SigningKey)>,
     bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
     boot_nodes: &[String],
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-) -> Result<SubsystemHandles> {
+) -> Result<SubsystemHandles<R>> {
     // The evidence subsystem's own message-passing seam: `on_block` below
     // sends it competing-block sightings, it decides whether that's real
     // equivocation and (if this node has a validator key) reports it —
     // this thread never calls into slashing logic directly.
     let (evidence_tx, evidence_rx) = std_mpsc::channel();
-    let build_evidence_action = identity.as_ref().map(|(address, key)| {
+    // Not every runtime reports equivocation (e.g. a spoke chain with no
+    // slashing action); probe once at startup with empty dummy blocks
+    // instead of threading an `Option` return through the watcher's
+    // per-event hot path.
+    let build_evidence_action = identity.as_ref().and_then(|(address, key)| {
+        let dummy_block = || Block {
+            height: 0,
+            parent_hash: String::new(),
+            timestamp: 0,
+            actions: Vec::new(),
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+        };
+        R::build_evidence_action(
+            EquivocationEvidence { block_a: dummy_block(), block_b: dummy_block() },
+            address,
+            0,
+        )?;
+
         let address = address.clone();
         let key = key.clone();
         let db = db.clone();
-        move |evidence: EquivocationEvidence<ActionPayload>| -> Action<ActionPayload> {
+        Some(move |evidence: EquivocationEvidence<R::Payload>| -> Action<R::Payload> {
             let nonce = db
                 .get_account(&address)
                 .ok()
                 .flatten()
                 .map(|entry| entry.nonce)
                 .unwrap_or(0);
-            let mut action = Action {
-                sender: address.clone(),
-                nonce,
-                signature: None,
-                payload: ActionPayload::SubmitEquivocationEvidence {
-                    block_a: Box::new(evidence.block_a),
-                    block_b: Box::new(evidence.block_b),
-                },
-            };
+            let mut action = R::build_evidence_action(evidence, &address, nonce)
+                .expect("probed Some for this runtime at startup");
             let signature = key.sign(&action.signing_bytes());
             action.signature = Some(hex::encode(signature.to_bytes()));
             action
-        }
+        })
     });
     spawn_supervised(
         "evidence",
@@ -236,7 +248,7 @@ fn spawn_subsystems(
     // freshly-signed votes come back out on `finality_vote_rx` to be
     // gossiped over the network layer's precommit topic.
     let (finality_event_tx, finality_event_rx) =
-        std_mpsc::channel::<FinalityEvent<ActionPayload>>();
+        std_mpsc::channel::<FinalityEvent<R::Payload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
     spawn_supervised(
         "finality",
@@ -273,8 +285,8 @@ fn spawn_subsystems(
     // Shared between RPC submission and gossip receipt so a `JoinValidator`/
     // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
     // `dispatch` gets rejected here instead, immediately and with a real
-    // reason — see `runtime::admission_precheck`'s doc comment.
-    let payload_precheck: xc_mempool::PayloadPrecheck<ActionPayload> = Arc::new(admission_precheck);
+    // reason — see `ChainRuntime::admission_precheck`'s doc comment.
+    let payload_precheck: xc_mempool::PayloadPrecheck<R::Payload> = Arc::new(R::admission_precheck);
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(
@@ -286,8 +298,8 @@ fn spawn_subsystems(
         Some(gossip_tx),
         metrics_handle,
         Some(payload_precheck.clone()),
-        Some(runtime::MIN_VALIDATOR_STAKE),
-        Some(runtime::ACTION_FEE),
+        R::min_validator_stake(),
+        Some(R::action_fee()),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -302,13 +314,13 @@ fn spawn_subsystems(
     // unambiguously forged, never just an honest peer relaying something
     // out of order (wrong turn, stale height, etc.) — so the network layer
     // can penalize the sending peer for exactly that case and no other.
-    let on_block: Box<dyn Fn(ChainBlock, bool) -> bool + Send> = {
+    let on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send> = {
         let db = db.clone();
         let chain_lock = chain_lock.clone();
         let evidence_tx = evidence_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
         let mempool = mempool.clone();
-        Box::new(move |block: ChainBlock, sync: bool| -> bool {
+        Box::new(move |block: Block<R::Payload>, sync: bool| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
             let candidate = block.clone();
@@ -317,17 +329,16 @@ fn spawn_subsystems(
                 block,
                 SLOT_DURATION.as_secs(),
                 sync,
-                runtime::ACTION_FEE,
+                R::action_fee(),
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
-                    dispatch(
+                    R::dispatch(
                         action,
                         view,
+                        &db,
                         operator_lookup,
                         operator_validators_lookup,
                         validators,
                         height,
-                        &|h, p| db.evidence_processed(h, p),
-                        &|pk: &xc_bls::BlsPublicKey| db.bls_pubkey_owner(pk),
                     )
                 },
             ) {
@@ -439,7 +450,7 @@ fn spawn_subsystems(
     })
 }
 
-pub fn run() -> Result<()> {
+pub fn run<R: ChainRuntime>() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(Command::NodeKey { base_path }) = &cli.command {
@@ -564,7 +575,7 @@ pub fn run() -> Result<()> {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
         };
-        let components = new_partial(&config)?;
+        let components = new_partial::<R>(&config)?;
         components.db.export_checkpoint(output).with_context(|| {
             format!(
                 "failed to write checkpoint to {} (must not already exist)",
@@ -638,7 +649,8 @@ pub fn run() -> Result<()> {
         identity,
         bls_identity,
         mempool,
-    } = new_partial(&config)?;
+        ..
+    } = new_partial::<R>(&config)?;
     let chain_id = hex::encode(genesis_hash);
     info!("booted chain={chain_name} genesis={chain_id}");
 
@@ -653,8 +665,8 @@ pub fn run() -> Result<()> {
     // block it never produces.
     let startup_tip = db.get_tip_height()?.unwrap_or(0);
     let startup_tip_timestamp = db
-        .get_block::<ActionPayload>(startup_tip)?
-        .map(|b: ChainBlock| b.timestamp)
+        .get_block::<R::Payload>(startup_tip)?
+        .map(|b: Block<R::Payload>| b.timestamp)
         .unwrap_or(0);
     record_tip(startup_tip, startup_tip_timestamp);
 
@@ -670,7 +682,7 @@ pub fn run() -> Result<()> {
         on_precommit_vote,
         payload_precheck,
         shutdown,
-    } = spawn_subsystems(
+    } = spawn_subsystems::<R>(
         &config,
         &db,
         &mempool,
@@ -698,7 +710,7 @@ pub fn run() -> Result<()> {
         Some(payload_precheck.clone()),
     )?;
 
-    produce::produce_loop(
+    produce::produce_loop::<R>(
         &db,
         &mempool,
         identity,
