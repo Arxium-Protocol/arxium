@@ -206,6 +206,7 @@ fn spawn_subsystems<R: ChainRuntime>(
             parent_hash: String::new(),
             timestamp: 0,
             actions: Vec::new(),
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),

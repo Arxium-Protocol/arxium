@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{info, warn};
-use xc_artifact::{BlockAttestation, EvidenceArtifact, Fault, ARTIFACT_VERSION};
+use xc_artifact::{BlockAttestation, CanonicalHeader, EvidenceArtifact, Fault, ARTIFACT_VERSION};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
 use xc_storage::ArxiumDb;
@@ -80,9 +80,12 @@ pub enum EvidenceEvent<P> {
 
 /// Builds a self-describing evidence artifact (see `xc_artifact`) from a
 /// verified equivocation and writes it to
-/// `<evidence_dir>/<height>-<proposer>.json`. Commits to `signing_bytes` +
-/// `signature` + `block_hash` for each block, never the decoded block
-/// itself, so `arx-verify` can check it without knowing `P`.
+/// `<evidence_dir>/<height>-<proposer>.json`. Commits to a `CanonicalHeader`
+/// + `signature` for each block — `verify()` recomputes the signing bytes
+/// from the header rather than trusting anything this artifact merely
+/// asserts, so `arx-verify` can check it without knowing `P` and without
+/// trusting the artifact's author. The decoded blocks (including their
+/// full hash) go under `human_readable` only.
 fn write_equivocation_artifact<P: Serialize>(
     evidence_dir: &Path,
     genesis_hash: [u8; 32],
@@ -90,9 +93,15 @@ fn write_equivocation_artifact<P: Serialize>(
     evidence: &EquivocationEvidence<P>,
 ) {
     let attest = |block: &Block<P>| BlockAttestation {
-        signing_bytes: format!("0x{}", hex::encode(block.signing_bytes(proposer))),
+        header: CanonicalHeader {
+            height: block.height,
+            parent_hash: block.parent_hash.clone(),
+            timestamp: block.timestamp,
+            tx_root: format!("0x{}", hex::encode(block.tx_root)),
+            proposer: proposer.to_string(),
+            state_root: block.state_root.clone(),
+        },
         signature: format!("0x{}", block.signature.clone().unwrap_or_default()),
-        block_hash: block.hash(),
     };
     let proposer_pubkey = match proposer.pubkey_bytes() {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
@@ -112,7 +121,9 @@ fn write_equivocation_artifact<P: Serialize>(
         },
         human_readable: serde_json::json!({
             "block_a": evidence.block_a,
+            "block_a_hash": evidence.block_a.hash(),
             "block_b": evidence.block_b,
+            "block_b_hash": evidence.block_b.hash(),
         }),
     };
 

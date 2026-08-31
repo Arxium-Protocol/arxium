@@ -1053,6 +1053,7 @@ mod explorer_index_tests {
             parent_hash: "0xparent".into(),
             timestamp: height,
             actions,
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),

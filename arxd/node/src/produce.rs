@@ -120,6 +120,11 @@ pub fn produce_block<R: ChainRuntime>(
     };
     let state_root = db.compute_state_root(&state_root_overlay)?;
 
+    // `tx_root` is signed as part of the block header (see
+    // `xc_primitives::Block::signing_bytes`) — computed once here and reused
+    // both for that and for the (still observation-only) EP hash below.
+    let tx_root = xc_poe::tx_root(&applied)?;
+
     // PoE v5 (observation-only, see PoE_v5_design.md): logs and times the
     // execution-proof hash but doesn't touch the signed block or wire
     // format yet — purely to measure EP compute cost against real block
@@ -128,7 +133,7 @@ pub fn produce_block<R: ChainRuntime>(
     // resources_used: no real metering yet (PoE_v5_design.md never defines
     // a unit) — 0 rather than a stand-in number that could be misread as a
     // real measurement in logs/metrics.
-    let ep = xc_poe::execution_proof(&parent.state_root, &xc_poe::tx_root(&applied)?, &state_root, 0);
+    let ep = xc_poe::execution_proof(&parent.state_root, &tx_root, &state_root, 0);
     histogram!("arxium_poe_ep_compute_nanos").record(poe_start.elapsed().as_nanos() as f64);
     info!(height = next_height, ep = %hex::encode(ep), "computed proof-of-execution hash");
 
@@ -137,6 +142,7 @@ pub fn produce_block<R: ChainRuntime>(
         parent_hash: parent.hash(),
         timestamp,
         actions: applied,
+        tx_root,
         proposer: None,
         signature: None,
         state_root,

@@ -7,13 +7,14 @@ license.workspace = true
 [dependencies]
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
+xc-poe = { workspace = true }
 circuit-staking = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+hex = { workspace = true }
 
 [dev-dependencies]
 circuit-account = { workspace = true }
 ed25519-dalek = { workspace = true }
-hex = { workspace = true }

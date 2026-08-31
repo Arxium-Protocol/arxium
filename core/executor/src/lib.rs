@@ -93,6 +93,20 @@ pub enum ExecutorError {
 pub enum AcceptBlockError {
     #[error("proposer signature invalid: {0}")]
     Signature(#[from] SignatureError),
+    #[error("failed to hash block {height} actions for its tx_root: {source}")]
+    TxRootEncode {
+        height: u64,
+        #[source]
+        source: xc_poe::ActionEncodeError,
+    },
+    #[error(
+        "block {height} signed tx_root {claimed}, but its actions actually hash to {expected} — actions were altered after signing"
+    )]
+    TxRootMismatch {
+        height: u64,
+        expected: String,
+        claimed: String,
+    },
     #[error("wrong proposer for height {height}: expected {expected:?}, got {actual:?}")]
     WrongProposer {
         height: u64,
@@ -186,6 +200,24 @@ where
     P: Serialize + DeserializeOwned + Clone,
 {
     block.verify_proposer_signature()?;
+
+    // The signature covers `tx_root`, not `actions` (see `BlockSigningPayload`)
+    // — a valid signature alone proves nothing about the actions in this
+    // block. Recomputing `tx_root` from them and rejecting a mismatch is
+    // what actually binds the signature to `actions`; skip this and a relay
+    // could swap `actions` in a validly-signed block for anything it likes.
+    let expected_tx_root =
+        xc_poe::tx_root(&block.actions).map_err(|source| AcceptBlockError::TxRootEncode {
+            height: block.height,
+            source,
+        })?;
+    if block.tx_root != expected_tx_root {
+        return Err(AcceptBlockError::TxRootMismatch {
+            height: block.height,
+            expected: format!("0x{}", hex::encode(expected_tx_root)),
+            claimed: format!("0x{}", hex::encode(block.tx_root)),
+        });
+    }
 
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     if block.height != tip_height + 1 {
@@ -609,6 +641,7 @@ mod tests {
         proposer: &Address,
         key: &SigningKey,
     ) -> Result<Block<TestPayload>, AcceptBlockError> {
+        block.tx_root = xc_poe::tx_root(&block.actions).unwrap();
         block.sign(proposer.clone(), key);
         if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
             accept_block(db, block.clone(), 4, false, 0, dispatch, seal)
@@ -653,6 +686,7 @@ mod tests {
             parent_hash: genesis.hash(),
             timestamp: 1,
             actions: vec![signed_join(&bob_key, &bob, 0)],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
@@ -778,6 +812,7 @@ mod tests {
             parent_hash: genesis.hash(),
             timestamp: 1,
             actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 400)],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
@@ -867,6 +902,7 @@ mod tests {
             // Without the unbonding-resolves-first ordering, this would hit
             // `AlreadyUnbonding` since the allocation above is still mid-unbond.
             actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 200)],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
@@ -922,6 +958,7 @@ mod tests {
             parent_hash: genesis.hash(),
             timestamp: block1_timestamp,
             actions: vec![],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
@@ -955,6 +992,7 @@ mod tests {
             parent_hash: parent.hash(),
             timestamp,
             actions: vec![],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
@@ -1075,6 +1113,7 @@ mod tests {
             parent_hash: genesis.hash(),
             timestamp: now_secs(),
             actions: vec![],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
@@ -1144,6 +1183,7 @@ mod tests {
             parent_hash: "not the real parent hash".to_string(),
             timestamp: block1.timestamp + 1,
             actions: vec![],
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: String::new(),
@@ -1170,6 +1210,7 @@ mod tests {
                 parent_hash: block1.hash(),
                 timestamp: block1.timestamp + 1,
                 actions: vec![],
+                tx_root: [0u8; 32],
                 proposer: None,
                 signature: None,
                 state_root: String::new(),
@@ -1223,11 +1264,14 @@ mod tests {
         let mut forged = signed_transfer(&alice_key, &alice, 1, &bob, 10);
         forged.signature = Some("00".repeat(64));
 
+        let actions = vec![signed_transfer(&alice_key, &alice, 0, &bob, 40), forged];
+        let tx_root = xc_poe::tx_root(&actions).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
             timestamp: 1,
-            actions: vec![signed_transfer(&alice_key, &alice, 0, &bob, 40), forged],
+            actions,
+            tx_root,
             proposer: None,
             signature: None,
             state_root: String::new(),

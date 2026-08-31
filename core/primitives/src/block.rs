@@ -14,6 +14,15 @@ pub struct Block<P> {
     pub parent_hash: String,
     pub timestamp: u64,
     pub actions: Vec<Action<P>>,
+    /// Binary Merkle root (RFC 6962 shape) over `actions` — see
+    /// `xc_poe::tx_root`, which is what computes it. Signed in place of
+    /// `actions` itself (see `BlockSigningPayload`), so the signing payload
+    /// never has to know `P`. A signature over `tx_root` alone only means
+    /// something if the two are kept in lockstep: whoever accepts a block
+    /// must independently recompute `tx_root` from `actions` and reject a
+    /// mismatch (`xc_executor::accept_block` does), or `actions` could be
+    /// swapped out after signing without invalidating the signature.
+    pub tx_root: [u8; 32],
     /// Validator that produced this block. `None` for the (trusted, unsigned)
     /// genesis block, and for blocks produced by a non-validator solo node.
     pub proposer: Option<Address>,
@@ -27,12 +36,22 @@ pub struct Block<P> {
 
 /// What actually gets signed: everything but the signature itself (it can't
 /// sign itself). Mirrors `Action`'s `SigningPayload`.
+///
+/// Commits to `tx_root`, not `actions` — deliberately. `actions: &[Action<P>]`
+/// used to be signed directly, which made the signing payload (and this
+/// struct) generic over `P`. That meant a verifier had to know a chain's
+/// payload type just to check whether two blocks the same proposer signed
+/// were equivocation or not, and — worse — made the signed bytes opaque:
+/// nothing about them said whether two blocks were at the same height, since
+/// that required decoding `P` to find out. `tx_root` is a plain `[u8; 32]`,
+/// so every field here is `P`-free, and a chain-agnostic verifier can read
+/// `height` straight off it without decoding anything.
 #[derive(Serialize)]
-struct BlockSigningPayload<'a, P> {
+struct BlockSigningPayload<'a> {
     height: u64,
     parent_hash: &'a str,
     timestamp: u64,
-    actions: &'a [Action<P>],
+    tx_root: &'a [u8; 32],
     proposer: &'a Address,
     state_root: &'a str,
 }
@@ -45,6 +64,9 @@ impl<P: Serialize> Block<P> {
                 .to_string(),
             timestamp,
             actions: Vec::new(),
+            // Matches `xc_poe::tx_root(&[])` — empty action list hashes to
+            // the zero root.
+            tx_root: [0u8; 32],
             proposer: None,
             signature: None,
             state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
@@ -70,7 +92,7 @@ impl<P: Serialize> Block<P> {
             height: self.height,
             parent_hash: &self.parent_hash,
             timestamp: self.timestamp,
-            actions: &self.actions,
+            tx_root: &self.tx_root,
             proposer,
             state_root: &self.state_root,
         };
@@ -87,7 +109,11 @@ impl<P: Serialize> Block<P> {
     }
 
     /// Verifies `signature` was produced by the private key behind `proposer`,
-    /// over this block's (height, parent_hash, timestamp, actions, proposer).
+    /// over this block's (height, parent_hash, timestamp, tx_root, proposer,
+    /// state_root). Proves nothing about `actions` on its own — a caller
+    /// that trusts `actions` off a validly-signed block without separately
+    /// checking `tx_root` against them is trusting an unverified field; see
+    /// `xc_executor::accept_block`.
     pub fn verify_proposer_signature(&self) -> Result<(), SignatureError> {
         let proposer = self.proposer.as_ref().ok_or(SignatureError::Missing)?;
         let sig_hex = self.signature.as_deref().ok_or(SignatureError::Missing)?;
@@ -135,6 +161,23 @@ mod tests {
         block.sign(addr, &key);
 
         block.timestamp += 1;
+        assert!(block.verify_proposer_signature().is_err());
+    }
+
+    /// `tx_root` is part of the signed header, so changing it after signing
+    /// (e.g. to claim a different action list without re-signing) must
+    /// invalidate the signature — same guarantee `timestamp` etc. get above.
+    /// This is the only thing `verify_proposer_signature` can prove about
+    /// `actions` by itself; whether `tx_root` actually matches `actions` is
+    /// a separate check owned by the caller (`xc_executor::accept_block`).
+    #[test]
+    fn tampered_tx_root_fails_verification() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let mut block: Block<()> = Block::genesis(1234);
+        block.sign(addr, &key);
+
+        block.tx_root = [0xffu8; 32];
         assert!(block.verify_proposer_signature().is_err());
     }
 

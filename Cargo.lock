@@ -5074,11 +5074,11 @@ dependencies = [
 name = "xc-artifact"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "ed25519-dalek 3.0.0",
  "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "thiserror 2.0.19",
 ]
 
@@ -5146,6 +5146,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.19",
  "tracing",
+ "xc-poe",
  "xc-primitives",
  "xc-storage",
 ]
