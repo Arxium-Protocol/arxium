@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -9,6 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{info, warn};
+use xc_artifact::{BlockAttestation, EvidenceArtifact, Fault, ARTIFACT_VERSION};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
 use xc_storage::ArxiumDb;
@@ -76,6 +78,61 @@ pub enum EvidenceEvent<P> {
     BlockObserved(Block<P>),
 }
 
+/// Builds a self-describing evidence artifact (see `xc_artifact`) from a
+/// verified equivocation and writes it to
+/// `<evidence_dir>/<height>-<proposer>.json`. Commits to `signing_bytes` +
+/// `signature` + `block_hash` for each block, never the decoded block
+/// itself, so `arx-verify` can check it without knowing `P`.
+fn write_equivocation_artifact<P: Serialize>(
+    evidence_dir: &Path,
+    genesis_hash: [u8; 32],
+    proposer: &Address,
+    evidence: &EquivocationEvidence<P>,
+) {
+    let attest = |block: &Block<P>| BlockAttestation {
+        signing_bytes: format!("0x{}", hex::encode(block.signing_bytes(proposer))),
+        signature: format!("0x{}", block.signature.clone().unwrap_or_default()),
+        block_hash: block.hash(),
+    };
+    let proposer_pubkey = match proposer.pubkey_bytes() {
+        Ok(bytes) => format!("0x{}", hex::encode(bytes)),
+        Err(err) => {
+            warn!("evidence: failed to encode proposer pubkey for artifact: {err}");
+            return;
+        }
+    };
+
+    let artifact = EvidenceArtifact {
+        artifact_version: ARTIFACT_VERSION,
+        genesis_hash: format!("0x{}", hex::encode(genesis_hash)),
+        fault: Fault::Equivocation {
+            proposer_pubkey,
+            height: evidence.block_a.height,
+            blocks: [attest(&evidence.block_a), attest(&evidence.block_b)],
+        },
+        human_readable: serde_json::json!({
+            "block_a": evidence.block_a,
+            "block_b": evidence.block_b,
+        }),
+    };
+
+    if let Err(err) = std::fs::create_dir_all(evidence_dir) {
+        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        return;
+    }
+    let path = evidence_dir.join(format!("{}-{proposer}.json", evidence.block_a.height));
+    match serde_json::to_vec_pretty(&artifact) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&path, bytes) {
+                warn!("evidence: failed to write artifact {}: {err}", path.display());
+            } else {
+                info!("evidence: wrote artifact {}", path.display());
+            }
+        }
+        Err(err) => warn!("evidence: failed to encode artifact for {proposer}: {err}"),
+    }
+}
+
 /// Runs on its own thread, reacting to `events`. `build_evidence_action` is
 /// `None` on a non-validator node — it still detects and logs equivocation,
 /// it just has no funded/nonced account to sign a report with.
@@ -89,6 +146,8 @@ pub fn spawn_evidence_watcher<P, F>(
     mempool: Arc<Mutex<Mempool<P>>>,
     events: Receiver<EvidenceEvent<P>>,
     build_evidence_action: Option<F>,
+    evidence_dir: PathBuf,
+    genesis_hash: [u8; 32],
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -128,6 +187,11 @@ where
                     continue;
                 }
             }
+
+            // Independent of whether this node can sign a report: even a
+            // non-validator observer should leave a durable, standalone
+            // artifact that `arx-verify` can check later.
+            write_equivocation_artifact(&evidence_dir, genesis_hash, &proposer, &evidence);
 
             let Some(build_evidence_action) = &build_evidence_action else {
                 warn!("evidence: observed equivocation by {proposer}, no local validator key to report it");
@@ -241,7 +305,15 @@ mod tests {
             signature: None,
             payload: (),
         });
-        spawn_evidence_watcher(db.clone(), mempool.clone(), rx, build_evidence_action);
+        let evidence_dir = dir.join("evidence");
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            rx,
+            build_evidence_action,
+            evidence_dir.clone(),
+            [7u8; 32],
+        );
 
         tx.send(EvidenceEvent::BlockObserved(competing)).unwrap();
         drop(tx);
@@ -259,6 +331,13 @@ mod tests {
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].sender, addr);
         assert!(db.evidence_processed(5, &addr).unwrap_or(false) == false, "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
+
+        let artifact_path = evidence_dir.join(format!("5-{addr}.json"));
+        let artifact: xc_artifact::EvidenceArtifact =
+            serde_json::from_slice(&std::fs::read(&artifact_path).expect("artifact written to disk"))
+                .expect("artifact is valid JSON");
+        let verdict = xc_artifact::verify(&artifact).expect("artifact verifies standalone");
+        assert_eq!(verdict.culpable_pubkey, format!("0x{}", hex::encode(key.verifying_key().as_bytes())));
 
         std::fs::remove_dir_all(&dir).ok();
     }

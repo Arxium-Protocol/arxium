@@ -182,6 +182,8 @@ struct SubsystemHandles<R: ChainRuntime> {
 /// aren't "subsystems" spawned here so much as `run()`'s own next steps.
 fn spawn_subsystems<R: ChainRuntime>(
     config: &xc_primitives::NodeConfig,
+    chain_name: &str,
+    genesis_hash: [u8; 32],
     db: &ArxiumDb,
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
     identity: &Option<(Address, ed25519_dalek::SigningKey)>,
@@ -238,6 +240,8 @@ fn spawn_subsystems<R: ChainRuntime>(
             mempool.clone(),
             evidence_rx,
             build_evidence_action,
+            config.base_path.join(chain_name).join("evidence"),
+            genesis_hash,
         ),
     );
 
@@ -694,6 +698,8 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         shutdown,
     } = spawn_subsystems::<R>(
         &config,
+        &chain_name,
+        genesis_hash,
         &db,
         &mempool,
         &identity,

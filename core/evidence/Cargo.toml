@@ -8,9 +8,12 @@ license.workspace = true
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-mempool = { workspace = true }
+xc-artifact = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

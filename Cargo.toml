@@ -17,6 +17,7 @@ members = [
     "core/rpc",
     "core/runtime-api",
     "core/evidence",
+    "core/artifact",
     "core/poe",
     #
     "arxd/node",
@@ -30,6 +31,8 @@ members = [
     "scripts/send-tx",
     "scripts/admin-slash",
     "scripts/load-test",
+    #
+    "tools/arx-verify",
     #
     "examples/toy-chain",
 ]
@@ -62,6 +65,7 @@ xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
 xc-runtime-api = { path = "core/runtime-api" }
 xc-evidence = { path = "core/evidence" }
+xc-artifact = { path = "core/artifact" }
 xc-poe = { path = "core/poe" }
 arxd-node = { path = "arxd/node" }
 arxd-runtime = { path = "arxd/runtime" }

@@ -61,7 +61,11 @@ impl<P: Serialize> Block<P> {
         format!("0x{}", hex::encode(digest))
     }
 
-    fn signing_bytes(&self, proposer: &Address) -> Vec<u8> {
+    /// Deterministic bytes a valid proposer signature must cover — exposed
+    /// (not just used internally by `sign`/`verify_proposer_signature`) so
+    /// evidence tooling can commit to what was actually signed without
+    /// needing to decode `P`.
+    pub fn signing_bytes(&self, proposer: &Address) -> Vec<u8> {
         let payload = BlockSigningPayload {
             height: self.height,
             parent_hash: &self.parent_hash,

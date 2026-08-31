@@ -1,0 +1,13 @@
+[package]
+name = "arx-verify"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[[bin]]
+name = "arx-verify"
+path = "src/main.rs"
+
+[dependencies]
+xc-artifact = { workspace = true }
+serde_json = { workspace = true }
