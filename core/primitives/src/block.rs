@@ -189,4 +189,66 @@ mod tests {
             Err(SignatureError::Missing)
         ));
     }
+
+    /// `xc_artifact::CanonicalHeader`'s `signing_bytes_for` must produce
+    /// byte-identical bincode to `Block::signing_bytes` for the equivalent
+    /// header, but the two are separate implementations in separate crates
+    /// by design (`xc-artifact` deliberately doesn't depend on
+    /// `xc-primitives`) — nothing in the compiler binds them together. They
+    /// currently agree because `Address(String)`'s derived `Serialize`
+    /// encodes as a transparent newtype (bincode's serde
+    /// `serialize_newtype_struct` forwards straight to the inner value), so
+    /// `&Address` and `&str` produce identical bytes. That stops being true
+    /// the moment `Address` gains a field, a custom `Serialize`, or
+    /// `BlockSigningPayload`'s field order changes — silently: no compile
+    /// error, no test failure in either crate alone, just every
+    /// previously-issued evidence artifact quietly becoming unverifiable.
+    /// This test is what would catch that.
+    /// Builds the `Block` equivalent of `xc_artifact::frozen_test_header()`
+    /// — same header, reused (not retyped) by both tests below so the two
+    /// crates' fixtures can't themselves drift apart.
+    fn block_matching_frozen_artifact_header() -> (Block<()>, Address) {
+        let header = xc_artifact::frozen_test_header();
+        let proposer = Address::parse(&header.proposer).unwrap();
+        let tx_root: [u8; 32] = hex::decode(header.tx_root.trim_start_matches("0x"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let block = Block {
+            height: header.height,
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+            actions: Vec::new(),
+            tx_root,
+            proposer: Some(proposer.clone()),
+            signature: None,
+            state_root: header.state_root,
+        };
+        (block, proposer)
+    }
+
+    #[test]
+    fn artifact_signing_bytes_match_block_signing_bytes() {
+        let (block, proposer) = block_matching_frozen_artifact_header();
+        let header = xc_artifact::frozen_test_header();
+        assert_eq!(
+            block.signing_bytes(&proposer),
+            xc_artifact::signing_bytes_for(&header).unwrap(),
+        );
+    }
+
+    /// Same fixture and expected bytes as `xc_artifact`'s
+    /// `frozen_signing_bytes_vector` test (`core/artifact/src/lib.rs`),
+    /// pinned independently here. If the two crates' encodings ever drift
+    /// apart, this hardcoded hex is what makes the failure loud and points
+    /// at exactly what changed — the two tests together are the format
+    /// spec for what "signing bytes" means.
+    #[test]
+    fn frozen_signing_bytes_vector_matches_artifact_crate() {
+        let (block, proposer) = block_matching_frozen_artifact_header();
+        assert_eq!(
+            hex::encode(block.signing_bytes(&proposer)),
+            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f7448617368",
+        );
+    }
 }

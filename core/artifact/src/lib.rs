@@ -58,7 +58,15 @@ struct SigningPayload<'a> {
     state_root: &'a str,
 }
 
-fn signing_bytes(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyError> {
+/// Recomputes the exact bytes a proposer signs for `header` — byte-for-byte
+/// the same encoding as `xc_primitives::block::Block::signing_bytes`
+/// produces for the equivalent block (pinned by a cross-crate test in
+/// `core/primitives`, since this crate deliberately can't depend on
+/// `xc-primitives` to enforce that with the type system). Public because
+/// it's genuinely useful to anyone implementing a verifier outside this
+/// codebase, in another language: it's the one function that defines what
+/// "signing bytes" means for this format.
+pub fn signing_bytes_for(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyError> {
     let tx_root = decode_hex("tx_root", &header.tx_root)?;
     let tx_root: [u8; 32] =
         tx_root.as_slice().try_into().map_err(|_| VerifyError::BadTxRootLength(tx_root.len()))?;
@@ -71,7 +79,10 @@ fn signing_bytes(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyError> {
         state_root: &header.state_root,
     };
     let config = bincode::config::standard();
-    Ok(bincode::serde::encode_to_vec(&payload, config).expect("payload encoding never fails"))
+    // Every field is a primitive or `&str`/`&[u8; 32]` — no user `Serialize`
+    // impl in the payload, so bincode encoding has nothing to fail on.
+    Ok(bincode::serde::encode_to_vec(&payload, config)
+        .expect("SigningPayload is all primitives/&str, encoding cannot fail"))
 }
 
 /// One block's contribution to a fault: enough to recompute the signing
@@ -145,6 +156,26 @@ pub struct Verdict {
     pub culpable_pubkey: String,
 }
 
+/// The fixed header used to pin `signing_bytes_for`'s encoding against
+/// `xc_primitives::block::Block::signing_bytes` — see
+/// `frozen_signing_bytes_vector` below and its twin in
+/// `core/primitives/src/block.rs`. Exposed (not `#[cfg(test)]`) so the
+/// cross-crate test can build the identical header without duplicating
+/// these literals and risking the two copies drifting apart.
+pub fn frozen_test_header() -> CanonicalHeader {
+    CanonicalHeader {
+        height: 42,
+        parent_hash: "0xdeadbeef".to_string(),
+        timestamp: 1_000_000_000,
+        tx_root: format!("0x{}", "ab".repeat(32)),
+        // `xc_primitives::Address::from_pubkey_bytes(&[0xaa; 32])` — hardcoded
+        // (not computed) since this crate has no bech32 dependency and must
+        // not gain one just for a test fixture.
+        proposer: "arx1424242424242424242424242424242424242424242424242424q5p8vly".to_string(),
+        state_root: "0xstaterootHash".to_string(),
+    }
+}
+
 fn decode_hex(field: &'static str, s: &str) -> Result<Vec<u8>, VerifyError> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).map_err(|source| VerifyError::BadHex { field, source })
@@ -185,7 +216,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
 
             let mut signed = Vec::with_capacity(2);
             for (i, block) in blocks.iter().enumerate() {
-                let bytes = signing_bytes(&block.header)?;
+                let bytes = signing_bytes_for(&block.header)?;
                 let sig_bytes = decode_hex("signature", &block.signature)?;
                 let sig_bytes: [u8; 64] = sig_bytes
                     .as_slice()
@@ -224,7 +255,7 @@ mod tests {
     }
 
     fn attestation(key: &SigningKey, header: CanonicalHeader) -> BlockAttestation {
-        let bytes = signing_bytes(&header).unwrap();
+        let bytes = signing_bytes_for(&header).unwrap();
         let signature = key.sign(&bytes);
         BlockAttestation { header, signature: format!("0x{}", hex::encode(signature.to_bytes())) }
     }
@@ -309,6 +340,25 @@ mod tests {
             verify(&artifact(&key, [a, b], 99)),
             Err(VerifyError::FaultHeightMismatch { claimed: 99, actual: 5 })
         ));
+    }
+
+    /// Pins the exact bytes `signing_bytes_for` produces for one fixed
+    /// header. This is the format spec, not just a test: the identical
+    /// header + identical assertion also lives in
+    /// `core/primitives/src/block.rs` (`frozen_signing_bytes_vector`),
+    /// checked against `Block::signing_bytes`. If either crate's encoding
+    /// drifts from the other, one of the two copies of this test fails
+    /// loudly and points at exactly what changed — the alternative is a
+    /// change that silently makes every previously-issued artifact
+    /// unverifiable.
+    #[test]
+    fn frozen_signing_bytes_vector() {
+        let header = frozen_test_header();
+        let bytes = signing_bytes_for(&header).unwrap();
+        assert_eq!(
+            hex::encode(&bytes),
+            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f7448617368",
+        );
     }
 
     #[test]
