@@ -11,7 +11,81 @@ use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 use xc_primitives::{Address, Block, quorum};
-use xc_storage::{ArxiumDb, FinalityRecord, PrecommitVoteRecord};
+use xc_storage::{ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord};
+
+// Domain tags, mixed into what gets signed, so a signature over a precommit
+// can never be replayed as a dissent (or vice versa) even though both cover
+// overlapping fields (height, a hash, an EP).
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
+const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v1";
+
+fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Exact bytes a validator signs for a precommit vote.
+pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_PRECOMMIT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, block_hash.as_bytes());
+    push_field(&mut buf, ep);
+    buf
+}
+
+/// Exact bytes a dissenting validator signs. Must match
+/// `xc_artifact::dissent_signing_bytes` byte-for-byte — that crate can't
+/// depend on this one, so it carries its own copy, pinned by a frozen
+/// vector test in each crate (same pattern as `xc_artifact::signing_bytes_for`
+/// vs. `core/primitives`).
+pub fn dissent_signing_bytes(height: u64, block_hash: &str, state_root: &str, ep: &[u8; 32], reason: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_DISSENT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, block_hash.as_bytes());
+    push_field(&mut buf, state_root.as_bytes());
+    push_field(&mut buf, ep);
+    push_field(&mut buf, reason.as_bytes());
+    buf
+}
+
+/// Which kind of execution disagreement a `Dissent` reports — mirrors
+/// `xc_executor::AcceptBlockError::is_execution_disagreement`'s two
+/// dissent-worthy variants. `as_str()`'s output is what actually gets
+/// signed/hashed (via `dissent_signing_bytes`) and persisted
+/// (`DissentRecord::reason`), so it's the wire format — do not rename the
+/// strings without a coordinated migration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum DissentReason {
+    StateRootMismatch,
+    ActionMismatch,
+}
+
+impl DissentReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DissentReason::StateRootMismatch => "state_root_mismatch",
+            DissentReason::ActionMismatch => "action_mismatch",
+        }
+    }
+}
+
+/// A validator's signed claim that it independently executed `block_hash`
+/// at `height` and got `state_root`/`ep` instead of what the proposer
+/// claimed. Gossiped over `arxd/network`'s dissent topic and fed into
+/// `spawn_finality` on every node (including the dissenter's own), same
+/// shape as `PrecommitVote`.
+#[derive(Clone, Serialize, serde::Deserialize)]
+pub struct Dissent {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub ep: [u8; 32],
+    pub reason: DissentReason,
+    pub voter: Address,
+    pub signature: BlsSignature,
+}
 
 /// How many heights of unfinalized precommit tallies to keep.
 ///
@@ -46,14 +120,22 @@ pub struct PrecommitVote {
     pub block_hash: String,
     pub voter: Address,
     pub signature: BlsSignature,
+    /// Execution proof this voter computed for the block — see
+    /// `xc_poe::block_ep`. Tallied as part of the key (see `spawn_finality`'s
+    /// `tallies`), so two votes agreeing on `block_hash` but disagreeing on
+    /// `ep` never aggregate into the same quorum.
+    pub ep: [u8; 32],
 }
 
 /// Fed to `spawn_finality`: either a block this node just accepted/produced
-/// (triggers signing a precommit, if this node has a BLS identity), or a
-/// precommit vote received from a peer (tallied toward quorum).
+/// (triggers signing a precommit, if this node has a BLS identity), a
+/// precommit vote received from a peer (tallied toward quorum), or a dissent
+/// (verified, tallied one-per-voter, and persisted — but never contributes
+/// to a precommit quorum; see `handle_dissent`).
 pub enum FinalityEvent<P> {
     BlockObserved(Block<P>),
     VoteObserved(PrecommitVote),
+    DissentObserved(Dissent),
 }
 
 /// Runs on its own thread. `bls_identity` is `Some((address, secret_key))`
@@ -71,10 +153,11 @@ where
     P: Serialize + DeserializeOwned + Send + 'static,
 {
     thread::spawn(move || {
-        // height -> (block_hash -> (voter -> signature)); a height can only
-        // ever have one canonical hash in practice, but keyed this way a
-        // stray vote for a competing hash can't corrupt the real tally.
-        let mut tallies: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> = HashMap::new();
+        // height -> ((block_hash, ep) -> (voter -> signature)); a height can
+        // only ever have one canonical (hash, ep) pair in practice, but keyed
+        // this way a stray vote for a competing hash or a diverging ep can't
+        // corrupt the real tally.
+        let mut tallies: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> = HashMap::new();
 
         // This node's own not-yet-finalized votes, kept so they can be
         // re-sent on VOTE_REBROADCAST_INTERVAL — see the constant's doc.
@@ -101,12 +184,24 @@ where
                     tallies
                         .entry(record.height)
                         .or_default()
-                        .entry(record.block_hash)
+                        .entry((record.block_hash, record.ep))
                         .or_default()
                         .insert(record.voter, record.signature);
                 }
             }
             Err(err) => warn!("finality: failed to reload persisted precommit votes: {err}"),
+        }
+
+        // Dissents don't feed any in-memory structure (one-per-voter is
+        // enforced by a direct `db.get_dissent` read on each new one, not an
+        // in-memory set) — reloading them just brings the pruning watermark
+        // up to date, so a restart right after a dissent at a height beyond
+        // any tallied vote doesn't leave it un-prunable.
+        match db.get_dissents_from(0) {
+            Ok(records) => {
+                highest_seen = highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
+            }
+            Err(err) => warn!("finality: failed to reload persisted dissents: {err}"),
         }
 
         loop {
@@ -127,6 +222,7 @@ where
             highest_seen = highest_seen.max(match &event {
                 FinalityEvent::BlockObserved(block) => block.height,
                 FinalityEvent::VoteObserved(vote) => vote.height,
+                FinalityEvent::DissentObserved(dissent) => dissent.height,
             });
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
@@ -134,6 +230,9 @@ where
             for height in tallies.keys().copied().filter(|h| *h < cutoff).collect::<Vec<_>>() {
                 if let Err(err) = db.delete_precommit_votes(height) {
                     warn!("finality: failed to prune persisted precommit votes for height {height}: {err}");
+                }
+                if let Err(err) = db.delete_dissents(height) {
+                    warn!("finality: failed to prune persisted dissents for height {height}: {err}");
                 }
             }
             tallies.retain(|height, _| *height >= cutoff);
@@ -143,8 +242,25 @@ where
                 FinalityEvent::BlockObserved(block) => {
                     let Some((address, secret_key)) = &bls_identity else { continue };
                     let hash = block.hash();
-                    let signature = xc_bls::sign(secret_key, hash.as_bytes());
-                    let vote = PrecommitVote { height: block.height, block_hash: hash, voter: address.clone(), signature };
+                    // ponytail: parent lookup failure (or genesis) falls back
+                    // to an empty parent state root rather than dropping the
+                    // vote — EP mismatches from that are self-consistent
+                    // (every honest node hits the same fallback), so quorum
+                    // still forms; only an actually-diverging EP should ever
+                    // block it.
+                    let parent_state_root = match db.get_block::<P>(block.height.saturating_sub(1)) {
+                        Ok(Some(parent)) => parent.state_root,
+                        Ok(None) => String::new(),
+                        Err(err) => {
+                            warn!("finality: failed to read parent block for EP at height {}: {err}", block.height);
+                            String::new()
+                        }
+                    };
+                    let ep = xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root);
+                    let msg = precommit_signing_bytes(block.height, &hash, &ep);
+                    let signature = xc_bls::sign(secret_key, &msg);
+                    let vote =
+                        PrecommitVote { height: block.height, block_hash: hash, voter: address.clone(), signature, ep };
                     my_votes.insert(vote.height, vote.clone());
                     if vote_tx.send(vote).is_err() {
                         warn!("finality: vote channel closed, stopping");
@@ -156,6 +272,11 @@ where
                         warn!("finality: failed to process precommit vote: {err}");
                     }
                 }
+                FinalityEvent::DissentObserved(dissent) => {
+                    if let Err(err) = handle_dissent(&db, dissent) {
+                        warn!("finality: failed to process dissent: {err}");
+                    }
+                }
             }
         }
     })
@@ -163,7 +284,7 @@ where
 
 fn tally_vote(
     db: &ArxiumDb,
-    tallies: &mut HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>>,
+    tallies: &mut HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>>,
     my_votes: &mut HashMap<u64, PrecommitVote>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
@@ -175,7 +296,8 @@ fn tally_vote(
         warn!("finality: vote from {} with no registered BLS key, dropping", vote.voter);
         return Ok(());
     };
-    if xc_bls::verify(vote.block_hash.as_bytes(), &pubkey, &vote.signature).is_err() {
+    let msg = precommit_signing_bytes(vote.height, &vote.block_hash, &vote.ep);
+    if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!("finality: dropping vote from {} with an invalid signature", vote.voter);
         return Ok(());
     }
@@ -191,12 +313,13 @@ fn tally_vote(
         block_hash: vote.block_hash.clone(),
         voter: vote.voter.clone(),
         signature: vote.signature.clone(),
+        ep: vote.ep,
     };
 
     let signers = tallies
         .entry(vote.height)
         .or_default()
-        .entry(vote.block_hash.clone())
+        .entry((vote.block_hash.clone(), vote.ep))
         .or_default();
     signers.insert(vote.voter, vote.signature);
 
@@ -217,7 +340,7 @@ fn tally_vote(
         warn!("finality: failed to aggregate signatures for height {}", vote.height);
         return Ok(());
     };
-    if xc_bls::verify_aggregate(vote.block_hash.as_bytes(), &pubkeys, &aggregate_signature).is_err() {
+    if xc_bls::verify_aggregate(&msg, &pubkeys, &aggregate_signature).is_err() {
         warn!("finality: aggregate signature failed to verify for height {}", vote.height);
         return Ok(());
     }
@@ -235,6 +358,53 @@ fn tally_vote(
     tallies.remove(&vote.height);
     my_votes.remove(&vote.height);
     info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
+    Ok(())
+}
+
+/// Verifies a dissent's signature and validator membership, enforces one
+/// dissent per (height, voter) against what's already persisted, and — if
+/// it's new — persists it and bumps `arxium_dissent_total{reason}`. Never
+/// touches `tallies`: a dissent is not a precommit vote and never
+/// contributes to quorum, it's only recorded as evidence.
+fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::StorageError> {
+    if db.get_finality_record(dissent.height)?.is_some() {
+        return Ok(()); // already finalized; a late dissent proves nothing new
+    }
+
+    let Some(pubkey) = db.get_bls_pubkey(&dissent.voter)? else {
+        warn!("finality: dissent from {} with no registered BLS key, dropping", dissent.voter);
+        return Ok(());
+    };
+    let reason = dissent.reason.as_str();
+    let msg = dissent_signing_bytes(dissent.height, &dissent.block_hash, &dissent.state_root, &dissent.ep, reason);
+    if xc_bls::verify(&msg, &pubkey, &dissent.signature).is_err() {
+        warn!("finality: dropping dissent from {} with an invalid signature", dissent.voter);
+        return Ok(());
+    }
+
+    let validators = db.get_validator_set_at(dissent.height)?;
+    if !validators.contains(&dissent.voter) {
+        warn!("finality: dropping dissent from {}, not a validator at height {}", dissent.voter, dissent.height);
+        return Ok(());
+    }
+
+    if db.get_dissent(dissent.height, &dissent.voter)?.is_some() {
+        warn!("finality: dropping duplicate dissent from {} at height {}", dissent.voter, dissent.height);
+        return Ok(());
+    }
+
+    let record = DissentRecord {
+        height: dissent.height,
+        block_hash: dissent.block_hash,
+        state_root: dissent.state_root,
+        ep: dissent.ep,
+        reason: reason.to_string(),
+        voter: dissent.voter,
+        signature: dissent.signature,
+    };
+    db.write_batches(&[&record])?;
+    metrics::counter!("arxium_dissent_total", "reason" => reason).increment(1);
+    info!("finality: recorded dissent from {} at height {} ({reason})", record.voter, record.height);
     Ok(())
 }
 
@@ -292,13 +462,16 @@ mod tests {
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
 
+        let ep = [1u8; 32];
+
         // 3 of 4 validators is quorum() == 3; first two votes shouldn't finalize.
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
                 block_hash: block_hash.clone(),
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, block_hash.as_bytes()),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                ep,
             };
             tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
             assert!(db.get_finality_record(5).unwrap().is_none());
@@ -309,7 +482,8 @@ mod tests {
             height: 5,
             block_hash: block_hash.clone(),
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, block_hash.as_bytes()),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+            ep,
         };
         tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
 
@@ -340,6 +514,7 @@ mod tests {
         // Below quorum (3): only 2 of 4 vote, then simulate a crash by
         // dropping the in-memory tally entirely and reconstructing it the
         // same way `spawn_finality` does on startup.
+        let ep = [1u8; 32];
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
         for (addr, sk) in addrs_and_keys.iter().take(2) {
@@ -347,24 +522,25 @@ mod tests {
                 height: 5,
                 block_hash: block_hash.clone(),
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, block_hash.as_bytes()),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                ep,
             };
             tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
         }
         drop(tallies);
 
-        let mut reloaded: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> = HashMap::new();
+        let mut reloaded: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> = HashMap::new();
         for record in db.get_precommit_votes_from(0).unwrap() {
             reloaded
                 .entry(record.height)
                 .or_default()
-                .entry(record.block_hash)
+                .entry((record.block_hash, record.ep))
                 .or_default()
                 .insert(record.voter, record.signature);
         }
         let mut reloaded_my_votes = HashMap::new();
         assert_eq!(
-            reloaded.get(&5).unwrap().get(&block_hash).unwrap().len(),
+            reloaded.get(&5).unwrap().get(&(block_hash.clone(), ep)).unwrap().len(),
             2,
             "both pre-crash votes should have survived via persisted records"
         );
@@ -376,7 +552,8 @@ mod tests {
             height: 5,
             block_hash: block_hash.clone(),
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, block_hash.as_bytes()),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+            ep,
         };
         tally_vote(&db, &mut reloaded, &mut reloaded_my_votes, vote).unwrap();
         assert!(db.get_finality_record(5).unwrap().is_some());
@@ -384,6 +561,128 @@ mod tests {
             db.get_precommit_votes_from(0).unwrap().is_empty(),
             "finalized height's persisted votes must be cleaned up"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two votes for the identical `block_hash` but a different `ep` must
+    /// not aggregate into the same quorum — that's the whole point of
+    /// keying `tallies` by `(block_hash, ep)` instead of `block_hash` alone.
+    #[test]
+    fn votes_agreeing_on_block_hash_but_disagreeing_on_ep_do_not_aggregate() {
+        let (db, dir) = open_test_db();
+        let addrs_and_keys: Vec<(Address, BlsSecretKey)> = (0u8..3)
+            .map(|i| {
+                let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
+                let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+                let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                (addr, sk)
+            })
+            .collect();
+        let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+
+        let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
+        let ep_a = [1u8; 32];
+        let ep_b = [2u8; 32];
+
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+
+        // quorum() of 3 validators is 3 — two votes on ep_a, one on ep_b:
+        // neither group reaches quorum even though all three agree on
+        // block_hash.
+        for (i, (addr, sk)) in addrs_and_keys.iter().enumerate() {
+            let ep = if i < 2 { ep_a } else { ep_b };
+            let vote = PrecommitVote {
+                height: 5,
+                block_hash: block_hash.clone(),
+                voter: addr.clone(),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                ep,
+            };
+            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
+        }
+
+        assert!(db.get_finality_record(5).unwrap().is_none(), "neither ep group alone reached quorum");
+        assert_eq!(tallies.get(&5).unwrap().get(&(block_hash.clone(), ep_a)).unwrap().len(), 2);
+        assert_eq!(tallies.get(&5).unwrap().get(&(block_hash, ep_b)).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn dissent_fixture(voter: Address, sk: &BlsSecretKey, height: u64, block_hash: &str) -> Dissent {
+        let state_root = "0xdisputed".to_string();
+        let ep = [9u8; 32];
+        let reason = DissentReason::StateRootMismatch;
+        let msg = dissent_signing_bytes(height, block_hash, &state_root, &ep, reason.as_str());
+        Dissent {
+            height,
+            block_hash: block_hash.to_string(),
+            state_root,
+            ep,
+            reason,
+            voter,
+            signature: xc_bls::sign(sk, &msg),
+        }
+    }
+
+    #[test]
+    fn valid_dissent_is_verified_tallied_and_persisted() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
+            .unwrap();
+
+        let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xblockhash");
+        handle_dissent(&db, dissent).unwrap();
+
+        let stored = db.get_dissent(5, &addr).unwrap().expect("dissent should be persisted");
+        assert_eq!(stored.reason, "state_root_mismatch");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_dissent_from_the_same_voter_at_the_same_height_is_dropped() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
+            .unwrap();
+
+        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xblockhash")).unwrap();
+        // A second, differently-shaped dissent from the same voter at the
+        // same height must not overwrite the first.
+        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash")).unwrap();
+
+        let stored = db.get_dissent(5, &addr).unwrap().unwrap();
+        assert_eq!(stored.block_hash, "0xblockhash", "the first dissent must win, not be overwritten");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn forged_dissent_signature_is_rejected() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        let (other_sk, _) = xc_bls::keygen_from_seed(&[51u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
+            .unwrap();
+
+        // Signed with a key that doesn't match the registered pubkey for `addr`.
+        handle_dissent(&db, dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash")).unwrap();
+
+        assert!(db.get_dissent(5, &addr).unwrap().is_none(), "a forged dissent signature must not be persisted");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -446,7 +745,7 @@ mod tests {
     /// retention window — and requires the map to stay bounded.
     #[test]
     fn unfinalized_tallies_do_not_grow_without_bound() {
-        let mut tallies: HashMap<u64, HashMap<String, HashMap<Address, BlsSignature>>> =
+        let mut tallies: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> =
             HashMap::new();
 
         // Stand in for the loop's pruning step, which is what the retention
@@ -457,7 +756,7 @@ mod tests {
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
             tallies.retain(|h, _| *h >= cutoff);
             // A vote arrives for this height and never reaches quorum.
-            tallies.entry(height).or_default().entry("0xdeadbeef".into()).or_default();
+            tallies.entry(height).or_default().entry(("0xdeadbeef".into(), [0u8; 32])).or_default();
         }
 
         assert!(

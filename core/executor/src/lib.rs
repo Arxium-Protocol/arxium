@@ -145,6 +145,11 @@ pub enum AcceptBlockError {
         block_height: u64,
         claimed: usize,
         executed: usize,
+        /// State root computed from what actually executed so far (accounts/
+        /// stakes only — before whole-block sealing, which never runs on
+        /// this path). Best-effort, for citing in a dissent; not compared
+        /// against anything.
+        local_state_root: String,
     },
     #[error("block {height} claimed state root {claimed}, locally computed {expected} — proposer's state disagrees with ours")]
     StateRootMismatch {
@@ -154,6 +159,21 @@ pub enum AcceptBlockError {
     },
     #[error("on_block_sealed failed: {0}")]
     BlockSealed(String),
+}
+
+impl AcceptBlockError {
+    /// Does this rejection represent a disagreement about *execution* that
+    /// names the proposer, as opposed to a relay fault, a view mismatch, or
+    /// a local failure (e.g. our own storage breaking)? Only
+    /// `StateRootMismatch`/`ActionMismatch` genuinely disagree with what the
+    /// proposer executed; every other variant is ordering, signature, clock,
+    /// or a fault on this node alone — dissenting on those would accuse an
+    /// innocent proposer or self-slash a broken local disk. A new variant
+    /// added above without a matching arm here defaults to `false`, so a
+    /// silent miss fails closed (no dissent) rather than open.
+    pub fn is_execution_disagreement(&self) -> bool {
+        matches!(self, AcceptBlockError::StateRootMismatch { .. } | AcceptBlockError::ActionMismatch { .. })
+    }
 }
 
 /// Validates a block received from a peer — proposer signature, that the
@@ -329,10 +349,13 @@ where
         operator_updates,
     ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
+        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
             claimed,
             executed: applied.len(),
+            local_state_root,
         });
     }
 

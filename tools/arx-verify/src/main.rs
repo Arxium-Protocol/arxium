@@ -12,7 +12,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
-use xc_artifact::EvidenceArtifact;
+use xc_artifact::{EvidenceArtifact, Verdict};
 
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
@@ -38,11 +38,23 @@ fn main() -> ExitCode {
     };
 
     match xc_artifact::verify(&artifact) {
-        Ok(verdict) => {
+        Ok(Verdict::Culpable { fault, culpable_pubkey }) => {
             println!("VALID");
-            println!("fault: {}", verdict.fault);
+            println!("fault: {fault}");
             println!("genesis_hash: {}", artifact.genesis_hash);
-            println!("culpable_pubkey: {}", verdict.culpable_pubkey);
+            println!("culpable_pubkey: {culpable_pubkey}");
+            ExitCode::SUCCESS
+        }
+        Ok(Verdict::Disagreement { fault, parties }) => {
+            // Not a verdict — the artifact proves a genuine dispute exists,
+            // not who's at fault. Exit 0 because the artifact itself is
+            // well-formed and its signatures check out; it just doesn't
+            // resolve to a culprit the way an equivocation does.
+            println!("UNRESOLVED");
+            println!("fault: {fault}");
+            println!("genesis_hash: {}", artifact.genesis_hash);
+            println!("parties: {}", parties.join(", "));
+            println!("note: this artifact proves a proposer/validator execution disagreement, not who is at fault");
             ExitCode::SUCCESS
         }
         Err(err) => {

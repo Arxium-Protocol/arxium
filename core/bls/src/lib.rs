@@ -31,6 +31,7 @@ fn map_blst_err(err: BLST_ERROR) -> Result<(), BlsError> {
     if err == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::VerificationFailed) }
 }
 
+#[derive(Clone)]
 pub struct BlsSecretKey(SecretKey);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

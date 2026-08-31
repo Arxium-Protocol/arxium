@@ -7,9 +7,11 @@ license.workspace = true
 [dependencies]
 tracing = { workspace = true }
 serde = { workspace = true }
+metrics = { workspace = true }
 xc-primitives = { workspace = true }
 xc-bls = { workspace = true }
 xc-storage = { workspace = true }
+xc-poe = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

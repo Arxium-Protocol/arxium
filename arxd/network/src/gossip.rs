@@ -41,6 +41,12 @@ pub(crate) fn blocks_topic(chain_id: &str) -> String {
 pub(crate) fn precommits_topic(chain_id: &str) -> String {
     format!("arxium/precommits/v1/{chain_id}")
 }
+/// One pub/sub topic for dissents (`arxd_finality::Dissent`) — same rule as
+/// precommits: signature/voter/one-per-height validation happens in
+/// `arxd/finality`, not here.
+pub(crate) fn dissents_topic(chain_id: &str) -> String {
+    format!("arxium/dissents/v1/{chain_id}")
+}
 
 /// A peer sending this many unambiguously-bad gossip messages (undecodable
 /// bytes, forged signatures) in a row gets banned — see `record_bad_gossip`.

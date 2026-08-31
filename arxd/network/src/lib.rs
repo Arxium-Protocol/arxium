@@ -24,13 +24,13 @@ use std::thread;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
-use arxd_finality::PrecommitVote;
+use arxd_finality::{Dissent, PrecommitVote};
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
 
 use discovery::{dial_bootnodes, dial_discovered};
-use gossip::{actions_topic, blocks_topic, precommits_topic, record_bad_gossip};
+use gossip::{actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
     advance_stuck_tip, local_tip_height,
@@ -76,6 +76,7 @@ pub fn spawn_p2p_node<P: Payload>(
     gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
+    dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
     // Returns `true` if the block's signature is itself forged, so the
     // sending peer can be penalized — see `record_bad_gossip`. Second
     // argument is `sync`: true when applying a `SyncRequest::Blocks` page
@@ -85,6 +86,9 @@ pub fn spawn_p2p_node<P: Payload>(
     // Undecodable-bytes handling only — `arxd/finality` owns signature and
     // quorum validation, this crate just moves bytes.
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
+    // Same "undecodable bytes only" rule as `on_precommit_vote` — `arxd/finality`
+    // owns signature/voter/one-per-height validation for dissents too.
+    on_dissent: impl Fn(Dissent) + Send + 'static,
     // Same chain-specific admission hook RPC submission runs — see
     // `xc_mempool::PayloadPrecheck` doc comment. `None` for chains with no
     // such rules.
@@ -124,7 +128,7 @@ pub fn spawn_p2p_node<P: Payload>(
 
         runtime.block_on(run_swarm(
             keypair, listen_port, bootnodes, &chain_id, mempool, db, gossip_rx, block_rx, precommit_rx,
-            on_block, on_precommit_vote, payload_precheck, ready_tx,
+            dissent_rx, on_block, on_precommit_vote, on_dissent, payload_precheck, ready_tx,
         ));
     });
 
@@ -145,8 +149,10 @@ async fn run_swarm<P: Payload>(
     mut gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
     mut block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     mut precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
+    mut dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
     on_block: impl Fn(Block<P>, bool) -> bool + Send + 'static,
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
+    on_dissent: impl Fn(Dissent) + Send + 'static,
     payload_precheck: Option<PayloadPrecheck<P>>,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
@@ -170,6 +176,11 @@ async fn run_swarm<P: Payload>(
     }
     let precommits_topic = gossipsub::IdentTopic::new(precommits_topic(chain_id));
     if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&precommits_topic) {
+        let _ = ready_tx.send(Err(err.into()));
+        return;
+    }
+    let dissents_topic = gossipsub::IdentTopic::new(dissents_topic(chain_id));
+    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&dissents_topic) {
         let _ = ready_tx.send(Err(err.into()));
         return;
     }
@@ -268,6 +279,20 @@ async fn run_swarm<P: Payload>(
                         }
                     }
                     Err(err) => warn!("failed to encode precommit vote for gossip: {err}"),
+                }
+            }
+            dissent = dissent_rx.recv() => {
+                let Some(dissent) = dissent else {
+                    // Sender side (finality/node subsystem) is gone — nothing left to publish.
+                    continue;
+                };
+                match bincode::serde::encode_to_vec(&dissent, bincode::config::standard()) {
+                    Ok(bytes) => {
+                        if let Err(err) = swarm.behaviour_mut().gossipsub.publish(dissents_topic.clone(), bytes) {
+                            log_publish_error("dissent", &err);
+                        }
+                    }
+                    Err(err) => warn!("failed to encode dissent for gossip: {err}"),
                 }
             }
             event = swarm.select_next_some() => match event {
@@ -411,6 +436,30 @@ async fn run_swarm<P: Payload>(
                     };
                     counter!("arxium_gossip_accepted_total", "topic" => "precommits").increment(1);
                     on_precommit_vote(vote);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message,
+                    ..
+                })) if message.topic == dissents_topic.hash() => {
+                    let dissent: Dissent = match bincode::serde::decode_from_slice(
+                        &message.data,
+                        bincode::config::standard(),
+                    ) {
+                        Ok((dissent, _)) => dissent,
+                        Err(err) => {
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                "dissents",
+                                &format!("undecodable gossiped dissent: {err}"),
+                            );
+                            continue;
+                        }
+                    };
+                    counter!("arxium_gossip_accepted_total", "topic" => "dissents").increment(1);
+                    on_dissent(dissent);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
                     peer,
@@ -675,10 +724,11 @@ mod tests {
         let (_gossip_tx, gossip_rx) = tokio_mpsc::unbounded_channel();
         let (_block_tx, block_rx) = tokio_mpsc::unbounded_channel();
         let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
+        let (_dissent_tx, dissent_rx) = tokio_mpsc::unbounded_channel();
 
         let peer_id = spawn_p2p_node(
             &base_path, 0, &[], false, "test-chain", mempool, db, gossip_rx, block_rx, precommit_rx,
-            |_, _| false, |_| {}, None,
+            dissent_rx, |_, _| false, |_| {}, |_| {}, None,
         )
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());

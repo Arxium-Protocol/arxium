@@ -527,6 +527,61 @@ impl ArxiumDb {
         Ok(())
     }
 
+    /// One voter's persisted dissent at `height`, if any — used to enforce
+    /// one dissent per (height, voter).
+    pub fn get_dissent(&self, height: u64, voter: &Address) -> Result<Option<DissentRecord>, StorageError> {
+        let key = format!("meta:dissent:{height:020}:{voter}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (record, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Every persisted dissent at heights >= `cutoff` — mirrors
+    /// `get_precommit_votes_from`, used by `spawn_finality` on startup.
+    pub fn get_dissents_from(&self, cutoff: u64) -> Result<Vec<DissentRecord>, StorageError> {
+        let prefix = b"meta:dissent:";
+        let seek_key = format!("meta:dissent:{cutoff:020}");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (record, _len): (DissentRecord, usize) = bincode::serde::decode_from_slice(&value, config)?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    /// Deletes every persisted dissent at `height` — mirrors
+    /// `delete_precommit_votes`, called once `height` ages out of
+    /// `TALLY_RETENTION_HEIGHTS`.
+    pub fn delete_dissents(&self, height: u64) -> Result<(), StorageError> {
+        let prefix = format!("meta:dissent:{height:020}:");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_META), key);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     /// Look up a block's height by its content hash.
     pub fn get_block_height_by_hash(&self, hash: &str) -> Result<Option<u64>, StorageError> {
         let key = format!("block_hash:{}", hash);
@@ -854,11 +909,35 @@ pub struct PrecommitVoteRecord {
     pub block_hash: String,
     pub voter: Address,
     pub signature: BlsSignature,
+    pub ep: [u8; 32],
 }
 
 impl BatchWritable for PrecommitVoteRecord {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let key = format!("meta:precommit:{:020}:{}:{}", self.height, self.block_hash, self.voter).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
+/// One validator's persisted dissent for `height` — mirrors
+/// `PrecommitVoteRecord` exactly, including the `TALLY_RETENTION_HEIGHTS`
+/// pruning schedule; see `arxd_finality::Dissent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DissentRecord {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub ep: [u8; 32],
+    pub reason: String,
+    pub voter: Address,
+    pub signature: BlsSignature,
+}
+
+impl BatchWritable for DissentRecord {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:dissent:{:020}:{}", self.height, self.voter).into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
         Ok(vec![(key, value)])

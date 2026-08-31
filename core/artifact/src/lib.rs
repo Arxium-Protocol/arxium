@@ -8,7 +8,10 @@
 //! Deliberately depends on nothing chain-shaped (no `xc-primitives`, no
 //! storage, no node code) and encodes as JSON, not bincode: an artifact may
 //! be read by a stranger, possibly years from now, possibly not in Rust. It
-//! must stand on its own.
+//! must stand on its own. The one exception is `xc-bls`, itself a
+//! chain-agnostic crypto primitive (BLS12-381 signing/verification, no
+//! consensus or storage of its own) — needed to verify a `Dissent`'s
+//! signature for `Fault::ExecutionDisagreement`.
 //!
 //! Each block a fault cites contributes a `CanonicalHeader` + `signature`.
 //! `verify()` recomputes the signing bytes from the header itself — it does
@@ -21,6 +24,7 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use xc_bls::{BlsPublicKey, BlsSignature};
 
 /// Frozen once shipped: an artifact written today must still verify in ten
 /// years, so this never changes meaning, only grows new `Fault` variants.
@@ -95,10 +99,64 @@ pub struct BlockAttestation {
     pub signature: String,
 }
 
-/// One variant today, because equivocation is the only fault this codebase
-/// can currently produce — deliberately not a generic multi-fault
-/// framework. Tagged so more fault types have an obvious place to land
-/// later without breaking this one.
+/// A dissenting validator's signed claim that it independently executed a
+/// block and got a different result — the counterpart to a proposer's
+/// `BlockAttestation` for `Fault::ExecutionDisagreement`. Signing bytes are
+/// reimplemented here to byte-for-byte match `arxd_finality::dissent_signing_bytes`
+/// (same cross-crate duplication pattern as `signing_bytes_for` above, since
+/// this crate can't depend on `arxd-finality`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DissentAttestation {
+    pub height: u64,
+    pub block_hash: String,
+    /// State root the dissenter computed instead of the proposer's.
+    pub state_root: String,
+    /// Hex-encoded (`0x...`) 32-byte execution proof the dissenter computed.
+    pub ep: String,
+    /// Machine-readable reason tag (e.g. `"state_root_mismatch"`), the same
+    /// string `arxd_finality::DissentReason::as_str()` produces.
+    pub reason: String,
+    /// Bech32 address of the dissenting validator.
+    pub voter: String,
+    /// Hex-encoded (`0x...`) raw BLS12-381 public key (48 bytes) of the dissenter.
+    pub voter_pubkey: String,
+    /// Hex-encoded (`0x...`) BLS signature (96 bytes) over `dissent_signing_bytes`.
+    pub signature: String,
+}
+
+const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v1";
+
+fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// The exact bytes a dissenting validator signs — must match
+/// `arxd_finality::dissent_signing_bytes` byte-for-byte (pinned by a frozen
+/// vector test in each crate, mirroring `signing_bytes_for`/`CanonicalHeader`
+/// above).
+pub fn dissent_signing_bytes(
+    height: u64,
+    block_hash: &str,
+    state_root: &str,
+    ep: &[u8; 32],
+    reason: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_DISSENT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, block_hash.as_bytes());
+    push_field(&mut buf, state_root.as_bytes());
+    push_field(&mut buf, ep);
+    push_field(&mut buf, reason.as_bytes());
+    buf
+}
+
+/// Two fault kinds today: equivocation (a proposer double-signed) and
+/// execution disagreement (a dissenter's honest re-execution diverged from
+/// the proposer's claimed result — see module docs for why this crate can
+/// verify the dispute exists but not who's at fault). Tagged so more fault
+/// types have an obvious place to land later without breaking these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "fault", rename_all = "snake_case")]
 pub enum Fault {
@@ -107,6 +165,16 @@ pub enum Fault {
         proposer_pubkey: String,
         height: u64,
         blocks: [BlockAttestation; 2],
+    },
+    /// Deliberately does not name a culpable party: this artifact proves a
+    /// proposer and a validator disagree about execution, not which of them
+    /// is wrong. See `Verdict::Disagreement`.
+    ExecutionDisagreement {
+        /// Hex-encoded (`0x...`) raw Ed25519 public key of the proposer.
+        proposer_pubkey: String,
+        height: u64,
+        proposed: BlockAttestation,
+        dissent: DissentAttestation,
     },
 }
 
@@ -146,14 +214,40 @@ pub enum VerifyError {
     SameBlock,
     #[error("signature over block {0} does not verify against proposer_pubkey")]
     SignatureInvalid(usize),
+    #[error("dissent claims height {claimed} but the proposed block is at height {actual}")]
+    DisagreementHeightMismatch { claimed: u64, actual: u64 },
+    #[error("proposed block signature does not verify against proposer_pubkey")]
+    ProposedSignatureInvalid,
+    #[error("voter_pubkey must be 48 bytes, got {0}")]
+    BadBlsPubkeyLength(usize),
+    #[error("signature must be 96 bytes, got {0}")]
+    BadBlsSignatureLength(usize),
+    #[error("dissent signature does not verify against voter_pubkey")]
+    DissentSignatureInvalid,
+    #[error("dissent's state_root is identical to the proposed block's — not a disagreement")]
+    NoDisagreement,
 }
 
-/// What a verified artifact proves, once `verify()` accepts it.
+/// What a verified artifact proves, once `verify()` accepts it. Two shapes:
+/// `verify()` either names exactly who is at fault (`Culpable`, today only
+/// from equivocation, where both signatures came from the same key), or
+/// confirms a genuine dispute exists without resolving it (`Disagreement`,
+/// from execution disagreement — a proposer and a validator each signed a
+/// different result, and only re-execution by a third party can say who's
+/// right).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Verdict {
-    pub fault: &'static str,
-    /// Hex-encoded (`0x...`) raw Ed25519 public key of the culpable party.
-    pub culpable_pubkey: String,
+pub enum Verdict {
+    Culpable {
+        fault: &'static str,
+        /// Hex-encoded (`0x...`) raw Ed25519 public key of the culpable party.
+        culpable_pubkey: String,
+    },
+    Disagreement {
+        fault: &'static str,
+        /// Hex-encoded (`0x...`) identifiers of the disagreeing parties:
+        /// `[proposer_pubkey, voter_pubkey]`.
+        parties: Vec<String>,
+    },
 }
 
 /// The fixed header used to pin `signing_bytes_for`'s encoding against
@@ -233,7 +327,75 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 return Err(VerifyError::SameBlock);
             }
 
-            Ok(Verdict { fault: "equivocation", culpable_pubkey: proposer_pubkey.clone() })
+            Ok(Verdict::Culpable { fault: "equivocation", culpable_pubkey: proposer_pubkey.clone() })
+        }
+        Fault::ExecutionDisagreement { proposer_pubkey, height, proposed, dissent } => {
+            let pubkey_bytes = decode_hex("proposer_pubkey", proposer_pubkey)?;
+            let pubkey_bytes: [u8; 32] = pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadPubkeyLength(pubkey_bytes.len()))?;
+            let verifying_key =
+                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
+
+            if proposed.header.height != *height {
+                return Err(VerifyError::FaultHeightMismatch {
+                    claimed: *height,
+                    actual: proposed.header.height,
+                });
+            }
+            if dissent.height != *height {
+                return Err(VerifyError::DisagreementHeightMismatch {
+                    claimed: dissent.height,
+                    actual: *height,
+                });
+            }
+
+            let bytes = signing_bytes_for(&proposed.header)?;
+            let sig_bytes = decode_hex("signature", &proposed.signature)?;
+            let sig_bytes: [u8; 64] = sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
+            let signature = Signature::from_bytes(&sig_bytes);
+            verifying_key.verify(&bytes, &signature).map_err(|_| VerifyError::ProposedSignatureInvalid)?;
+
+            if proposed.header.state_root == dissent.state_root {
+                return Err(VerifyError::NoDisagreement);
+            }
+
+            let voter_pubkey_bytes = decode_hex("voter_pubkey", &dissent.voter_pubkey)?;
+            let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
+            let voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
+
+            let dissent_sig_bytes = decode_hex("signature", &dissent.signature)?;
+            let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
+            let dissent_signature = BlsSignature(dissent_sig_bytes);
+
+            let ep_bytes = decode_hex("ep", &dissent.ep)?;
+            let ep_bytes: [u8; 32] =
+                ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadPubkeyLength(ep_bytes.len()))?;
+
+            let dissent_msg = dissent_signing_bytes(
+                dissent.height,
+                &dissent.block_hash,
+                &dissent.state_root,
+                &ep_bytes,
+                &dissent.reason,
+            );
+            xc_bls::verify(&dissent_msg, &voter_pubkey, &dissent_signature)
+                .map_err(|_| VerifyError::DissentSignatureInvalid)?;
+
+            Ok(Verdict::Disagreement {
+                fault: "execution_disagreement",
+                parties: vec![proposer_pubkey.clone(), dissent.voter_pubkey.clone()],
+            })
         }
     }
 }
@@ -276,7 +438,7 @@ mod tests {
         let a = attestation(&key, header(5, 1, "arx1proposer"));
         let b = attestation(&key, header(5, 2, "arx1proposer"));
         let verdict = verify(&artifact(&key, [a, b], 5)).unwrap();
-        assert_eq!(verdict.fault, "equivocation");
+        assert!(matches!(verdict, Verdict::Culpable { fault: "equivocation", .. }));
     }
 
     #[test]
@@ -369,5 +531,122 @@ mod tests {
         let mut art = artifact(&key, [a, b], 5);
         art.artifact_version = 2;
         assert!(matches!(verify(&art), Err(VerifyError::UnsupportedVersion(2))));
+    }
+
+    fn dissent_attestation(
+        voter_sk: &xc_bls::BlsSecretKey,
+        voter_pubkey: &xc_bls::BlsPublicKey,
+        height: u64,
+        state_root: &str,
+    ) -> DissentAttestation {
+        let ep = [3u8; 32];
+        let msg = dissent_signing_bytes(height, "0xblockhash", state_root, &ep, "state_root_mismatch");
+        let signature = xc_bls::sign(voter_sk, &msg);
+        DissentAttestation {
+            height,
+            block_hash: "0xblockhash".to_string(),
+            state_root: state_root.to_string(),
+            ep: format!("0x{}", hex::encode(ep)),
+            reason: "state_root_mismatch".to_string(),
+            voter: "arx1voter".to_string(),
+            voter_pubkey: format!("0x{}", hex::encode(voter_pubkey.0)),
+            signature: format!("0x{}", hex::encode(signature.0)),
+        }
+    }
+
+    fn disagreement_artifact(
+        proposer_key: &SigningKey,
+        voter_sk: &xc_bls::BlsSecretKey,
+        voter_pubkey: &xc_bls::BlsPublicKey,
+        height: u64,
+    ) -> EvidenceArtifact {
+        let proposed = attestation(proposer_key, header(height, 1, "arx1proposer"));
+        let dissent = dissent_attestation(voter_sk, voter_pubkey, height, "0xdifferentstate");
+        EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::ExecutionDisagreement {
+                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                height,
+                proposed,
+                dissent,
+            },
+            human_readable: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn valid_execution_disagreement_verifies_as_disagreement_not_culpable() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
+        let verdict = verify(&art).unwrap();
+        match verdict {
+            Verdict::Disagreement { fault: "execution_disagreement", parties } => {
+                assert_eq!(parties.len(), 2);
+            }
+            other => panic!("expected Disagreement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forged_dissent_signature_is_rejected() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let (_, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let (other_sk, _) = xc_bls::keygen_from_seed(&[22u8; 32]).unwrap();
+        // Sign with a different key than the one named as voter_pubkey.
+        let art = disagreement_artifact(&proposer, &other_sk, &voter_pk, 5);
+        assert!(matches!(verify(&art), Err(VerifyError::DissentSignatureInvalid)));
+    }
+
+    #[test]
+    fn matching_state_roots_are_not_a_disagreement() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let proposed = attestation(&proposer, header(5, 1, "arx1proposer"));
+        // Dissenter's claimed state_root matches the proposer's ("0xstate", set by `header()`).
+        let dissent = dissent_attestation(&voter_sk, &voter_pk, 5, "0xstate");
+        let art = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::ExecutionDisagreement {
+                proposer_pubkey: format!("0x{}", hex::encode(proposer.verifying_key().as_bytes())),
+                height: 5,
+                proposed,
+                dissent,
+            },
+            human_readable: serde_json::json!({}),
+        };
+        assert!(matches!(verify(&art), Err(VerifyError::NoDisagreement)));
+    }
+
+    #[test]
+    fn disagreement_height_must_match() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        // Dissent signs height 99 while the proposed block and Fault claim height 5.
+        let mut art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
+        if let Fault::ExecutionDisagreement { dissent, .. } = &mut art.fault {
+            *dissent = dissent_attestation(&voter_sk, &voter_pk, 99, "0xdifferentstate");
+        }
+        assert!(matches!(
+            verify(&art),
+            Err(VerifyError::DisagreementHeightMismatch { claimed: 99, actual: 5 })
+        ));
+    }
+
+    /// `dissent_signing_bytes` must be pure/deterministic and sensitive to
+    /// every field, or two dissents that disagree in substance could collide
+    /// onto the same signed message (or the same dissent re-encode
+    /// differently between the signer and verifier).
+    #[test]
+    fn dissent_signing_bytes_is_deterministic_and_field_sensitive() {
+        let base = dissent_signing_bytes(5, "0xblock", "0xstate", &[1u8; 32], "state_root_mismatch");
+        assert_eq!(base, dissent_signing_bytes(5, "0xblock", "0xstate", &[1u8; 32], "state_root_mismatch"));
+        assert_ne!(base, dissent_signing_bytes(6, "0xblock", "0xstate", &[1u8; 32], "state_root_mismatch"));
+        assert_ne!(base, dissent_signing_bytes(5, "0xother", "0xstate", &[1u8; 32], "state_root_mismatch"));
+        assert_ne!(base, dissent_signing_bytes(5, "0xblock", "0xother", &[1u8; 32], "state_root_mismatch"));
+        assert_ne!(base, dissent_signing_bytes(5, "0xblock", "0xstate", &[2u8; 32], "state_root_mismatch"));
+        assert_ne!(base, dissent_signing_bytes(5, "0xblock", "0xstate", &[1u8; 32], "action_mismatch"));
     }
 }

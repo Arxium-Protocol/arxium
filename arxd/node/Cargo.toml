@@ -35,6 +35,7 @@ xc-evidence = { workspace = true }
 arxd-finality = { workspace = true }
 xc-runtime-api = { workspace = true }
 xc-poe = { workspace = true }
+xc-artifact = { workspace = true }
 
 [dev-dependencies]
 # arxd-node is generic over ChainRuntime and must never depend on

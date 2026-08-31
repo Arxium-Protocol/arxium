@@ -10,7 +10,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{info, warn};
-use xc_artifact::{BlockAttestation, CanonicalHeader, EvidenceArtifact, Fault, ARTIFACT_VERSION};
+use xc_artifact::{
+    BlockAttestation, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault, ARTIFACT_VERSION,
+};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
 use xc_storage::ArxiumDb;
@@ -70,12 +72,17 @@ pub fn verify_equivocation<P: Serialize>(
     Ok(proposer_a)
 }
 
-/// Fed to `spawn_evidence_watcher` whenever `arxd/node` sees a block competing for an
-/// already-committed height — the one signal this subsystem reacts to today.
-/// A single-variant enum so more event kinds (downtime signals,
-/// unbonding-due ticks) have an obvious place to land later.
+/// Fed to `spawn_evidence_watcher` by `arxd/node`. `BlockObserved` signals a
+/// block competing for an already-committed height (equivocation).
+/// `ExecutionDisagreement` signals a block `arxd/node` itself rejected on
+/// execution grounds, paired with the `Dissent` it signed and sent — built
+/// by the caller (`arxd/finality` owns the `Dissent` type and its signing;
+/// this crate only needs the already-signed, already-hex-encoded
+/// `DissentAttestation` to write the artifact, so it doesn't need to depend
+/// on `arxd/finality`).
 pub enum EvidenceEvent<P> {
     BlockObserved(Block<P>),
+    ExecutionDisagreement { proposed: Block<P>, dissent: DissentAttestation },
 }
 
 /// Builds a self-describing evidence artifact (see `xc_artifact`) from a
@@ -144,6 +151,69 @@ fn write_equivocation_artifact<P: Serialize>(
     }
 }
 
+/// Builds and writes an `ExecutionDisagreement` artifact from a block
+/// `arxd/node` rejected and the `Dissent` it signed over that rejection.
+/// Unlike equivocation, `verify()` on this artifact can't name a culpable
+/// party — see `xc_artifact::Verdict::Disagreement` — so this just records
+/// that the dispute happened, to `<evidence_dir>/<height>-disagreement-<voter>.json`.
+fn write_disagreement_artifact<P: Serialize>(
+    evidence_dir: &Path,
+    genesis_hash: [u8; 32],
+    proposer: &Address,
+    proposed: &Block<P>,
+    dissent: &DissentAttestation,
+) {
+    let proposer_pubkey = match proposer.pubkey_bytes() {
+        Ok(bytes) => format!("0x{}", hex::encode(bytes)),
+        Err(err) => {
+            warn!("evidence: failed to encode proposer pubkey for disagreement artifact: {err}");
+            return;
+        }
+    };
+    let attestation = BlockAttestation {
+        header: CanonicalHeader {
+            height: proposed.height,
+            parent_hash: proposed.parent_hash.clone(),
+            timestamp: proposed.timestamp,
+            tx_root: format!("0x{}", hex::encode(proposed.tx_root)),
+            proposer: proposer.to_string(),
+            state_root: proposed.state_root.clone(),
+        },
+        signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
+    };
+
+    let artifact = EvidenceArtifact {
+        artifact_version: ARTIFACT_VERSION,
+        genesis_hash: format!("0x{}", hex::encode(genesis_hash)),
+        fault: Fault::ExecutionDisagreement {
+            proposer_pubkey,
+            height: proposed.height,
+            proposed: attestation,
+            dissent: dissent.clone(),
+        },
+        human_readable: serde_json::json!({
+            "proposed": proposed,
+            "proposed_hash": proposed.hash(),
+        }),
+    };
+
+    if let Err(err) = std::fs::create_dir_all(evidence_dir) {
+        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        return;
+    }
+    let path = evidence_dir.join(format!("{}-disagreement-{}.json", proposed.height, dissent.voter));
+    match serde_json::to_vec_pretty(&artifact) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&path, bytes) {
+                warn!("evidence: failed to write artifact {}: {err}", path.display());
+            } else {
+                info!("evidence: wrote artifact {}", path.display());
+            }
+        }
+        Err(err) => warn!("evidence: failed to encode disagreement artifact for {proposer}: {err}"),
+    }
+}
+
 /// Runs on its own thread, reacting to `events`. `build_evidence_action` is
 /// `None` on a non-validator node — it still detects and logs equivocation,
 /// it just has no funded/nonced account to sign a report with.
@@ -166,7 +236,20 @@ where
 {
     thread::spawn(move || {
         for event in events {
-            let EvidenceEvent::BlockObserved(block) = event;
+            let block = match event {
+                EvidenceEvent::BlockObserved(block) => block,
+                EvidenceEvent::ExecutionDisagreement { proposed, dissent } => {
+                    let Some(proposer) = proposed.proposer.clone() else {
+                        warn!(
+                            "evidence: execution disagreement for unsigned block at height {}, skipping artifact",
+                            proposed.height
+                        );
+                        continue;
+                    };
+                    write_disagreement_artifact(&evidence_dir, genesis_hash, &proposer, &proposed, &dissent);
+                    continue;
+                }
+            };
             let existing: Option<Block<P>> = match db.get_block(block.height) {
                 Ok(existing) => existing,
                 Err(err) => {
@@ -284,6 +367,59 @@ mod tests {
         assert!(matches!(err, EvidenceError::Signature(_)));
     }
 
+    /// Exercises the `ExecutionDisagreement` event path: `arxd/node` hands
+    /// the watcher a block it rejected plus the `Dissent` it signed, and the
+    /// watcher must write a disagreement artifact to disk (not touch the
+    /// mempool — nobody is being slashed here).
+    #[test]
+    fn spawn_evidence_watcher_writes_disagreement_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-spawn-evidence-watcher-disagreement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = ArxiumDb::open(&dir).expect("open test db");
+
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let proposed = signed_block(&key, 5, 100);
+        let dissent = DissentAttestation {
+            height: 5,
+            block_hash: format!("0x{}", hex::encode(proposed.hash())),
+            state_root: "0xdisputed".to_string(),
+            ep: format!("0x{}", hex::encode([1u8; 32])),
+            reason: "state_root_mismatch".to_string(),
+            voter: "arx1voter".to_string(),
+            voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
+            signature: format!("0x{}", hex::encode([3u8; 96])),
+        };
+
+        let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        let evidence_dir = dir.join("evidence");
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            rx,
+            build_evidence_action,
+            evidence_dir.clone(),
+            [7u8; 32],
+        );
+
+        tx.send(EvidenceEvent::ExecutionDisagreement { proposed: proposed.clone(), dissent }).unwrap();
+        drop(tx);
+
+        let path = evidence_dir.join(format!("{}-disagreement-arx1voter.json", proposed.height));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "disagreement artifact was never written");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(artifact.fault, Fault::ExecutionDisagreement { height: 5, .. }));
+    }
+
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real
     /// competing gossiped block, minus the libp2p transport: stored block at
     /// the tip, a `BlockObserved` for a second block signed by the same
@@ -348,7 +484,12 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&artifact_path).expect("artifact written to disk"))
                 .expect("artifact is valid JSON");
         let verdict = xc_artifact::verify(&artifact).expect("artifact verifies standalone");
-        assert_eq!(verdict.culpable_pubkey, format!("0x{}", hex::encode(key.verifying_key().as_bytes())));
+        match verdict {
+            xc_artifact::Verdict::Culpable { culpable_pubkey, .. } => {
+                assert_eq!(culpable_pubkey, format!("0x{}", hex::encode(key.verifying_key().as_bytes())));
+            }
+            other => panic!("expected Culpable verdict, got {other:?}"),
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }

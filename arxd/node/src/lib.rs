@@ -20,10 +20,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
-use arxd_finality::{FinalityEvent, PrecommitVote, spawn_finality};
+use arxd_finality::{Dissent, DissentReason, FinalityEvent, PrecommitVote, dissent_signing_bytes, spawn_finality};
 use arxd_network::{identity, spawn_p2p_node};
+use xc_artifact::DissentAttestation;
 use xc_cli::{Cli, Command};
-use xc_executor::accept_block;
+use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
 use xc_rpc::spawn_http_ingest;
@@ -168,8 +169,10 @@ struct SubsystemHandles<R: ChainRuntime> {
     block_rx: tokio::sync::mpsc::UnboundedReceiver<Block<R::Payload>>,
     gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>,
     precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
+    dissent_rx: tokio::sync::mpsc::UnboundedReceiver<Dissent>,
     on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
+    on_dissent: Box<dyn Fn(Dissent) + Send>,
     payload_precheck: xc_mempool::PayloadPrecheck<R::Payload>,
     shutdown: Arc<AtomicBool>,
 }
@@ -253,6 +256,9 @@ fn spawn_subsystems<R: ChainRuntime>(
     let (finality_event_tx, finality_event_rx) =
         std_mpsc::channel::<FinalityEvent<R::Payload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
+    // `on_block` below also needs the BLS key to sign dissents on execution
+    // disagreement, so clone before `spawn_finality` consumes the original.
+    let bls_identity_for_dissent = bls_identity.clone();
     spawn_supervised(
         "finality",
         spawn_finality(
@@ -284,6 +290,15 @@ fn spawn_subsystems<R: ChainRuntime>(
             let _ = finality_event_tx.send(FinalityEvent::VoteObserved(vote));
         })
     };
+
+    let on_dissent: Box<dyn Fn(Dissent) + Send> = {
+        let finality_event_tx = finality_event_tx.clone();
+        Box::new(move |dissent: Dissent| {
+            let _ = finality_event_tx.send(FinalityEvent::DissentObserved(dissent));
+        })
+    };
+
+    let (dissent_tx, dissent_rx) = tokio::sync::mpsc::unbounded_channel::<Dissent>();
 
     // Shared between RPC submission and gossip receipt so a `JoinValidator`/
     // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
@@ -323,6 +338,8 @@ fn spawn_subsystems<R: ChainRuntime>(
         let evidence_tx = evidence_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
         let mempool = mempool.clone();
+        let bls_identity = bls_identity_for_dissent.clone();
+        let dissent_tx = dissent_tx.clone();
         Box::new(move |block: Block<R::Payload>, sync: bool| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
@@ -397,7 +414,69 @@ fn spawn_subsystems<R: ChainRuntime>(
                         debug!("rejected gossiped block: {err}");
                     } else {
                         warn!("rejected gossiped block: {err}");
-                        if let xc_executor::AcceptBlockError::NotNextHeight {
+                        if err.is_execution_disagreement() {
+                            if let Some((address, bls_key)) = &bls_identity {
+                                // Only these two variants can reach here — see
+                                // `AcceptBlockError::is_execution_disagreement`.
+                                let (state_root, reason) = match &err {
+                                    AcceptBlockError::StateRootMismatch { expected, .. } => {
+                                        (expected.clone(), DissentReason::StateRootMismatch)
+                                    }
+                                    AcceptBlockError::ActionMismatch { local_state_root, .. } => {
+                                        (local_state_root.clone(), DissentReason::ActionMismatch)
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                // ponytail: same self-consistent-fallback reasoning as
+                                // arxd_finality's precommit EP — an honest node hitting
+                                // a missing/unreadable parent falls back identically,
+                                // so this dissent's EP still lines up with what this
+                                // node's own precommit vote for the parent used.
+                                let parent_state_root =
+                                    match db.get_block::<R::Payload>(height.saturating_sub(1)) {
+                                        Ok(Some(parent)) => parent.state_root,
+                                        Ok(None) => String::new(),
+                                        Err(err) => {
+                                            warn!(
+                                                "failed to read parent block {} for dissent EP: {err}",
+                                                height.saturating_sub(1)
+                                            );
+                                            String::new()
+                                        }
+                                    };
+                                let block_hash = candidate.hash();
+                                let ep = xc_poe::block_ep(&parent_state_root, &candidate.tx_root, &state_root);
+                                let msg = dissent_signing_bytes(height, &block_hash, &state_root, &ep, reason.as_str());
+                                let signature = xc_bls::sign(bls_key, &msg);
+                                let dissent = Dissent {
+                                    height,
+                                    block_hash,
+                                    state_root,
+                                    ep,
+                                    reason,
+                                    voter: address.clone(),
+                                    signature,
+                                };
+                                let _ = finality_event_tx.send(FinalityEvent::DissentObserved(dissent.clone()));
+                                let _ = dissent_tx.send(dissent.clone());
+                                if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
+                                    let attestation = DissentAttestation {
+                                        height: dissent.height,
+                                        block_hash: dissent.block_hash.clone(),
+                                        state_root: dissent.state_root.clone(),
+                                        ep: format!("0x{}", hex::encode(dissent.ep)),
+                                        reason: reason.as_str().to_string(),
+                                        voter: address.to_string(),
+                                        voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                                        signature: format!("0x{}", hex::encode(dissent.signature.0)),
+                                    };
+                                    let _ = evidence_tx.send(EvidenceEvent::ExecutionDisagreement {
+                                        proposed: candidate.clone(),
+                                        dissent: attestation,
+                                    });
+                                }
+                            }
+                        } else if let xc_executor::AcceptBlockError::NotNextHeight {
                             block_height,
                             tip_height,
                         } = &err
@@ -449,8 +528,10 @@ fn spawn_subsystems<R: ChainRuntime>(
         block_rx,
         gossip_rx,
         precommit_rx,
+        dissent_rx,
         on_block,
         on_precommit_vote,
+        on_dissent,
         payload_precheck,
         shutdown,
     })
@@ -693,8 +774,10 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         block_rx,
         gossip_rx,
         precommit_rx,
+        dissent_rx,
         on_block,
         on_precommit_vote,
+        on_dissent,
         payload_precheck,
         shutdown,
     } = spawn_subsystems::<R>(
@@ -722,8 +805,10 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         gossip_rx,
         block_rx,
         precommit_rx,
+        dissent_rx,
         on_block,
         on_precommit_vote,
+        on_dissent,
         Some(payload_precheck.clone()),
     )?;
 

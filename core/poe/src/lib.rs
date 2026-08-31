@@ -36,6 +36,16 @@ pub fn execution_proof(
     hasher.finalize().into()
 }
 
+/// EP for a block, given its parent's post-state root. The single place
+/// this is derived: producer (`arxd/node/src/produce.rs`) and attester
+/// (`arxd/finality`) must not compute it two ways.
+///
+/// `resources_used` is hardcoded 0 until real metering exists — see
+/// `execution_proof`'s doc comment.
+pub fn block_ep(parent_state_root: &str, block_tx_root: &[u8; 32], block_state_root: &str) -> [u8; 32] {
+    execution_proof(parent_state_root, block_tx_root, block_state_root, 0)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("action failed to encode for hashing")]
 pub struct ActionEncodeError(#[from] bincode::error::EncodeError);
