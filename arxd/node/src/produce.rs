@@ -125,15 +125,10 @@ pub fn produce_block<R: ChainRuntime>(
     // format yet — purely to measure EP compute cost against real block
     // production time before it's wired into consensus.
     let poe_start = Instant::now();
-    // ponytail: resources_used has no real metering yet (PoE_v5_design.md
-    // doesn't define one) — action count stands in until gas/compute
-    // accounting exists.
-    let ep = xc_poe::execution_proof(
-        &parent.state_root,
-        &xc_poe::tx_root(&applied),
-        &state_root,
-        applied.len() as u64,
-    );
+    // resources_used: no real metering yet (PoE_v5_design.md never defines
+    // a unit) — 0 rather than a stand-in number that could be misread as a
+    // real measurement in logs/metrics.
+    let ep = xc_poe::execution_proof(&parent.state_root, &xc_poe::tx_root(&applied)?, &state_root, 0);
     histogram!("arxium_poe_ep_compute_nanos").record(poe_start.elapsed().as_nanos() as f64);
     info!(height = next_height, ep = %hex::encode(ep), "computed proof-of-execution hash");
 
