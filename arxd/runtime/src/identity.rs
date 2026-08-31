@@ -48,7 +48,7 @@ pub(crate) fn verify_identity_credential(
     let mut verified_entry = entry;
     verified_entry.zk_identity_verified = true;
     Ok(BlockUpdates {
-        accounts: AccountUpdates(std::collections::HashMap::from([(
+        accounts: AccountUpdates(std::collections::BTreeMap::from([(
             action.sender.clone(),
             verified_entry,
         )])),

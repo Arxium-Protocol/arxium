@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 use xc_circuit::{AccountKey, KvRead};
@@ -69,7 +69,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
     // itself in `updates` and mint balance out of nowhere) — just bump nonce.
     if to == sender {
         sender_entry.nonce += 1;
-        let mut updates = HashMap::new();
+        let mut updates = BTreeMap::new();
         updates.insert(sender.clone(), sender_entry);
         return Ok(AccountUpdates(updates));
     }
@@ -85,7 +85,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
     sender_entry.nonce += 1;
     receiver_entry.balance += amount;
 
-    let mut updates = HashMap::new();
+    let mut updates = BTreeMap::new();
     updates.insert(sender.clone(), sender_entry);
     updates.insert(to.clone(), receiver_entry);
 
@@ -123,7 +123,7 @@ mod tests {
     fn self_transfer_is_balance_neutral_and_bumps_nonce() {
         let db = temp_db();
         let sender = addr();
-        db.write_batch(&AccountUpdates(HashMap::from([(
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
             sender.clone(),
             AccountEntry {
                 balance: 100,

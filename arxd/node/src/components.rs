@@ -3,7 +3,7 @@
 
 use crate::validator;
 use anyhow::{Context, Result};
-use genesis::ChainSpec;
+use arxd_genesis::ChainSpec;
 use xc_runtime_api::ChainRuntime;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
@@ -73,14 +73,27 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     // against its own declared `state_root` inside `write_raw`, so a raw
     // spec generated for a different chain (or corrupted, or stale after an
     // encoding change) is refused here rather than silently installed; see
-    // `genesis::write_raw`'s doc comment.
+    // `arxd_genesis::write_raw`'s doc comment.
+    //
+    // Deliberately called directly, not through `ChainRuntime` — this is a
+    // decision, not an oversight: `arxd-node`'s consensus/finality path
+    // (`arxd_finality`, wired into every `run::<R>()` regardless of `R`) is
+    // BLS-quorum finality for every chain this crate runs, not something a
+    // `ChainRuntime` implementor opts into. `arxd_genesis::register_genesis_bls_keys`
+    // registers exactly the keys that same finality path requires to reach
+    // quorum, so it belongs with the other node-level, runtime-independent
+    // setup here rather than behind a `ChainRuntime::write_genesis` hook — a
+    // hook would let a runtime opt out of a requirement it doesn't actually
+    // have the freedom to opt out of. A validator entry missing `bls_pubkey`
+    // does not fail this call; it only warns (see `register_genesis_bls_keys`)
+    // and that validator simply cannot vote until it registers one.
     let (chain_name, boot_nodes, state_root) = match &chain_spec {
         ChainSpec::Plain(snapshot) => {
-            let state_root = genesis::write_plain(&db, snapshot)?;
+            let state_root = arxd_genesis::write_plain(&db, snapshot)?;
             (snapshot.chain_name.clone(), snapshot.boot_nodes.clone(), state_root)
         }
         ChainSpec::Raw(raw) => {
-            genesis::write_raw(&db, raw)?;
+            arxd_genesis::write_raw(&db, raw)?;
             (raw.chain_name.clone(), raw.boot_nodes.clone(), raw.state_root.clone())
         }
     };
@@ -291,7 +304,7 @@ mod tests {
         drop(plain.db);
 
         let devnet_spec = include_str!("../../runtime/specs/devnet.json");
-        let raw = genesis::derive_raw(devnet_spec).unwrap();
+        let raw = arxd_genesis::derive_raw(devnet_spec).unwrap();
         let raw_spec = ChainSpec::Raw(raw);
         let raw_json = serde_json::to_string(&raw_spec).unwrap();
 

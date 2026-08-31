@@ -1,5 +1,5 @@
 [package]
-name = "network"
+name = "arxd-network"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
@@ -15,5 +15,5 @@ xc-primitives = { workspace = true }
 xc-wire = { workspace = true }
 xc-mempool = { workspace = true }
 xc-storage = { workspace = true }
-finality = { workspace = true }
+arxd-finality = { workspace = true }
 libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub", "request-response", "cbor"] }

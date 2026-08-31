@@ -24,7 +24,7 @@ use std::thread;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
-use finality::PrecommitVote;
+use arxd_finality::PrecommitVote;
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;

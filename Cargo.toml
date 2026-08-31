@@ -17,6 +17,7 @@ members = [
     "core/rpc",
     "core/runtime-api",
     "core/evidence",
+    "core/poe",
     #
     "arxd/node",
     "arxd/runtime",
@@ -61,12 +62,13 @@ xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
 xc-runtime-api = { path = "core/runtime-api" }
 xc-evidence = { path = "core/evidence" }
+xc-poe = { path = "core/poe" }
 arxd-node = { path = "arxd/node" }
 arxd-runtime = { path = "arxd/runtime" }
-network = { path = "arxd/network" }
-finality = { path = "arxd/finality" }
-genesis = { path = "arxd/genesis" }
-spec-builder = { path = "arxd/spec-builder" }
+arxd-network = { path = "arxd/network" }
+arxd-finality = { path = "arxd/finality" }
+arxd-genesis = { path = "arxd/genesis" }
+arxd-spec-builder = { path = "arxd/spec-builder" }
 
 # external packages
 clap = { version = "4.4", features = ["derive", "env"] }

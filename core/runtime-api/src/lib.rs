@@ -16,6 +16,15 @@
 //! (`xc-storage`) and `BlockUpdates` (`xc-executor`), both of which already
 //! depend on `xc-primitives` — putting the trait there would be a dependency
 //! cycle.
+//!
+//! No `write_genesis` hook, deliberately: genesis writing
+//! (`arxd_genesis::write_plain`/`write_raw`, called directly from
+//! `arxd-node`'s `new_partial`) registers the BLS keys that `arxd-node`'s
+//! finality subsystem needs to reach quorum, and that subsystem runs
+//! identically for every `ChainRuntime` implementor — it is not something a
+//! runtime opts into. BLS finality is a node-level contract in this
+//! codebase, not a per-runtime choice, so genesis writing stays a node-level
+//! concern rather than a trait method a runtime could override or skip.
 
 use xc_evidence::EquivocationEvidence;
 use serde::{Serialize, de::DeserializeOwned};

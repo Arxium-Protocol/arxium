@@ -8,7 +8,7 @@
 // through the same `--chain` loader it uses for a preset name.
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use genesis::ChainSpec;
+use arxd_genesis::ChainSpec;
 use std::path::PathBuf;
 use xc_chain_spec::presets::PresetRegistry;
 
@@ -35,7 +35,7 @@ enum Command {
     /// and writes it back out — as-is for a plain build, or converted to the
     /// raw representation with `--raw`. A raw build re-derives the state
     /// root from the exact same code path a node boots through
-    /// (`genesis::write_plain`), so it can never drift from what booting the
+    /// (`arxd_genesis::write_plain`), so it can never drift from what booting the
     /// plain spec directly would produce.
     Build {
         /// Preset name (`devnet`, `local`) or path to a plain chain spec.
@@ -76,7 +76,7 @@ fn run_build(chain: &str, raw: bool, output: &std::path::Path) -> Result<()> {
     let spec_json = xc_chain_spec::resolve_chain_spec(chain, &CORECHAIN_PRESETS)?;
 
     let out_json = if raw {
-        let raw_spec = genesis::derive_raw(&spec_json)?;
+        let raw_spec = arxd_genesis::derive_raw(&spec_json)?;
         serde_json::to_vec_pretty(&ChainSpec::Raw(raw_spec))?
     } else {
         // Already tagged `"genesis_format": "plain"` by whoever authored it;

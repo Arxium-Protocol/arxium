@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use circuit_account::{AccountError, apply_transfer};
 use thiserror::Error;
@@ -61,7 +61,7 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
     entry.balance += amount;
     entry.nonce += 1;
 
-    let mut updates = HashMap::new();
+    let mut updates = BTreeMap::new();
     updates.insert(sender.clone(), entry);
     Ok(AccountUpdates(updates))
 }
@@ -142,7 +142,7 @@ mod tests {
         let kyc_recipient = addr(2);
         let non_kyc = addr(3);
 
-        db.write_batch(&AccountUpdates(HashMap::from([
+        db.write_batch(&AccountUpdates(BTreeMap::from([
             (
                 kyc_sender.clone(),
                 AccountEntry {

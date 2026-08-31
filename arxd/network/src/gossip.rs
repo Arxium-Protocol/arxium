@@ -35,7 +35,7 @@ pub(crate) fn actions_topic(chain_id: &str) -> String {
 pub(crate) fn blocks_topic(chain_id: &str) -> String {
     format!("arxium/blocks/v1/{chain_id}")
 }
-/// One pub/sub topic for BLS precommit votes (`finality::PrecommitVote`) —
+/// One pub/sub topic for BLS precommit votes (`arxd_finality::PrecommitVote`) —
 /// same "gossip is just another untrusted entry point" rule as actions;
 /// signature/voter/quorum validation happens in `arxd/finality`, not here.
 pub(crate) fn precommits_topic(chain_id: &str) -> String {

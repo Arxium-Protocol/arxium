@@ -878,7 +878,7 @@ impl BatchWritable for FinalityRecord {
 /// business logic — just the write-batch shape any circuit that touches
 /// accounts (`circuit-account`, `circuit-rwa-asset`, ...) hands back.
 #[derive(Debug, Default)]
-pub struct AccountUpdates(pub HashMap<Address, AccountEntry>);
+pub struct AccountUpdates(pub BTreeMap<Address, AccountEntry>);
 
 impl BatchWritable for AccountUpdates {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {

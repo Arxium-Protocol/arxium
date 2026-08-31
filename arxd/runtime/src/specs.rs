@@ -24,8 +24,8 @@ mod tests {
     fn corechain_presets_all_resolve_and_validate() {
         for name in CORECHAIN_PRESETS.names() {
             let json = CORECHAIN_PRESETS.get(name).unwrap();
-            let spec = genesis::ChainSpec::parse(json).unwrap_or_else(|e| panic!("preset {name:?} failed to parse: {e}"));
-            let genesis::ChainSpec::Plain(snapshot) = &spec else {
+            let spec = arxd_genesis::ChainSpec::parse(json).unwrap_or_else(|e| panic!("preset {name:?} failed to parse: {e}"));
+            let arxd_genesis::ChainSpec::Plain(snapshot) = &spec else {
                 panic!("preset {name:?} must be a plain spec");
             };
             snapshot.validate().unwrap_or_else(|e| panic!("preset {name:?} failed validation: {e}"));

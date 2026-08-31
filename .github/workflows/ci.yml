@@ -27,6 +27,15 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: arxd-node must not depend on CoreChain in production
+        shell: bash
+        run: |
+          # arxd-node is generic over ChainRuntime; a production dependency on
+          # arxd-runtime (CoreChain's concrete runtime) is exactly the coupling
+          # that once let a toy-chain node inherit a `pair` subcommand it
+          # couldn't decode. arxd-runtime is only a dev-dependency (tests).
+          ! cargo tree -p arxd-node -e normal -i arxd-runtime 2>/dev/null | grep -q arxd-runtime
+
       - name: Test the workspace
         shell: bash
         run: cargo test --workspace --locked

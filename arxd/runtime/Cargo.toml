@@ -31,4 +31,4 @@ ark-serialize = { workspace = true }
 
 [dev-dependencies]
 ark-std = { workspace = true }
-genesis = { workspace = true }
+arxd-genesis = { workspace = true }

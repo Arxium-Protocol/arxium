@@ -116,3 +116,19 @@ impl ChainRuntime for ToyRuntime {
 fn main() -> Result<()> {
     arxd_node::run::<ToyRuntime>()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ToyRuntime;
+    use xc_runtime_api::ChainRuntime;
+
+    /// toy-chain has no built-in presets (`ToyRuntime::presets()` is
+    /// `PresetRegistry::EMPTY`) — CoreChain's `devnet`/`local` names must
+    /// stay CoreChain-only, not silently resolve for a Spoke Chain node
+    /// that boots on unrelated genesis state. Regression test for the bug
+    /// this crate exists to catch: presets leaking across runtimes.
+    #[test]
+    fn devnet_preset_is_not_available_to_toy_chain() {
+        assert!(xc_chain_spec::resolve_chain_spec("devnet", ToyRuntime::presets()).is_err());
+    }
+}

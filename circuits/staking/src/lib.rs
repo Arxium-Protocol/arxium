@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
@@ -114,7 +114,7 @@ pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
     let mut treasury_entry = view.get(&AccountKey(&treasury))?.unwrap_or_else(default_account);
     treasury_entry.balance += treasury_fee_share;
 
-    let mut updates = HashMap::new();
+    let mut updates = BTreeMap::new();
     updates.insert(pool_account, pool_entry);
     updates.insert(proposer.clone(), proposer_entry);
     updates.insert(treasury, treasury_entry);
@@ -191,7 +191,7 @@ pub fn apply_stake<V: KvRead<Error = StorageError>>(
         },
     };
 
-    let mut account_updates = HashMap::new();
+    let mut account_updates = BTreeMap::new();
     account_updates.insert(master.clone(), master_entry);
     account_updates.insert(sub_account, sub_entry);
 
@@ -242,7 +242,7 @@ pub fn apply_unstake<V: KvRead<Error = StorageError>>(
     existing.updated_at = now_height;
     master_entry.nonce += 1;
 
-    let mut account_updates = HashMap::new();
+    let mut account_updates = BTreeMap::new();
     account_updates.insert(master.clone(), master_entry);
 
     let mut stake_updates = StakeUpdates::default();
@@ -303,7 +303,7 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
     // ponytail: burned, not credited anywhere — deliberate v1 default. A
     // treasury-credit would go right here once that circuit exists.
 
-    let mut account_updates = HashMap::new();
+    let mut account_updates = BTreeMap::new();
     account_updates.insert(sub_account, sub_entry);
 
     let mut stake_updates = StakeUpdates::default();
@@ -363,7 +363,7 @@ pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
     view: &V,
     due: Vec<StakeAllocation>,
 ) -> Result<(AccountUpdates, StakeUpdates), StorageError> {
-    let mut overlay: HashMap<Address, AccountEntry> = HashMap::new();
+    let mut overlay: BTreeMap<Address, AccountEntry> = BTreeMap::new();
     let mut stake_updates = StakeUpdates::default();
 
     for mut allocation in due {
@@ -425,7 +425,7 @@ mod tests {
     }
 
     fn write_balance(db: &ArxiumDb, address: &Address, balance: u128) {
-        let mut updates = HashMap::new();
+        let mut updates = BTreeMap::new();
         updates.insert(address.clone(), AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false });
         db.write_batch(&AccountUpdates(updates)).unwrap();
     }
@@ -808,7 +808,7 @@ mod tests {
         // just bumped to 1 above survives — `write_balance` always resets it to 0.)
         let mut entry = db.get_account(&master).unwrap().unwrap();
         entry.balance = 1;
-        let mut updates = HashMap::new();
+        let mut updates = BTreeMap::new();
         updates.insert(master.clone(), entry);
         db.write_batch(&AccountUpdates(updates)).unwrap();
 

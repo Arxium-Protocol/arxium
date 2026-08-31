@@ -485,7 +485,7 @@ mod tests {
     use circuit_account::apply_transfer;
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use xc_primitives::{AccountEntry, StakeAllocation, expected_proposer};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -645,7 +645,7 @@ mod tests {
         })
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
-        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+        db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
 
         let block1 = Block {
@@ -676,7 +676,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let bob = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
 
-        db.write_batch(&AccountUpdates(HashMap::from([(
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
             alice.clone(),
             AccountEntry {
                 balance: 100,
@@ -760,7 +760,7 @@ mod tests {
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
-            &AccountUpdates(HashMap::from([(
+            &AccountUpdates(BTreeMap::from([(
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,
@@ -811,7 +811,7 @@ mod tests {
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
-            &AccountUpdates(HashMap::from([(
+            &AccountUpdates(BTreeMap::from([(
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,
@@ -849,7 +849,7 @@ mod tests {
         // Sub-account must actually hold the unbonding amount — it's what
         // `resolve_due_unbonding` debits back to alice.
         let sub_account = circuit_staking::stake_subaccount(&validator);
-        db.write_batch(&AccountUpdates(HashMap::from([(
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
             sub_account,
             AccountEntry {
                 balance: 300,
@@ -910,7 +910,7 @@ mod tests {
         })
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
-        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+        db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
 
         // No actions, but the block reward still touches state (see
@@ -1063,7 +1063,7 @@ mod tests {
         })
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
-        db.write_batches(&[&AccountUpdates(HashMap::new()), &genesis])
+        db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
 
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
@@ -1204,7 +1204,7 @@ mod tests {
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
-            &AccountUpdates(HashMap::from([(
+            &AccountUpdates(BTreeMap::from([(
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,

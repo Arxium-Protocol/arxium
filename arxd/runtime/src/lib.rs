@@ -532,7 +532,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use test_support::*;
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use xc_storage::{AccountUpdates, BlsKeyRegistration, OperatorUpdates, ValidatorSetSnapshot};
 
     // admission_precheck runs against a real ArxiumDb (unlike the
@@ -563,7 +563,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(HashMap::from([(bob.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(bob.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: bob,
@@ -584,7 +584,7 @@ mod tests {
     fn admission_precheck_rejects_below_minimum_stake() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(HashMap::from([(alice.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: alice.clone(),
@@ -605,7 +605,7 @@ mod tests {
     fn admission_precheck_rejects_leaving_the_last_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(&[alice.clone()]);
-        db.write_batches(&[&AccountUpdates(HashMap::from([(alice.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: alice.clone(),
@@ -622,7 +622,7 @@ mod tests {
     fn admission_precheck_accepts_authorized_sufficient_join() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(HashMap::from([(alice.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: alice.clone(),
@@ -645,7 +645,7 @@ mod tests {
         let db = precheck_test_db(&[]);
         let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey }]).unwrap();
-        db.write_batches(&[&AccountUpdates(HashMap::from([(alice.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: alice.clone(),
@@ -672,7 +672,7 @@ mod tests {
             operator_index: std::collections::BTreeMap::from([(bob.clone(), vec![alice.clone()])]),
         }])
         .unwrap();
-        db.write_batches(&[&AccountUpdates(HashMap::from([(bob.clone(), funded(ACTION_FEE))]))])
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(bob.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {
             sender: bob,

@@ -4,8 +4,8 @@
 use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, SLOT_DURATION, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
-use finality::FinalityEvent;
-use metrics::{counter, gauge};
+use arxd_finality::FinalityEvent;
+use metrics::{counter, gauge, histogram};
 use xc_runtime_api::ChainRuntime;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -119,6 +119,23 @@ pub fn produce_block<R: ChainRuntime>(
         overlay
     };
     let state_root = db.compute_state_root(&state_root_overlay)?;
+
+    // PoE v5 (observation-only, see PoE_v5_design.md): logs and times the
+    // execution-proof hash but doesn't touch the signed block or wire
+    // format yet — purely to measure EP compute cost against real block
+    // production time before it's wired into consensus.
+    let poe_start = Instant::now();
+    // ponytail: resources_used has no real metering yet (PoE_v5_design.md
+    // doesn't define one) — action count stands in until gas/compute
+    // accounting exists.
+    let ep = xc_poe::execution_proof(
+        &parent.state_root,
+        &xc_poe::tx_root(&applied),
+        &state_root,
+        applied.len() as u64,
+    );
+    histogram!("arxium_poe_ep_compute_nanos").record(poe_start.elapsed().as_nanos() as f64);
+    info!(height = next_height, ep = %hex::encode(ep), "computed proof-of-execution hash");
 
     let mut new_block = Block {
         height: next_height,

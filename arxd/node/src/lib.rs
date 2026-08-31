@@ -20,8 +20,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
-use finality::{FinalityEvent, PrecommitVote, spawn_finality};
-use network::{identity, spawn_p2p_node};
+use arxd_finality::{FinalityEvent, PrecommitVote, spawn_finality};
+use arxd_network::{identity, spawn_p2p_node};
 use xc_cli::{Cli, Command};
 use xc_executor::accept_block;
 use xc_mempool::Mempool;
@@ -457,7 +457,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
     if let Some(Command::NodeKey { base_path }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
         let keypair = identity::load_or_generate_keypair(base_path)?;
-        println!("{}", network::PeerId::from(keypair.public()));
+        println!("{}", arxd_network::PeerId::from(keypair.public()));
         return Ok(());
     }
 
@@ -474,7 +474,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
         let bls_hex = hex::encode(bls_pubkey.0);
         let peer_id =
-            network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
+            arxd_network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
 
         // Built from `ValidatorEntry` itself rather than hand-written JSON, so
         // the field names cannot drift from what the spec loader expects —
@@ -608,9 +608,9 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             return Ok(());
         }
         let spec_json = xc_chain_spec::resolve_chain_spec(chain, R::presets())?;
-        let chain_spec = genesis::ChainSpec::parse(&spec_json)?;
+        let chain_spec = arxd_genesis::ChainSpec::parse(&spec_json)?;
         match &chain_spec {
-            genesis::ChainSpec::Plain(snapshot) => {
+            arxd_genesis::ChainSpec::Plain(snapshot) => {
                 snapshot
                     .validate()
                     .context("chain spec failed validation")?;
@@ -627,7 +627,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
                 println!("accounts:       {}", snapshot.accounts.len());
                 println!("boot nodes:     {}", snapshot.boot_nodes.len());
             }
-            genesis::ChainSpec::Raw(raw) => {
+            arxd_genesis::ChainSpec::Raw(raw) => {
                 println!(
                     "format:         raw (format_version {})",
                     raw.format_version

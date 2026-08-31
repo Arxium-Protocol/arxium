@@ -385,19 +385,66 @@ dependencies = [
 ]
 
 [[package]]
+name = "arxd-finality"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 3.0.0",
+ "serde",
+ "tracing",
+ "xc-bls",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "arxd-genesis"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "blst",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tracing",
+ "xc-bls",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "arxd-network"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arxd-finality",
+ "bincode",
+ "libp2p",
+ "metrics",
+ "serde",
+ "tokio",
+ "tracing",
+ "xc-mempool",
+ "xc-primitives",
+ "xc-storage",
+ "xc-wire",
+]
+
+[[package]]
 name = "arxd-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arxd-finality",
+ "arxd-genesis",
+ "arxd-network",
  "arxd-runtime",
  "clap",
  "ed25519-dalek 3.0.0",
- "finality",
- "genesis",
  "hex",
  "metrics",
  "metrics-exporter-prometheus",
- "network",
  "qrcode",
  "rand 0.9.5",
  "serde",
@@ -413,6 +460,7 @@ dependencies = [
  "xc-evidence",
  "xc-executor",
  "xc-mempool",
+ "xc-poe",
  "xc-primitives",
  "xc-rpc",
  "xc-runtime-api",
@@ -427,12 +475,12 @@ dependencies = [
  "ark-bls12-381",
  "ark-serialize",
  "ark-std",
+ "arxd-genesis",
  "blst",
  "circuit-account",
  "circuit-identity-zk",
  "circuit-staking",
  "ed25519-dalek 3.0.0",
- "genesis",
  "hex",
  "qrcode",
  "serde",
@@ -445,6 +493,17 @@ dependencies = [
  "xc-primitives",
  "xc-runtime-api",
  "xc-storage",
+]
+
+[[package]]
+name = "arxd-spec-builder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arxd-genesis",
+ "clap",
+ "serde_json",
+ "xc-chain-spec",
 ]
 
 [[package]]
@@ -1499,18 +1558,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
 
 [[package]]
-name = "finality"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek 3.0.0",
- "serde",
- "tracing",
- "xc-bls",
- "xc-primitives",
- "xc-storage",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1676,23 +1723,6 @@ checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
 dependencies = [
  "typenum",
  "version_check",
-]
-
-[[package]]
-name = "genesis"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "blst",
- "hex",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tracing",
- "xc-bls",
- "xc-primitives",
- "xc-storage",
 ]
 
 [[package]]
@@ -3040,24 +3070,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "network"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bincode",
- "finality",
- "libp2p",
- "metrics",
- "serde",
- "tokio",
- "tracing",
- "xc-mempool",
- "xc-primitives",
- "xc-storage",
- "xc-wire",
-]
-
-[[package]]
 name = "nix"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4128,17 +4140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "spec-builder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "genesis",
- "serde_json",
- "xc-chain-spec",
-]
-
-[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5136,6 +5137,16 @@ dependencies = [
  "thiserror 2.0.19",
  "xc-primitives",
  "xc-storage",
+]
+
+[[package]]
+name = "xc-poe"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "sha2 0.11.0",
+ "xc-primitives",
 ]
 
 [[package]]
