@@ -97,6 +97,26 @@ mod reject_severity_tests {
     }
 }
 
+/// `arxd-node` is the only crate that already depends on both `arxd-finality`
+/// and `xc-artifact`, so it's the natural home for a direct cross-crate
+/// equality check on top of the frozen-vector test each of those two crates
+/// carries individually (`frozen_dissent_signing_bytes_vector`). Neither
+/// frozen vector alone can catch the two copies drifting apart — each only
+/// proves its own crate is internally self-consistent — so this is the test
+/// that actually enforces the invariant the doc comments on both functions
+/// claim.
+#[cfg(test)]
+mod dissent_cross_crate_tests {
+    #[test]
+    fn dissent_signing_bytes_match_across_crates() {
+        let ep = [7u8; 32];
+        assert_eq!(
+            arxd_finality::dissent_signing_bytes(5, "0xblock", "0xstate", &ep, "state_root_mismatch"),
+            xc_artifact::dissent_signing_bytes(5, "0xblock", "0xstate", &ep, "state_root_mismatch"),
+        );
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -416,22 +436,38 @@ fn spawn_subsystems<R: ChainRuntime>(
                         warn!("rejected gossiped block: {err}");
                         if err.is_execution_disagreement() {
                             if let Some((address, bls_key)) = &bls_identity {
-                                // Only these two variants can reach here — see
-                                // `AcceptBlockError::is_execution_disagreement`.
-                                let (state_root, reason) = match &err {
+                                // Only these two variants should reach here — see
+                                // `AcceptBlockError::is_execution_disagreement`. That
+                                // classifier lives in a different crate than this
+                                // match, though, so a future variant added there
+                                // without a matching arm here must not panic the
+                                // block-handling path: skip the dissent instead.
+                                let dissent_fields = match &err {
                                     AcceptBlockError::StateRootMismatch { expected, .. } => {
-                                        (expected.clone(), DissentReason::StateRootMismatch)
+                                        Some((expected.clone(), DissentReason::StateRootMismatch))
                                     }
                                     AcceptBlockError::ActionMismatch { local_state_root, .. } => {
-                                        (local_state_root.clone(), DissentReason::ActionMismatch)
+                                        Some((local_state_root.clone(), DissentReason::ActionMismatch))
                                     }
-                                    _ => unreachable!(),
+                                    _ => {
+                                        warn!(
+                                            "is_execution_disagreement() true for a variant this match doesn't \
+                                             handle ({err}) — skipping dissent, not panicking"
+                                        );
+                                        None
+                                    }
                                 };
-                                // ponytail: same self-consistent-fallback reasoning as
-                                // arxd_finality's precommit EP — an honest node hitting
-                                // a missing/unreadable parent falls back identically,
-                                // so this dissent's EP still lines up with what this
-                                // node's own precommit vote for the parent used.
+                                if let Some((state_root, reason)) = dissent_fields {
+                                // TODO(security): a node that can't read its own
+                                // parent falls back to computing its EP from `""`
+                                // rather than staying quiet — safe for *agreement*
+                                // between honest nodes (every honest node hits the
+                                // same fallback, so quorum still forms), but once
+                                // dissent carries slashing consequences this is a
+                                // signed claim built on data the node never actually
+                                // read. Should go quiet here instead, same principle
+                                // that excludes `Storage` errors from
+                                // `is_execution_disagreement` in the first place.
                                 let parent_state_root =
                                     match db.get_block::<R::Payload>(height.saturating_sub(1)) {
                                         Ok(Some(parent)) => parent.state_root,
@@ -474,6 +510,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         proposed: candidate.clone(),
                                         dissent: attestation,
                                     });
+                                }
                                 }
                             }
                         } else if let xc_executor::AcceptBlockError::NotNextHeight {

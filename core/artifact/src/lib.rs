@@ -132,9 +132,11 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// The exact bytes a dissenting validator signs — must match
-/// `arxd_finality::dissent_signing_bytes` byte-for-byte (pinned by a frozen
-/// vector test in each crate, mirroring `signing_bytes_for`/`CanonicalHeader`
-/// above).
+/// `arxd_finality::dissent_signing_bytes` byte-for-byte. Pinned by
+/// `frozen_dissent_signing_bytes_vector` below, its twin in
+/// `arxd/finality/src/lib.rs`, and `dissent_signing_bytes_match_across_crates`
+/// in `arxd/node/src/lib.rs` (the only crate that already depends on both),
+/// mirroring `signing_bytes_for`/`CanonicalHeader` above.
 pub fn dissent_signing_bytes(
     height: u64,
     block_hash: &str,
@@ -520,6 +522,24 @@ mod tests {
         assert_eq!(
             hex::encode(&bytes),
             "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f7448617368",
+        );
+    }
+
+    /// Pins `dissent_signing_bytes`'s exact output against a hardcoded hex
+    /// vector, twinned with `frozen_dissent_signing_bytes_vector` in
+    /// `arxd/finality/src/lib.rs`. If either crate's encoding drifts from
+    /// the other, one of the two copies fails loudly instead of silently —
+    /// every previously-issued disagreement artifact would otherwise
+    /// quietly stop verifying. `dissent_signing_bytes_match_across_crates`
+    /// in `arxd/node/src/lib.rs` covers the same invariant directly (that
+    /// crate depends on both), but a frozen vector also catches a drift
+    /// where both crates change in lockstep to the same *wrong* answer.
+    #[test]
+    fn frozen_dissent_signing_bytes_vector() {
+        let bytes = dissent_signing_bytes(5, "0xblockhash", "0xstateroot", &[7u8; 32], "state_root_mismatch");
+        assert_eq!(
+            hex::encode(&bytes),
+            "110000000000000061727869756d2f64697373656e742f7631080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f7420000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
         );
     }
 

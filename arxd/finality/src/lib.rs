@@ -36,9 +36,11 @@ pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> 
 
 /// Exact bytes a dissenting validator signs. Must match
 /// `xc_artifact::dissent_signing_bytes` byte-for-byte — that crate can't
-/// depend on this one, so it carries its own copy, pinned by a frozen
-/// vector test in each crate (same pattern as `xc_artifact::signing_bytes_for`
-/// vs. `core/primitives`).
+/// depend on this one, so it carries its own copy. Pinned by
+/// `frozen_dissent_signing_bytes_vector` below, its twin in
+/// `core/artifact/src/lib.rs`, and `dissent_signing_bytes_match_across_crates`
+/// in `arxd/node/src/lib.rs` (the only crate that already depends on both),
+/// mirroring `xc_artifact::signing_bytes_for` vs. `core/primitives`.
 pub fn dissent_signing_bytes(height: u64, block_hash: &str, state_root: &str, ep: &[u8; 32], reason: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_DISSENT);
@@ -429,6 +431,24 @@ mod tests {
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
         (ArxiumDb::open(&dir).expect("open test db"), dir)
+    }
+
+    /// Pins `dissent_signing_bytes`'s exact output against a hardcoded hex
+    /// vector, twinned with `frozen_dissent_signing_bytes_vector` in
+    /// `core/artifact/src/lib.rs`. If either crate's encoding drifts from
+    /// the other, one of the two copies fails loudly instead of silently —
+    /// every previously-issued disagreement artifact would otherwise
+    /// quietly stop verifying. `dissent_signing_bytes_match_across_crates`
+    /// in `arxd/node/src/lib.rs` covers the same invariant directly (that
+    /// crate depends on both), but a frozen vector also catches a drift
+    /// where both crates change in lockstep to the same *wrong* answer.
+    #[test]
+    fn frozen_dissent_signing_bytes_vector() {
+        let bytes = dissent_signing_bytes(5, "0xblockhash", "0xstateroot", &[7u8; 32], "state_root_mismatch");
+        assert_eq!(
+            hex::encode(&bytes),
+            "110000000000000061727869756d2f64697373656e742f7631080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f7420000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
+        );
     }
 
     #[test]
