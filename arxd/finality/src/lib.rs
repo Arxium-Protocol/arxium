@@ -17,7 +17,7 @@ use xc_storage::{ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord};
 // can never be replayed as a dissent (or vice versa) even though both cover
 // overlapping fields (height, a hash, an EP).
 const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
-const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v1";
+const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v2";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -41,12 +41,20 @@ pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> 
 /// `core/artifact/src/lib.rs`, and `dissent_signing_bytes_match_across_crates`
 /// in `arxd/node/src/lib.rs` (the only crate that already depends on both),
 /// mirroring `xc_artifact::signing_bytes_for` vs. `core/primitives`.
-pub fn dissent_signing_bytes(height: u64, block_hash: &str, state_root: &str, ep: &[u8; 32], reason: &str) -> Vec<u8> {
+pub fn dissent_signing_bytes(
+    height: u64,
+    block_hash: &str,
+    state_root: &str,
+    header_commitment: &[u8; 32],
+    ep: &[u8; 32],
+    reason: &str,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_DISSENT);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, state_root.as_bytes());
+    push_field(&mut buf, header_commitment);
     push_field(&mut buf, ep);
     push_field(&mut buf, reason.as_bytes());
     buf
@@ -83,6 +91,12 @@ pub struct Dissent {
     pub height: u64,
     pub block_hash: String,
     pub state_root: String,
+    /// `sha256(signing_bytes_for(disputed block's header))` — binds this
+    /// dissent to the exact block it disagrees with, since `block_hash`
+    /// alone is an opaque chain-internal hash a verifier holding only the
+    /// resulting evidence artifact can't recompute. See
+    /// `xc_artifact::DissentAttestation::header_commitment`.
+    pub header_commitment: [u8; 32],
     pub ep: [u8; 32],
     pub reason: DissentReason,
     pub voter: Address,
@@ -378,7 +392,14 @@ fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::Sto
         return Ok(());
     };
     let reason = dissent.reason.as_str();
-    let msg = dissent_signing_bytes(dissent.height, &dissent.block_hash, &dissent.state_root, &dissent.ep, reason);
+    let msg = dissent_signing_bytes(
+        dissent.height,
+        &dissent.block_hash,
+        &dissent.state_root,
+        &dissent.header_commitment,
+        &dissent.ep,
+        reason,
+    );
     if xc_bls::verify(&msg, &pubkey, &dissent.signature).is_err() {
         warn!("finality: dropping dissent from {} with an invalid signature", dissent.voter);
         return Ok(());
@@ -399,6 +420,7 @@ fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::Sto
         height: dissent.height,
         block_hash: dissent.block_hash,
         state_root: dissent.state_root,
+        header_commitment: dissent.header_commitment,
         ep: dissent.ep,
         reason: reason.to_string(),
         voter: dissent.voter,
@@ -444,10 +466,17 @@ mod tests {
     /// where both crates change in lockstep to the same *wrong* answer.
     #[test]
     fn frozen_dissent_signing_bytes_vector() {
-        let bytes = dissent_signing_bytes(5, "0xblockhash", "0xstateroot", &[7u8; 32], "state_root_mismatch");
+        let bytes = dissent_signing_bytes(
+            5,
+            "0xblockhash",
+            "0xstateroot",
+            &[9u8; 32],
+            &[7u8; 32],
+            "state_root_mismatch",
+        );
         assert_eq!(
             hex::encode(&bytes),
-            "110000000000000061727869756d2f64697373656e742f7631080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f7420000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
+            "110000000000000061727869756d2f64697373656e742f7632080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f742000000000000000090909090909090909090909090909090909090909090909090909090909090920000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
         );
     }
 
@@ -634,13 +663,15 @@ mod tests {
 
     fn dissent_fixture(voter: Address, sk: &BlsSecretKey, height: u64, block_hash: &str) -> Dissent {
         let state_root = "0xdisputed".to_string();
+        let header_commitment = [4u8; 32];
         let ep = [9u8; 32];
         let reason = DissentReason::StateRootMismatch;
-        let msg = dissent_signing_bytes(height, block_hash, &state_root, &ep, reason.as_str());
+        let msg = dissent_signing_bytes(height, block_hash, &state_root, &header_commitment, &ep, reason.as_str());
         Dissent {
             height,
             block_hash: block_hash.to_string(),
             state_root,
+            header_commitment,
             ep,
             reason,
             voter,

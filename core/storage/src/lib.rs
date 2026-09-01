@@ -933,6 +933,11 @@ pub struct DissentRecord {
     pub reason: String,
     pub voter: Address,
     pub signature: BlsSignature,
+    /// `sha256(signing_bytes_for(disputed block's header))` — binds this
+    /// dissent to the exact block it disagrees with, since `block_hash` is
+    /// an opaque chain-internal hash a verifier holding only this record
+    /// cannot recompute. See `arxd_finality::Dissent::header_commitment`.
+    pub header_commitment: [u8; 32],
 }
 
 impl BatchWritable for DissentRecord {

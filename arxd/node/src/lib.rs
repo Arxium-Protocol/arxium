@@ -12,6 +12,7 @@ use clap::Parser;
 use ed25519_dalek::Signer;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -109,10 +110,25 @@ mod reject_severity_tests {
 mod dissent_cross_crate_tests {
     #[test]
     fn dissent_signing_bytes_match_across_crates() {
+        let header_commitment = [4u8; 32];
         let ep = [7u8; 32];
         assert_eq!(
-            arxd_finality::dissent_signing_bytes(5, "0xblock", "0xstate", &ep, "state_root_mismatch"),
-            xc_artifact::dissent_signing_bytes(5, "0xblock", "0xstate", &ep, "state_root_mismatch"),
+            arxd_finality::dissent_signing_bytes(
+                5,
+                "0xblock",
+                "0xstate",
+                &header_commitment,
+                &ep,
+                "state_root_mismatch"
+            ),
+            xc_artifact::dissent_signing_bytes(
+                5,
+                "0xblock",
+                "0xstate",
+                &header_commitment,
+                &ep,
+                "state_root_mismatch"
+            ),
         );
     }
 }
@@ -482,12 +498,26 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     };
                                 let block_hash = candidate.hash();
                                 let ep = xc_poe::block_ep(&parent_state_root, &candidate.tx_root, &state_root);
-                                let msg = dissent_signing_bytes(height, &block_hash, &state_root, &ep, reason.as_str());
+                                let proposer = candidate
+                                    .proposer
+                                    .as_ref()
+                                    .expect("signature already verified, proposer present");
+                                let header_commitment: [u8; 32] =
+                                    Sha256::digest(candidate.signing_bytes(proposer)).into();
+                                let msg = dissent_signing_bytes(
+                                    height,
+                                    &block_hash,
+                                    &state_root,
+                                    &header_commitment,
+                                    &ep,
+                                    reason.as_str(),
+                                );
                                 let signature = xc_bls::sign(bls_key, &msg);
                                 let dissent = Dissent {
                                     height,
                                     block_hash,
                                     state_root,
+                                    header_commitment,
                                     ep,
                                     reason,
                                     voter: address.clone(),
@@ -500,6 +530,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         height: dissent.height,
                                         block_hash: dissent.block_hash.clone(),
                                         state_root: dissent.state_root.clone(),
+                                        header_commitment: format!("0x{}", hex::encode(dissent.header_commitment)),
                                         ep: format!("0x{}", hex::encode(dissent.ep)),
                                         reason: reason.as_str().to_string(),
                                         voter: address.to_string(),

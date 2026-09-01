@@ -386,6 +386,7 @@ mod tests {
             height: 5,
             block_hash: format!("0x{}", hex::encode(proposed.hash())),
             state_root: "0xdisputed".to_string(),
+            header_commitment: format!("0x{}", hex::encode([4u8; 32])),
             ep: format!("0x{}", hex::encode([1u8; 32])),
             reason: "state_root_mismatch".to_string(),
             voter: "arx1voter".to_string(),
