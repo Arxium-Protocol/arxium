@@ -4,20 +4,24 @@
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 use xc_primitives::{Address, Block, quorum};
-use xc_storage::{ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord};
+use xc_storage::{
+    ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord, RoundCertificate,
+    RoundTimeoutVoteRecord,
+};
 
 // Domain tags, mixed into what gets signed, so a signature over a precommit
-// can never be replayed as a dissent (or vice versa) even though both cover
-// overlapping fields (height, a hash, an EP).
+// can never be replayed as a dissent (or a round-timeout vote, or vice versa)
+// even though they can share fields (height).
 const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
 const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v2";
+const DOMAIN_ROUND_TIMEOUT: &[u8] = b"arxium/round_timeout/v1";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -57,6 +61,17 @@ pub fn dissent_signing_bytes(
     push_field(&mut buf, header_commitment);
     push_field(&mut buf, ep);
     push_field(&mut buf, reason.as_bytes());
+    buf
+}
+
+/// Exact bytes a validator signs for a round-timeout vote — see
+/// `xc_primitives::eligible_proposer` and `RoundCertificate` (B1b,
+/// `Arxium_OpenItems.md` §7).
+pub fn round_timeout_signing_bytes(height: u64, round: u32) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_ROUND_TIMEOUT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, &round.to_le_bytes());
     buf
 }
 
@@ -143,27 +158,62 @@ pub struct PrecommitVote {
     pub ep: [u8; 32],
 }
 
+/// One validator's BLS-signed claim that `round` at `height` timed out with
+/// no block produced — gossiped over `arxd/network`'s round-timeout topic
+/// and fed back into `spawn_finality` on every node, including the signer's
+/// own, same shape as `PrecommitVote`. Once a quorum of these for the same
+/// `(height, round)` aggregate, `tally_round_timeout` persists a
+/// `RoundCertificate`, which is what actually advances `eligible_proposer`'s
+/// round — see `Arxium_OpenItems.md` §7 (B1b).
+#[derive(Clone, Serialize, serde::Deserialize)]
+pub struct RoundTimeoutVote {
+    pub height: u64,
+    pub round: u32,
+    pub voter: Address,
+    pub signature: BlsSignature,
+}
+
+/// How long `spawn_finality` waits without the chain tip advancing before
+/// signing a round-timeout vote for the current round of the next height.
+///
+/// Deliberately a standalone copy rather than importing `arxd/node`'s
+/// `SLOT_DURATION`/`STALL_SUSPECT_AFTER`: `arxd/finality` is a lower layer
+/// that `arxd/node` depends on, so the reverse import isn't available.
+/// 8s is double `arxd/node::BLOCK_INTERVAL` (2s) — the same "one full slot"
+/// reasoning `SLOT_DURATION` uses, kept in sync by convention since both
+/// values are small, rarely-changed constants.
+#[cfg(not(test))]
+const ROUND_TIMEOUT: Duration = Duration::from_secs(8);
+// ponytail: short interval so timeout-triggering tests don't sleep 8s.
+#[cfg(test)]
+const ROUND_TIMEOUT: Duration = Duration::from_millis(150);
+
 /// Fed to `spawn_finality`: either a block this node just accepted/produced
-/// (triggers signing a precommit, if this node has a BLS identity), a
-/// precommit vote received from a peer (tallied toward quorum), or a dissent
-/// (verified, tallied one-per-voter, and persisted — but never contributes
-/// to a precommit quorum; see `handle_dissent`).
+/// (triggers signing a precommit, if this node has a BLS identity, and
+/// resets the round-timeout clock below), a precommit vote received from a
+/// peer (tallied toward quorum), a dissent (verified, tallied one-per-voter,
+/// and persisted — but never contributes to a precommit quorum; see
+/// `handle_dissent`), or a round-timeout vote received from a peer (tallied
+/// toward a `RoundCertificate`; see `tally_round_timeout`).
 pub enum FinalityEvent<P> {
     BlockObserved(Block<P>),
     VoteObserved(PrecommitVote),
     DissentObserved(Dissent),
+    RoundTimeoutObserved(RoundTimeoutVote),
 }
 
 /// Runs on its own thread. `bls_identity` is `Some((address, secret_key))`
 /// on a node that holds a registered BLS key — it still tallies and
 /// finalizes without one, it just can't contribute a vote. `vote_tx` is
-/// where freshly-signed precommits go out to be gossiped; `events` carries
-/// both locally-observed blocks and incoming peer votes.
+/// where freshly-signed precommits go out to be gossiped; `round_timeout_tx`
+/// is the same for round-timeout votes; `events` carries locally-observed
+/// blocks and incoming peer votes/dissents/round-timeouts.
 pub fn spawn_finality<P>(
     db: ArxiumDb,
     bls_identity: Option<(Address, BlsSecretKey)>,
     events: Receiver<FinalityEvent<P>>,
     vote_tx: Sender<PrecommitVote>,
+    round_timeout_tx: Sender<RoundTimeoutVote>,
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -178,6 +228,23 @@ where
         // This node's own not-yet-finalized votes, kept so they can be
         // re-sent on VOTE_REBROADCAST_INTERVAL — see the constant's doc.
         let mut my_votes: HashMap<u64, PrecommitVote> = HashMap::new();
+
+        // (height, round) -> voter -> signature; mirrors `tallies` above but
+        // keyed by round too, since more than one round of a single height
+        // can be mid-tally at once (an earlier round's stragglers arriving
+        // after a later round already got certified).
+        let mut round_timeout_tallies: HashMap<(u64, u32), HashMap<Address, BlsSignature>> = HashMap::new();
+        // This node's own not-yet-certified round-timeout votes — mirrors
+        // `my_votes`.
+        let mut my_round_timeout_votes: HashMap<(u64, u32), RoundTimeoutVote> = HashMap::new();
+        // (highest height with a block observed, when it was observed) —
+        // the round-timeout clock: if this stays untouched for
+        // `ROUND_TIMEOUT`, this node signs a round-timeout vote for the
+        // current round of the next height. Starts at "now" rather than a
+        // zero `Instant` so a freshly-started node gets one full
+        // `ROUND_TIMEOUT` of grace before it starts accusing round 0 of the
+        // chain's very first height.
+        let mut last_progress: (u64, Instant) = (0, Instant::now());
 
         // Highest height seen from either event kind, used as the pruning
         // watermark below.
@@ -220,6 +287,23 @@ where
             Err(err) => warn!("finality: failed to reload persisted dissents: {err}"),
         }
 
+        match db.get_round_timeout_votes_from(0) {
+            Ok(records) => {
+                highest_seen = highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
+                let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
+                for record in records {
+                    if record.height < cutoff {
+                        continue;
+                    }
+                    round_timeout_tallies
+                        .entry((record.height, record.round))
+                        .or_default()
+                        .insert(record.voter, record.signature);
+                }
+            }
+            Err(err) => warn!("finality: failed to reload persisted round-timeout votes: {err}"),
+        }
+
         loop {
             let event = match events.recv_timeout(VOTE_REBROADCAST_INTERVAL) {
                 Ok(event) => event,
@@ -228,6 +312,43 @@ where
                         if vote_tx.send(vote.clone()).is_err() {
                             warn!("finality: vote channel closed, stopping");
                             return;
+                        }
+                    }
+                    for vote in my_round_timeout_votes.values() {
+                        if round_timeout_tx.send(vote.clone()).is_err() {
+                            warn!("finality: round-timeout vote channel closed, stopping");
+                            return;
+                        }
+                    }
+                    if let Some((address, secret_key)) = &bls_identity {
+                        if last_progress.1.elapsed() >= ROUND_TIMEOUT {
+                            let next_height = last_progress.0 + 1;
+                            match db.current_round(next_height) {
+                                Ok(round) => {
+                                    let already_certified =
+                                        matches!(db.get_round_certificate(next_height, round), Ok(Some(_)));
+                                    if !already_certified
+                                        && !my_round_timeout_votes.contains_key(&(next_height, round))
+                                    {
+                                        let msg = round_timeout_signing_bytes(next_height, round);
+                                        let signature = xc_bls::sign(secret_key, &msg);
+                                        let vote = RoundTimeoutVote {
+                                            height: next_height,
+                                            round,
+                                            voter: address.clone(),
+                                            signature,
+                                        };
+                                        my_round_timeout_votes.insert((vote.height, vote.round), vote.clone());
+                                        if round_timeout_tx.send(vote).is_err() {
+                                            warn!("finality: round-timeout vote channel closed, stopping");
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    warn!("finality: failed to read current round for height {next_height}: {err}")
+                                }
+                            }
                         }
                     }
                     continue;
@@ -239,7 +360,13 @@ where
                 FinalityEvent::BlockObserved(block) => block.height,
                 FinalityEvent::VoteObserved(vote) => vote.height,
                 FinalityEvent::DissentObserved(dissent) => dissent.height,
+                FinalityEvent::RoundTimeoutObserved(vote) => vote.height,
             });
+            if let FinalityEvent::BlockObserved(block) = &event {
+                if block.height > last_progress.0 {
+                    last_progress = (block.height, Instant::now());
+                }
+            }
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
@@ -253,6 +380,16 @@ where
             }
             tallies.retain(|height, _| *height >= cutoff);
             my_votes.retain(|height, _| *height >= cutoff);
+            for key in round_timeout_tallies.keys().copied().filter(|(h, _)| *h < cutoff).collect::<Vec<_>>() {
+                if let Err(err) = db.delete_round_timeout_votes(key.0, key.1) {
+                    warn!(
+                        "finality: failed to prune persisted round-timeout votes for height {} round {}: {err}",
+                        key.0, key.1
+                    );
+                }
+            }
+            round_timeout_tallies.retain(|(height, _), _| *height >= cutoff);
+            my_round_timeout_votes.retain(|(height, _), _| *height >= cutoff);
 
             match event {
                 FinalityEvent::BlockObserved(block) => {
@@ -291,6 +428,13 @@ where
                 FinalityEvent::DissentObserved(dissent) => {
                     if let Err(err) = handle_dissent(&db, dissent) {
                         warn!("finality: failed to process dissent: {err}");
+                    }
+                }
+                FinalityEvent::RoundTimeoutObserved(vote) => {
+                    if let Err(err) =
+                        tally_round_timeout(&db, &mut round_timeout_tallies, &mut my_round_timeout_votes, vote)
+                    {
+                        warn!("finality: failed to process round-timeout vote: {err}");
                     }
                 }
             }
@@ -374,6 +518,95 @@ fn tally_vote(
     tallies.remove(&vote.height);
     my_votes.remove(&vote.height);
     info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
+    Ok(())
+}
+
+/// Mirrors `tally_vote` exactly, but for round-timeout votes: verifies
+/// signature and validator membership, persists the vote, and once a
+/// quorum for `(height, round)` is reached, aggregates and persists a
+/// `RoundCertificate` — which is what actually makes `round + 1` eligible
+/// (see `xc_storage::ArxiumDb::current_round`).
+fn tally_round_timeout(
+    db: &ArxiumDb,
+    tallies: &mut HashMap<(u64, u32), HashMap<Address, BlsSignature>>,
+    my_votes: &mut HashMap<(u64, u32), RoundTimeoutVote>,
+    vote: RoundTimeoutVote,
+) -> Result<(), xc_storage::StorageError> {
+    if db.get_round_certificate(vote.height, vote.round)?.is_some() {
+        return Ok(()); // already certified, nothing left to tally
+    }
+
+    let Some(pubkey) = db.get_bls_pubkey(&vote.voter)? else {
+        warn!("finality: round-timeout vote from {} with no registered BLS key, dropping", vote.voter);
+        return Ok(());
+    };
+    let msg = round_timeout_signing_bytes(vote.height, vote.round);
+    if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
+        warn!("finality: dropping round-timeout vote from {} with an invalid signature", vote.voter);
+        return Ok(());
+    }
+
+    let validators = db.get_validator_set_at(vote.height)?;
+    if !validators.contains(&vote.voter) {
+        warn!(
+            "finality: dropping round-timeout vote from {}, not a validator at height {}",
+            vote.voter, vote.height
+        );
+        return Ok(());
+    }
+
+    let vote_record = RoundTimeoutVoteRecord {
+        height: vote.height,
+        round: vote.round,
+        voter: vote.voter.clone(),
+        signature: vote.signature.clone(),
+    };
+
+    let key = (vote.height, vote.round);
+    let signers = tallies.entry(key).or_default();
+    signers.insert(vote.voter, vote.signature);
+
+    // Persisted before the quorum check so a crash between this vote and
+    // reaching quorum still leaves it recoverable on restart.
+    db.write_batches(&[&vote_record])?;
+
+    if signers.len() < quorum(validators.len()) {
+        return Ok(());
+    }
+
+    let pubkeys: Vec<BlsPublicKey> = signers
+        .keys()
+        .filter_map(|addr| db.get_bls_pubkey(addr).ok().flatten())
+        .collect();
+    let sigs: Vec<BlsSignature> = signers.values().cloned().collect();
+    let Ok(aggregate_signature) = xc_bls::aggregate(&sigs) else {
+        warn!("finality: failed to aggregate round-timeout signatures for height {} round {}", vote.height, vote.round);
+        return Ok(());
+    };
+    if xc_bls::verify_aggregate(&msg, &pubkeys, &aggregate_signature).is_err() {
+        warn!(
+            "finality: aggregate round-timeout signature failed to verify for height {} round {}",
+            vote.height, vote.round
+        );
+        return Ok(());
+    }
+
+    let record = RoundCertificate {
+        height: vote.height,
+        round: vote.round,
+        signers: signers.keys().cloned().collect(),
+        aggregate_signature,
+    };
+    db.write_batches(&[&record])?;
+    if let Err(err) = db.delete_round_timeout_votes(vote.height, vote.round) {
+        warn!(
+            "finality: failed to delete persisted round-timeout votes for certified height {} round {}: {err}",
+            vote.height, vote.round
+        );
+    }
+    tallies.remove(&key);
+    my_votes.remove(&key);
+    info!("finality: round {} at height {} certified as timed out with {} signers", vote.round, vote.height, record.signers.len());
     Ok(())
 }
 
@@ -746,7 +979,8 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
-        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx);
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
         let expected_hash = block.hash();
@@ -772,7 +1006,8 @@ mod tests {
 
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
-        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx);
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
         event_tx.send(FinalityEvent::BlockObserved(block)).unwrap();
@@ -834,5 +1069,127 @@ mod tests {
         assert_eq!(quorum(3), 3);
         assert_eq!(quorum(4), 3);
         assert_eq!(quorum(7), 5);
+    }
+
+    fn round_timeout_validators(db: &ArxiumDb, count: u8) -> Vec<(Address, BlsSecretKey)> {
+        let addrs_and_keys: Vec<(Address, BlsSecretKey)> = (0u8..count)
+            .map(|i| {
+                let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
+                let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+                let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                (addr, sk)
+            })
+            .collect();
+        let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        addrs_and_keys
+    }
+
+    fn round_timeout_vote(addr: &Address, sk: &BlsSecretKey, height: u64, round: u32) -> RoundTimeoutVote {
+        RoundTimeoutVote {
+            height,
+            round,
+            voter: addr.clone(),
+            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(height, round)),
+        }
+    }
+
+    /// Mirrors `no_finality_record_below_quorum_then_one_appears_at_quorum`:
+    /// no `RoundCertificate` exists below quorum, and one appears — signed
+    /// by exactly the voters who tallied — the moment quorum is reached.
+    #[test]
+    fn no_round_certificate_below_quorum_then_one_appears_at_quorum() {
+        let (db, dir) = open_test_db();
+        let addrs_and_keys = round_timeout_validators(&db, 4);
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+
+        for (addr, sk) in &addrs_and_keys[..2] {
+            tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+        }
+        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "below quorum (2 of 4) must not certify");
+
+        let (addr, sk) = &addrs_and_keys[2];
+        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+
+        let record = db.get_round_certificate(5, 0).unwrap().expect("expected a certificate at quorum");
+        assert_eq!(record.signers.len(), 3);
+        assert_eq!(db.current_round(5).unwrap(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Mirrors `votes_agreeing_on_block_hash_but_disagreeing_on_ep_do_not_aggregate`:
+    /// votes for different rounds of the same height must tally separately —
+    /// a quorum on round 0 must not also certify round 1.
+    #[test]
+    fn votes_for_different_rounds_do_not_cross_aggregate() {
+        let (db, dir) = open_test_db();
+        let addrs_and_keys = round_timeout_validators(&db, 3);
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+
+        let (addr0, sk0) = &addrs_and_keys[0];
+        let (addr1, sk1) = &addrs_and_keys[1];
+        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr0, sk0, 5, 0)).unwrap();
+        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr1, sk1, 5, 1)).unwrap();
+
+        assert!(db.get_round_certificate(5, 0).unwrap().is_none());
+        assert!(db.get_round_certificate(5, 1).unwrap().is_none());
+        assert_eq!(db.current_round(5).unwrap(), 0, "neither round has reached quorum yet");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Once a round is certified, a late vote for that same round is a
+    /// no-op — mirrors `tally_vote`'s "already finalized" short-circuit.
+    #[test]
+    fn a_vote_for_an_already_certified_round_is_a_no_op() {
+        let (db, dir) = open_test_db();
+        let addrs_and_keys = round_timeout_validators(&db, 3);
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+
+        for (addr, sk) in &addrs_and_keys {
+            tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+        }
+        assert_eq!(db.current_round(5).unwrap(), 1);
+
+        // A 4th, unregistered voter's vote arrives after certification.
+        let late_key = SigningKey::from_bytes(&[9u8; 32]);
+        let late_addr = Address::from_pubkey_bytes(late_key.verifying_key().as_bytes()).unwrap();
+        let (late_sk, _pk) = xc_bls::keygen_from_seed(&[99u8; 32]).unwrap();
+        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(&late_addr, &late_sk, 5, 0))
+            .unwrap();
+
+        // Still exactly the original 3 signers, no crash, no round change.
+        let record = db.get_round_certificate(5, 0).unwrap().unwrap();
+        assert_eq!(record.signers.len(), 3);
+        assert_eq!(db.current_round(5).unwrap(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `spawn_finality` signs and emits a round-timeout vote once the chain
+    /// tip has been stuck (no `BlockObserved`) for `ROUND_TIMEOUT`.
+    #[test]
+    fn spawn_finality_signs_a_round_timeout_vote_once_the_tip_stalls() {
+        let (db, dir) = open_test_db();
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (_vote_tx, _vote_rx) = mpsc::channel();
+        let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
+        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, _vote_tx, round_timeout_tx);
+
+        let vote =
+            round_timeout_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a round-timeout vote");
+        assert_eq!(vote.height, 1); // last_progress starts at height 0, so next_height is 1
+        assert_eq!(vote.round, 0);
+        assert_eq!(vote.voter, addr);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

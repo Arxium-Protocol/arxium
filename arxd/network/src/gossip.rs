@@ -47,6 +47,13 @@ pub(crate) fn precommits_topic(chain_id: &str) -> String {
 pub(crate) fn dissents_topic(chain_id: &str) -> String {
     format!("arxium/dissents/v1/{chain_id}")
 }
+/// One pub/sub topic for round-timeout votes
+/// (`arxd_finality::RoundTimeoutVote`) — same rule as precommits: signature/
+/// voter/quorum validation happens in `arxd/finality`, not here. See
+/// `Arxium_OpenItems.md` §7 (B1b).
+pub(crate) fn round_timeouts_topic(chain_id: &str) -> String {
+    format!("arxium/round_timeouts/v1/{chain_id}")
+}
 
 /// A peer sending this many unambiguously-bad gossip messages (undecodable
 /// bytes, forged signatures) in a row gets banned — see `record_bad_gossip`.

@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{AccountKey, BlsKeyKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
@@ -33,14 +33,118 @@ pub enum StorageError {
 
     #[error("corrupted metadata value in storage")]
     CorruptedMeta,
+
+    #[error(
+        "database schema version {found} is newer than this binary supports ({supported}) — upgrade the binary before opening this database"
+    )]
+    SchemaTooNew { found: u32, supported: u32 },
+
+    #[error(
+        "database schema version {found} predates what this binary requires ({supported}) and no migration from {found} is implemented — wipe and resync, or run a binary built for version {found}"
+    )]
+    SchemaTooOld { found: u32, supported: u32 },
 }
 
-const COLUMN_FAMILIES: [&str; 4] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS];
+/// Content-addressed Merkle-trie nodes (`B3`) — keyed by node hash, so a
+/// fresh vs. legacy DB is entirely a matter of whether this CF exists yet,
+/// gated by `SCHEMA_VERSION` below rather than a runtime probe.
+const CF_MERKLE: &str = "merkle";
+
+const COLUMN_FAMILIES: [&str; 5] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE];
+
+/// On-disk layout version this binary understands — covers column-family
+/// layout and key encoding (`cf_for_key`, `Block`'s bincode shape, etc; NOT
+/// the higher-level `Block.state_root`/consensus-format changes tracked
+/// separately). Bump this and add a migration arm in `migrate_schema` below
+/// whenever one of those changes (e.g. `CF_BLOCKS`'s planned re-keying for
+/// finality-gated commit).
+///
+/// ponytail: no migration runner exists yet because no forward migration is
+/// implemented — `open` below fails closed on any mismatch (older *or*
+/// newer) rather than guessing, which is the actual prerequisite (a version
+/// marker that makes silent drift impossible); the forward-migration code
+/// itself is naturally added the day it's actually needed, in
+/// `migrate_schema`.
+///
+/// Bumped 1 -> 2 for `B3`: `compute_state_root` moved from a full
+/// `CF_ACCOUNTS`+`CF_VALIDATORS` rescan to an incremental Merkle trie backed
+/// by the new `CF_MERKLE` CF (see `compute_state_root`'s doc comment). A
+/// version-1 DB has no trie built for its already-written state, so it's
+/// refused rather than silently treated as an empty trie — wipe and resync
+/// on a matching binary, same policy `Arxium_OpenItems.md` §7 already
+/// documents for this class of change.
+pub const SCHEMA_VERSION: u32 = 2;
+
+const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
+const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
+
+/// Whether `key` is covered by the `B3` state trie / `compute_state_root` —
+/// the same `CF_ACCOUNTS`/`CF_VALIDATORS`-only scope the old full-rescan
+/// implementation used.
+fn is_state_key(key: &[u8]) -> bool {
+    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS)
+}
+
+fn hash_key(key: &[u8]) -> [u8; 32] {
+    Sha256::digest(key).into()
+}
+
+/// Domain-separated from `internal_hash` (leading `0x00` vs `0x01`) so a
+/// leaf and an internal node can never collide in `CF_MERKLE`'s shared
+/// hash-keyed namespace.
+fn leaf_hash(key_hash: &[u8; 32], value: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([0x00]);
+    hasher.update(key_hash);
+    hasher.update(value);
+    hasher.finalize().into()
+}
+
+fn internal_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([0x01]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
+/// Bit `level` (0 = most significant) of a 256-bit path — which child to
+/// descend into at that level of the trie.
+fn bit_at(hash: &[u8; 32], level: usize) -> u8 {
+    (hash[level / 8] >> (7 - level % 8)) & 1
+}
+
+/// `defaults[d]` is the root hash of a subtree of depth `d` containing no
+/// occupied leaves — `defaults[0]` is the canonical "empty leaf" sentinel,
+/// `defaults[d] = internal_hash(defaults[d-1], defaults[d-1])` for `d` up to
+/// 256 (an empty whole trie). Precomputed once per process: descending into
+/// an empty subtree checks against this table instead of touching
+/// `CF_MERKLE`, which is what keeps updating a mostly-empty trie cheap.
+fn default_hashes() -> &'static [[u8; 32]; 257] {
+    static DEFAULTS: OnceLock<[[u8; 32]; 257]> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let mut table = [[0u8; 32]; 257];
+        for depth in 1..=256 {
+            table[depth] = internal_hash(&table[depth - 1], &table[depth - 1]);
+        }
+        table
+    })
+}
 
 /// Which column family a key belongs in, derived from its prefix rather than
 /// tracked separately at each call site — one place to keep in sync with the
 /// `format!("prefix:...")` calls below instead of every `get`/`put` call
 /// needing its own CF argument.
+///
+/// `CF_MERKLE` is the one exception to "prefix": its keys are raw 32-byte
+/// node hashes, not `format!`-built strings, so they're recognized by shape
+/// instead — safe because every other key in this codebase is a
+/// human-readable ASCII prefix well over 32 bytes long, so a real 32-byte
+/// key can only be a merkle node hash. This branch only matters for
+/// `arxd/genesis`'s raw-artifact export/verify round trip, which tags every
+/// entry with its CF generically and cross-checks it here; ordinary reads
+/// and writes always name `CF_MERKLE` explicitly and never reach this
+/// function with a node-hash key.
 pub fn cf_for_key(key: &[u8]) -> &'static str {
     if key.starts_with(b"account:") {
         CF_ACCOUNTS
@@ -48,6 +152,8 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_BLOCKS
     } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
         CF_VALIDATORS
+    } else if key.len() == 32 {
+        CF_MERKLE
     } else {
         CF_META
     }
@@ -78,7 +184,33 @@ impl ArxiumDb {
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, RocksOptions::default()));
         let db = DB::open_cf_descriptors(&db_opts, path, cf_descriptors)?;
-        Ok(Self { db: Arc::new(db) })
+        let this = Self { db: Arc::new(db) };
+        this.check_schema_version()?;
+        Ok(this)
+    }
+
+    /// Stamps a fresh (or pre-marker legacy) database with `SCHEMA_VERSION`,
+    /// or refuses to open one from a mismatched binary. See `SCHEMA_VERSION`
+    /// for what "schema" covers here.
+    fn check_schema_version(&self) -> Result<(), StorageError> {
+        let meta = self.cf(CF_META);
+        match self.db.get_cf(meta, SCHEMA_VERSION_KEY)? {
+            None => {
+                self.db.put_cf(meta, SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes())?;
+                Ok(())
+            }
+            Some(bytes) => {
+                let arr: [u8; 4] = bytes.as_slice().try_into().map_err(|_| StorageError::CorruptedMeta)?;
+                let found = u32::from_le_bytes(arr);
+                if found == SCHEMA_VERSION {
+                    Ok(())
+                } else if found > SCHEMA_VERSION {
+                    Err(StorageError::SchemaTooNew { found, supported: SCHEMA_VERSION })
+                } else {
+                    Err(StorageError::SchemaTooOld { found, supported: SCHEMA_VERSION })
+                }
+            }
+        }
     }
 
     /// Column family handle for `name` — always present since `open` creates
@@ -219,6 +351,45 @@ impl ArxiumDb {
 
     /// The finality certificate for `height`, if 2/3+ of that height's
     /// validator set has precommitted — see `arxd/finality`.
+    /// The round `eligible_proposer` should use for `height`: one past the
+    /// highest round with a persisted `RoundCertificate`, or `0` if none
+    /// exists yet. See `RoundCertificate`'s doc comment for why this — not a
+    /// block-claimed value — is the source of truth for round.
+    ///
+    /// ponytail: a linear scan over this height's certificates, not a
+    /// denormalized "current round" counter kept in sync on every write —
+    /// round certificates are rare (only formed on an actual timeout) and
+    /// small in number per height, so the scan is cheap and there is no
+    /// second value that can drift from the certificates themselves.
+    pub fn current_round(&self, height: u64) -> Result<u32, StorageError> {
+        let prefix = format!("meta:roundcert:{height:020}:");
+        let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let mut highest_certified: Option<u32> = None;
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let round_str =
+                std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
+            let round: u32 = round_str.parse().map_err(|_| StorageError::CorruptedMeta)?;
+            highest_certified = Some(highest_certified.map_or(round, |m| m.max(round)));
+        }
+        Ok(highest_certified.map_or(0, |m| m + 1))
+    }
+
+    pub fn get_round_certificate(&self, height: u64, round: u32) -> Result<Option<RoundCertificate>, StorageError> {
+        let key = format!("meta:roundcert:{height:020}:{round}");
+        match self.get(key.as_bytes())? {
+            Some(bytes) => {
+                let config = bincode::config::standard();
+                let (record, _len): (RoundCertificate, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
+                Ok(Some(record))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn get_finality_record(&self, height: u64) -> Result<Option<FinalityRecord>, StorageError> {
         let key = format!("meta:finality:{height:020}");
         match self.get(key.as_bytes())? {
@@ -273,13 +444,23 @@ impl ArxiumDb {
 
     fn write_batches_opt(&self, items: &[&dyn BatchWritable], sync: bool) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
+        let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for item in items {
             for (key, value) in item.batch_entries()? {
+                if is_state_key(&key) {
+                    state_changes.insert(hash_key(&key), Some(value.clone()));
+                }
                 batch.put_cf(self.cf(cf_for_key(&key)), key, value);
             }
             for key in item.batch_deletes()? {
+                if is_state_key(&key) {
+                    state_changes.insert(hash_key(&key), None);
+                }
                 batch.delete_cf(self.cf(cf_for_key(&key)), key);
             }
+        }
+        if !state_changes.is_empty() {
+            self.trie_root_after(&state_changes, Some(&mut batch))?;
         }
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(sync);
@@ -310,8 +491,15 @@ impl ArxiumDb {
     /// boot.
     pub fn write_raw_entries(&self, entries: &[(String, Vec<u8>, Vec<u8>)]) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
+        let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for (cf_name, key, value) in entries {
+            if matches!(cf_name.as_str(), CF_ACCOUNTS | CF_VALIDATORS) {
+                state_changes.insert(hash_key(key), Some(value.clone()));
+            }
             batch.put_cf(self.cf(cf_name), key, value);
+        }
+        if !state_changes.is_empty() {
+            self.trie_root_after(&state_changes, Some(&mut batch))?;
         }
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(true);
@@ -339,38 +527,148 @@ impl ArxiumDb {
     /// before writing anything) need the post-block root before the block
     /// itself is durable.
     ///
-    /// ponytail: rehashes the full account+validator state on every block —
-    /// O(state size), not O(block size). Fine at devnet scale; an
-    /// incremental Merkle structure is the upgrade path if state size ever
-    /// makes this the bottleneck. Deliberately excludes BLS-key
-    /// registrations, evidence markers, and operator authorizations — those
-    /// aren't balance-bearing and can be folded in later if a real
-    /// light-client use case needs them covered too.
+    /// `B3`: an incremental sparse Merkle trie over `CF_ACCOUNTS` +
+    /// `CF_VALIDATORS`, keyed by `SHA256(raw key)` as a 256-bit path —
+    /// content-addressed nodes live in `CF_MERKLE`, the current committed
+    /// root in `CF_META` (`MERKLE_ROOT_KEY`). Updating touches
+    /// `O(changed keys × 256)` nodes regardless of total state size, instead
+    /// of the old full-state rescan — see `Arxium_OpenItems.md` §4 for the
+    /// growth problem this replaces. `write_batches`/`write_raw_entries`
+    /// keep the persisted trie in lockstep with every write to those two CFs
+    /// automatically (filtered via `is_state_key`), so this is the only
+    /// place that needs to know the trie exists.
+    ///
+    /// `overlay` lets a caller ask "what would the root be *after* these
+    /// pending writes land" without committing them first — both a proposer
+    /// (deciding what to sign) and a validator (checking a peer's claim
+    /// before writing anything) need the post-block root before the block
+    /// itself is durable. This computes against the *persisted* trie plus
+    /// `overlay` purely in memory, staging nothing.
+    ///
+    /// Deliberately excludes BLS-key registrations, evidence markers, and
+    /// operator authorizations (`CF_META`) — those aren't balance-bearing
+    /// and can be folded in later if a real light-client use case needs them
+    /// covered too.
     pub fn compute_state_root(&self, overlay: &[&dyn BatchWritable]) -> Result<String, StorageError> {
-        let mut state: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        for cf_name in [CF_ACCOUNTS, CF_VALIDATORS] {
-            for item in self.db.iterator_cf(self.cf(cf_name), IteratorMode::Start) {
-                let (key, value) = item?;
-                state.insert(key.to_vec(), value.to_vec());
-            }
-        }
+        let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for writable in overlay {
             for (key, value) in writable.batch_entries()? {
-                state.insert(key, value);
+                if is_state_key(&key) {
+                    state_changes.insert(hash_key(&key), Some(value));
+                }
             }
             for key in writable.batch_deletes()? {
-                state.remove(&key);
+                if is_state_key(&key) {
+                    state_changes.insert(hash_key(&key), None);
+                }
             }
         }
+        let root = self.trie_root_after(&state_changes, None)?;
+        Ok(format!("0x{}", hex::encode(root)))
+    }
 
-        let mut hasher = Sha256::new();
-        for (key, value) in &state {
-            hasher.update((key.len() as u64).to_le_bytes());
-            hasher.update(key);
-            hasher.update((value.len() as u64).to_le_bytes());
-            hasher.update(value);
+    /// Reads the currently *persisted* trie root, or the canonical
+    /// empty-trie root if none has been written yet (a fresh DB, or one that
+    /// predates `B3` — unreachable in practice since `SCHEMA_VERSION` refuses
+    /// to open those, but this stays correct either way).
+    fn merkle_root(&self) -> Result<[u8; 32], StorageError> {
+        match self.db.get_cf(self.cf(CF_META), MERKLE_ROOT_KEY)? {
+            Some(bytes) => bytes.as_slice().try_into().map_err(|_| StorageError::CorruptedMeta),
+            None => Ok(default_hashes()[256]),
         }
-        Ok(format!("0x{}", hex::encode(hasher.finalize())))
+    }
+
+    /// An internal node's two children, by its own hash — from `overrides`
+    /// (a node this same call already produced) if present, else from
+    /// `CF_MERKLE`. Only ever called for a hash already known not to be a
+    /// default/empty-subtree hash, so a miss here means the trie is
+    /// corrupted, not merely sparse.
+    fn node_children(&self, hash: &[u8; 32], overrides: &HashMap<[u8; 32], Vec<u8>>) -> Result<([u8; 32], [u8; 32]), StorageError> {
+        let bytes = match overrides.get(hash) {
+            Some(bytes) => bytes.clone(),
+            None => self.db.get_cf(self.cf(CF_MERKLE), hash)?.ok_or(StorageError::CorruptedMeta)?,
+        };
+        if bytes.len() != 64 {
+            return Err(StorageError::CorruptedMeta);
+        }
+        let left: [u8; 32] = bytes[..32].try_into().expect("checked len above");
+        let right: [u8; 32] = bytes[32..].try_into().expect("checked len above");
+        Ok((left, right))
+    }
+
+    /// Applies `changes` (key-hash -> new value, or `None` to delete) to the
+    /// persisted trie and returns the resulting root. When `batch` is
+    /// `Some`, every newly-created node (and the root pointer, if anything
+    /// changed) is staged into it — the caller is responsible for actually
+    /// writing that batch atomically alongside the raw `CF_ACCOUNTS`/
+    /// `CF_VALIDATORS` entries it was derived from, so the trie can never
+    /// observably desync from the state it commits to. When `batch` is
+    /// `None`, nothing is persisted — this is the speculative preview path
+    /// `compute_state_root` uses.
+    fn trie_root_after(
+        &self,
+        changes: &BTreeMap<[u8; 32], Option<Vec<u8>>>,
+        mut batch: Option<&mut WriteBatch>,
+    ) -> Result<[u8; 32], StorageError> {
+        let defaults = default_hashes();
+        let mut root = self.merkle_root()?;
+        let mut overrides: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+
+        for (key_hash, new_value) in changes {
+            // Descend from `root`, recording the sibling at each of the 256
+            // levels — `defaults[depth]` short-circuits an entirely-empty
+            // subtree without ever touching storage, which is what keeps an
+            // update to one key cheap regardless of how much of the trie is
+            // still empty.
+            let mut siblings = [[0u8; 32]; 256];
+            let mut node = root;
+            for level in 0..256 {
+                let depth = 256 - level;
+                if node == defaults[depth] {
+                    siblings[level] = defaults[depth - 1];
+                    node = defaults[depth - 1];
+                } else {
+                    let (left, right) = self.node_children(&node, &overrides)?;
+                    let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
+                    siblings[level] = sibling;
+                    node = child;
+                }
+            }
+
+            // Climb back up, recomputing every node on the path with the new
+            // leaf in place of the old one.
+            let mut current = match new_value {
+                Some(value) => {
+                    let leaf = leaf_hash(key_hash, value);
+                    let content = [key_hash.as_slice(), value.as_slice()].concat();
+                    if let Some(batch) = batch.as_deref_mut() {
+                        batch.put_cf(self.cf(CF_MERKLE), leaf, &content);
+                    }
+                    overrides.insert(leaf, content);
+                    leaf
+                }
+                None => defaults[0],
+            };
+            for level in (0..256).rev() {
+                let sibling = siblings[level];
+                let (left, right) = if bit_at(key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let parent = internal_hash(&left, &right);
+                let content = [left.as_slice(), right.as_slice()].concat();
+                if let Some(batch) = batch.as_deref_mut() {
+                    batch.put_cf(self.cf(CF_MERKLE), parent, &content);
+                }
+                overrides.insert(parent, content);
+                current = parent;
+            }
+            root = current;
+        }
+
+        if let Some(batch) = batch.as_deref_mut() {
+            if !changes.is_empty() {
+                batch.put_cf(self.cf(CF_META), MERKLE_ROOT_KEY, root);
+            }
+        }
+        Ok(root)
     }
 
     /// Get the account state from the DB
@@ -512,6 +810,49 @@ impl ArxiumDb {
     /// memory already bounds.
     pub fn delete_precommit_votes(&self, height: u64) -> Result<(), StorageError> {
         let prefix = format!("meta:precommit:{height:020}:");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_META), key);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Every persisted round-timeout vote at heights >= `cutoff` — mirrors
+    /// `get_precommit_votes_from`, used by the same kind of restart-recovery
+    /// reload for round-timeout tallying.
+    pub fn get_round_timeout_votes_from(&self, cutoff: u64) -> Result<Vec<RoundTimeoutVoteRecord>, StorageError> {
+        let prefix = b"meta:roundtimeout:";
+        let seek_key = format!("meta:roundtimeout:{cutoff:020}");
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let mut results = Vec::new();
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (record, _len): (RoundTimeoutVoteRecord, usize) =
+                bincode::serde::decode_from_slice(&value, config)?;
+            results.push(record);
+        }
+        Ok(results)
+    }
+
+    /// Deletes every persisted round-timeout vote at `height, round` — called
+    /// once that round is certified (superseded by its `RoundCertificate`) or
+    /// ages out of `TALLY_RETENTION_HEIGHTS`. Mirrors `delete_precommit_votes`.
+    pub fn delete_round_timeout_votes(&self, height: u64, round: u32) -> Result<(), StorageError> {
+        let prefix = format!("meta:roundtimeout:{height:020}:{round}:");
         let iter = self
             .db
             .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
@@ -958,6 +1299,51 @@ impl BatchWritable for FinalityRecord {
     }
 }
 
+/// Proof a quorum of `height`'s validator set independently timed out
+/// `round` — see `xc_primitives::eligible_proposer` (B1b,
+/// `Arxium_OpenItems.md` §7) and `arxd_finality::tally_round_timeout`. Once
+/// persisted, `round + 1` becomes eligible: `ArxiumDb::current_round` counts
+/// these to find the height's current round, so a round change requires this
+/// record to exist, never just a claim in a block header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundCertificate {
+    pub height: u64,
+    pub round: u32,
+    pub signers: Vec<Address>,
+    pub aggregate_signature: BlsSignature,
+}
+
+impl BatchWritable for RoundCertificate {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key = format!("meta:roundcert:{:020}:{}", self.height, self.round).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
+/// One validator's persisted vote that `round` at `height` timed out —
+/// mirrors `PrecommitVoteRecord` exactly, including the
+/// `TALLY_RETENTION_HEIGHTS`-driven pruning; see
+/// `arxd_finality::RoundTimeoutVote`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundTimeoutVoteRecord {
+    pub height: u64,
+    pub round: u32,
+    pub voter: Address,
+    pub signature: BlsSignature,
+}
+
+impl BatchWritable for RoundTimeoutVoteRecord {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let key =
+            format!("meta:roundtimeout:{:020}:{}:{}", self.height, self.round, self.voter).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
 /// A set of account changes to be written atomically. Not account-circuit
 /// business logic — just the write-batch shape any circuit that touches
 /// accounts (`circuit-account`, `circuit-rwa-asset`, ...) hands back.
@@ -1294,5 +1680,272 @@ mod explorer_index_tests {
         db.export_checkpoint(&checkpoint_path).unwrap();
 
         assert!(db.export_checkpoint(&checkpoint_path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod schema_version_tests {
+    use super::*;
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "arxium-test-schema-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// A fresh database has no marker yet; `open` must stamp it rather than
+    /// error, and a second open of the same path must then see it agree.
+    #[test]
+    fn opening_a_fresh_db_stamps_the_current_schema_version() {
+        let path = temp_path();
+        {
+            let db = ArxiumDb::open(&path).unwrap();
+            let stamped = db.db.get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY).unwrap().unwrap();
+            assert_eq!(u32::from_le_bytes(stamped.try_into().unwrap()), SCHEMA_VERSION);
+        }
+        assert!(ArxiumDb::open(&path).is_ok());
+    }
+
+    /// A database stamped by a newer binary must not silently open under an
+    /// older one — that's the whole point of the marker (`Arxium_OpenItems.md`
+    /// §7's migration-mechanism prerequisite).
+    #[test]
+    fn opening_a_db_stamped_by_a_newer_binary_is_refused() {
+        let path = temp_path();
+        {
+            let db = ArxiumDb::open(&path).unwrap();
+            db.db
+                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, (SCHEMA_VERSION + 1).to_le_bytes())
+                .unwrap();
+        }
+        match ArxiumDb::open(&path) {
+            Err(err) => assert!(matches!(err, StorageError::SchemaTooNew { .. }), "got {err:?}"),
+            Ok(_) => panic!("expected SchemaTooNew"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod round_certificate_tests {
+    use super::*;
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "arxium-test-roundcert-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::from_pubkey_bytes(&[n; 32]).unwrap()
+    }
+
+    fn sig(n: u8) -> BlsSignature {
+        BlsSignature([n; 96])
+    }
+
+    /// A height with no persisted `RoundCertificate` is round 0 — the
+    /// primary is eligible until a quorum certifies otherwise.
+    #[test]
+    fn current_round_with_no_certificates_is_zero() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        assert_eq!(db.current_round(5).unwrap(), 0);
+    }
+
+    /// `current_round` is one past the highest certified round for that
+    /// height — a certificate for round 0 makes round 1 eligible, and a
+    /// gap (round 2 certified without round 1) still reports the highest
+    /// seen plus one, since eligibility only ever moves forward.
+    #[test]
+    fn current_round_is_one_past_the_highest_certificate_for_that_height() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batches(&[&RoundCertificate {
+            height: 5,
+            round: 0,
+            signers: vec![addr(1)],
+            aggregate_signature: sig(1),
+        }])
+        .unwrap();
+        assert_eq!(db.current_round(5).unwrap(), 1);
+
+        db.write_batches(&[&RoundCertificate {
+            height: 5,
+            round: 2,
+            signers: vec![addr(1), addr(2)],
+            aggregate_signature: sig(2),
+        }])
+        .unwrap();
+        assert_eq!(db.current_round(5).unwrap(), 3);
+
+        // A different height's certificates must not leak into this one.
+        assert_eq!(db.current_round(6).unwrap(), 0);
+    }
+
+    #[test]
+    fn round_certificate_round_trips_through_storage() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let record = RoundCertificate {
+            height: 9,
+            round: 1,
+            signers: vec![addr(3), addr(4)],
+            aggregate_signature: sig(7),
+        };
+        db.write_batches(&[&record]).unwrap();
+
+        let fetched = db.get_round_certificate(9, 1).unwrap().expect("certificate should be persisted");
+        assert_eq!(fetched.height, 9);
+        assert_eq!(fetched.round, 1);
+        assert_eq!(fetched.signers, vec![addr(3), addr(4)]);
+        assert!(db.get_round_certificate(9, 0).unwrap().is_none());
+    }
+
+    /// Round-timeout votes are readable by `get_round_timeout_votes_from`
+    /// and, once a round is certified, `delete_round_timeout_votes` removes
+    /// exactly that height/round's votes and no others.
+    #[test]
+    fn round_timeout_votes_are_listed_and_pruned_per_round() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batches(&[
+            &RoundTimeoutVoteRecord { height: 10, round: 0, voter: addr(1), signature: sig(1) },
+            &RoundTimeoutVoteRecord { height: 10, round: 1, voter: addr(1), signature: sig(2) },
+            &RoundTimeoutVoteRecord { height: 11, round: 0, voter: addr(1), signature: sig(3) },
+        ])
+        .unwrap();
+
+        assert_eq!(db.get_round_timeout_votes_from(0).unwrap().len(), 3);
+
+        db.delete_round_timeout_votes(10, 0).unwrap();
+
+        let remaining = db.get_round_timeout_votes_from(0).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|r| !(r.height == 10 && r.round == 0)));
+    }
+}
+
+/// `B3`: the incremental Merkle trie behind `compute_state_root`.
+#[cfg(test)]
+mod merkle_state_root_tests {
+    use super::*;
+    use xc_primitives::AccountEntry;
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "arxium-test-merkle-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::from_pubkey_bytes(&[n; 32]).unwrap()
+    }
+
+    fn entry(balance: u128) -> AccountEntry {
+        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false }
+    }
+
+    fn accounts(pairs: &[(u8, u128)]) -> AccountUpdates {
+        AccountUpdates(pairs.iter().map(|(n, bal)| (addr(*n), entry(*bal))).collect())
+    }
+
+    /// An empty database's root is the canonical empty-trie hash, and asking
+    /// twice gives the same answer without anything written.
+    #[test]
+    fn an_empty_db_has_a_stable_root() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let root1 = db.compute_state_root(&[]).unwrap();
+        let root2 = db.compute_state_root(&[]).unwrap();
+        assert_eq!(root1, root2);
+        assert_eq!(root1, format!("0x{}", hex::encode(default_hashes()[256])));
+    }
+
+    /// Speculating over an overlay never touches disk — the root the
+    /// overlay predicts must match the root actually observed once the same
+    /// overlay is committed for real.
+    #[test]
+    fn a_speculative_root_matches_the_root_after_actually_committing() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let updates = accounts(&[(1, 100), (2, 200)]);
+        let predicted = db.compute_state_root(&[&updates]).unwrap();
+
+        db.write_batch(&updates).unwrap();
+        let actual = db.compute_state_root(&[]).unwrap();
+        assert_eq!(predicted, actual);
+    }
+
+    /// The whole point of `B3`: committing changes across several separate
+    /// blocks (several `write_batch` calls) must land on exactly the same
+    /// root as committing the same net state in one shot — the incremental
+    /// walk can't be allowed to depend on how the writes were chunked.
+    #[test]
+    fn incremental_commits_match_one_combined_commit() {
+        let incremental = ArxiumDb::open(&temp_path()).unwrap();
+        incremental.write_batch(&accounts(&[(1, 100)])).unwrap();
+        incremental.write_batch(&accounts(&[(2, 200)])).unwrap();
+        incremental.write_batch(&accounts(&[(3, 300)])).unwrap();
+
+        let combined = ArxiumDb::open(&temp_path()).unwrap();
+        combined.write_batch(&accounts(&[(1, 100), (2, 200), (3, 300)])).unwrap();
+
+        assert_eq!(incremental.compute_state_root(&[]).unwrap(), combined.compute_state_root(&[]).unwrap());
+    }
+
+    /// Overwriting an existing key changes the root, and re-overwriting it
+    /// back to the original value returns the root to exactly what it was
+    /// before — the trie has no memory of the detour.
+    #[test]
+    fn overwriting_and_reverting_a_value_round_trips_the_root() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100)])).unwrap();
+        let original = db.compute_state_root(&[]).unwrap();
+
+        db.write_batch(&accounts(&[(1, 999)])).unwrap();
+        let changed = db.compute_state_root(&[]).unwrap();
+        assert_ne!(original, changed);
+
+        db.write_batch(&accounts(&[(1, 100)])).unwrap();
+        assert_eq!(db.compute_state_root(&[]).unwrap(), original);
+    }
+
+    /// Deleting a stake allocation back out of the trie must return the root
+    /// to what it was before the key ever existed, not leave a tombstone
+    /// behind that changes the hash.
+    #[test]
+    fn deleting_a_key_restores_the_prior_root() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let before = db.compute_state_root(&[]).unwrap();
+
+        let master = addr(1);
+        let validator = addr(2);
+        let allocation = xc_primitives::StakeAllocation {
+            master: master.clone(),
+            validator: validator.clone(),
+            active_amount: 500,
+            unbonding: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        db.write_batch(&StakeUpdates {
+            allocations: BTreeMap::from([((master.clone(), validator.clone()), Some(allocation))]),
+            validator_index: BTreeMap::from([(validator.clone(), vec![master.clone()])]),
+        })
+        .unwrap();
+        assert_ne!(db.compute_state_root(&[]).unwrap(), before);
+
+        db.write_batch(&StakeUpdates {
+            allocations: BTreeMap::from([((master, validator.clone()), None)]),
+            validator_index: BTreeMap::from([(validator, vec![])]),
+        })
+        .unwrap();
+        assert_eq!(db.compute_state_root(&[]).unwrap(), before);
     }
 }

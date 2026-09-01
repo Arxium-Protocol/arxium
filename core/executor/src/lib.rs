@@ -204,7 +204,6 @@ impl AcceptBlockError {
 pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
-    slot_duration_secs: u64,
     sync: bool,
     fee_per_action: u128,
     dispatch: impl Fn(
@@ -256,17 +255,18 @@ where
         });
     }
 
-    // Timestamps are consensus-critical here, not just metadata: proposer
-    // eligibility below is derived from `block.timestamp - parent.timestamp`,
-    // so an unchecked timestamp lets a proposer choose its own eligibility.
-    // Both rules are skipped for the block after genesis, whose parent
-    // timestamp is a synthetic 0 rather than a real moment (see the `elapsed`
-    // comment below).
+    // Timestamps are still consensus-critical, even though proposer
+    // eligibility (below) no longer derives from them — B1b moved that to
+    // `db.current_round`, quorum-certified rather than self-claimed (see
+    // `Arxium_OpenItems.md` §7). What's left here is ordering sanity: a
+    // block must not claim to precede or wildly outrun real time, since
+    // other consensus-adjacent code (state-root timing, evidence windows)
+    // still trusts `block.timestamp` as a real moment. Both rules are
+    // skipped for the block after genesis, whose parent timestamp is a
+    // synthetic 0 rather than a real one.
     if parent.height > 0 {
-        // Monotonicity. Without it, a proposer can stamp a block at or before
-        // its parent and `saturating_sub` silently reports `elapsed == 0`,
-        // which is always the primary's own window — a way to take a height
-        // that had already rotated away.
+        // Monotonicity: a block must not claim to have happened at or before
+        // its own parent.
         if block.timestamp <= parent.timestamp {
             return Err(AcceptBlockError::NonMonotonicTimestamp {
                 height: block.height,
@@ -276,13 +276,12 @@ where
         }
 
         // Future-drift bound. This is the one place acceptance consults the
-        // local wall clock, which is a deliberate exception to the
-        // "never wall-clock-at-receipt" rule `eligible_proposer` documents:
-        // two nodes with different clocks can briefly disagree about a block
-        // right at the boundary. That is safe here only because rejection is
-        // recoverable — the node stays behind and sync re-requests the height
-        // moments later — and because the alternative is unbounded: a
-        // timestamp years ahead poisons every descendant's `elapsed`.
+        // local wall clock: two nodes with different clocks can briefly
+        // disagree about a block right at the boundary. That is safe here
+        // only because rejection is recoverable — the node stays behind and
+        // sync re-requests the height moments later — and because the
+        // alternative is unbounded: a timestamp years ahead poisons every
+        // descendant block's monotonicity check above.
         //
         // Only *future* drift is checked. Historical blocks replayed during
         // sync have timestamps in the past and pass unconditionally, so
@@ -306,21 +305,15 @@ where
     // this is also the pre-block set `dispatch` should validate
     // JoinValidator/LeaveValidator preconditions against below.
     let validators = db.get_validator_set_at(block.height)?;
-    // `block.timestamp - parent.timestamp`, not wall-clock-at-receipt — every
-    // node (live or replaying during sync) computes the same elapsed time
-    // from the same two stored timestamps, so they always agree on who was
-    // eligible to stand in for a late primary.
-    //
-    // Genesis is the one exception: its timestamp is a synthetic constant
-    // (0), not a real wall-clock moment, so `block.timestamp - 0` is really
-    // just block 1's real epoch timestamp — tens of years, always capping
-    // skip at max. Height 1 always uses the plain primary, no timeout.
-    let elapsed = if parent.height == 0 {
-        0
-    } else {
-        block.timestamp.saturating_sub(parent.timestamp)
-    };
-    let expected = eligible_proposer(&validators, block.height, elapsed, slot_duration_secs);
+    // Which round this height is in comes from `db.current_round`, not from
+    // anything the block itself claims (see `Arxium_OpenItems.md` §7, B1b):
+    // it's the number of quorum-certified round timeouts persisted for this
+    // height, so a proposer can only be eligible for round R once a quorum
+    // has attested round R-1 actually timed out — no unilateral clock claim
+    // can move it. Every node (live or replaying during sync) reads the same
+    // persisted certificates, so they always agree.
+    let round = db.current_round(block.height)?;
+    let expected = eligible_proposer(&validators, block.height, round);
     if block.proposer != expected {
         return Err(AcceptBlockError::WrongProposer {
             height: block.height,
@@ -667,12 +660,12 @@ mod tests {
         block.tx_root = xc_poe::tx_root(&block.actions).unwrap();
         block.sign(proposer.clone(), key);
         if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
-            accept_block(db, block.clone(), 4, false, 0, dispatch, seal)
+            accept_block(db, block.clone(), false, 0, dispatch, seal)
         {
             block.state_root = expected;
             block.sign(proposer.clone(), key);
         }
-        accept_block(db, block, 4, false, 0, dispatch, seal)
+        accept_block(db, block, false, 0, dispatch, seal)
     }
 
     fn signed_join(key: &SigningKey, sender: &Address, nonce: u64) -> Action<TestPayload> {
@@ -987,7 +980,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr.clone(), &key);
-        let block1 = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap();
+        let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
         (db, key, addr, block1)
     }
 
@@ -1035,7 +1028,7 @@ mod tests {
 
         for stamp in [base, base - 1, 0] {
             let block2 = signed_block_at(&db, &key, &addr, &block1, stamp);
-            let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
+            let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NonMonotonicTimestamp { .. }),
                 "timestamp {stamp} against parent {base} should be rejected, got {err:?}",
@@ -1044,7 +1037,7 @@ mod tests {
 
         // One second later is the minimum acceptable step, and it works.
         let block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
-        assert!(accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok());
+        assert!(accept_block(&db, block2, false, 0, dispatch, seal).is_ok());
     }
 
     /// Proposer eligibility is derived from block timestamps, so an unbounded
@@ -1057,7 +1050,7 @@ mod tests {
 
         // A year ahead: the shape that used to stall the rotation indefinitely.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 31_536_000);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::TimestampTooFarAhead { .. }),
             "got {err:?}",
@@ -1066,14 +1059,14 @@ mod tests {
         // Just past the bound is still rejected.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
         assert!(matches!(
-            accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err(),
+            accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err(),
             AcceptBlockError::TimestampTooFarAhead { .. }
         ));
 
         // Modest skew inside the bound is accepted — an honest node with a
         // slightly fast clock must not have its blocks refused.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 2);
-        assert!(accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok());
+        assert!(accept_block(&db, block2, false, 0, dispatch, seal).is_ok());
     }
 
     /// Only *future* drift is bounded. Blocks replayed during sync are old by
@@ -1086,7 +1079,7 @@ mod tests {
 
         let block2 = signed_block_at(&db, &key, &addr, &block1, long_ago + 4);
         assert!(
-            accept_block(&db, block2, 4, true, 0, dispatch, seal).is_ok(),
+            accept_block(&db, block2, true, 0, dispatch, seal).is_ok(),
             "a year-old block must still replay during sync",
         );
     }
@@ -1142,7 +1135,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
         };
         block1.sign(addr1, &key1);
-        let block1 = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap();
+        let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
         (db, sorted, block1)
     }
 
@@ -1161,7 +1154,7 @@ mod tests {
         // One second later: nowhere near a full slot (4s), so the primary
         // (sorted[0]) is still the only eligible proposer.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 1);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::WrongProposer { .. }),
             "non-primary signing during the primary's window should be rejected, got {err:?}",
@@ -1176,20 +1169,24 @@ mod tests {
     /// proposer from nudging itself a round or two forward"), not a bug —
     /// this test pins the bound so a future change can't silently widen it.
     #[test]
-    fn a_backup_proposer_becomes_eligible_once_its_claimed_elapsed_crosses_a_slot() {
+    fn a_backup_proposer_stays_ineligible_even_once_a_slot_elapses() {
         let (db, sorted, block1) = two_validator_chain_at_height_one();
-        // height 2 % 2 == 0: sorted[0] is primary; one full slot of claimed
-        // elapsed advances the offset to sorted[1].
+        // height 2 % 2 == 0: sorted[0] is primary. Under the pre-B1a
+        // rotation, one full slot of claimed elapsed would have advanced the
+        // offset onto sorted[1]. Pinned to round 0 (B1a stopgap,
+        // `Arxium_OpenItems.md` §7), it must not: only the primary is
+        // ever eligible for a height, which is what makes the primary's
+        // round-0 block and a backup's round-1 block racing at the same
+        // height structurally impossible.
         let (key1, addr1) = sorted[1].clone();
 
-        // 5s claimed elapsed against a 4s slot: one full round advances
-        // eligibility onto sorted[1], and this is within
-        // MAX_FUTURE_DRIFT_SECS (30s) of "now", so drift-rejection doesn't
-        // interfere.
+        // 5s claimed elapsed against a 4s slot — within MAX_FUTURE_DRIFT_SECS
+        // (30s) of "now", so this fails on eligibility, not drift-rejection.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 5);
+        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
         assert!(
-            accept_block(&db, block2, 4, false, 0, dispatch, seal).is_ok(),
-            "non-primary should be accepted once its own timestamp shows a full slot elapsed",
+            matches!(err, AcceptBlockError::WrongProposer { .. }),
+            "non-primary must stay ineligible once rotation is pinned to round 0, got {err:?}",
         );
     }
 
@@ -1212,7 +1209,7 @@ mod tests {
             state_root: String::new(),
         };
         block2.sign(addr, &key);
-        let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ParentMismatch { .. }),
             "got {err:?}",
@@ -1239,7 +1236,7 @@ mod tests {
                 state_root: String::new(),
             };
             block2.sign(addr.clone(), &key);
-            let err = accept_block(&db, block2, 4, false, 0, dispatch, seal).unwrap_err();
+            let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NotNextHeight { .. }),
                 "height {bad_height} against tip 1 should be rejected, got {err:?}",
@@ -1301,7 +1298,7 @@ mod tests {
         };
         block1.sign(alice, &alice_key);
 
-        let err = accept_block(&db, block1, 4, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block1, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
             "got {err:?}",

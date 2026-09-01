@@ -24,13 +24,15 @@ use std::thread;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
-use arxd_finality::{Dissent, PrecommitVote};
+use arxd_finality::{Dissent, PrecommitVote, RoundTimeoutVote};
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::ArxiumDb;
 
 use discovery::{dial_bootnodes, dial_discovered};
-use gossip::{actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip};
+use gossip::{
+    actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip, round_timeouts_topic,
+};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
     advance_stuck_tip, local_tip_height,
@@ -77,6 +79,7 @@ pub fn spawn_p2p_node<P: Payload>(
     block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
+    round_timeout_rx: tokio_mpsc::UnboundedReceiver<RoundTimeoutVote>,
     // Returns `true` if the block's signature is itself forged, so the
     // sending peer can be penalized — see `record_bad_gossip`. Second
     // argument is `sync`: true when applying a `SyncRequest::Blocks` page
@@ -89,6 +92,9 @@ pub fn spawn_p2p_node<P: Payload>(
     // Same "undecodable bytes only" rule as `on_precommit_vote` — `arxd/finality`
     // owns signature/voter/one-per-height validation for dissents too.
     on_dissent: impl Fn(Dissent) + Send + 'static,
+    // Same "undecodable bytes only" rule — `arxd/finality` owns
+    // signature/voter/quorum validation for round-timeout votes too.
+    on_round_timeout_vote: impl Fn(RoundTimeoutVote) + Send + 'static,
     // Same chain-specific admission hook RPC submission runs — see
     // `xc_mempool::PayloadPrecheck` doc comment. `None` for chains with no
     // such rules.
@@ -128,7 +134,8 @@ pub fn spawn_p2p_node<P: Payload>(
 
         runtime.block_on(run_swarm(
             keypair, listen_port, bootnodes, &chain_id, mempool, db, gossip_rx, block_rx, precommit_rx,
-            dissent_rx, on_block, on_precommit_vote, on_dissent, payload_precheck, ready_tx,
+            dissent_rx, round_timeout_rx, on_block, on_precommit_vote, on_dissent, on_round_timeout_vote,
+            payload_precheck, ready_tx,
         ));
     });
 
@@ -150,9 +157,11 @@ async fn run_swarm<P: Payload>(
     mut block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
     mut precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
     mut dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
+    mut round_timeout_rx: tokio_mpsc::UnboundedReceiver<RoundTimeoutVote>,
     on_block: impl Fn(Block<P>, bool) -> bool + Send + 'static,
     on_precommit_vote: impl Fn(PrecommitVote) + Send + 'static,
     on_dissent: impl Fn(Dissent) + Send + 'static,
+    on_round_timeout_vote: impl Fn(RoundTimeoutVote) + Send + 'static,
     payload_precheck: Option<PayloadPrecheck<P>>,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
@@ -181,6 +190,11 @@ async fn run_swarm<P: Payload>(
     }
     let dissents_topic = gossipsub::IdentTopic::new(dissents_topic(chain_id));
     if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&dissents_topic) {
+        let _ = ready_tx.send(Err(err.into()));
+        return;
+    }
+    let round_timeouts_topic = gossipsub::IdentTopic::new(round_timeouts_topic(chain_id));
+    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&round_timeouts_topic) {
         let _ = ready_tx.send(Err(err.into()));
         return;
     }
@@ -293,6 +307,20 @@ async fn run_swarm<P: Payload>(
                         }
                     }
                     Err(err) => warn!("failed to encode dissent for gossip: {err}"),
+                }
+            }
+            round_timeout_vote = round_timeout_rx.recv() => {
+                let Some(round_timeout_vote) = round_timeout_vote else {
+                    // Sender side (finality subsystem) is gone — nothing left to publish.
+                    continue;
+                };
+                match bincode::serde::encode_to_vec(&round_timeout_vote, bincode::config::standard()) {
+                    Ok(bytes) => {
+                        if let Err(err) = swarm.behaviour_mut().gossipsub.publish(round_timeouts_topic.clone(), bytes) {
+                            log_publish_error("round-timeout vote", &err);
+                        }
+                    }
+                    Err(err) => warn!("failed to encode round-timeout vote for gossip: {err}"),
                 }
             }
             event = swarm.select_next_some() => match event {
@@ -460,6 +488,30 @@ async fn run_swarm<P: Payload>(
                     };
                     counter!("arxium_gossip_accepted_total", "topic" => "dissents").increment(1);
                     on_dissent(dissent);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message,
+                    ..
+                })) if message.topic == round_timeouts_topic.hash() => {
+                    let vote: RoundTimeoutVote = match bincode::serde::decode_from_slice(
+                        &message.data,
+                        bincode::config::standard(),
+                    ) {
+                        Ok((vote, _)) => vote,
+                        Err(err) => {
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                "round_timeouts",
+                                &format!("undecodable gossiped round-timeout vote: {err}"),
+                            );
+                            continue;
+                        }
+                    };
+                    counter!("arxium_gossip_accepted_total", "topic" => "round_timeouts").increment(1);
+                    on_round_timeout_vote(vote);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::OutboundFailure {
                     peer,
@@ -725,10 +777,11 @@ mod tests {
         let (_block_tx, block_rx) = tokio_mpsc::unbounded_channel();
         let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
         let (_dissent_tx, dissent_rx) = tokio_mpsc::unbounded_channel();
+        let (_round_timeout_tx, round_timeout_rx) = tokio_mpsc::unbounded_channel();
 
         let peer_id = spawn_p2p_node(
             &base_path, 0, &[], false, "test-chain", mempool, db, gossip_rx, block_rx, precommit_rx,
-            dissent_rx, |_, _| false, |_| {}, |_| {}, None,
+            dissent_rx, round_timeout_rx, |_, _| false, |_| {}, |_| {}, |_| {}, None,
         )
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());

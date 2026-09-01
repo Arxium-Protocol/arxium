@@ -21,7 +21,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
 
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
-use arxd_finality::{Dissent, DissentReason, FinalityEvent, PrecommitVote, dissent_signing_bytes, spawn_finality};
+use arxd_finality::{
+    Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
+};
 use arxd_network::{identity, spawn_p2p_node};
 use xc_artifact::DissentAttestation;
 use xc_cli::{Cli, Command};
@@ -206,9 +208,11 @@ struct SubsystemHandles<R: ChainRuntime> {
     gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>,
     precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
     dissent_rx: tokio::sync::mpsc::UnboundedReceiver<Dissent>,
+    round_timeout_rx: tokio::sync::mpsc::UnboundedReceiver<RoundTimeoutVote>,
     on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
     on_dissent: Box<dyn Fn(Dissent) + Send>,
+    on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
     payload_precheck: xc_mempool::PayloadPrecheck<R::Payload>,
     shutdown: Arc<AtomicBool>,
 }
@@ -292,6 +296,8 @@ fn spawn_subsystems<R: ChainRuntime>(
     let (finality_event_tx, finality_event_rx) =
         std_mpsc::channel::<FinalityEvent<R::Payload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
+    let (finality_round_timeout_tx, finality_round_timeout_rx) =
+        std_mpsc::channel::<RoundTimeoutVote>();
     // `on_block` below also needs the BLS key to sign dissents on execution
     // disagreement, so clone before `spawn_finality` consumes the original.
     let bls_identity_for_dissent = bls_identity.clone();
@@ -302,6 +308,7 @@ fn spawn_subsystems<R: ChainRuntime>(
             bls_identity,
             finality_event_rx,
             finality_vote_tx,
+            finality_round_timeout_tx,
         ),
     );
 
@@ -320,10 +327,32 @@ fn spawn_subsystems<R: ChainRuntime>(
         }),
     );
 
+    let (round_timeout_tx, round_timeout_rx) =
+        tokio::sync::mpsc::unbounded_channel::<RoundTimeoutVote>();
+    // Bridges the round-timeout equivalent of `finality_vote_rx` — same
+    // shape as `precommit_bridge` above.
+    spawn_supervised(
+        "round_timeout_bridge",
+        thread::spawn(move || {
+            for vote in finality_round_timeout_rx {
+                if round_timeout_tx.send(vote).is_err() {
+                    break;
+                }
+            }
+        }),
+    );
+
     let on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send> = {
         let finality_event_tx = finality_event_tx.clone();
         Box::new(move |vote: PrecommitVote| {
             let _ = finality_event_tx.send(FinalityEvent::VoteObserved(vote));
+        })
+    };
+
+    let on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send> = {
+        let finality_event_tx = finality_event_tx.clone();
+        Box::new(move |vote: RoundTimeoutVote| {
+            let _ = finality_event_tx.send(FinalityEvent::RoundTimeoutObserved(vote));
         })
     };
 
@@ -383,7 +412,6 @@ fn spawn_subsystems<R: ChainRuntime>(
             match accept_block(
                 &db,
                 block,
-                SLOT_DURATION.as_secs(),
                 sync,
                 R::action_fee(),
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
@@ -597,9 +625,11 @@ fn spawn_subsystems<R: ChainRuntime>(
         gossip_rx,
         precommit_rx,
         dissent_rx,
+        round_timeout_rx,
         on_block,
         on_precommit_vote,
         on_dissent,
+        on_round_timeout_vote,
         payload_precheck,
         shutdown,
     })
@@ -843,9 +873,11 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         gossip_rx,
         precommit_rx,
         dissent_rx,
+        round_timeout_rx,
         on_block,
         on_precommit_vote,
         on_dissent,
+        on_round_timeout_vote,
         payload_precheck,
         shutdown,
     } = spawn_subsystems::<R>(
@@ -874,9 +906,11 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         block_rx,
         precommit_rx,
         dissent_rx,
+        round_timeout_rx,
         on_block,
         on_precommit_vote,
         on_dissent,
+        on_round_timeout_vote,
         Some(payload_precheck.clone()),
     )?;
 

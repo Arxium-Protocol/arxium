@@ -47,49 +47,41 @@ pub const MAX_FUTURE_DRIFT_SECS: u64 = 30;
 /// `ValidatorChange`), but within a single height every node computes the
 /// same primary proposer from the same set.
 pub fn expected_proposer(validators: &[Address], height: u64) -> Option<Address> {
-    eligible_proposer(validators, height, 0, 1)
+    eligible_proposer(validators, height, 0)
 }
 
-/// Like `expected_proposer`, but allows a later validator in the rotation to
-/// stand in once the primary has missed its window. `elapsed_secs` is the
-/// time since the parent block (`block.timestamp - parent.timestamp` when a
-/// candidate is validated, or `now - parent.timestamp` when a node is
-/// deciding whether it may produce) — never wall-clock-at-receipt, so a live
-/// node and one replaying the same block during sync always agree on who was
-/// eligible.
+/// Like `expected_proposer`, but lets a later validator in the rotation
+/// stand in once a quorum has certified that an earlier round missed its
+/// window.
 ///
-/// Every full `slot_duration_secs` of silence advances eligibility one
-/// validator further along the rotation, **wrapping indefinitely**: after the
-/// whole set has been offered a turn, the primary comes back around and the
-/// cycle repeats.
+/// `round` is deliberately **not** derived from anything the block itself
+/// claims (a timestamp, an elapsed duration) — see `Arxium_OpenItems.md` §7
+/// (B1b). It comes from `xc_storage::ArxiumDb::current_round`, which counts
+/// persisted `RoundCertificate`s: quorum-BLS-aggregated proof that a quorum
+/// of validators independently timed out round `R`, produced by
+/// `arxd_finality::tally_round_timeout`. A single validator (or a fast/slow
+/// clock) can never move a height to round `R+1` unilaterally — only a
+/// quorum's agreement can, and both the proposer and every validating peer
+/// read the same persisted certificates, so they always agree on `round`
+/// before checking who is eligible for it.
 ///
-/// That wrapping is the entire point, and it is a consensus rule — see
-/// `Arxium_OpenItems.md` §1. This used to cap the offset at the last
-/// validator (`.min(sorted.len() - 1)`), which meant a height whose final
-/// fallback was offline could never be produced by anyone, ever: the chain
-/// halted at that height while every process stayed healthy. Capping is safe
-/// only in the degenerate one-validator case, which is why the devnet ran a
-/// single validator as a mitigation. Any change here must land on every
-/// validator binary before any of them uses it — `accept_block` validates
-/// historical blocks with the same function that live production consults.
-pub fn eligible_proposer(
-    validators: &[Address],
-    height: u64,
-    elapsed_secs: u64,
-    slot_duration_secs: u64,
-) -> Option<Address> {
+/// This replaces the earlier round-0-pinned stopgap (B1a): that fix's known
+/// cost — any missed primary slot halted the height forever, since nothing
+/// else could ever produce it — is what this closes. A missed primary now
+/// recovers once a quorum certifies the timeout, instead of never.
+///
+/// Any change here must land on every validator binary before any of them
+/// uses it — `accept_block` validates historical blocks with the same
+/// function that live production consults, so a mixed fleet rejects each
+/// other's history, not just new blocks.
+pub fn eligible_proposer(validators: &[Address], height: u64, round: u32) -> Option<Address> {
     if validators.is_empty() {
         return None;
     }
     let mut sorted = validators.to_vec();
     sorted.sort();
-    let primary = (height as usize) % sorted.len();
-    let round = elapsed_secs / slot_duration_secs.max(1);
-    // Reduced as u64 before narrowing: `elapsed_secs` is attacker-influenced
-    // (it comes from a proposer's own timestamp), and `as usize` on a 32-bit
-    // target would truncate a large round to an arbitrary one instead.
-    let offset = (round % sorted.len() as u64) as usize;
-    Some(sorted[(primary + offset) % sorted.len()].clone())
+    let idx = (height as usize).wrapping_add(round as usize) % sorted.len();
+    Some(sorted[idx].clone())
 }
 
 #[cfg(test)]
@@ -128,104 +120,42 @@ mod tests {
         assert_eq!(picks[0], expected_proposer(&forward, 3)); // wraps around
     }
 
+    /// Round 0 always picks the same primary as `expected_proposer` — a
+    /// height with no certified timeout has exactly one eligible proposer.
     #[test]
-    fn eligible_proposer_advances_through_rotation_as_primary_goes_silent() {
+    fn round_zero_is_pinned_to_the_primary() {
         let mut sorted = vec![addr(1), addr(2), addr(3)];
         sorted.sort();
-        let (a, b, c) = (sorted[0].clone(), sorted[1].clone(), sorted[2].clone());
-
-        // Within the primary's own window, only the primary is eligible.
-        assert_eq!(eligible_proposer(&sorted, 0, 0, 4), Some(a.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 3, 4), Some(a.clone()));
-
-        // One full slot of silence hands eligibility to the next validator
-        // in rotation order — deterministic from elapsed time alone.
-        assert_eq!(eligible_proposer(&sorted, 0, 4, 4), Some(b.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 7, 4), Some(b.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 8, 4), Some(c.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 11, 4), Some(c));
+        let a = sorted[0].clone();
+        assert_eq!(eligible_proposer(&sorted, 0, 0), Some(a));
     }
 
-    /// The bug from `Arxium_OpenItems.md` §1, as a test: the rotation
-    /// must come back around to the primary rather than parking on the last
-    /// validator forever. The previous implementation returned the last
-    /// validator for every elapsed time past `slot * (len - 1)`, so a height
-    /// whose last fallback was offline could never be produced by anyone.
+    /// A quorum-certified round advance hands eligibility to a *different*
+    /// validator — this is what B1b buys over the B1a stopgap: a missed
+    /// primary is no longer a permanent halt, because round 1 (and beyond)
+    /// has its own eligible proposer once `current_round` says so.
     #[test]
-    fn rotation_wraps_back_to_the_primary_instead_of_parking_on_the_last() {
+    fn a_higher_round_hands_eligibility_to_a_different_validator() {
         let mut sorted = vec![addr(1), addr(2), addr(3)];
         sorted.sort();
-        let (a, b, c) = (sorted[0].clone(), sorted[1].clone(), sorted[2].clone());
-
-        // Round 3 is a full cycle later: back to the primary.
-        assert_eq!(eligible_proposer(&sorted, 0, 12, 4), Some(a.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 15, 4), Some(a.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 16, 4), Some(b));
-        assert_eq!(eligible_proposer(&sorted, 0, 20, 4), Some(c));
-
-        // 1000s = round 250; 250 % 3 == 1, so the primary's successor. The
-        // old code returned the last validator here no matter how long it had
-        // been. Nothing is ever permanently unproducible now.
-        assert_eq!(eligible_proposer(&sorted, 0, 1000, 4), sorted.get(1).cloned());
-
-        // Over many rounds every validator keeps getting offered turns.
-        let mut seen: Vec<Address> = (0..30)
-            .map(|round| eligible_proposer(&sorted, 0, round * 4, 4).unwrap())
-            .collect();
-        seen.sort();
-        seen.dedup();
-        assert_eq!(seen.len(), 3, "every validator must keep getting turns");
-        assert!(seen.contains(&a));
+        let round0 = eligible_proposer(&sorted, 0, 0).unwrap();
+        let round1 = eligible_proposer(&sorted, 0, 1).unwrap();
+        let round2 = eligible_proposer(&sorted, 0, 2).unwrap();
+        assert_ne!(round0, round1);
+        assert_ne!(round1, round2);
+        assert_ne!(round0, round2);
+        // and it wraps back around after cycling through every validator
+        assert_eq!(eligible_proposer(&sorted, 0, 3), Some(round0));
     }
 
-    /// A single validator is eligible at every elapsed time — there is nobody
-    /// to hand a missed slot to. This is what kept the mitigated devnet alive
-    /// while the cap was still in place, so it must not regress.
+    /// A single validator is eligible at every round — there is nobody else
+    /// to hand a certified timeout to.
     #[test]
     fn a_lone_validator_is_always_eligible() {
         let only = vec![addr(7)];
-        for elapsed in [0u64, 1, 4, 9, 1_000, u64::MAX] {
-            assert_eq!(eligible_proposer(&only, 5, elapsed, 4), Some(addr(7)));
+        for round in [0u32, 1, 4, 9, 1_000, u32::MAX] {
+            assert_eq!(eligible_proposer(&only, 5, round), Some(addr(7)));
         }
-    }
-
-    /// Two validators with one offline: the online one has to keep getting
-    /// turns. Under the old cap, whichever sorted last held the height
-    /// forever once a slot was missed.
-    #[test]
-    fn an_online_validator_keeps_getting_turns_while_the_other_is_offline() {
-        let mut sorted = vec![addr(1), addr(2)];
-        sorted.sort();
-
-        // Whichever validator is primary for this height, the *other* one is
-        // offline — check both directions rather than assuming an ordering.
-        for height in [0u64, 1] {
-            let online = eligible_proposer(&sorted, height, 0, 4).unwrap();
-            let recovered = (0..12u64)
-                .map(|round| eligible_proposer(&sorted, height, round * 4, 4).unwrap())
-                .filter(|pick| pick == &online)
-                .count();
-            assert!(
-                recovered >= 5,
-                "online validator got only {recovered} turns in 12 rounds at height {height}",
-            );
-        }
-    }
-
-    /// Exact slot boundaries, spelled out — the root-cause doc calls these out
-    /// specifically because the stall happened on one (a commit that landed
-    /// 2.4s late pushed height 203 across the 4s boundary).
-    #[test]
-    fn slot_boundaries_select_the_expected_validator() {
-        let mut sorted = vec![addr(1), addr(2)];
-        sorted.sort();
-        let (a, b) = (sorted[0].clone(), sorted[1].clone());
-
-        // Height 0 -> primary is index 0.
-        assert_eq!(eligible_proposer(&sorted, 0, 3, 4), Some(a.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 4, 4), Some(b.clone()));
-        assert_eq!(eligible_proposer(&sorted, 0, 7, 4), Some(b));
-        assert_eq!(eligible_proposer(&sorted, 0, 8, 4), Some(a));
     }
 
     /// Input ordering must not change the answer — nodes learn the validator
@@ -235,33 +165,25 @@ mod tests {
         let forward = vec![addr(1), addr(2), addr(3), addr(4)];
         let shuffled = vec![addr(3), addr(1), addr(4), addr(2)];
         for height in 0..8u64 {
-            for elapsed in [0u64, 4, 9, 13, 400] {
+            for round in [0u32, 1, 2, 3, 400] {
                 assert_eq!(
-                    eligible_proposer(&forward, height, elapsed, 4),
-                    eligible_proposer(&shuffled, height, elapsed, 4),
+                    eligible_proposer(&forward, height, round),
+                    eligible_proposer(&shuffled, height, round),
                 );
             }
         }
     }
 
     /// `expected_proposer` is `eligible_proposer` at round 0, so the two must
-    /// never disagree about who holds a height before any slot has elapsed.
+    /// never disagree about who holds a height before any round is certified.
     #[test]
     fn expected_proposer_matches_eligible_at_round_zero() {
         let validators = vec![addr(1), addr(2), addr(3)];
         for height in 0..10u64 {
             assert_eq!(
                 expected_proposer(&validators, height),
-                eligible_proposer(&validators, height, 0, 4),
+                eligible_proposer(&validators, height, 0),
             );
         }
-    }
-
-    /// A slot duration of 0 would divide by zero; `max(1)` guards it. Worth a
-    /// test because the value reaches here from a caller-supplied config.
-    #[test]
-    fn zero_slot_duration_does_not_panic() {
-        let validators = vec![addr(1), addr(2)];
-        assert!(eligible_proposer(&validators, 0, 5, 0).is_some());
     }
 }

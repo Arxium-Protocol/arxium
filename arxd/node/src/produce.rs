@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, SLOT_DURATION, STALL_SUSPECT_AFTER, now_secs};
+use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
 use ed25519_dalek::SigningKey;
 use arxd_finality::FinalityEvent;
@@ -118,12 +118,24 @@ pub fn produce_block<R: ChainRuntime>(
         }
         overlay
     };
+    // The denominator against which PoE cost must be judged: this rescans
+    // the entire accounts/validators column families (O(total state), not
+    // O(delta)) on every block, so it's the number that decides whether
+    // tx_root/block_ep are actually cheap or just cheap next to something
+    // already pathological.
+    let sr_start = Instant::now();
     let state_root = db.compute_state_root(&state_root_overlay)?;
+    histogram!("arxium_state_root_nanos").record(sr_start.elapsed().as_nanos() as f64);
 
     // `tx_root` is signed as part of the block header (see
     // `xc_primitives::Block::signing_bytes`) — computed once here and reused
     // both for that and for the (still observation-only) EP hash below.
+    // Timed separately from `block_ep` below: this is the part that scales
+    // with block size (bincode encode + SHA-256 per action + Merkle tree),
+    // whereas `block_ep` is a fixed handful of hashes regardless of load.
+    let txr_start = Instant::now();
     let tx_root = xc_poe::tx_root(&applied)?;
+    histogram!("arxium_poe_tx_root_nanos").record(txr_start.elapsed().as_nanos() as f64);
 
     // PoE v5 (observation-only, see PoE_v5_design.md): logs and times the
     // execution-proof hash but doesn't touch the signed block or wire
@@ -256,10 +268,16 @@ pub fn produce_loop<R: ChainRuntime>(
                 gauge!("arxium_validators_with_bls_key").set(voters as f64);
                 gauge!("arxium_finality_quorum").set(quorum(validators.len()) as f64);
 
-                let round = elapsed / SLOT_DURATION.as_secs().max(1);
+                // Eligibility itself no longer comes from `elapsed` — see
+                // `xc_primitives::eligible_proposer`'s doc comment (B1b).
+                // `elapsed` (and the heuristic `round` derived from it below)
+                // survive purely for the stall logging: they're this node's
+                // own clock's opinion of how overdue the height is, used to
+                // decide when to escalate a log line from info to warn, not
+                // to decide who may propose.
+                let round = db.current_round(next_height)?;
                 gauge!("arxium_consensus_round").set(round as f64);
-                match eligible_proposer(&validators, next_height, elapsed, SLOT_DURATION.as_secs())
-                {
+                match eligible_proposer(&validators, next_height, round) {
                     Some(expected) if &expected == address => {
                         gauge!("arxium_is_expected_proposer").set(1.0);
                         Some((address, key))
@@ -494,14 +512,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A block this node produces must be one its peers accept. `produce_loop`
-    /// picks the producer from `eligible_proposer` using `now - parent`, while
-    /// `accept_block` re-derives it from the block's *stamped* timestamp — so
-    /// this walks a two-validator rotation across slot boundaries, has whichever
-    /// validator is eligible at that elapsed time produce, and requires a peer
-    /// to accept it. Two validators (not one) is the point: with a single
-    /// validator `eligible_proposer` returns the same address at every round
-    /// and the assertion would hold vacuously.
+    /// A block this node produces must be one its peers accept, at a range of
+    /// elapsed times across old slot boundaries — those boundaries no longer
+    /// affect eligibility (B1b: round comes from `db.current_round`, not
+    /// elapsed time), but timestamp monotonicity/drift rules still apply and
+    /// this keeps them exercised. With no `RoundCertificate` persisted,
+    /// `current_round` is always 0, so every sweep produces the same primary;
+    /// cross-round eligibility is covered separately by `consensus::tests` in
+    /// `core/primitives`.
     #[test]
     fn a_produced_block_is_accepted_by_the_same_rules_that_validate_a_gossiped_one() {
         let key_a = SigningKey::from_bytes(&[21u8; 32]);
@@ -546,8 +564,7 @@ mod tests {
                     .unwrap();
 
             // Exactly the decision `produce_loop` makes before producing.
-            let eligible =
-                eligible_proposer(&validators, 2, elapsed, SLOT_DURATION.as_secs()).unwrap();
+            let eligible = eligible_proposer(&validators, 2, db.current_round(2).unwrap()).unwrap();
             covered.insert(eligible.clone());
             let key_2 = if eligible == addr_a { &key_a } else { &key_b };
             let block2 =
@@ -567,7 +584,6 @@ mod tests {
                 let result = xc_executor::accept_block(
                     &peer,
                     block,
-                    SLOT_DURATION.as_secs(),
                     false,
                     ACTION_FEE,
                     |action, view, operator_lookup, operator_validators_lookup, vals| {
@@ -592,9 +608,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        // The sweep has to have actually exercised both validators, or the
-        // agreement it proves is the vacuous single-validator one.
-        assert_eq!(covered.len(), 2, "rotation never handed height 2 to both validators");
+        // No RoundCertificate was ever persisted, so current_round stays 0
+        // for every iteration — only the primary is ever eligible for
+        // height 2.
+        assert_eq!(covered.len(), 1, "eligible_proposer should be pinned to a single validator");
     }
 
     /// A produced block always advances past its parent's timestamp, even when
