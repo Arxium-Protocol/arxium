@@ -462,7 +462,12 @@ fn tally_vote(
         return Ok(()); // already finalized, nothing left to tally
     }
 
-    let Some(pubkey) = db.get_bls_pubkey(&vote.voter)? else {
+    // Height-scoped, not `get_bls_pubkey` (the current key): this vote may
+    // be tallied long after it was signed, and this record is later
+    // replayed as-is by any node syncing this height — it must verify
+    // against the key that was valid when the vote was cast, not whatever
+    // the voter has rotated to since. See `ArxiumDb::get_bls_pubkey_at`.
+    let Some(pubkey) = db.get_bls_pubkey_at(&vote.voter, vote.height)? else {
         warn!("finality: vote from {} with no registered BLS key, dropping", vote.voter);
         return Ok(());
     };
@@ -503,7 +508,7 @@ fn tally_vote(
 
     let pubkeys: Vec<BlsPublicKey> = signers
         .keys()
-        .filter_map(|addr| db.get_bls_pubkey(addr).ok().flatten())
+        .filter_map(|addr| db.get_bls_pubkey_at(addr, vote.height).ok().flatten())
         .collect();
     let sigs: Vec<BlsSignature> = signers.values().cloned().collect();
     let Ok(aggregate_signature) = xc_bls::aggregate(&sigs) else {
@@ -555,7 +560,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         return Ok(());
     };
 
-    let Some(pubkey) = db.get_bls_pubkey(&vote.voter)? else {
+    let Some(pubkey) = db.get_bls_pubkey_at(&vote.voter, vote.height)? else {
         warn!("finality: round-timeout vote from {} with no registered BLS key, dropping", vote.voter);
         return Ok(());
     };
@@ -595,7 +600,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
 
     let pubkeys: Vec<BlsPublicKey> = signers
         .keys()
-        .filter_map(|addr| db.get_bls_pubkey(addr).ok().flatten())
+        .filter_map(|addr| db.get_bls_pubkey_at(addr, vote.height).ok().flatten())
         .collect();
     let sigs: Vec<BlsSignature> = signers.values().cloned().collect();
     let Ok(aggregate_signature) = xc_bls::aggregate(&sigs) else {
@@ -639,7 +644,7 @@ fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::Sto
         return Ok(()); // already finalized; a late dissent proves nothing new
     }
 
-    let Some(pubkey) = db.get_bls_pubkey(&dissent.voter)? else {
+    let Some(pubkey) = db.get_bls_pubkey_at(&dissent.voter, dissent.height)? else {
         warn!("finality: dissent from {} with no registered BLS key, dropping", dissent.voter);
         return Ok(());
     };
@@ -748,7 +753,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -803,7 +808,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -877,7 +882,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -937,7 +942,7 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -956,7 +961,7 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -978,7 +983,7 @@ mod tests {
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
         let (other_sk, _) = xc_bls::keygen_from_seed(&[51u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -1096,7 +1101,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
                 (addr, sk)
             })
             .collect();

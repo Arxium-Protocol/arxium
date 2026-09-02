@@ -60,7 +60,11 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
                 bail!("genesis validator {address} BLS pubkey is already owned by {owner}");
             }
         }
-        db.write_batch(&xc_storage::BlsKeyRegistration { address: address.clone(), pubkey: BlsPublicKey(bytes) })?;
+        db.write_batch(&xc_storage::BlsKeyRegistration {
+            address: address.clone(),
+            pubkey: BlsPublicKey(bytes),
+            effective_height: 0,
+        })?;
     }
     Ok(())
 }

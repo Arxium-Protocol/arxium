@@ -87,6 +87,10 @@ pub(crate) fn join_validator(
         bls_key: Some(BlsKeyRegistration {
             address: validator.clone(),
             pubkey: xc_bls::BlsPublicKey(bytes),
+            // Same one-block delay as the `ValidatorSetSnapshot` this join
+            // produces — the validator isn't eligible to vote until
+            // `current_height + 1` either, so the key becomes valid then too.
+            effective_height: current_height + 1,
         }),
         ..Default::default()
     })

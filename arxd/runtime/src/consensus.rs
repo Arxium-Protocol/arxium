@@ -87,6 +87,7 @@ pub(crate) fn register_bls_key(
     action: &ChainAction,
     validator: &Address,
     pubkey: &[u8],
+    current_height: u64,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
@@ -100,9 +101,12 @@ pub(crate) fn register_bls_key(
         }
     }
     Ok(BlockUpdates {
+        // Effective one block later, same delay as `ValidatorSetSnapshot` —
+        // see `BlsKeyRegistration`'s doc comment.
         bls_key: Some(BlsKeyRegistration {
             address: validator.clone(),
             pubkey: xc_bls::BlsPublicKey(bytes),
+            effective_height: current_height + 1,
         }),
         ..Default::default()
     })

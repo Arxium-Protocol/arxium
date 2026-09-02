@@ -247,7 +247,10 @@ fn verify_round_certificate(
                 signer: signer.clone(),
             });
         }
-        let Some(pubkey) = db.get_bls_pubkey(signer)? else {
+        // Height-scoped: must match whatever key `arxd_finality::tally_round_timeout`
+        // verified this signer's vote against when it was cast, not this
+        // signer's current key — see `ArxiumDb::get_bls_pubkey_at`.
+        let Some(pubkey) = db.get_bls_pubkey_at(signer, height)? else {
             return Err(AcceptBlockError::RoundCertificateUnknownSigner {
                 height,
                 round,

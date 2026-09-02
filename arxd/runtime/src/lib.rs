@@ -426,6 +426,7 @@ fn dispatch_inner(
             action,
             validator,
             pubkey,
+            current_height,
             operator_lookup,
             bls_pubkey_owner_lookup,
         ),
@@ -644,7 +645,7 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
         let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey }]).unwrap();
+        db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey, effective_height: 0 }]).unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {

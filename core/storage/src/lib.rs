@@ -286,11 +286,42 @@ impl ArxiumDb {
         Ok(self.get(key.as_bytes())?.is_some())
     }
 
-    /// A validator's registered BLS pubkey, if any — set via
-    /// `BlsKeyRegistration`, looked up by `arxd/finality` when tallying
-    /// precommit votes and verifying the resulting aggregate signature.
+    /// A validator's *currently* registered BLS pubkey, if any — set via
+    /// `BlsKeyRegistration`. Only safe for live, present-tense reads (e.g.
+    /// reporting `validators_with_bls_key` over RPC); anything that verifies
+    /// a signature which could have been produced at an earlier height must
+    /// use `get_bls_pubkey_at` instead, since a key rotation would otherwise
+    /// silently reinterpret an old signature against the wrong key.
     pub fn get_bls_pubkey(&self, address: &Address) -> Result<Option<BlsPublicKey>, StorageError> {
         KvRead::get(self, &BlsKeyKey(address))
+    }
+
+    /// `address`'s BLS pubkey as of `height` — the latest `BlsKeyRegistration`
+    /// with `effective_height <= height` (same reverse-seek pattern and
+    /// "recorded effective one block after the action that caused it" rule
+    /// as `get_validator_set_at`). Verifying a round certificate or a
+    /// finality/precommit vote against `get_bls_pubkey` (the *current* key)
+    /// instead of this would make verification depend on whether the signer
+    /// has rotated its key since — the same non-determinism bug fixed for
+    /// round eligibility itself, reintroduced through the key lookup instead
+    /// of the round lookup. A syncing node replaying an old height must
+    /// reach the same verdict as the node that originally verified it live.
+    pub fn get_bls_pubkey_at(&self, address: &Address, height: u64) -> Result<Option<BlsPublicKey>, StorageError> {
+        let prefix = format!("meta:blskey_hist:{address}:").into_bytes();
+        let seek_key = format!("meta:blskey_hist:{address}:{height:020}").into_bytes();
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_META), IteratorMode::From(&seek_key, Direction::Reverse));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(&prefix) {
+                break;
+            }
+            let config = bincode::config::standard();
+            let (pubkey, _len) = bincode::serde::decode_from_slice(&value, config)?;
+            return Ok(Some(pubkey));
+        }
+        Ok(None)
     }
 
     // ponytail: linear scan over the `meta:blskey:` prefix, fine at
@@ -1159,18 +1190,28 @@ impl BatchWritable for EvidenceMarker {
 /// from `Address` (an Ed25519-derived bech32 identity) rather than folded
 /// in — BLS pubkeys are a different byte length and only meaningful once/if
 /// the address is in the validator set, not an identity of their own.
+///
+/// `effective_height` is the height this key becomes valid *from* — a
+/// `RegisterBlsKey` action executed in block `H` takes effect at `H + 1`,
+/// same one-block delay as `ValidatorSetSnapshot`, so a block never observes
+/// a key change caused by its own actions. Genesis registrations use `0`.
+/// Written alongside the plain current-key record so `get_bls_pubkey_at` can
+/// recover which key was valid at any past height even after a rotation.
 #[derive(Debug)]
 pub struct BlsKeyRegistration {
     pub address: Address,
     pub pubkey: BlsPublicKey,
+    pub effective_height: u64,
 }
 
 impl BatchWritable for BlsKeyRegistration {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        let key = BlsKeyKey(&self.address).encode();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
-        Ok(vec![(key, value)])
+        let current_key = BlsKeyKey(&self.address).encode();
+        let history_key =
+            format!("meta:blskey_hist:{}:{:020}", self.address, self.effective_height).into_bytes();
+        Ok(vec![(current_key, value.clone()), (history_key, value)])
     }
 }
 
@@ -1820,6 +1861,70 @@ mod round_certificate_tests {
         let remaining = db.get_round_timeout_votes_from(0).unwrap();
         assert_eq!(remaining.len(), 2);
         assert!(remaining.iter().all(|r| !(r.height == 10 && r.round == 0)));
+    }
+}
+
+#[cfg(test)]
+mod bls_key_history_tests {
+    use super::*;
+
+    fn temp_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "arxium-test-blskeyhist-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::from_pubkey_bytes(&[n; 32]).unwrap()
+    }
+
+    fn pubkey(n: u8) -> BlsPublicKey {
+        BlsPublicKey([n; 48])
+    }
+
+    /// A validator signs at height 5 under key A, then rotates to key B
+    /// (effective at height 11). A node syncing from a fresh DB must still
+    /// verify the height-5 artifact against key A — `get_bls_pubkey_at(5)`
+    /// must return the pre-rotation key, not whatever `get_bls_pubkey`
+    /// (current) now reports. This is the exact scenario the B1c-follow-up
+    /// gap allowed: `get_bls_pubkey` alone would return key B for a height-5
+    /// lookup post-rotation, making replay verification signer-history
+    /// dependent instead of deterministic.
+    #[test]
+    fn replaying_a_pre_rotation_height_from_a_fresh_db_still_resolves_the_old_key() {
+        let path = temp_path();
+        let validator = addr(1);
+        let key_a = pubkey(0xAA);
+        let key_b = pubkey(0xBB);
+
+        {
+            let db = ArxiumDb::open(&path).unwrap();
+            db.write_batches(&[&BlsKeyRegistration { address: validator.clone(), pubkey: key_a.clone(), effective_height: 0 }])
+                .unwrap();
+            db.write_batches(&[&BlsKeyRegistration {
+                address: validator.clone(),
+                pubkey: key_b.clone(),
+                effective_height: 11,
+            }])
+            .unwrap();
+        }
+
+        // Fresh open, as a syncing node would do — not reusing the handle
+        // that wrote the rotation.
+        let db = ArxiumDb::open(&path).unwrap();
+
+        assert_eq!(db.get_bls_pubkey_at(&validator, 5).unwrap(), Some(key_a.clone()));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 10).unwrap(), Some(key_a));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 11).unwrap(), Some(key_b.clone()));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 100).unwrap(), Some(key_b.clone()));
+
+        // The current-key lookup reflects only the latest rotation — using
+        // it for a historical height would silently return the wrong key.
+        assert_eq!(db.get_bls_pubkey(&validator).unwrap(), Some(key_b));
     }
 }
 

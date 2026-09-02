@@ -1610,6 +1610,7 @@ mod tests {
                 .write_batch(&xc_storage::BlsKeyRegistration {
                     address: validator.clone(),
                     pubkey: xc_bls::BlsPublicKey([7u8; 48]),
+                    effective_height: 0,
                 })
                 .unwrap();
 
