@@ -18,8 +18,17 @@ use anyhow::Result;
 use xc_runtime_api::ChainRuntime;
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address, ValidatorChange};
-use xc_storage::{AccountUpdates, ArxiumDb, BlockView};
+use xc_primitives::{Action, Address, Asset, ValidatorChange};
+use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
+
+/// toy-chain has no `RegisterAsset` action or registry — there is exactly
+/// one implicit asset, constructed fresh on every dispatch rather than
+/// looked up. `circuits/rwa-asset` takes a caller-resolved `&Asset` for
+/// exactly this reason: CoreChain backs it with a real `meta:asset:{id}`
+/// registry, toy-chain doesn't need one.
+fn toy_asset(issuer: &Address) -> Asset {
+    Asset { asset_id: "toy".into(), issuer: issuer.clone(), compliance_required: true }
+}
 
 /// The RWA chain's own action set — distinct from CoreChain's `ActionPayload`
 /// in `arxd/runtime`, proving payloads are chain-specific rather than one
@@ -40,20 +49,22 @@ fn dispatch(
     action: &RwaAction,
     view: &BlockView<'_>,
     issuer: &Address,
-) -> anyhow::Result<(AccountUpdates, Option<ValidatorChange>)> {
-    let updates = match &action.payload {
+) -> anyhow::Result<(AccountUpdates, AssetBalanceUpdates, Option<ValidatorChange>)> {
+    let asset = toy_asset(issuer);
+    let (accounts, assets) = match &action.payload {
         RwaPayload::Issue { amount } => {
-            circuit_rwa_asset::apply_issue(view, issuer, &action.sender, action.nonce, *amount)?
+            circuit_rwa_asset::apply_issue(view, &asset, &action.sender, action.nonce, *amount)?
         }
         RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
             view,
+            &asset,
             &action.sender,
             action.nonce,
             to,
             *amount,
         )?,
     };
-    Ok((updates, None))
+    Ok((accounts, assets, None))
 }
 
 struct ToyRuntime;
@@ -81,9 +92,10 @@ impl ChainRuntime for ToyRuntime {
 
     fn dispatch(action: &RwaAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
         let issuer = Address::parse(ISSUER).expect("ISSUER is a valid address");
-        let (accounts, validator_change) = dispatch(action, ctx.view, &issuer)?;
+        let (accounts, assets, validator_change) = dispatch(action, ctx.view, &issuer)?;
         Ok(BlockUpdates {
             accounts,
+            assets,
             validator_change,
             ..Default::default()
         })

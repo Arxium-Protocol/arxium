@@ -12,6 +12,7 @@
 //! chain's runtime.
 
 mod account;
+mod asset;
 mod consensus;
 mod identity;
 mod pair;
@@ -161,6 +162,41 @@ pub enum ActionPayload {
     /// compromised or unwanted operator regardless of what that operator
     /// does or doesn't do.
     RevokeOperator,
+    /// Marks `subject` eligible (sets `AccountEntry.identity_hash`) — only
+    /// the chain-spec-designated attestor (`identity::AttestorKey`, read
+    /// from genesis) may submit this. Governance-controlled attestor
+    /// rotation is deferred; for now it's a fixed genesis address.
+    GrantAttestation {
+        subject: Address,
+        hash: String,
+    },
+    /// Reverses `GrantAttestation` — clears `identity_hash` and, since a
+    /// revoked KYC status shouldn't leave a stale ZK-verified flag around,
+    /// also clears `zk_identity_verified`. Same attestor-only authorization
+    /// as `GrantAttestation`.
+    RevokeAttestation {
+        subject: Address,
+    },
+    /// Registers a new regulated asset, `sender` becoming its issuer.
+    /// Rejected if `asset_id` is already registered.
+    RegisterAsset {
+        asset_id: String,
+        compliance_required: bool,
+    },
+    /// Mints `amount` of `asset_id` into the issuer's own asset balance —
+    /// only the registered issuer may call this. Native balance untouched.
+    IssueAsset {
+        asset_id: String,
+        amount: u128,
+    },
+    /// Compliance-gated transfer of a registered asset — distinct from
+    /// `Transfer`, which only ever moves the native token and is never
+    /// KYC-gated.
+    TransferAsset {
+        asset_id: String,
+        to: Address,
+        amount: u128,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -438,6 +474,21 @@ fn dispatch_inner(
         }
         ActionPayload::RevokeOperator => {
             account::revoke_operator(action, operator_lookup, operator_validators_lookup)
+        }
+        ActionPayload::GrantAttestation { subject, hash } => {
+            identity::grant_attestation(view, action, subject, hash)
+        }
+        ActionPayload::RevokeAttestation { subject } => {
+            identity::revoke_attestation(view, action, subject)
+        }
+        ActionPayload::RegisterAsset { asset_id, compliance_required } => {
+            asset::register_asset(view, action, asset_id, *compliance_required)
+        }
+        ActionPayload::IssueAsset { asset_id, amount } => {
+            asset::issue_asset(view, action, asset_id, *amount)
+        }
+        ActionPayload::TransferAsset { asset_id, to, amount } => {
+            asset::transfer_asset(view, action, asset_id, to, *amount)
         }
     }
 }

@@ -4,11 +4,69 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use std::sync::OnceLock;
-use xc_circuit::{AccountKey, KvRead};
+use xc_circuit::{AccountKey, AttestorKey, KvRead};
 use xc_executor::BlockUpdates;
+use xc_primitives::{AccountEntry, Address};
 use xc_storage::{AccountUpdates, BlockView};
 
 use crate::ChainAction;
+
+/// Shared authorization check for `GrantAttestation`/`RevokeAttestation` —
+/// both require `action.sender` to be the chain-spec-designated attestor
+/// (`identity::AttestorKey`, seeded at genesis; see `Snapshot.attestor`).
+/// Governance-controlled rotation is deferred, so this is a fixed address
+/// for now, not a role anyone can be granted at runtime.
+fn require_attestor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Result<()> {
+    let attestor = view
+        .get(&AttestorKey)?
+        .ok_or_else(|| anyhow::anyhow!("chain has no attestor configured"))?;
+    if action.sender != attestor {
+        anyhow::bail!("{} is not the chain attestor", action.sender);
+    }
+    Ok(())
+}
+
+/// Marks `subject` eligible by setting `AccountEntry.identity_hash`.
+/// Creates a fresh account entry if `subject` has none yet.
+pub(crate) fn grant_attestation(
+    view: &BlockView<'_>,
+    action: &ChainAction,
+    subject: &Address,
+    hash: &str,
+) -> anyhow::Result<BlockUpdates> {
+    require_attestor(view, action)?;
+    let mut entry = view.get(&AccountKey(subject))?.unwrap_or(AccountEntry {
+        balance: 0,
+        nonce: 0,
+        identity_hash: None,
+        zk_identity_verified: false,
+    });
+    entry.identity_hash = Some(hash.to_string());
+    Ok(BlockUpdates {
+        accounts: AccountUpdates(std::collections::BTreeMap::from([(subject.clone(), entry)])),
+        ..Default::default()
+    })
+}
+
+/// Reverses `grant_attestation` — clears `identity_hash` and
+/// `zk_identity_verified` (a revoked KYC status shouldn't leave a stale
+/// ZK-verified flag standing).
+pub(crate) fn revoke_attestation(
+    view: &BlockView<'_>,
+    action: &ChainAction,
+    subject: &Address,
+) -> anyhow::Result<BlockUpdates> {
+    require_attestor(view, action)?;
+    let mut entry = view
+        .get(&AccountKey(subject))?
+        .ok_or_else(|| anyhow::anyhow!("account {subject} not found"))?;
+    entry.identity_hash = None;
+    entry.zk_identity_verified = false;
+    Ok(BlockUpdates {
+        accounts: AccountUpdates(std::collections::BTreeMap::from([(subject.clone(), entry)])),
+        ..Default::default()
+    })
+}
 
 pub(crate) fn identity_zk_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls12_381> {
     static VK: OnceLock<circuit_identity_zk::VerifyingKey<Bls12_381>> = OnceLock::new();
@@ -65,6 +123,75 @@ mod tests {
     use std::collections::HashMap;
     use xc_primitives::{Action, Address};
     use xc_storage::StorageError;
+
+    #[test]
+    fn grant_attestation_then_verify_identity_credential_succeeds_end_to_end() {
+        use ark_std::rand::{rngs::StdRng, SeedableRng};
+
+        let attestor = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let pk_bytes: &[u8] = include_bytes!("../../../circuits/identity-zk/pk.bin");
+        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
+
+        let preimage = b"alice's secret preimage";
+        let params = circuit_identity_zk::poseidon_params();
+        let hash = circuit_identity_zk::credential_hash(&params, preimage);
+        let mut hash_bytes = Vec::new();
+        hash.serialize_compressed(&mut hash_bytes).unwrap();
+        let hash_hex = hex::encode(&hash_bytes);
+
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE * 2)), (attestor.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
+        view.put(&AttestorKey, &attestor).unwrap();
+
+        let grant = Action {
+            sender: attestor.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::GrantAttestation { subject: alice.clone(), hash: hash_hex },
+        };
+        let grant_updates = crate::dispatch(
+            &grant,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
+        )
+        .unwrap();
+        assert!(grant_updates.accounts.0[&alice].identity_hash.is_some());
+        view.apply_accounts(&grant_updates.accounts).unwrap();
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let proof = circuit_identity_zk::prove(preimage, &pk, &mut rng);
+        let mut proof_bytes = Vec::new();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+
+        let verify = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::VerifyIdentityCredential { proof: proof_bytes },
+        };
+        let verify_updates = crate::dispatch(
+            &verify,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &|_, _| Ok::<bool, StorageError>(false),
+            &no_bls_owner,
+        )
+        .unwrap();
+        assert!(verify_updates.accounts.0[&alice].zk_identity_verified);
+    }
 
     #[test]
     fn verify_identity_credential_accepts_a_valid_proof() {

@@ -1353,6 +1353,7 @@ mod tests {
                     )]),
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
+                    attestor: None,
                 })
                 .unwrap();
             let stale = signed_action(&key, 0);
@@ -1426,6 +1427,7 @@ mod tests {
                     accounts: BTreeMap::new(),
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
+                    attestor: None,
                 })
                 .unwrap();
             state.db.write_batch(&genesis).unwrap();
@@ -1576,6 +1578,7 @@ mod tests {
                     accounts: BTreeMap::new(),
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
+                    attestor: None,
                 })
                 .unwrap();
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);

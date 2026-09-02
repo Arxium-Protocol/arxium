@@ -108,6 +108,18 @@ pub enum ValidatorChange {
     Leave(Address),
 }
 
+/// A registered regulated asset (`ActionPayload::RegisterAsset`) — the
+/// record lives in `CF_META` (`meta:asset:{asset_id}`), separate from its
+/// balances (`CF_ASSETS`, one entry per `(asset_id, owner)`), which is what
+/// makes asset issuance/transfer a compliance-gated overlay on top of the
+/// native token rather than a replacement for it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Asset {
+    pub asset_id: String,
+    pub issuer: Address,
+    pub compliance_required: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub height: u64,
@@ -120,6 +132,14 @@ pub struct Snapshot {
     /// means rely on mDNS or an explicit CLI override.
     #[serde(default)]
     pub boot_nodes: Vec<String>,
+    /// The sole address allowed to grant/revoke `identity_hash` attestations
+    /// (`ActionPayload::GrantAttestation`/`RevokeAttestation`). Fixed at
+    /// genesis rather than governed — see the compliance-integration plan's
+    /// Stage 1 note that a governance mechanism is deferred. `Option` and
+    /// `#[serde(default)]` so existing specs without compliance features
+    /// still parse; a chain with no attestor simply can't grant attestations.
+    #[serde(default)]
+    pub attestor: Option<Address>,
 }
 
 impl Snapshot {

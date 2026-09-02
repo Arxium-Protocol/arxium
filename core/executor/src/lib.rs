@@ -10,9 +10,10 @@ use xc_primitives::{
     Action, Address, Block, MAX_FUTURE_DRIFT_SECS, RoundCertificate, SignatureError,
     ValidatorChange, eligible_proposer, quorum, round_timeout_signing_bytes,
 };
+use xc_primitives::Asset;
 use xc_storage::{
-    AccountUpdates, ArxiumDb, BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker,
-    OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
+    AccountUpdates, ArxiumDb, AssetBalanceUpdates, BatchWritable, BlockView, BlsKeyRegistration,
+    EvidenceMarker, OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
 };
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -33,6 +34,12 @@ pub struct BlockUpdates {
     pub bls_key: Option<BlsKeyRegistration>,
     /// Set only by `AuthorizeOperator`/`RevokeOperator`.
     pub operator: OperatorUpdates,
+    /// Set by `IssueAsset`/`TransferAsset` — regulated-asset balance changes,
+    /// kept separate from `accounts` (the native token) so compliance gating
+    /// never touches fees/staking. See `circuits/rwa-asset`.
+    pub assets: AssetBalanceUpdates,
+    /// Set only by `RegisterAsset` — a new `meta:asset:{id}` registry entry.
+    pub asset_registration: Option<Asset>,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -51,6 +58,8 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         evidence: None,
         bls_key: None,
         operator: OperatorUpdates::default(),
+        assets: AssetBalanceUpdates::default(),
+        asset_registration: None,
     })
 }
 
@@ -444,9 +453,11 @@ where
         evidence_markers,
         bls_keys,
         operator_updates,
+        mut asset_updates,
+        asset_registrations,
     ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
-        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -463,11 +474,13 @@ where
     let mut view = BlockView::new(db);
     view.apply_accounts(&account_updates)?;
     view.apply_stakes(&stake_updates)?;
+    view.apply_asset_balances(&asset_updates)?;
     let sealed_updates = on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
         .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
     account_updates.0.extend(sealed_updates.accounts.0);
     stake_updates.allocations.extend(sealed_updates.stakes.allocations);
     stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
+    asset_updates.0.extend(sealed_updates.assets.0);
 
     let new_validator_set = if validator_changes.is_empty() {
         None
@@ -482,7 +495,7 @@ where
     // actions locally actually produces — same principle as `ActionMismatch`
     // above, applied to state instead of the action list.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
@@ -497,7 +510,7 @@ where
         });
     }
 
-    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
     if let Some(snapshot) = &new_validator_set {
         writables.push(snapshot);
     }
@@ -506,6 +519,9 @@ where
     }
     for registration in &bls_keys {
         writables.push(registration);
+    }
+    for asset in &asset_registrations {
+        writables.push(asset);
     }
     writables.push(&operator_updates);
     writables.push(&block);
@@ -554,6 +570,8 @@ pub fn execute_actions<P>(
         Vec<EvidenceMarker>,
         Vec<BlsKeyRegistration>,
         OperatorUpdates,
+        AssetBalanceUpdates,
+        Vec<Asset>,
     ),
     ExecutorError,
 >
@@ -572,6 +590,8 @@ where
     let mut bls_keys: Vec<BlsKeyRegistration> = seed.bls_key.into_iter().collect();
     let mut operator_overlay = seed.operator.authorization;
     let mut operator_index_overlay = seed.operator.operator_index;
+    let mut asset_overlay = seed.assets.0;
+    let mut asset_registrations: Vec<Asset> = seed.asset_registration.into_iter().collect();
 
     let mut view = BlockView::new(db);
     view.apply_accounts(&AccountUpdates(overlay.clone()))?;
@@ -579,6 +599,7 @@ where
         allocations: stake_overlay.clone(),
         validator_index: validator_index_overlay.clone(),
     })?;
+    view.apply_asset_balances(&AssetBalanceUpdates(asset_overlay.clone()))?;
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -608,6 +629,9 @@ where
                 bls_keys.extend(updates.bls_key);
                 operator_overlay.extend(updates.operator.authorization);
                 operator_index_overlay.extend(updates.operator.operator_index);
+                asset_overlay.extend(updates.assets.0.clone());
+                view.apply_asset_balances(&updates.assets)?;
+                asset_registrations.extend(updates.asset_registration);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
@@ -628,6 +652,8 @@ where
             authorization: operator_overlay,
             operator_index: operator_index_overlay,
         },
+        AssetBalanceUpdates(asset_overlay),
+        asset_registrations,
     ))
 }
 
@@ -860,6 +886,8 @@ mod tests {
             _evidence_markers,
             _bls_keys,
             _operator_updates,
+            _asset_updates,
+            _asset_registrations,
         ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(

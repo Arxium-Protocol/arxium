@@ -491,6 +491,7 @@ dependencies = [
  "blst",
  "circuit-account",
  "circuit-identity-zk",
+ "circuit-rwa-asset",
  "circuit-staking",
  "ed25519-dalek 3.0.0",
  "hex",

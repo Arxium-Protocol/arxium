@@ -65,6 +65,8 @@ pub fn produce_block<R: ChainRuntime>(
         evidence_markers,
         bls_keys,
         operator_updates,
+        mut asset_updates,
+        asset_registrations,
     ) = execute_actions(
         db,
         actions,
@@ -93,10 +95,12 @@ pub fn produce_block<R: ChainRuntime>(
         let mut view = xc_storage::BlockView::new(db);
         view.apply_accounts(&account_updates)?;
         view.apply_stakes(&stake_updates)?;
+        view.apply_asset_balances(&asset_updates)?;
         let sealed_updates = R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
         account_updates.0.extend(sealed_updates.accounts.0);
         stake_updates.allocations.extend(sealed_updates.stakes.allocations);
         stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
+        asset_updates.0.extend(sealed_updates.assets.0);
     }
 
     let snapshot = if validator_changes.is_empty() {
@@ -112,7 +116,7 @@ pub fn produce_block<R: ChainRuntime>(
     // recompute from the same overlay before accepting this block — must be
     // known before signing, since the signature covers it.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
         }
@@ -175,7 +179,7 @@ pub fn produce_block<R: ChainRuntime>(
     // unbonding resolved above), and (if any) the resulting validator-set
     // change — a crash here must never leave these disagreeing (e.g. nonces
     // bumped with no block on record for it, or vice versa).
-    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates];
+    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
     if let Some(snapshot) = &snapshot {
         writables.push(snapshot);
     }
@@ -184,6 +188,9 @@ pub fn produce_block<R: ChainRuntime>(
     }
     for registration in &bls_keys {
         writables.push(registration);
+    }
+    for asset in &asset_registrations {
+        writables.push(asset);
     }
     writables.push(&operator_updates);
     writables.push(&new_block);
@@ -453,7 +460,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _, _, _, _) = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -496,6 +503,7 @@ mod tests {
             accounts,
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
+            attestor: None,
         })
         .unwrap();
 

@@ -10,9 +10,9 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
-use xc_circuit::{AccountKey, BlsKeyKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
-use xc_circuit::{CF_ACCOUNTS, CF_BLOCKS, CF_META, CF_VALIDATORS};
-use xc_primitives::{stake_subaccount, AccountEntry, Address, Block, Snapshot, StakeAllocation};
+use xc_circuit::{AccountKey, AssetBalanceKey, AssetKey, AttestorKey, BlsKeyKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_BLOCKS, CF_META, CF_VALIDATORS};
+use xc_primitives::{stake_subaccount, AccountEntry, Address, Asset, Block, Snapshot, StakeAllocation};
 #[cfg(test)]
 use xc_primitives::Action;
 
@@ -50,7 +50,7 @@ pub enum StorageError {
 /// gated by `SCHEMA_VERSION` below rather than a runtime probe.
 const CF_MERKLE: &str = "merkle";
 
-const COLUMN_FAMILIES: [&str; 5] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE];
+const COLUMN_FAMILIES: [&str; 6] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS];
 
 /// On-disk layout version this binary understands — covers column-family
 /// layout and key encoding (`cf_for_key`, `Block`'s bincode shape, etc; NOT
@@ -73,16 +73,20 @@ const COLUMN_FAMILIES: [&str; 5] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATO
 /// refused rather than silently treated as an empty trie — wipe and resync
 /// on a matching binary, same policy `Arxium_OpenItems.md` §7 already
 /// documents for this class of change.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped 2 -> 3 for regulated-asset balances (`CF_ASSETS`) joining the
+/// state trie via `is_state_key` — a version-2 DB's trie doesn't include
+/// whatever `asset_balance:` entries it already has, same "wipe and resync"
+/// policy as the 1 -> 2 bump above, deliberately accepted before mainnet.
+pub const SCHEMA_VERSION: u32 = 3;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
 
 /// Whether `key` is covered by the `B3` state trie / `compute_state_root` —
-/// the same `CF_ACCOUNTS`/`CF_VALIDATORS`-only scope the old full-rescan
-/// implementation used.
+/// `CF_ACCOUNTS`/`CF_VALIDATORS`/`CF_ASSETS`, i.e. every balance-bearing CF.
 fn is_state_key(key: &[u8]) -> bool {
-    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS)
+    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS)
 }
 
 fn hash_key(key: &[u8]) -> [u8; 32] {
@@ -152,6 +156,8 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_BLOCKS
     } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
         CF_VALIDATORS
+    } else if key.starts_with(b"asset_balance:") {
+        CF_ASSETS
     } else if key.len() == 32 {
         CF_MERKLE
     } else {
@@ -366,6 +372,23 @@ impl ArxiumDb {
         }
     }
 
+    /// The chain's genesis-fixed attestor address, if configured — see
+    /// `Snapshot::attestor`.
+    pub fn get_attestor(&self) -> Result<Option<Address>, StorageError> {
+        KvRead::get(self, &AttestorKey)
+    }
+
+    /// A registered asset's registry record (`issuer`/`compliance_required`),
+    /// if `asset_id` has been registered via `RegisterAsset`.
+    pub fn get_asset(&self, asset_id: &str) -> Result<Option<Asset>, StorageError> {
+        KvRead::get(self, &AssetKey(asset_id))
+    }
+
+    /// `owner`'s balance of `asset_id`, defaulting to 0 if never minted.
+    pub fn get_asset_balance(&self, asset_id: &str, owner: &Address) -> Result<u128, StorageError> {
+        Ok(KvRead::get(self, &AssetBalanceKey { asset_id, owner })?.unwrap_or(0))
+    }
+
     /// Every validator address currently authorizing `operator` to act for
     /// them — drives a "your validators" listing for a delegated client.
     pub fn get_validators_for_operator(&self, operator: &Address) -> Result<Vec<Address>, StorageError> {
@@ -524,7 +547,7 @@ impl ArxiumDb {
         let mut batch = WriteBatch::default();
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for (cf_name, key, value) in entries {
-            if matches!(cf_name.as_str(), CF_ACCOUNTS | CF_VALIDATORS) {
+            if matches!(cf_name.as_str(), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS) {
                 state_changes.insert(hash_key(key), Some(value.clone()));
             }
             batch.put_cf(self.cf(cf_name), key, value);
@@ -1109,6 +1132,9 @@ impl BatchWritable for Snapshot {
             b"validator_set:00000000000000000000".to_vec(),
             bincode::serde::encode_to_vec(&genesis_validators, config)?,
         ));
+        if let Some(attestor) = &self.attestor {
+            entries.push((AttestorKey.encode(), bincode::serde::encode_to_vec(attestor, config)?));
+        }
         Ok(entries)
     }
 }
@@ -1445,6 +1471,36 @@ impl BatchWritable for StakeUpdates {
     }
 }
 
+/// A set of asset-balance changes to be written atomically alongside a
+/// block, same reasoning as `AccountUpdates` — mint (`RegisterAsset`'s
+/// `IssueAsset`) and compliance-gated transfer both produce one of these
+/// rather than touching `AccountUpdates`, which is what keeps regulated
+/// asset balances out of the native token balance.
+#[derive(Debug, Default)]
+pub struct AssetBalanceUpdates(pub BTreeMap<(String, Address), u128>);
+
+impl BatchWritable for AssetBalanceUpdates {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        for ((asset_id, owner), balance) in &self.0 {
+            let key = AssetBalanceKey { asset_id, owner }.encode();
+            let value = bincode::serde::encode_to_vec(balance, config)?;
+            entries.push((key, value));
+        }
+        Ok(entries)
+    }
+}
+
+impl BatchWritable for Asset {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let key = AssetKey(&self.asset_id).encode();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
 /// Read view for in-progress block execution: checks not-yet-committed
 /// updates from earlier actions in the same block before falling through to
 /// `db`. Lets circuits (`circuits/staking`, `circuits/account`, ...) see a
@@ -1497,6 +1553,16 @@ impl<'a> BlockView<'a> {
             } else {
                 self.put(&StakeByValidatorKey(validator), masters)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Folds a batch of asset-balance changes into the view — every entry is
+    /// an upsert, mirroring `apply_accounts` (balances go to 0, never get
+    /// deleted as a row).
+    pub fn apply_asset_balances(&mut self, updates: &AssetBalanceUpdates) -> Result<(), StorageError> {
+        for ((asset_id, owner), balance) in &updates.0 {
+            self.put(&AssetBalanceKey { asset_id, owner }, balance)?;
         }
         Ok(())
     }
@@ -1621,6 +1687,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
+            attestor: None,
         })
         .unwrap();
 
@@ -1655,6 +1722,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
+            attestor: None,
         })
         .unwrap();
 
@@ -1682,6 +1750,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
+            attestor: None,
         })
         .unwrap();
 

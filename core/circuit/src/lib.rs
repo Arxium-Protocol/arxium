@@ -14,12 +14,13 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use xc_bls::BlsPublicKey;
-use xc_primitives::{AccountEntry, Address, StakeAllocation};
+use xc_primitives::{AccountEntry, Address, Asset, StakeAllocation};
 
 pub const CF_META: &str = "meta";
 pub const CF_BLOCKS: &str = "blocks";
 pub const CF_ACCOUNTS: &str = "accounts";
 pub const CF_VALIDATORS: &str = "validators";
+pub const CF_ASSETS: &str = "assets";
 
 /// A typed storage key: which column family it lives in, what value it
 /// decodes to, and how to encode itself to the raw bytes RocksDB stores.
@@ -67,6 +68,43 @@ impl KeySpec for BlsKeyKey<'_> {
     type Value = BlsPublicKey;
     fn encode(&self) -> Vec<u8> {
         format!("meta:blskey:{}", self.0).into_bytes()
+    }
+}
+
+/// The registry record for a regulated asset — `issuer`/`compliance_required`,
+/// not its balances (see `AssetBalanceKey`).
+pub struct AssetKey<'a>(pub &'a str);
+impl KeySpec for AssetKey<'_> {
+    const CF: &'static str = CF_META;
+    type Value = Asset;
+    fn encode(&self) -> Vec<u8> {
+        format!("meta:asset:{}", self.0).into_bytes()
+    }
+}
+
+/// One account's balance of one asset. Lives in its own column family
+/// (`CF_ASSETS`, included in `is_state_key`) so regulated-asset balances are
+/// merkleized separately from the native token balance in `CF_ACCOUNTS`.
+pub struct AssetBalanceKey<'a> {
+    pub asset_id: &'a str,
+    pub owner: &'a Address,
+}
+impl KeySpec for AssetBalanceKey<'_> {
+    const CF: &'static str = CF_ASSETS;
+    type Value = u128;
+    fn encode(&self) -> Vec<u8> {
+        format!("asset_balance:{}:{}", self.asset_id, self.owner).into_bytes()
+    }
+}
+
+/// The chain's sole attestor address (genesis-fixed, see `Snapshot::attestor`)
+/// — the only sender `GrantAttestation`/`RevokeAttestation` accept.
+pub struct AttestorKey;
+impl KeySpec for AttestorKey {
+    const CF: &'static str = CF_META;
+    type Value = Address;
+    fn encode(&self) -> Vec<u8> {
+        b"meta:attestor".to_vec()
     }
 }
 
