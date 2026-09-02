@@ -107,6 +107,7 @@ fn write_equivocation_artifact<P: Serialize>(
             tx_root: format!("0x{}", hex::encode(block.tx_root)),
             proposer: proposer.to_string(),
             state_root: block.state_root.clone(),
+            round: block.round,
         },
         signature: format!("0x{}", block.signature.clone().unwrap_or_default()),
     };
@@ -178,6 +179,7 @@ fn write_disagreement_artifact<P: Serialize>(
             tx_root: format!("0x{}", hex::encode(proposed.tx_root)),
             proposer: proposer.to_string(),
             state_root: proposed.state_root.clone(),
+            round: proposed.round,
         },
         signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
     };

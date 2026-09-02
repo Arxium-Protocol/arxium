@@ -3,6 +3,7 @@
 
 use crate::action::{Action, SignatureError};
 use crate::address::Address;
+use crate::consensus::RoundCertificate;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -32,6 +33,19 @@ pub struct Block<P> {
     /// a node verify a full state snapshot against what the chain actually
     /// finalized, instead of trusting the source.
     pub state_root: String,
+    /// Which round of `height` this block was produced for — see
+    /// `xc_primitives::eligible_proposer`. Part of `BlockSigningPayload`, so
+    /// it can't be swapped post-signing.
+    pub round: u32,
+    /// Quorum proof that `round - 1` timed out, required whenever `round >
+    /// 0` (`None` at round 0, where there is nothing to prove). Carried in
+    /// the block itself, not just this node's local `ArxiumDb::current_round`
+    /// state, so `xc_executor::accept_block` can verify eligibility from the
+    /// block alone: a node with no local round-timeout history (e.g. syncing
+    /// this height for the first time) can still validate it, and two nodes
+    /// with different locally-held certificates always agree on the same
+    /// verdict. See `Arxium_OpenItems.md` §7 (B1c).
+    pub round_certificate: Option<RoundCertificate>,
 }
 
 /// What actually gets signed: everything but the signature itself (it can't
@@ -54,6 +68,7 @@ struct BlockSigningPayload<'a> {
     tx_root: &'a [u8; 32],
     proposer: &'a Address,
     state_root: &'a str,
+    round: u32,
 }
 
 impl<P: Serialize> Block<P> {
@@ -71,6 +86,8 @@ impl<P: Serialize> Block<P> {
             signature: None,
             state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
+            round: 0,
+            round_certificate: None,
         }
     }
 
@@ -95,6 +112,7 @@ impl<P: Serialize> Block<P> {
             tx_root: &self.tx_root,
             proposer,
             state_root: &self.state_root,
+            round: self.round,
         };
         bincode::serde::encode_to_vec(&payload, bincode::config::standard())
             .expect("signing payload encoding should never fail")
@@ -223,6 +241,8 @@ mod tests {
             proposer: Some(proposer.clone()),
             signature: None,
             state_root: header.state_root,
+            round: header.round,
+            round_certificate: None,
         };
         (block, proposer)
     }
@@ -248,7 +268,7 @@ mod tests {
         let (block, proposer) = block_matching_frozen_artifact_header();
         assert_eq!(
             hex::encode(block.signing_bytes(&proposer)),
-            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f7448617368",
+            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
         );
     }
 }

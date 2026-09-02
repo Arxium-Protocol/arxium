@@ -1299,19 +1299,11 @@ impl BatchWritable for FinalityRecord {
     }
 }
 
-/// Proof a quorum of `height`'s validator set independently timed out
-/// `round` — see `xc_primitives::eligible_proposer` (B1b,
-/// `Arxium_OpenItems.md` §7) and `arxd_finality::tally_round_timeout`. Once
-/// persisted, `round + 1` becomes eligible: `ArxiumDb::current_round` counts
-/// these to find the height's current round, so a round change requires this
-/// record to exist, never just a claim in a block header.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoundCertificate {
-    pub height: u64,
-    pub round: u32,
-    pub signers: Vec<Address>,
-    pub aggregate_signature: BlsSignature,
-}
+// The type itself now lives in `xc_primitives` (so `Block::round_certificate`
+// can carry it — `core/primitives` can't depend on `core/storage`). Re-
+// exported under its old name here so existing `use xc_storage::
+// RoundCertificate` call sites (`arxd/finality`) don't need to change.
+pub use xc_primitives::RoundCertificate;
 
 impl BatchWritable for RoundCertificate {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
@@ -1527,6 +1519,8 @@ mod explorer_index_tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         }
     }
 

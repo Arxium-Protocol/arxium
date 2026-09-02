@@ -253,6 +253,8 @@ fn spawn_subsystems<R: ChainRuntime>(
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
         R::build_evidence_action(
             EquivocationEvidence { block_a: dummy_block(), block_b: dummy_block() },

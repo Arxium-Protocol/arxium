@@ -146,6 +146,15 @@ pub fn produce_block<R: ChainRuntime>(
     histogram!("arxium_poe_ep_compute_nanos").record(poe_start.elapsed().as_nanos() as f64);
     info!(height = next_height, ep = %hex::encode(ep), "computed proof-of-execution hash");
 
+    // Which round this node is producing for, and — if it isn't round 0 —
+    // the certificate proving the round(s) before it timed out. Read fresh
+    // here (rather than threaded through from `produce_loop`'s eligibility
+    // check) so this stays correct however `produce_block` is called,
+    // including directly from tests. See `xc_primitives::Block::round`.
+    let round = db.current_round(next_height)?;
+    let round_certificate =
+        if round == 0 { None } else { db.get_round_certificate(next_height, round - 1)? };
+
     let mut new_block = Block {
         height: next_height,
         parent_hash: parent.hash(),
@@ -155,6 +164,8 @@ pub fn produce_block<R: ChainRuntime>(
         proposer: None,
         signature: None,
         state_root,
+        round,
+        round_certificate,
     };
     if let Some((address, key)) = proposer {
         new_block.sign(address.clone(), key);

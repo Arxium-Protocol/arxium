@@ -24,6 +24,7 @@ bech32 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 bincode = { workspace = true }
+xc-bls = { workspace = true }
 
 [dev-dependencies]
 xc-artifact = { workspace = true }

@@ -8,6 +8,7 @@ license.workspace = true
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-poe = { workspace = true }
+xc-bls = { workspace = true }
 circuit-staking = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

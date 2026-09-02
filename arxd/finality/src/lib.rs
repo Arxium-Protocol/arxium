@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
-use xc_primitives::{Address, Block, quorum};
+use xc_primitives::{Address, Block, quorum, round_timeout_signing_bytes};
 use xc_storage::{
     ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord, RoundCertificate,
     RoundTimeoutVoteRecord,
@@ -21,7 +21,6 @@ use xc_storage::{
 // even though they can share fields (height).
 const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
 const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v2";
-const DOMAIN_ROUND_TIMEOUT: &[u8] = b"arxium/round_timeout/v1";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -61,17 +60,6 @@ pub fn dissent_signing_bytes(
     push_field(&mut buf, header_commitment);
     push_field(&mut buf, ep);
     push_field(&mut buf, reason.as_bytes());
-    buf
-}
-
-/// Exact bytes a validator signs for a round-timeout vote — see
-/// `xc_primitives::eligible_proposer` and `RoundCertificate` (B1b,
-/// `Arxium_OpenItems.md` §7).
-pub fn round_timeout_signing_bytes(height: u64, round: u32) -> Vec<u8> {
-    let mut buf = Vec::new();
-    push_field(&mut buf, DOMAIN_ROUND_TIMEOUT);
-    push_field(&mut buf, &height.to_le_bytes());
-    push_field(&mut buf, &round.to_le_bytes());
     buf
 }
 
@@ -330,18 +318,37 @@ where
                                     if !already_certified
                                         && !my_round_timeout_votes.contains_key(&(next_height, round))
                                     {
-                                        let msg = round_timeout_signing_bytes(next_height, round);
-                                        let signature = xc_bls::sign(secret_key, &msg);
-                                        let vote = RoundTimeoutVote {
-                                            height: next_height,
-                                            round,
-                                            voter: address.clone(),
-                                            signature,
-                                        };
-                                        my_round_timeout_votes.insert((vote.height, vote.round), vote.clone());
-                                        if round_timeout_tx.send(vote).is_err() {
-                                            warn!("finality: round-timeout vote channel closed, stopping");
-                                            return;
+                                        match db.get_block::<P>(next_height.saturating_sub(1)) {
+                                            Ok(Some(parent)) => {
+                                                let msg = round_timeout_signing_bytes(
+                                                    next_height,
+                                                    round,
+                                                    &parent.hash(),
+                                                );
+                                                let signature = xc_bls::sign(secret_key, &msg);
+                                                let vote = RoundTimeoutVote {
+                                                    height: next_height,
+                                                    round,
+                                                    voter: address.clone(),
+                                                    signature,
+                                                };
+                                                my_round_timeout_votes
+                                                    .insert((vote.height, vote.round), vote.clone());
+                                                if round_timeout_tx.send(vote).is_err() {
+                                                    warn!(
+                                                        "finality: round-timeout vote channel closed, stopping"
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                            Ok(None) => warn!(
+                                                "finality: no parent block at height {} to sign a round-timeout vote against",
+                                                next_height.saturating_sub(1)
+                                            ),
+                                            Err(err) => warn!(
+                                                "finality: failed to read parent block at height {}: {err}",
+                                                next_height.saturating_sub(1)
+                                            ),
                                         }
                                     }
                                 }
@@ -431,9 +438,12 @@ where
                     }
                 }
                 FinalityEvent::RoundTimeoutObserved(vote) => {
-                    if let Err(err) =
-                        tally_round_timeout(&db, &mut round_timeout_tallies, &mut my_round_timeout_votes, vote)
-                    {
+                    if let Err(err) = tally_round_timeout::<P>(
+                        &db,
+                        &mut round_timeout_tallies,
+                        &mut my_round_timeout_votes,
+                        vote,
+                    ) {
                         warn!("finality: failed to process round-timeout vote: {err}");
                     }
                 }
@@ -526,7 +536,7 @@ fn tally_vote(
 /// quorum for `(height, round)` is reached, aggregates and persists a
 /// `RoundCertificate` — which is what actually makes `round + 1` eligible
 /// (see `xc_storage::ArxiumDb::current_round`).
-fn tally_round_timeout(
+fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     db: &ArxiumDb,
     tallies: &mut HashMap<(u64, u32), HashMap<Address, BlsSignature>>,
     my_votes: &mut HashMap<(u64, u32), RoundTimeoutVote>,
@@ -536,11 +546,20 @@ fn tally_round_timeout(
         return Ok(()); // already certified, nothing left to tally
     }
 
+    let Some(parent) = db.get_block::<P>(vote.height.saturating_sub(1))? else {
+        warn!(
+            "finality: round-timeout vote for height {} with no local parent block at {}, dropping",
+            vote.height,
+            vote.height.saturating_sub(1)
+        );
+        return Ok(());
+    };
+
     let Some(pubkey) = db.get_bls_pubkey(&vote.voter)? else {
         warn!("finality: round-timeout vote from {} with no registered BLS key, dropping", vote.voter);
         return Ok(());
     };
-    let msg = round_timeout_signing_bytes(vote.height, vote.round);
+    let msg = round_timeout_signing_bytes(vote.height, vote.round, &parent.hash());
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!("finality: dropping round-timeout vote from {} with an invalid signature", vote.voter);
         return Ok(());
@@ -1086,12 +1105,29 @@ mod tests {
         addrs_and_keys
     }
 
-    fn round_timeout_vote(addr: &Address, sk: &BlsSecretKey, height: u64, round: u32) -> RoundTimeoutVote {
+    /// Writes a stub parent block at `height` so tests can sign/verify
+    /// round-timeout votes against it — `round_timeout_signing_bytes` now
+    /// binds the parent hash, so a round-timeout vote needs an actual parent
+    /// block in the db, not just a bare height/round pair.
+    fn parent_block_for(db: &ArxiumDb, height: u64) -> Block<()> {
+        let mut block: Block<()> = Block::genesis(1_000_000 + height);
+        block.height = height;
+        db.write_batches(&[&block]).unwrap();
+        block
+    }
+
+    fn round_timeout_vote(
+        addr: &Address,
+        sk: &BlsSecretKey,
+        height: u64,
+        round: u32,
+        parent_hash: &str,
+    ) -> RoundTimeoutVote {
         RoundTimeoutVote {
             height,
             round,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(height, round)),
+            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(height, round, parent_hash)),
         }
     }
 
@@ -1102,16 +1138,29 @@ mod tests {
     fn no_round_certificate_below_quorum_then_one_appears_at_quorum() {
         let (db, dir) = open_test_db();
         let addrs_and_keys = round_timeout_validators(&db, 4);
+        let parent = parent_block_for(&db, 4);
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
 
         for (addr, sk) in &addrs_and_keys[..2] {
-            tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+            tally_round_timeout::<()>(
+                &db,
+                &mut tallies,
+                &mut my_votes,
+                round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+            )
+            .unwrap();
         }
         assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "below quorum (2 of 4) must not certify");
 
         let (addr, sk) = &addrs_and_keys[2];
-        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+        tally_round_timeout::<()>(
+            &db,
+            &mut tallies,
+            &mut my_votes,
+            round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+        )
+        .unwrap();
 
         let record = db.get_round_certificate(5, 0).unwrap().expect("expected a certificate at quorum");
         assert_eq!(record.signers.len(), 3);
@@ -1127,13 +1176,26 @@ mod tests {
     fn votes_for_different_rounds_do_not_cross_aggregate() {
         let (db, dir) = open_test_db();
         let addrs_and_keys = round_timeout_validators(&db, 3);
+        let parent = parent_block_for(&db, 4);
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
 
         let (addr0, sk0) = &addrs_and_keys[0];
         let (addr1, sk1) = &addrs_and_keys[1];
-        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr0, sk0, 5, 0)).unwrap();
-        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr1, sk1, 5, 1)).unwrap();
+        tally_round_timeout::<()>(
+            &db,
+            &mut tallies,
+            &mut my_votes,
+            round_timeout_vote(addr0, sk0, 5, 0, &parent.hash()),
+        )
+        .unwrap();
+        tally_round_timeout::<()>(
+            &db,
+            &mut tallies,
+            &mut my_votes,
+            round_timeout_vote(addr1, sk1, 5, 1, &parent.hash()),
+        )
+        .unwrap();
 
         assert!(db.get_round_certificate(5, 0).unwrap().is_none());
         assert!(db.get_round_certificate(5, 1).unwrap().is_none());
@@ -1148,11 +1210,18 @@ mod tests {
     fn a_vote_for_an_already_certified_round_is_a_no_op() {
         let (db, dir) = open_test_db();
         let addrs_and_keys = round_timeout_validators(&db, 3);
+        let parent = parent_block_for(&db, 4);
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
 
         for (addr, sk) in &addrs_and_keys {
-            tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0)).unwrap();
+            tally_round_timeout::<()>(
+                &db,
+                &mut tallies,
+                &mut my_votes,
+                round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+            )
+            .unwrap();
         }
         assert_eq!(db.current_round(5).unwrap(), 1);
 
@@ -1160,8 +1229,13 @@ mod tests {
         let late_key = SigningKey::from_bytes(&[9u8; 32]);
         let late_addr = Address::from_pubkey_bytes(late_key.verifying_key().as_bytes()).unwrap();
         let (late_sk, _pk) = xc_bls::keygen_from_seed(&[99u8; 32]).unwrap();
-        tally_round_timeout(&db, &mut tallies, &mut my_votes, round_timeout_vote(&late_addr, &late_sk, 5, 0))
-            .unwrap();
+        tally_round_timeout::<()>(
+            &db,
+            &mut tallies,
+            &mut my_votes,
+            round_timeout_vote(&late_addr, &late_sk, 5, 0, &parent.hash()),
+        )
+        .unwrap();
 
         // Still exactly the original 3 signers, no crash, no round change.
         let record = db.get_round_certificate(5, 0).unwrap().unwrap();
@@ -1176,6 +1250,7 @@ mod tests {
     #[test]
     fn spawn_finality_signs_a_round_timeout_vote_once_the_tip_stalls() {
         let (db, dir) = open_test_db();
+        parent_block_for(&db, 0);
         let (sk, _pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
         let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
 

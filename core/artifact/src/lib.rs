@@ -57,6 +57,8 @@ pub struct CanonicalHeader {
     /// wire encoding exactly — see `signing_bytes` below).
     pub proposer: String,
     pub state_root: String,
+    /// Mirrors `xc_primitives::block::Block::round`.
+    pub round: u32,
 }
 
 /// What `BlockSigningPayload` actually encodes, reimplemented here so the
@@ -70,6 +72,7 @@ struct SigningPayload<'a> {
     tx_root: &'a [u8; 32],
     proposer: &'a str,
     state_root: &'a str,
+    round: u32,
 }
 
 /// Recomputes the exact bytes a proposer signs for `header` — byte-for-byte
@@ -91,6 +94,7 @@ pub fn signing_bytes_for(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyErro
         tx_root: &tx_root,
         proposer: &header.proposer,
         state_root: &header.state_root,
+        round: header.round,
     };
     let config = bincode::config::standard();
     // Every field is a primitive or `&str`/`&[u8; 32]` — no user `Serialize`
@@ -296,6 +300,7 @@ pub fn frozen_test_header() -> CanonicalHeader {
         // not gain one just for a test fixture.
         proposer: "arx1424242424242424242424242424242424242424242424242424q5p8vly".to_string(),
         state_root: "0xstaterootHash".to_string(),
+        round: 3,
     }
 }
 
@@ -452,6 +457,7 @@ mod tests {
             tx_root: format!("0x{}", hex::encode([tx_root; 32])),
             proposer: proposer.to_string(),
             state_root: "0xstate".to_string(),
+            round: 0,
         }
     }
 
@@ -558,7 +564,7 @@ mod tests {
         let bytes = signing_bytes_for(&header).unwrap();
         assert_eq!(
             hex::encode(&bytes),
-            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f7448617368",
+            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
         );
     }
 

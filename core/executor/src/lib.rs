@@ -7,8 +7,8 @@ use thiserror::Error;
 use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
 use xc_primitives::{
-    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, SignatureError, ValidatorChange,
-    eligible_proposer,
+    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, RoundCertificate, SignatureError,
+    ValidatorChange, eligible_proposer, quorum, round_timeout_signing_bytes,
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker,
@@ -113,6 +113,33 @@ pub enum AcceptBlockError {
         expected: Option<Address>,
         actual: Option<Address>,
     },
+    #[error("block {height} claims round {round} but carries no round certificate to prove round {} timed out", round - 1)]
+    MissingRoundCertificate { height: u64, round: u32 },
+    #[error("block {height} claims round 0 but carries a round certificate — round 0 needs no proof")]
+    UnexpectedRoundCertificate { height: u64 },
+    #[error(
+        "block {height} round {round} carries a certificate for height {cert_height} round {cert_round} — must be this block's own height and round - 1"
+    )]
+    RoundCertificateMismatch {
+        height: u64,
+        round: u32,
+        cert_height: u64,
+        cert_round: u32,
+    },
+    #[error(
+        "block {height} round {round} certificate has only {signers} signer(s), quorum of {quorum} validators is {needed}"
+    )]
+    RoundCertificateBelowQuorum {
+        height: u64,
+        round: u32,
+        signers: usize,
+        quorum: usize,
+        needed: usize,
+    },
+    #[error("block {height} round {round} certificate includes signer {signer} who is not a registered BLS validator at this height")]
+    RoundCertificateUnknownSigner { height: u64, round: u32, signer: Address },
+    #[error("block {height} round {round} certificate's aggregate signature does not verify")]
+    RoundCertificateInvalid { height: u64, round: u32 },
     #[error("block height {block_height} does not extend local tip {tip_height}")]
     NotNextHeight { block_height: u64, tip_height: u64 },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
@@ -174,6 +201,65 @@ impl AcceptBlockError {
     pub fn is_execution_disagreement(&self) -> bool {
         matches!(self, AcceptBlockError::StateRootMismatch { .. } | AcceptBlockError::ActionMismatch { .. })
     }
+}
+
+/// Checks that `cert` actually proves `round - 1` timed out for this block:
+/// it names the right height/round, carries at least `quorum(validators)`
+/// distinct signers who are all members of `validators`, and its aggregate
+/// signature verifies against `round_timeout_signing_bytes` for that height/
+/// round/parent. Distinctness matters — without it a validator holding a
+/// single real vote could list itself N times and aggregate its own
+/// signature N times over, faking quorum out of one signer.
+fn verify_round_certificate(
+    db: &ArxiumDb,
+    cert: &RoundCertificate,
+    height: u64,
+    round: u32,
+    parent_hash: &str,
+    validators: &[Address],
+) -> Result<(), AcceptBlockError> {
+    if cert.height != height || cert.round != round - 1 {
+        return Err(AcceptBlockError::RoundCertificateMismatch {
+            height,
+            round,
+            cert_height: cert.height,
+            cert_round: cert.round,
+        });
+    }
+
+    let needed = quorum(validators.len());
+    if cert.signers.len() < needed {
+        return Err(AcceptBlockError::RoundCertificateBelowQuorum {
+            height,
+            round,
+            signers: cert.signers.len(),
+            quorum: validators.len(),
+            needed,
+        });
+    }
+
+    let mut pubkeys = Vec::with_capacity(cert.signers.len());
+    for (i, signer) in cert.signers.iter().enumerate() {
+        if cert.signers[..i].contains(signer) || !validators.contains(signer) {
+            return Err(AcceptBlockError::RoundCertificateUnknownSigner {
+                height,
+                round,
+                signer: signer.clone(),
+            });
+        }
+        let Some(pubkey) = db.get_bls_pubkey(signer)? else {
+            return Err(AcceptBlockError::RoundCertificateUnknownSigner {
+                height,
+                round,
+                signer: signer.clone(),
+            });
+        };
+        pubkeys.push(pubkey);
+    }
+
+    let msg = round_timeout_signing_bytes(height, round - 1, parent_hash);
+    xc_bls::verify_aggregate(&msg, &pubkeys, &cert.aggregate_signature)
+        .map_err(|_| AcceptBlockError::RoundCertificateInvalid { height, round })
 }
 
 /// Validates a block received from a peer — proposer signature, that the
@@ -305,14 +391,29 @@ where
     // this is also the pre-block set `dispatch` should validate
     // JoinValidator/LeaveValidator preconditions against below.
     let validators = db.get_validator_set_at(block.height)?;
-    // Which round this height is in comes from `db.current_round`, not from
-    // anything the block itself claims (see `Arxium_OpenItems.md` §7, B1b):
-    // it's the number of quorum-certified round timeouts persisted for this
-    // height, so a proposer can only be eligible for round R once a quorum
-    // has attested round R-1 actually timed out — no unilateral clock claim
-    // can move it. Every node (live or replaying during sync) reads the same
-    // persisted certificates, so they always agree.
-    let round = db.current_round(block.height)?;
+    // Which round this height is in is carried on the block itself, not
+    // read from this node's local `db.current_round` (see
+    // `Arxium_OpenItems.md` §7, B1c — this replaced the earlier B1b design,
+    // whose local-state read made acceptance depend on which round-timeout
+    // votes this particular node happened to receive over gossip, breaking
+    // both determinism and fresh sync of any height past round 0). `round ==
+    // 0` needs no proof; `round > 0` must carry a `RoundCertificate` proving
+    // `round - 1` timed out, verified below against this block's own
+    // validator set and parent hash — recomputable by any node from the
+    // block alone, live or replaying during sync.
+    let round = block.round;
+    match &block.round_certificate {
+        None if round == 0 => {}
+        None => {
+            return Err(AcceptBlockError::MissingRoundCertificate { height: block.height, round });
+        }
+        Some(_) if round == 0 => {
+            return Err(AcceptBlockError::UnexpectedRoundCertificate { height: block.height });
+        }
+        Some(cert) => {
+            verify_round_certificate(db, cert, block.height, round, &block.parent_hash, &validators)?;
+        }
+    }
     let expected = eligible_proposer(&validators, block.height, round);
     if block.proposer != expected {
         return Err(AcceptBlockError::WrongProposer {
@@ -706,6 +807,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -832,6 +935,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -922,6 +1027,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -978,6 +1085,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
+            round: 0,
+            round_certificate: None,
         };
         block1.sign(addr.clone(), &key);
         let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
@@ -1012,6 +1121,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
+            round: 0,
+            round_certificate: None,
         };
         block.sign(addr.clone(), key);
         block
@@ -1133,6 +1244,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
+            round: 0,
+            round_certificate: None,
         };
         block1.sign(addr1, &key1);
         let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
@@ -1207,6 +1320,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
         block2.sign(addr, &key);
         let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
@@ -1234,6 +1349,8 @@ mod tests {
                 proposer: None,
                 signature: None,
                 state_root: String::new(),
+                round: 0,
+                round_certificate: None,
             };
             block2.sign(addr.clone(), &key);
             let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
@@ -1295,6 +1412,8 @@ mod tests {
             proposer: None,
             signature: None,
             state_root: String::new(),
+            round: 0,
+            round_certificate: None,
         };
         block1.sign(alice, &alice_key);
 

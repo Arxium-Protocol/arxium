@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Address;
+use serde::{Deserialize, Serialize};
+use xc_bls::BlsSignature;
 
 /// How many validators must precommit to a block before it is final: 2/3 of
 /// the set plus one, counted by head rather than weighted by stake.
@@ -82,6 +84,52 @@ pub fn eligible_proposer(validators: &[Address], height: u64, round: u32) -> Opt
     sorted.sort();
     let idx = (height as usize).wrapping_add(round as usize) % sorted.len();
     Some(sorted[idx].clone())
+}
+
+/// Proof a quorum of `height`'s validator set independently timed out
+/// `round`. Carried in `Block::round_certificate` so a block that advances
+/// past round 0 is self-certifying — any node can verify `eligible_proposer`
+/// against the certificate it ships with, instead of consulting local,
+/// gossip-dependent state (`Arxium_OpenItems.md` §7, B1b/B1c). Also persisted
+/// locally by `arxd_finality::tally_round_timeout` as votes arrive, for the
+/// producer side: `xc_storage::ArxiumDb::current_round` counts these to
+/// decide which round *this node* may propose next, before any block exists
+/// to carry the proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundCertificate {
+    pub height: u64,
+    pub round: u32,
+    pub signers: Vec<Address>,
+    pub aggregate_signature: BlsSignature,
+}
+
+// Domain tag, mixed into what gets signed, so a round-timeout vote can never
+// be replayed as some other kind of signed message.
+const DOMAIN_ROUND_TIMEOUT: &[u8] = b"arxium/round_timeout/v2";
+
+fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
+}
+
+/// Exact bytes a validator signs for a round-timeout vote. Lives here rather
+/// than in `arxd/finality` for the same reason `quorum` does: both
+/// `arxd_finality::tally_round_timeout` (tallying gossiped votes) and
+/// `xc_executor::accept_block` (verifying a `RoundCertificate` a block ships
+/// with) need to recompute it, and `core/` may not depend on `arxd/`.
+///
+/// Binds `parent_hash` (v2; v1 bound only `height`/`round`) — without it, a
+/// vote saying "height H round R timed out" verifies against any parent, so
+/// it is replayable across competing histories at the same height. Binding
+/// the parent makes a certificate meaningful only for the specific chain it
+/// was signed against.
+pub fn round_timeout_signing_bytes(height: u64, round: u32, parent_hash: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_ROUND_TIMEOUT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, &round.to_le_bytes());
+    push_field(&mut buf, parent_hash.as_bytes());
+    buf
 }
 
 #[cfg(test)]
