@@ -379,6 +379,13 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/accounts/{address}", get(get_account::<P>))
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
                 .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
+                .route("/accounts/{address}/assets", get(get_account_assets::<P>))
+                .route(
+                    "/accounts/{address}/assets/{asset_id}",
+                    get(get_account_asset_balance::<P>),
+                )
+                .route("/assets", get(get_assets::<P>))
+                .route("/assets/{asset_id}", get(get_asset::<P>))
                 .route("/validators", get(get_validators::<P>))
                 .route("/finality", get(get_finality::<P>))
                 .route("/operators/{address}/validators", get(get_operator_validators::<P>))
@@ -723,6 +730,117 @@ async fn get_account_bls_key<P: Payload>(
 
     match state.db.get_bls_pubkey(&address) {
         Ok(Some(pubkey)) => Json(serde_json::json!({ "pubkey": pubkey })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// One row of `GET /accounts/{address}/assets`.
+///
+/// Carries the registry fields alongside the balance rather than just the id:
+/// a wallet has to know whether an asset is compliance-gated before it can
+/// tell the holder why a transfer would be refused, and making that a second
+/// request per asset would put an N+1 on the one screen that lists them all.
+#[derive(serde::Serialize)]
+struct AccountAssetBalance {
+    asset_id: String,
+    issuer: String,
+    compliance_required: bool,
+    balance: u128,
+}
+
+/// Every regulated asset `address` holds a balance row for.
+///
+/// Includes rows that have gone to zero — a balance row is never deleted, and
+/// "you held this and now hold none" is a different statement from "you never
+/// held this". Answered from the `meta:account_assets:` index; the balance
+/// keys themselves are ordered `{asset_id}:{owner}` and cannot be scanned by
+/// owner.
+async fn get_account_assets<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    let asset_ids = match state.db.get_account_assets(&address) {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let mut balances = Vec::with_capacity(asset_ids.len());
+    for asset_id in asset_ids {
+        let asset = match state.db.get_asset(&asset_id) {
+            Ok(Some(asset)) => asset,
+            // Indexed but unregistered is impossible through the normal write
+            // path (both rows land in one atomic batch), so skip rather than
+            // fail the whole listing.
+            Ok(None) => continue,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        let balance = match state.db.get_asset_balance(&asset_id, &address) {
+            Ok(balance) => balance,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        balances.push(AccountAssetBalance {
+            asset_id,
+            issuer: asset.issuer.to_string(),
+            compliance_required: asset.compliance_required,
+            balance,
+        });
+    }
+
+    Json(balances).into_response()
+}
+
+/// `address`'s balance of one asset. 404 when the asset was never registered,
+/// which is a different answer from a registered asset held at zero — the
+/// latter is a legitimate 200 with `balance: 0`.
+async fn get_account_asset_balance<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path((address, asset_id)): Path<(String, String)>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    let asset = match state.db.get_asset(&asset_id) {
+        Ok(Some(asset)) => asset,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    match state.db.get_asset_balance(&asset_id, &address) {
+        Ok(balance) => Json(AccountAssetBalance {
+            asset_id,
+            issuer: asset.issuer.to_string(),
+            compliance_required: asset.compliance_required,
+            balance,
+        })
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Every asset registered on this chain, in registration order.
+async fn get_assets<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    match state.db.list_assets() {
+        Ok(assets) => Json(assets).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// One asset's registry record — issuer and whether transfers of it are
+/// compliance-gated.
+async fn get_asset<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(asset_id): Path<String>,
+) -> Response {
+    match state.db.get_asset(&asset_id) {
+        Ok(Some(asset)) => Json(asset).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

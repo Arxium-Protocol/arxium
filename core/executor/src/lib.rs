@@ -510,7 +510,16 @@ where
         });
     }
 
+    // Read-side indexes for the asset state this block just changed. Computed
+    // after the seal above so a fee/reward that moved an asset balance is
+    // indexed too, and deliberately *not* in `state_root_overlay` — these are
+    // `CF_META` rows, outside `is_state_key`, so they must not move the root.
+    let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
+
     let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+    if !asset_index.is_empty() {
+        writables.push(&asset_index);
+    }
     if let Some(snapshot) = &new_validator_set {
         writables.push(snapshot);
     }

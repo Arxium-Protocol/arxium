@@ -97,6 +97,45 @@ impl KeySpec for AssetBalanceKey<'_> {
     }
 }
 
+/// Every registered asset id, as one list.
+///
+/// A maintained index rather than a prefix scan over `meta:asset:`, for the
+/// same reason `meta:operator_index:` exists: listing is a read path and the
+/// codebase resolves column families by key *prefix* (`cf_for_key`), not by
+/// `KeySpec::CF`. `meta:asset:{id}` is 11 bytes plus the id, so a 21-byte
+/// asset id lands on the `key.len() == 32` arm and is filed under `CF_MERKLE`
+/// instead of `CF_META`. It still round-trips — reads take the same arm — but
+/// a scan of `CF_META` would silently skip exactly those assets. An index has
+/// no such hole, and is a single read besides.
+pub struct AssetIndexKey;
+impl KeySpec for AssetIndexKey {
+    const CF: &'static str = CF_META;
+    type Value = Vec<String>;
+    fn encode(&self) -> Vec<u8> {
+        b"meta:asset_index".to_vec()
+    }
+}
+
+/// Every asset id `owner` holds a balance row for.
+///
+/// The reverse of `AssetBalanceKey`, which is keyed `{asset_id}:{owner}` and
+/// so can only be scanned by asset, never by owner. A wallet asks the
+/// opposite question — "what does this account hold" — and answering it from
+/// the balance keys alone would mean reading every balance on the chain.
+///
+/// Kept in `CF_META`, which `is_state_key` excludes, so maintaining it costs
+/// nothing in the state root and cannot affect consensus. That is also why
+/// this is an index and not a re-keying of `AssetBalanceKey`: those keys are
+/// merkleized, and reordering them would change the state root.
+pub struct AccountAssetsKey<'a>(pub &'a Address);
+impl KeySpec for AccountAssetsKey<'_> {
+    const CF: &'static str = CF_META;
+    type Value = Vec<String>;
+    fn encode(&self) -> Vec<u8> {
+        format!("meta:account_assets:{}", self.0).into_bytes()
+    }
+}
+
 /// The chain's sole attestor address (genesis-fixed, see `Snapshot::attestor`)
 /// — the only sender `GrantAttestation`/`RevokeAttestation` accept.
 pub struct AttestorKey;

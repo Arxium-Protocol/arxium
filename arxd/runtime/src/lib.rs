@@ -741,3 +741,56 @@ mod tests {
             .expect("operator authorized via AuthorizeOperator should be allowed to join");
     }
 }
+
+/// Signing-byte vectors shared with the mobile clients.
+///
+/// `ArxiumCodec` in the iOS app and `ArxiumCodec.kt` on Android reimplement
+/// bincode's framing by hand — they cannot call this encoder — so the only
+/// thing standing between a wallet and a silently rejected signature is a
+/// vector produced here and pinned there. A signature over the wrong bytes
+/// fails verification on the node, not on the device, so drift shows up as
+/// "my transfer vanished" rather than as an error.
+///
+/// Same purpose as the cross-crate dissent signing-byte checks: pin the
+/// encoding at the boundary where two implementations have to agree.
+#[cfg(test)]
+mod client_signing_vectors {
+    use super::*;
+
+    const ALICE: &str = "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz";
+    const BOB: &str = "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5";
+
+    fn hex_signing_bytes(nonce: u64, payload: ActionPayload) -> String {
+        let action = Action {
+            sender: Address::parse(ALICE).expect("valid sender"),
+            nonce,
+            payload,
+            signature: None,
+        };
+        hex::encode(action.signing_bytes())
+    }
+
+    /// `TransferAsset` is variant 14 — after `RegisterAsset` (12) and
+    /// `IssueAsset` (13), which the wallet never builds. Its fields frame as
+    /// `{asset_id, to, amount}`, so the encoding is one more length-prefixed
+    /// string than `Transfer` carries before the amount varint.
+    #[test]
+    fn transfer_asset_vector_matches_the_mobile_codecs() {
+        assert_eq!(
+            hex_signing_bytes(
+                3,
+                ActionPayload::TransferAsset {
+                    asset_id: "gold".to_string(),
+                    to: Address::parse(BOB).expect("valid recipient"),
+                    amount: 1_000_000,
+                },
+            ),
+            TRANSFER_ASSET_VECTOR,
+            "TransferAsset signing bytes changed — the mobile codecs pin this \
+             exact string and will sign rejected transactions until updated"
+        );
+    }
+
+    /// Kept as a constant so the value is greppable from the app repos.
+    const TRANSFER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a030e04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fc40420f00";
+}

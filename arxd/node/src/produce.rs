@@ -179,7 +179,16 @@ pub fn produce_block<R: ChainRuntime>(
     // unbonding resolved above), and (if any) the resulting validator-set
     // change — a crash here must never leave these disagreeing (e.g. nonces
     // bumped with no block on record for it, or vice versa).
+    // Same read-side asset indexes `accept_block` writes — a locally produced
+    // block has to index itself, or a solo validator would serve empty asset
+    // listings for blocks it authored. `CF_META` only, so the state root
+    // signed above is unaffected.
+    let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
+
     let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+    if !asset_index.is_empty() {
+        writables.push(&asset_index);
+    }
     if let Some(snapshot) = &snapshot {
         writables.push(snapshot);
     }

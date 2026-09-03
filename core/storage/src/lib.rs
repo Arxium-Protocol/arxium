@@ -10,7 +10,10 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
-use xc_circuit::{AccountKey, AssetBalanceKey, AssetKey, AttestorKey, BlsKeyKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{
+    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey, AttestorKey, BlsKeyKey,
+    KeySpec, KvRead, StakeByValidatorKey, StakeKey,
+};
 use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_BLOCKS, CF_META, CF_VALIDATORS};
 use xc_primitives::{stake_subaccount, AccountEntry, Address, Asset, Block, Snapshot, StakeAllocation};
 #[cfg(test)]
@@ -387,6 +390,86 @@ impl ArxiumDb {
     /// `owner`'s balance of `asset_id`, defaulting to 0 if never minted.
     pub fn get_asset_balance(&self, asset_id: &str, owner: &Address) -> Result<u128, StorageError> {
         Ok(KvRead::get(self, &AssetBalanceKey { asset_id, owner })?.unwrap_or(0))
+    }
+
+    /// Every registered asset id, in registration order. Empty on a chain
+    /// where `RegisterAsset` has never run.
+    pub fn list_asset_ids(&self) -> Result<Vec<String>, StorageError> {
+        Ok(KvRead::get(self, &AssetIndexKey)?.unwrap_or_default())
+    }
+
+    /// Every registered asset's registry record. Drives an "assets on this
+    /// chain" listing; a wallet needs `compliance_required` per asset to know
+    /// which balances are gated before it offers a transfer.
+    pub fn list_assets(&self) -> Result<Vec<Asset>, StorageError> {
+        let mut assets = Vec::new();
+        for asset_id in self.list_asset_ids()? {
+            // An id in the index with no record would mean the two writes in
+            // `AssetIndexUpdates`/`Asset` came apart, which they cannot: both
+            // go in one atomic batch. Skipped rather than errored so a single
+            // bad row can't take out the whole listing.
+            if let Some(asset) = self.get_asset(&asset_id)? {
+                assets.push(asset);
+            }
+        }
+        Ok(assets)
+    }
+
+    /// Every asset id `owner` has a balance row for, including rows that have
+    /// since gone to zero — a balance is never deleted (see
+    /// `apply_asset_balances`), so neither is its index entry.
+    pub fn get_account_assets(&self, owner: &Address) -> Result<Vec<String>, StorageError> {
+        Ok(KvRead::get(self, &AccountAssetsKey(owner))?.unwrap_or_default())
+    }
+
+    /// The index rows implied by one block's asset effects: the registry list
+    /// grows by any newly registered ids, and each owner touched by a balance
+    /// change gains the ids it was touched for.
+    ///
+    /// Same shape as `OperatorUpdates` — the caller reads the current value
+    /// and hands storage the *full* new list, because `BatchWritable` has no
+    /// read access of its own. Returns only rows that actually change, so a
+    /// block with no asset activity writes nothing.
+    pub fn asset_index_updates(
+        &self,
+        registrations: &[Asset],
+        balances: &AssetBalanceUpdates,
+    ) -> Result<AssetIndexUpdates, StorageError> {
+        let mut updates = AssetIndexUpdates::default();
+
+        if !registrations.is_empty() {
+            let mut ids = self.list_asset_ids()?;
+            let before = ids.len();
+            for asset in registrations {
+                if !ids.contains(&asset.asset_id) {
+                    ids.push(asset.asset_id.clone());
+                }
+            }
+            if ids.len() != before {
+                updates.registry = Some(ids);
+            }
+        }
+
+        // Grouped by owner first so an owner touched for several assets in one
+        // block is read once, not once per asset.
+        let mut by_owner: BTreeMap<&Address, Vec<&String>> = BTreeMap::new();
+        for (asset_id, owner) in balances.0.keys() {
+            by_owner.entry(owner).or_default().push(asset_id);
+        }
+        for (owner, asset_ids) in by_owner {
+            let mut held = self.get_account_assets(owner)?;
+            let before = held.len();
+            for asset_id in asset_ids {
+                if !held.contains(asset_id) {
+                    held.push(asset_id.clone());
+                }
+            }
+            if held.len() != before {
+                updates.owners.insert(owner.clone(), held);
+            }
+        }
+
+        Ok(updates)
     }
 
     /// Every validator address currently authorizing `operator` to act for
@@ -1492,6 +1575,51 @@ impl BatchWritable for AssetBalanceUpdates {
     }
 }
 
+/// The non-consensus index rows that make asset state readable by wallet:
+/// the registry list behind `GET /assets`, and one list per owner behind
+/// `GET /accounts/{address}/assets`.
+///
+/// Both live in `CF_META`, which `is_state_key` excludes, so writing them
+/// leaves the state root untouched — a node that somehow lost these rows
+/// would serve worse listings but would still agree on consensus. That is
+/// the whole reason this is an index rather than a re-keying of
+/// `AssetBalanceKey`, whose keys are merkleized.
+///
+/// Only changed rows are present; a block with no asset activity produces an
+/// empty value here and writes nothing.
+#[derive(Debug, Default)]
+pub struct AssetIndexUpdates {
+    /// The full new registered-asset-id list, when a `RegisterAsset` in this
+    /// block added to it.
+    pub registry: Option<Vec<String>>,
+    /// `owner -> full new list of asset ids held`.
+    pub owners: BTreeMap<Address, Vec<String>>,
+}
+
+impl AssetIndexUpdates {
+    /// Whether anything would be written. Lets a caller skip pushing this
+    /// into the batch at all on the common no-asset-activity block.
+    pub fn is_empty(&self) -> bool {
+        self.registry.is_none() && self.owners.is_empty()
+    }
+}
+
+impl BatchWritable for AssetIndexUpdates {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        if let Some(ids) = &self.registry {
+            let value = bincode::serde::encode_to_vec(ids, config)?;
+            entries.push((AssetIndexKey.encode(), value));
+        }
+        for (owner, asset_ids) in &self.owners {
+            let value = bincode::serde::encode_to_vec(asset_ids, config)?;
+            entries.push((AccountAssetsKey(owner).encode(), value));
+        }
+        Ok(entries)
+    }
+}
+
 impl BatchWritable for Asset {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let config = bincode::config::standard();
@@ -1784,6 +1912,187 @@ mod explorer_index_tests {
         db.export_checkpoint(&checkpoint_path).unwrap();
 
         assert!(db.export_checkpoint(&checkpoint_path).is_err());
+    }
+}
+
+#[cfg(test)]
+mod asset_index_tests {
+    use super::*;
+
+    /// A counter, not just a timestamp: `cargo test` runs these in parallel
+    /// threads of one process, and macOS clock granularity is coarse enough
+    /// that two of them read the same nanosecond, collide on a path, and fail
+    /// on RocksDB's LOCK file. Same reason `explorer_index_tests::uuid_like`
+    /// mixes in an atomic.
+    fn temp_db() -> ArxiumDb {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "arxium-test-asset-index-{}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        ArxiumDb::open(&path).unwrap()
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::from_pubkey_bytes(&[n; 32]).unwrap()
+    }
+
+    fn asset(id: &str, issuer: &Address, gated: bool) -> Asset {
+        Asset {
+            asset_id: id.to_string(),
+            issuer: issuer.clone(),
+            compliance_required: gated,
+        }
+    }
+
+    fn balances(rows: &[(&str, &Address, u128)]) -> AssetBalanceUpdates {
+        AssetBalanceUpdates(
+            rows.iter()
+                .map(|(id, owner, amount)| ((id.to_string(), (*owner).clone()), *amount))
+                .collect(),
+        )
+    }
+
+    /// The whole point of the index: a wallet asks "what does this account
+    /// hold" and gets an answer without reading every balance on the chain.
+    #[test]
+    fn registering_and_issuing_makes_an_asset_listable_and_findable_by_owner() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let holder = addr(2);
+        let gold = asset("gold", &issuer, true);
+
+        let updates = balances(&[("gold", &holder, 1_000)]);
+        let index = db.asset_index_updates(&[gold.clone()], &updates).unwrap();
+        db.write_batches(&[&gold, &updates, &index]).unwrap();
+
+        assert_eq!(db.list_asset_ids().unwrap(), vec!["gold".to_string()]);
+        let listed = db.list_assets().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].asset_id, "gold");
+        assert!(listed[0].compliance_required);
+
+        assert_eq!(
+            db.get_account_assets(&holder).unwrap(),
+            vec!["gold".to_string()]
+        );
+        assert_eq!(db.get_asset_balance("gold", &holder).unwrap(), 1_000);
+        // An account that has never held anything gets an empty list, not an
+        // error and not someone else's.
+        assert!(db.get_account_assets(&addr(9)).unwrap().is_empty());
+    }
+
+    /// A second block must extend both lists rather than replace them —
+    /// `asset_index_updates` reads the current value and hands back the full
+    /// new one, so a bug here silently drops the earlier holdings.
+    #[test]
+    fn a_later_block_extends_the_lists_instead_of_overwriting_them() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let holder = addr(2);
+
+        let gold = asset("gold", &issuer, true);
+        let first = balances(&[("gold", &holder, 1_000)]);
+        let index = db.asset_index_updates(&[gold.clone()], &first).unwrap();
+        db.write_batches(&[&gold, &first, &index]).unwrap();
+
+        let silver = asset("silver", &issuer, false);
+        let second = balances(&[("silver", &holder, 50)]);
+        let index = db.asset_index_updates(&[silver.clone()], &second).unwrap();
+        db.write_batches(&[&silver, &second, &index]).unwrap();
+
+        assert_eq!(
+            db.list_asset_ids().unwrap(),
+            vec!["gold".to_string(), "silver".to_string()]
+        );
+        assert_eq!(
+            db.get_account_assets(&holder).unwrap(),
+            vec!["gold".to_string(), "silver".to_string()]
+        );
+    }
+
+    /// Re-touching the same (asset, owner) pair must not grow the list — a
+    /// wallet would otherwise show the same holding once per transfer ever
+    /// made.
+    #[test]
+    fn repeated_activity_on_one_holding_does_not_duplicate_it() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let holder = addr(2);
+        let gold = asset("gold", &issuer, true);
+
+        for amount in [1_000u128, 900, 800] {
+            let updates = balances(&[("gold", &holder, amount)]);
+            let index = db.asset_index_updates(&[], &updates).unwrap();
+            db.write_batches(&[&gold, &updates, &index]).unwrap();
+        }
+
+        assert_eq!(
+            db.get_account_assets(&holder).unwrap(),
+            vec!["gold".to_string()]
+        );
+    }
+
+    /// A block with no asset activity must write nothing, so the common case
+    /// costs one map lookup rather than a batch entry.
+    #[test]
+    fn a_block_with_no_asset_activity_produces_no_index_rows() {
+        let db = temp_db();
+        let index = db
+            .asset_index_updates(&[], &AssetBalanceUpdates::default())
+            .unwrap();
+        assert!(index.is_empty());
+        assert!(index.batch_entries().unwrap().is_empty());
+    }
+
+    /// Both sides of a transfer are indexed, not just the sender — the
+    /// recipient is the account that most needs to discover it now holds
+    /// something.
+    #[test]
+    fn a_transfer_indexes_the_recipient_too() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let recipient = addr(3);
+        let gold = asset("gold", &issuer, true);
+
+        let updates = balances(&[("gold", &issuer, 900), ("gold", &recipient, 100)]);
+        let index = db.asset_index_updates(&[gold.clone()], &updates).unwrap();
+        db.write_batches(&[&gold, &updates, &index]).unwrap();
+
+        assert_eq!(
+            db.get_account_assets(&issuer).unwrap(),
+            vec!["gold".to_string()]
+        );
+        assert_eq!(
+            db.get_account_assets(&recipient).unwrap(),
+            vec!["gold".to_string()]
+        );
+    }
+
+    /// The index lives in `CF_META`, which `is_state_key` excludes. If it ever
+    /// started counting toward the merkle root, two nodes that indexed
+    /// differently would disagree on state and the chain would halt.
+    #[test]
+    fn index_rows_are_not_consensus_state() {
+        let holder = addr(2);
+        let index = AssetIndexUpdates {
+            registry: Some(vec!["gold".to_string()]),
+            owners: [(holder, vec!["gold".to_string()])].into_iter().collect(),
+        };
+        for (key, _) in index.batch_entries().unwrap() {
+            assert!(
+                !is_state_key(&key),
+                "index key {} must stay out of the state root",
+                String::from_utf8_lossy(&key)
+            );
+            assert_eq!(cf_for_key(&key), CF_META);
+        }
     }
 }
 
