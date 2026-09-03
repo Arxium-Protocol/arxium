@@ -85,12 +85,20 @@ jobs:
 
           docker compose -p arxium-monitoring-ci \
             -f monitoring/docker-compose.monitoring.yml up -d
-          for attempt in $(seq 1 30); do
+          for attempt in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:9090/-/ready >/dev/null \
-              && curl -fsS http://127.0.0.1:3000/api/health >/dev/null; then
+              && curl -fsS http://127.0.0.1:3000/api/health >/dev/null \
+              && curl -fsS \
+                --user "admin:${GRAFANA_ADMIN_PASSWORD}" \
+                'http://127.0.0.1:3000/api/search?query=Arxium%20Node' \
+                | jq -e 'any(.[]; .title == "Arxium Node")' >/dev/null \
+              && curl -fsS \
+                --user "admin:${GRAFANA_ADMIN_PASSWORD}" \
+                http://127.0.0.1:3000/api/datasources/uid/prometheus \
+                | jq -e '.url == "http://127.0.0.1:9090"' >/dev/null; then
               break
             fi
-            if [[ "$attempt" -eq 30 ]]; then
+            if [[ "$attempt" -eq 60 ]]; then
               docker compose -p arxium-monitoring-ci \
                 -f monitoring/docker-compose.monitoring.yml logs
               exit 1

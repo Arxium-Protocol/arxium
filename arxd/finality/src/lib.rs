@@ -1030,17 +1030,26 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
-        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr.clone(), sk)),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+        );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
         let expected_hash = block.hash();
         event_tx.send(FinalityEvent::BlockObserved(block)).unwrap();
         drop(event_tx);
 
-        let vote = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a precommit vote");
+        let vote = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a precommit vote");
         assert_eq!(vote.height, 5);
         assert_eq!(vote.voter, addr);
         assert_eq!(vote.block_hash, expected_hash);
+        handle.join().expect("finality worker should stop cleanly");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1067,7 +1076,13 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
-        spawn_finality::<()>(db.clone(), Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
+        let handle = spawn_finality::<()>(
+            db.clone(),
+            Some((addr.clone(), sk)),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+        );
 
         event_tx
             .send(FinalityEvent::BlockObserved(signed_block(
@@ -1078,11 +1093,18 @@ mod tests {
             .unwrap();
         drop(event_tx);
 
-        let vote = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a precommit vote");
+        let vote = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a precommit vote");
         let persisted = db.get_precommit_votes_from(0).unwrap();
-        assert_eq!(persisted.len(), 1, "the local vote must enter the tally without gossip loopback");
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the local vote must enter the tally without gossip loopback"
+        );
         assert_eq!(persisted[0].voter, addr);
         assert_eq!(persisted[0].height, vote.height);
+        handle.join().expect("finality worker should stop cleanly");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1099,21 +1121,32 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
-        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr.clone(), sk)),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+        );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
         event_tx.send(FinalityEvent::BlockObserved(block)).unwrap();
 
-        let first = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected the initial vote");
+        let first = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected the initial vote");
         assert_eq!(first.height, 5);
 
         // No further events arrive, but the interval (shortened for tests)
         // should fire a resend of the same vote without any new input.
-        let resent = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a rebroadcast");
+        let resent = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a rebroadcast");
         assert_eq!(resent.height, first.height);
         assert_eq!(resent.signature, first.signature);
 
         drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1327,16 +1360,25 @@ mod tests {
         let (sk, _pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
         let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
 
-        let (_event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (_vote_tx, _vote_rx) = mpsc::channel();
         let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
-        spawn_finality::<()>(db, Some((addr.clone(), sk)), event_rx, _vote_tx, round_timeout_tx);
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr.clone(), sk)),
+            event_rx,
+            _vote_tx,
+            round_timeout_tx,
+        );
 
-        let vote =
-            round_timeout_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a round-timeout vote");
+        let vote = round_timeout_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a round-timeout vote");
         assert_eq!(vote.height, 1); // last_progress starts at height 0, so next_height is 1
         assert_eq!(vote.round, 0);
         assert_eq!(vote.voter, addr);
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1361,19 +1403,31 @@ mod tests {
         ])
         .unwrap();
 
-        let (_event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let (_vote_tx, _vote_rx) = mpsc::channel();
         let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
-        spawn_finality::<()>(db.clone(), Some((addr.clone(), sk)), event_rx, _vote_tx, round_timeout_tx);
+        let handle = spawn_finality::<()>(
+            db.clone(),
+            Some((addr.clone(), sk)),
+            event_rx,
+            _vote_tx,
+            round_timeout_tx,
+        );
 
         let vote = round_timeout_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("expected a round-timeout vote");
         let persisted = db.get_round_timeout_votes_from(0).unwrap();
-        assert_eq!(persisted.len(), 1, "the local timeout vote must enter the tally without gossip loopback");
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the local timeout vote must enter the tally without gossip loopback"
+        );
         assert_eq!(persisted[0].voter, addr);
         assert_eq!(persisted[0].height, vote.height);
         assert_eq!(persisted[0].round, vote.round);
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
 
         std::fs::remove_dir_all(&dir).ok();
     }
