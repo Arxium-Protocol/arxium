@@ -163,17 +163,18 @@ pub enum ActionPayload {
     /// does or doesn't do.
     RevokeOperator,
     /// Marks `subject` eligible (sets `AccountEntry.identity_hash`) — only
-    /// the chain-spec-designated attestor (`identity::AttestorKey`, read
-    /// from genesis) may submit this. Governance-controlled attestor
-    /// rotation is deferred; for now it's a fixed genesis address.
+    /// a registered attestor (membership in `CF_ATTESTORS`, managed via
+    /// `RegisterAttestor`/`DeregisterAttestor`) may submit this. Records
+    /// `sender` in `AccountEntry.attested_by` for accountability.
     GrantAttestation {
         subject: Address,
         hash: String,
     },
     /// Reverses `GrantAttestation` — clears `identity_hash` and, since a
     /// revoked KYC status shouldn't leave a stale ZK-verified flag around,
-    /// also clears `zk_identity_verified`. Same attestor-only authorization
-    /// as `GrantAttestation`.
+    /// also clears `zk_identity_verified`. Any registered attestor may
+    /// revoke any attestation (permissive revocation), not just the one
+    /// that granted it.
     RevokeAttestation {
         subject: Address,
     },
@@ -196,6 +197,21 @@ pub enum ActionPayload {
         asset_id: String,
         to: Address,
         amount: u128,
+    },
+    /// Adds `attestor` to the trusted-attestor set (`identity::GovernorKey`
+    /// only, see `Snapshot.governor`) — the Trust Spectrum's multi-attestor
+    /// model: more than one regulated KYC provider can hold
+    /// `GrantAttestation`/`RevokeAttestation` rights at once. Rejected if
+    /// `attestor` is already registered.
+    RegisterAttestor {
+        attestor: Address,
+        name: String,
+    },
+    /// Removes `attestor` from the trusted-attestor set (`GovernorKey`
+    /// only). Any registered attestor may still revoke attestations that
+    /// `attestor` previously granted — see `identity::require_attestor`.
+    DeregisterAttestor {
+        attestor: Address,
     },
 }
 
@@ -487,6 +503,12 @@ fn dispatch_inner(
         ActionPayload::IssueAsset { asset_id, amount } => {
             asset::issue_asset(view, action, asset_id, *amount)
         }
+        ActionPayload::RegisterAttestor { attestor, name } => {
+            identity::register_attestor(view, action, attestor, name, current_height)
+        }
+        ActionPayload::DeregisterAttestor { attestor } => {
+            identity::deregister_attestor(view, action, attestor)
+        }
         ActionPayload::TransferAsset { asset_id, to, amount } => {
             asset::transfer_asset(view, action, asset_id, to, *amount)
         }
@@ -558,6 +580,7 @@ pub(crate) mod test_support {
             nonce: 0,
             identity_hash: None,
             zk_identity_verified: false,
+        attested_by: None,
         }
     }
 

@@ -61,6 +61,7 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
         nonce: 0,
         identity_hash: None,
         zk_identity_verified: false,
+    attested_by: None,
     });
 
     if nonce != entry.nonce {
@@ -114,6 +115,7 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
         nonce: 0,
         identity_hash: None,
         zk_identity_verified: false,
+    attested_by: None,
     });
     if nonce != sender_account.nonce {
         return Err(RwaError::InvalidNonce {
@@ -205,7 +207,7 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             issuer.clone(),
-            AccountEntry { balance: 0, nonce: 0, identity_hash: Some("kyc-issuer".into()), zk_identity_verified: false },
+            AccountEntry { balance: 0, nonce: 0, identity_hash: Some("kyc-issuer".into()), zk_identity_verified: false, attested_by: None },
         )])))
         .unwrap();
         let (accounts, assets) = apply_issue(&db, &asset, &issuer, 0, 100).unwrap();
@@ -219,7 +221,7 @@ mod tests {
         // Attestor grants recipient an attestation — now it succeeds.
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             recipient.clone(),
-            AccountEntry { balance: 0, nonce: 0, identity_hash: Some("kyc-recipient".into()), zk_identity_verified: false },
+            AccountEntry { balance: 0, nonce: 0, identity_hash: Some("kyc-recipient".into()), zk_identity_verified: false, attested_by: None },
         )])))
         .unwrap();
         let (accounts, assets) = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 40).unwrap();

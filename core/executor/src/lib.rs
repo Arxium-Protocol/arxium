@@ -12,8 +12,9 @@ use xc_primitives::{
 };
 use xc_primitives::Asset;
 use xc_storage::{
-    AccountUpdates, ArxiumDb, AssetBalanceUpdates, BatchWritable, BlockView, BlsKeyRegistration,
-    EvidenceMarker, OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
+    AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
+    BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StakeUpdates,
+    StorageError, ValidatorSetSnapshot,
 };
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -40,6 +41,10 @@ pub struct BlockUpdates {
     pub assets: AssetBalanceUpdates,
     /// Set only by `RegisterAsset` — a new `meta:asset:{id}` registry entry.
     pub asset_registration: Option<Asset>,
+    /// Set only by `RegisterAttestor` — a new `CF_ATTESTORS` entry.
+    pub attestor_registration: Option<AttestorRegistration>,
+    /// Set only by `DeregisterAttestor` — removes a `CF_ATTESTORS` entry.
+    pub attestor_deregistration: Option<AttestorDeregistration>,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -60,6 +65,8 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         operator: OperatorUpdates::default(),
         assets: AssetBalanceUpdates::default(),
         asset_registration: None,
+        attestor_registration: None,
+        attestor_deregistration: None,
     })
 }
 
@@ -455,6 +462,8 @@ where
         operator_updates,
         mut asset_updates,
         asset_registrations,
+        attestor_registrations,
+        attestor_deregistrations,
     ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
@@ -499,6 +508,16 @@ where
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
+        // Unlike `asset_registrations` below, attestor-set membership lives
+        // in `CF_ATTESTORS` (merkleized, see `is_state_key`) rather than
+        // `CF_META` — it gates who may grant/revoke attestations, so it has
+        // to move the root the same way balances do.
+        for registration in &attestor_registrations {
+            overlay.push(registration);
+        }
+        for deregistration in &attestor_deregistrations {
+            overlay.push(deregistration);
+        }
         overlay
     };
     let expected_state_root = db.compute_state_root(&state_root_overlay)?;
@@ -531,6 +550,12 @@ where
     }
     for asset in &asset_registrations {
         writables.push(asset);
+    }
+    for registration in &attestor_registrations {
+        writables.push(registration);
+    }
+    for deregistration in &attestor_deregistrations {
+        writables.push(deregistration);
     }
     writables.push(&operator_updates);
     writables.push(&block);
@@ -581,6 +606,8 @@ pub fn execute_actions<P>(
         OperatorUpdates,
         AssetBalanceUpdates,
         Vec<Asset>,
+        Vec<AttestorRegistration>,
+        Vec<AttestorDeregistration>,
     ),
     ExecutorError,
 >
@@ -601,6 +628,10 @@ where
     let mut operator_index_overlay = seed.operator.operator_index;
     let mut asset_overlay = seed.assets.0;
     let mut asset_registrations: Vec<Asset> = seed.asset_registration.into_iter().collect();
+    let mut attestor_registrations: Vec<AttestorRegistration> =
+        seed.attestor_registration.into_iter().collect();
+    let mut attestor_deregistrations: Vec<AttestorDeregistration> =
+        seed.attestor_deregistration.into_iter().collect();
 
     let mut view = BlockView::new(db);
     view.apply_accounts(&AccountUpdates(overlay.clone()))?;
@@ -609,6 +640,12 @@ where
         validator_index: validator_index_overlay.clone(),
     })?;
     view.apply_asset_balances(&AssetBalanceUpdates(asset_overlay.clone()))?;
+    for registration in &attestor_registrations {
+        view.apply_attestor_registration(registration)?;
+    }
+    for deregistration in &attestor_deregistrations {
+        view.apply_attestor_deregistration(deregistration);
+    }
 
     for action in actions {
         if let Err(err) = action.verify_signature() {
@@ -641,6 +678,14 @@ where
                 asset_overlay.extend(updates.assets.0.clone());
                 view.apply_asset_balances(&updates.assets)?;
                 asset_registrations.extend(updates.asset_registration);
+                if let Some(registration) = &updates.attestor_registration {
+                    view.apply_attestor_registration(registration)?;
+                }
+                attestor_registrations.extend(updates.attestor_registration);
+                if let Some(deregistration) = &updates.attestor_deregistration {
+                    view.apply_attestor_deregistration(deregistration);
+                }
+                attestor_deregistrations.extend(updates.attestor_deregistration);
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
@@ -663,6 +708,8 @@ where
         },
         AssetBalanceUpdates(asset_overlay),
         asset_registrations,
+        attestor_registrations,
+        attestor_deregistrations,
     ))
 }
 
@@ -874,6 +921,7 @@ mod tests {
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
+            attested_by: None,
             },
         )])))
         .unwrap();
@@ -897,6 +945,8 @@ mod tests {
             _operator_updates,
             _asset_updates,
             _asset_registrations,
+            _attestor_registrations,
+            _attestor_deregistrations,
         ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
@@ -960,6 +1010,7 @@ mod tests {
                     nonce: 0,
                     identity_hash: None,
                     zk_identity_verified: false,
+                attested_by: None,
                 },
             )])),
             &genesis,
@@ -1014,6 +1065,7 @@ mod tests {
                     nonce: 0,
                     identity_hash: None,
                     zk_identity_verified: false,
+                attested_by: None,
                 },
             )])),
             &genesis,
@@ -1052,6 +1104,7 @@ mod tests {
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
+            attested_by: None,
             },
         )])))
         .unwrap();
@@ -1429,6 +1482,7 @@ mod tests {
                     nonce: 0,
                     identity_hash: None,
                     zk_identity_verified: false,
+                attested_by: None,
                 },
             )])),
             &genesis,

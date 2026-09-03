@@ -14,13 +14,14 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use xc_bls::BlsPublicKey;
-use xc_primitives::{AccountEntry, Address, Asset, StakeAllocation};
+use xc_primitives::{AccountEntry, Address, Asset, AttestorRecord, StakeAllocation};
 
 pub const CF_META: &str = "meta";
 pub const CF_BLOCKS: &str = "blocks";
 pub const CF_ACCOUNTS: &str = "accounts";
 pub const CF_VALIDATORS: &str = "validators";
 pub const CF_ASSETS: &str = "assets";
+pub const CF_ATTESTORS: &str = "attestors";
 
 /// A typed storage key: which column family it lives in, what value it
 /// decodes to, and how to encode itself to the raw bytes RocksDB stores.
@@ -144,6 +145,30 @@ impl KeySpec for AttestorKey {
     type Value = Address;
     fn encode(&self) -> Vec<u8> {
         b"meta:attestor".to_vec()
+    }
+}
+
+/// One registered attestor's registry record — `CF_ATTESTORS`, included in
+/// `is_state_key`, so an address's membership in the trusted set is
+/// merkleized and provable in the state root, not just a `CF_META` row a
+/// light client has to trust a full node for.
+pub struct AttestorRecordKey<'a>(pub &'a Address);
+impl KeySpec for AttestorRecordKey<'_> {
+    const CF: &'static str = CF_ATTESTORS;
+    type Value = AttestorRecord;
+    fn encode(&self) -> Vec<u8> {
+        format!("attestor_record:{}", self.0).into_bytes()
+    }
+}
+
+/// Address allowed to `RegisterAttestor`/`DeregisterAttestor` — see
+/// `Snapshot::governor`.
+pub struct GovernorKey;
+impl KeySpec for GovernorKey {
+    const CF: &'static str = CF_META;
+    type Value = Address;
+    fn encode(&self) -> Vec<u8> {
+        b"meta:governor".to_vec()
     }
 }
 

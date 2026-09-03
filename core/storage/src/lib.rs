@@ -11,11 +11,13 @@ use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
-    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey, AttestorKey, BlsKeyKey,
-    KeySpec, KvRead, StakeByValidatorKey, StakeKey,
+    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey, AttestorKey,
+    AttestorRecordKey, BlsKeyKey, GovernorKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey,
 };
-use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_BLOCKS, CF_META, CF_VALIDATORS};
-use xc_primitives::{stake_subaccount, AccountEntry, Address, Asset, Block, Snapshot, StakeAllocation};
+use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_META, CF_VALIDATORS};
+use xc_primitives::{
+    stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation,
+};
 #[cfg(test)]
 use xc_primitives::Action;
 
@@ -53,7 +55,8 @@ pub enum StorageError {
 /// gated by `SCHEMA_VERSION` below rather than a runtime probe.
 const CF_MERKLE: &str = "merkle";
 
-const COLUMN_FAMILIES: [&str; 6] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS];
+const COLUMN_FAMILIES: [&str; 7] =
+    [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS];
 
 /// On-disk layout version this binary understands — covers column-family
 /// layout and key encoding (`cf_for_key`, `Block`'s bincode shape, etc; NOT
@@ -81,7 +84,13 @@ const COLUMN_FAMILIES: [&str; 6] = [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATO
 /// state trie via `is_state_key` — a version-2 DB's trie doesn't include
 /// whatever `asset_balance:` entries it already has, same "wipe and resync"
 /// policy as the 1 -> 2 bump above, deliberately accepted before mainnet.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped 3 -> 4 for the attestor registry (`CF_ATTESTORS`) joining the
+/// state trie the same way — attestor-set membership gates
+/// `GrantAttestation`/`RevokeAttestation`, so it has to be provable in the
+/// state root from the moment it becomes runtime-mutable, same "wipe and
+/// resync" policy as the prior two bumps.
+pub const SCHEMA_VERSION: u32 = 4;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -89,7 +98,7 @@ const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
 /// Whether `key` is covered by the `B3` state trie / `compute_state_root` —
 /// `CF_ACCOUNTS`/`CF_VALIDATORS`/`CF_ASSETS`, i.e. every balance-bearing CF.
 fn is_state_key(key: &[u8]) -> bool {
-    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS)
+    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS)
 }
 
 fn hash_key(key: &[u8]) -> [u8; 32] {
@@ -161,6 +170,8 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_VALIDATORS
     } else if key.starts_with(b"asset_balance:") {
         CF_ASSETS
+    } else if key.starts_with(b"attestor_record:") {
+        CF_ATTESTORS
     } else if key.len() == 32 {
         CF_MERKLE
     } else {
@@ -379,6 +390,31 @@ impl ArxiumDb {
     /// `Snapshot::attestor`.
     pub fn get_attestor(&self) -> Result<Option<Address>, StorageError> {
         KvRead::get(self, &AttestorKey)
+    }
+
+    /// One attestor's registry record, if `attestor` is currently registered.
+    pub fn get_attestor_record(&self, attestor: &Address) -> Result<Option<AttestorRecord>, StorageError> {
+        KvRead::get(self, &AttestorRecordKey(attestor))
+    }
+
+    /// Every registered attestor, as `(address, record)` pairs. Registry
+    /// entries are small and governance-sized (nowhere near asset or account
+    /// volume), so this scans `CF_ATTESTORS` directly rather than
+    /// maintaining a separate `CF_META` listing index the way assets do.
+    pub fn list_attestors(&self) -> Result<Vec<(Address, AttestorRecord)>, StorageError> {
+        let config = bincode::config::standard();
+        let mut attestors = Vec::new();
+        for item in self.db.iterator_cf(self.cf(CF_ATTESTORS), IteratorMode::Start) {
+            let (key, value) = item?;
+            let key_str = std::str::from_utf8(&key).map_err(|_| StorageError::CorruptedMeta)?;
+            let address_str = key_str
+                .strip_prefix("attestor_record:")
+                .ok_or(StorageError::CorruptedMeta)?;
+            let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
+            let (record, _): (AttestorRecord, _) = bincode::serde::decode_from_slice(&value, config)?;
+            attestors.push((address, record));
+        }
+        Ok(attestors)
     }
 
     /// A registered asset's registry record (`issuer`/`compliance_required`),
@@ -1202,7 +1238,7 @@ impl BatchWritable for Snapshot {
                 .accounts
                 .get(&sub_account)
                 .cloned()
-                .unwrap_or(AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false });
+                .unwrap_or(AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None });
             sub_entry.balance += validator.stake;
             entries.push((
                 AccountKey(&sub_account).encode(),
@@ -1217,6 +1253,18 @@ impl BatchWritable for Snapshot {
         ));
         if let Some(attestor) = &self.attestor {
             entries.push((AttestorKey.encode(), bincode::serde::encode_to_vec(attestor, config)?));
+            // Also seeds the multi-attestor registry with this chain-spec's
+            // legacy single attestor, so a spec written before the Trust
+            // Spectrum registry existed still grants a working attestor at
+            // genesis instead of silently having none.
+            let record = AttestorRecord { name: "genesis".to_string(), registered_at: self.height };
+            entries.push((
+                AttestorRecordKey(attestor).encode(),
+                bincode::serde::encode_to_vec(&record, config)?,
+            ));
+        }
+        if let Some(governor) = &self.governor {
+            entries.push((GovernorKey.encode(), bincode::serde::encode_to_vec(governor, config)?));
         }
         Ok(entries)
     }
@@ -1629,6 +1677,40 @@ impl BatchWritable for Asset {
     }
 }
 
+/// One `RegisterAttestor` write — a single `CF_ATTESTORS` record, merkleized
+/// via `is_state_key` (unlike `Asset`'s `CF_META` registry row).
+#[derive(Debug)]
+pub struct AttestorRegistration {
+    pub attestor: Address,
+    pub record: AttestorRecord,
+}
+
+impl BatchWritable for AttestorRegistration {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        let key = AttestorRecordKey(&self.attestor).encode();
+        let value = bincode::serde::encode_to_vec(&self.record, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
+/// One `DeregisterAttestor` write — physically removes the `CF_ATTESTORS`
+/// record rather than flagging it inactive, same as any other merkleized
+/// state key; deletions are already routed through the state root via
+/// `batch_deletes`.
+#[derive(Debug)]
+pub struct AttestorDeregistration(pub Address);
+
+impl BatchWritable for AttestorDeregistration {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(vec![AttestorRecordKey(&self.0).encode()])
+    }
+}
+
 /// Read view for in-progress block execution: checks not-yet-committed
 /// updates from earlier actions in the same block before falling through to
 /// `db`. Lets circuits (`circuits/staking`, `circuits/account`, ...) see a
@@ -1693,6 +1775,19 @@ impl<'a> BlockView<'a> {
             self.put(&AssetBalanceKey { asset_id, owner }, balance)?;
         }
         Ok(())
+    }
+
+    /// Folds a `RegisterAttestor` write into the view — see `put`/`delete`
+    /// above, used directly (not a `KeySpec` bulk struct like
+    /// `apply_asset_balances`) since a block registers/deregisters at most
+    /// one attestor per action.
+    pub fn apply_attestor_registration(&mut self, registration: &AttestorRegistration) -> Result<(), StorageError> {
+        self.put(&AttestorRecordKey(&registration.attestor), &registration.record)
+    }
+
+    /// Folds a `DeregisterAttestor` write into the view.
+    pub fn apply_attestor_deregistration(&mut self, deregistration: &AttestorDeregistration) {
+        self.delete(&AttestorRecordKey(&deregistration.0))
     }
 }
 
@@ -1816,6 +1911,7 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
+            governor: None,
         })
         .unwrap();
 
@@ -1851,6 +1947,7 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
+            governor: None,
         })
         .unwrap();
 
@@ -1879,6 +1976,7 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
+            governor: None,
         })
         .unwrap();
 
@@ -2327,7 +2425,7 @@ mod merkle_state_root_tests {
     }
 
     fn entry(balance: u128) -> AccountEntry {
-        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false }
+        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
     }
 
     fn accounts(pairs: &[(u8, u128)]) -> AccountUpdates {

@@ -47,6 +47,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
         nonce: 0,
         identity_hash: None,
         zk_identity_verified: false,
+    attested_by: None,
     });
 
     if nonce != sender_entry.nonce {
@@ -79,6 +80,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
         nonce: 0,
         identity_hash: None,
         zk_identity_verified: false,
+    attested_by: None,
     });
 
     sender_entry.balance -= amount;
@@ -130,6 +132,7 @@ mod tests {
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
+            attested_by: None,
             },
         )])))
         .unwrap();

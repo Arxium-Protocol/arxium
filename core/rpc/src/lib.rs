@@ -393,6 +393,8 @@ pub fn spawn_http_ingest<P: Payload>(
                 )
                 .route("/assets", get(get_assets::<P>))
                 .route("/assets/{asset_id}", get(get_asset::<P>))
+                .route("/attestors", get(get_attestors::<P>))
+                .route("/attestors/{address}", get(get_attestor::<P>))
                 .route("/validators", get(get_validators::<P>))
                 .route("/finality", get(get_finality::<P>))
                 .route("/operators/{address}/validators", get(get_operator_validators::<P>))
@@ -850,6 +852,53 @@ async fn get_asset<P: Payload>(
 ) -> Response {
     match state.db.get_asset(&asset_id) {
         Ok(Some(asset)) => Json(asset).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// One row of `GET /attestors` — a registered KYC provider.
+#[derive(serde::Serialize)]
+struct AttestorResponse {
+    attestor: String,
+    name: String,
+    registered_at: u64,
+}
+
+/// Every attestor currently in the trust-spectrum registry.
+async fn get_attestors<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    match state.db.list_attestors() {
+        Ok(attestors) => Json(
+            attestors
+                .into_iter()
+                .map(|(attestor, record)| AttestorResponse {
+                    attestor: attestor.to_string(),
+                    name: record.name,
+                    registered_at: record.registered_at,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// One address's attestor registry record, if currently registered.
+async fn get_attestor<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    match state.db.get_attestor_record(&address) {
+        Ok(Some(record)) => Json(AttestorResponse {
+            attestor: address.to_string(),
+            name: record.name,
+            registered_at: record.registered_at,
+        })
+        .into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1528,11 +1577,13 @@ mod tests {
                             nonce: 5,
                             identity_hash: None,
                             zk_identity_verified: false,
+                        attested_by: None,
                         },
                     )]),
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
+                governor: None,
                 })
                 .unwrap();
             let stale = signed_action(&key, 0);
@@ -1607,6 +1658,7 @@ mod tests {
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
+                governor: None,
                 })
                 .unwrap();
             state.db.write_batch(&genesis).unwrap();
@@ -1798,6 +1850,7 @@ mod tests {
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
+                governor: None,
                 })
                 .unwrap();
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);

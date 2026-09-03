@@ -4,29 +4,87 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use std::sync::OnceLock;
-use xc_circuit::{AccountKey, AttestorKey, KvRead};
+use xc_circuit::{AccountKey, AttestorRecordKey, GovernorKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{AccountEntry, Address};
-use xc_storage::{AccountUpdates, BlockView};
+use xc_primitives::{AccountEntry, Address, AttestorRecord};
+use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, BlockView};
 
 use crate::ChainAction;
 
 /// Shared authorization check for `GrantAttestation`/`RevokeAttestation` —
-/// both require `action.sender` to be the chain-spec-designated attestor
-/// (`identity::AttestorKey`, seeded at genesis; see `Snapshot.attestor`).
-/// Governance-controlled rotation is deferred, so this is a fixed address
-/// for now, not a role anyone can be granted at runtime.
+/// both require `action.sender` to be a currently-registered attestor
+/// (`CF_ATTESTORS`, membership managed by `register_attestor`/
+/// `deregister_attestor`, both `GovernorKey`-gated). This is the Trust
+/// Spectrum's multi-attestor model: more than one regulated KYC provider
+/// can hold this authority at once, rather than one chain-spec-fixed
+/// address for the whole chain's lifetime.
 fn require_attestor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Result<()> {
-    let attestor = view
-        .get(&AttestorKey)?
-        .ok_or_else(|| anyhow::anyhow!("chain has no attestor configured"))?;
-    if action.sender != attestor {
-        anyhow::bail!("{} is not the chain attestor", action.sender);
+    if view.get(&AttestorRecordKey(&action.sender))?.is_none() {
+        anyhow::bail!("{} is not a registered attestor", action.sender);
     }
     Ok(())
 }
 
-/// Marks `subject` eligible by setting `AccountEntry.identity_hash`.
+/// Authorization check for `RegisterAttestor`/`DeregisterAttestor` —
+/// `action.sender` must be the chain-spec-designated governor
+/// (`identity::GovernorKey`, seeded at genesis; see `Snapshot.governor`).
+/// Deliberately a single fixed address for now, same walking-skeleton
+/// stage `require_attestor` used to be: a Compliance Committee
+/// (multi-sig/voting) is the deferred upgrade for this role.
+fn require_governor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Result<()> {
+    let governor = view
+        .get(&GovernorKey)?
+        .ok_or_else(|| anyhow::anyhow!("chain has no governor configured"))?;
+    if action.sender != governor {
+        anyhow::bail!("{} is not the chain governor", action.sender);
+    }
+    Ok(())
+}
+
+/// Adds `attestor` to the trusted-attestor set. Rejected if already
+/// registered — deregister first to change `name`.
+pub(crate) fn register_attestor(
+    view: &BlockView<'_>,
+    action: &ChainAction,
+    attestor: &Address,
+    name: &str,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    require_governor(view, action)?;
+    if view.get(&AttestorRecordKey(attestor))?.is_some() {
+        anyhow::bail!("{attestor} is already a registered attestor");
+    }
+    Ok(BlockUpdates {
+        attestor_registration: Some(AttestorRegistration {
+            attestor: attestor.clone(),
+            record: AttestorRecord { name: name.to_string(), registered_at: current_height },
+        }),
+        ..Default::default()
+    })
+}
+
+/// Removes `attestor` from the trusted-attestor set. Attestations it
+/// already granted are untouched — see `require_attestor`'s doc comment on
+/// who may revoke them.
+pub(crate) fn deregister_attestor(
+    view: &BlockView<'_>,
+    action: &ChainAction,
+    attestor: &Address,
+) -> anyhow::Result<BlockUpdates> {
+    require_governor(view, action)?;
+    if view.get(&AttestorRecordKey(attestor))?.is_none() {
+        anyhow::bail!("{attestor} is not a registered attestor");
+    }
+    Ok(BlockUpdates {
+        attestor_deregistration: Some(AttestorDeregistration(attestor.clone())),
+        ..Default::default()
+    })
+}
+
+/// Marks `subject` eligible by setting `AccountEntry.identity_hash`, and
+/// records `action.sender` as the attestor who granted it — the minimum
+/// accountability trail needed once more than one attestor can grant
+/// attestations (no slashing or dispute path on top of it yet).
 /// Creates a fresh account entry if `subject` has none yet.
 pub(crate) fn grant_attestation(
     view: &BlockView<'_>,
@@ -40,8 +98,10 @@ pub(crate) fn grant_attestation(
         nonce: 0,
         identity_hash: None,
         zk_identity_verified: false,
+        attested_by: None,
     });
     entry.identity_hash = Some(hash.to_string());
+    entry.attested_by = Some(action.sender.clone());
     Ok(BlockUpdates {
         accounts: AccountUpdates(std::collections::BTreeMap::from([(subject.clone(), entry)])),
         ..Default::default()
@@ -146,7 +206,7 @@ mod tests {
             HashMap::from([(alice.clone(), funded(ACTION_FEE * 2)), (attestor.clone(), funded(ACTION_FEE))]),
             HashMap::new(),
         );
-        view.put(&AttestorKey, &attestor).unwrap();
+        view.put(&AttestorRecordKey(&attestor), &AttestorRecord { name: "test".to_string(), registered_at: 0 }).unwrap();
 
         let grant = Action {
             sender: attestor.clone(),

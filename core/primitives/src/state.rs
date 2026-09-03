@@ -20,6 +20,13 @@ pub struct AccountEntry {
     // without a migration.
     #[serde(default)]
     pub zk_identity_verified: bool,
+    /// Which registered attestor most recently granted `identity_hash` —
+    /// `None` for entries written before the attestor registry existed, or
+    /// for an account that's never been attested. Doesn't (yet) drive any
+    /// enforcement; it's the accountability trail a future dispute/slashing
+    /// path would need, recorded now so it isn't missing retroactively.
+    #[serde(default)]
+    pub attested_by: Option<Address>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -120,6 +127,19 @@ pub struct Asset {
     pub compliance_required: bool,
 }
 
+/// A registered KYC provider (`ActionPayload::RegisterAttestor`) — the
+/// Trust Spectrum's multi-attestor model. Lives in `CF_ATTESTORS`, which
+/// (unlike `Asset`'s `CF_META` registry record) *is* merkleized: whether an
+/// address belongs to the trusted-attestor set gates every
+/// `GrantAttestation`/`RevokeAttestation`, so membership must be provable in
+/// the state root the same way balances are, not just agreed on by
+/// full nodes reading `CF_META`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestorRecord {
+    pub name: String,
+    pub registered_at: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
     pub height: u64,
@@ -140,6 +160,14 @@ pub struct Snapshot {
     /// still parse; a chain with no attestor simply can't grant attestations.
     #[serde(default)]
     pub attestor: Option<Address>,
+    /// Address allowed to submit `RegisterAttestor`/`DeregisterAttestor` —
+    /// separate from `attestor` above because deciding *who* may act as a
+    /// KYC provider shouldn't require the same key to also perform KYC.
+    /// Single fixed key for now, same as `attestor`; a Compliance Committee
+    /// (multi-sig/voting) is the deferred upgrade for this role, not built
+    /// here. `Option`/`#[serde(default)]` for the same reason as `attestor`.
+    #[serde(default)]
+    pub governor: Option<Address>,
 }
 
 impl Snapshot {

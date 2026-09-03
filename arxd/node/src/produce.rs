@@ -67,6 +67,8 @@ pub fn produce_block<R: ChainRuntime>(
         operator_updates,
         mut asset_updates,
         asset_registrations,
+        attestor_registrations,
+        attestor_deregistrations,
     ) = execute_actions(
         db,
         actions,
@@ -119,6 +121,12 @@ pub fn produce_block<R: ChainRuntime>(
         let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
+        }
+        for registration in &attestor_registrations {
+            overlay.push(registration);
+        }
+        for deregistration in &attestor_deregistrations {
+            overlay.push(deregistration);
         }
         overlay
     };
@@ -200,6 +208,12 @@ pub fn produce_block<R: ChainRuntime>(
     }
     for asset in &asset_registrations {
         writables.push(asset);
+    }
+    for registration in &attestor_registrations {
+        writables.push(registration);
+    }
+    for deregistration in &attestor_deregistrations {
+        writables.push(deregistration);
     }
     writables.push(&operator_updates);
     writables.push(&new_block);
@@ -469,7 +483,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _, _, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _, _, _, _, _, _) = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -504,6 +518,7 @@ mod tests {
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
+            attested_by: None,
             },
         );
         db.write_batch(&Snapshot {
@@ -513,6 +528,7 @@ mod tests {
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
             attestor: None,
+        governor: None,
         })
         .unwrap();
 

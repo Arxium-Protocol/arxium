@@ -18,8 +18,8 @@ pub use consensus::{
     round_timeout_signing_bytes,
 };
 pub use state::{
-    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, Snapshot,
-    StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
+    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, AttestorRecord,
+    Snapshot, StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
 };
 
 #[derive(Debug)]
