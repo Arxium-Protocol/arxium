@@ -419,6 +419,22 @@ monitoring scripts) needs the new token before the old one is retired —
 there's no dual-token grace period, the check is a single constant-time
 comparison against one configured value (`core/rpc/src/lib.rs`).
 
+## Fault evidence verification
+
+When a validator observes another validator equivocate or a proposed
+block's execution disagree with its own, it writes a signed JSON evidence
+artifact and serves it over its own RPC — no shell access to the node
+required to check it:
+
+1. `GET /evidence` lists the artifact filenames a node currently has.
+2. `GET /evidence/{id}` fetches one artifact's raw JSON.
+3. Check the artifact's `genesis_hash` against a genesis-hash registry you
+   trust independently of the node that served it — the artifact's
+   signatures being valid only proves internal consistency, not that
+   it's about a chain you should care about.
+4. Run `arx-verify <file>` (see `tools/arx-verify/README.md`) to check the
+   signatures and get a `VALID`/`UNRESOLVED` verdict.
+
 ## Known limitations worth an operator's awareness
 
 From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,

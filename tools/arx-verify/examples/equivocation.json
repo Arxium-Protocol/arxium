@@ -1,0 +1,36 @@
+{
+  "artifact_version": 1,
+  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
+  "fault": "equivocation",
+  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "height": 5,
+  "blocks": [
+    {
+      "header": {
+        "height": 5,
+        "parent_hash": "0xparent",
+        "timestamp": 1234,
+        "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+        "proposer": "arx1proposer",
+        "state_root": "0xstate",
+        "round": 0
+      },
+      "signature": "0x4bb76b93729f46566912f943770711e59e6be3a02889515d89978ab8c2244c85ba597cee8f1b551b452659519bec6f3482411b7ce4f524317753fa7c091b4504"
+    },
+    {
+      "header": {
+        "height": 5,
+        "parent_hash": "0xparent",
+        "timestamp": 1234,
+        "tx_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
+        "proposer": "arx1proposer",
+        "state_root": "0xstate",
+        "round": 0
+      },
+      "signature": "0x9da01d8e5728db259e1ac511fcb1509a78e30bfc00490bc9ab1ca194e47efb631cdb70881d22acf526c5a7cccb0bffd34639dbf7815da3a4e4299a09b6be7f07"
+    }
+  ],
+  "human_readable": {
+    "note": "devnet soak run, height 5"
+  }
+}

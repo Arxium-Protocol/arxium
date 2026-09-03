@@ -385,6 +385,7 @@ fn spawn_subsystems<R: ChainRuntime>(
         Some(payload_precheck.clone()),
         R::min_validator_stake(),
         Some(R::action_fee()),
+        config.base_path.join(chain_name).join("evidence"),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this

@@ -1,0 +1,33 @@
+{
+  "artifact_version": 1,
+  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
+  "fault": "execution_disagreement",
+  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
+  "height": 5,
+  "proposed": {
+    "header": {
+      "height": 5,
+      "parent_hash": "0xparent",
+      "timestamp": 1234,
+      "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+      "proposer": "arx1proposer",
+      "state_root": "0xstate",
+      "round": 0
+    },
+    "signature": "0x4bb76b93729f46566912f943770711e59e6be3a02889515d89978ab8c2244c85ba597cee8f1b551b452659519bec6f3482411b7ce4f524317753fa7c091b4504"
+  },
+  "dissent": {
+    "height": 5,
+    "block_hash": "0xblockhash",
+    "state_root": "0xdifferentstate",
+    "header_commitment": "0x8235e6a3b90561e0861bfe285ba70143ed103dee3d947e29010af02fd76f87eb",
+    "ep": "0x0303030303030303030303030303030303030303030303030303030303030303",
+    "reason": "state_root_mismatch",
+    "voter": "arx1voter",
+    "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b",
+    "signature": "0x95df08766e56845d1f4deb3828377d2a753f576da76b4d783aa8b290d1eb5a7fa163a2c9b389123305ebca220adf5f7512f6eeab6c77c402a1240300de3b90a699ae8de5f769ef78a8acc42fef28994a54a49944bf8f6db53008fa20a5738719"
+  },
+  "human_readable": {
+    "note": "devnet soak run, height 5"
+  }
+}

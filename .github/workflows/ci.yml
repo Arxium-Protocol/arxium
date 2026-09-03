@@ -1,9 +1,15 @@
 name: Version CI and Release
 
+# `monitoring` runs sudo/apt/docker steps with the repo's secrets available.
+# Keep the trigger as `pull_request` (not `pull_request_target`) so external
+# fork PRs run in a sandbox without those secrets.
 on:
   push:
+    branches: [main]
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -206,6 +212,9 @@ jobs:
     needs:
       - test
       - monitoring
+    # Only an actual version tag push builds a release; on plain pushes and
+    # PRs GITHUB_REF_NAME isn't a version string and there's nothing to publish.
+    if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     runs-on: ubuntu-24.04

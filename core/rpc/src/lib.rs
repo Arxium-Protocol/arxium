@@ -14,6 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,6 +76,10 @@ struct AppState<P: Payload> {
     // Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so
     // a client can show it before submitting. `None` for chains with no fee.
     action_fee: Option<u128>,
+    // Where `xc_evidence` writes fault artifacts (see `write_equivocation_artifact`
+    // / `write_disagreement_artifact`). `GET /evidence*` just lists/serves this
+    // directory's contents — no separate storage of its own.
+    evidence_dir: PathBuf,
 }
 
 struct RateLimiter {
@@ -340,6 +345,7 @@ pub fn spawn_http_ingest<P: Payload>(
     payload_precheck: Option<PayloadPrecheck<P>>,
     min_stake: Option<u128>,
     action_fee: Option<u128>,
+    evidence_dir: PathBuf,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
@@ -353,6 +359,7 @@ pub fn spawn_http_ingest<P: Payload>(
         pairing: Arc::new(PairingStore::new()),
         min_stake,
         action_fee,
+        evidence_dir,
     };
 
     thread::spawn(move || {
@@ -397,6 +404,8 @@ pub fn spawn_http_ingest<P: Payload>(
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
                 .route("/blocks/by-hash/{hash}", get(get_block_by_hash::<P>))
+                .route("/evidence", get(get_evidence_list::<P>))
+                .route("/evidence/{id}", get(get_evidence_by_id::<P>))
                 .route("/search", get(search::<P>))
                 .route("/status", get(get_status::<P>))
                 .route("/min-stake", get(get_min_stake::<P>))
@@ -1165,6 +1174,57 @@ async fn get_block_by_hash<P: Payload>(
     }
 }
 
+/// Lists the filenames `xc_evidence::write_equivocation_artifact` /
+/// `write_disagreement_artifact` have written to `evidence_dir` — each one
+/// an `EvidenceArtifact` an outside party can fetch via `GET /evidence/{id}`
+/// and check with `arx-verify`, no shell access to the node required.
+async fn get_evidence_list<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    let entries = match std::fs::read_dir(&state.evidence_dir) {
+        Ok(entries) => entries,
+        // No evidence directory yet just means no faults observed so far.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Json(Vec::<String>::new()).into_response();
+        }
+        Err(err) => {
+            warn!("failed to read evidence dir {}: {err}", state.evidence_dir.display());
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let mut ids: Vec<String> = entries
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    ids.sort();
+    Json(ids).into_response()
+}
+
+/// Serves one evidence artifact's raw JSON by filename, as listed by
+/// `GET /evidence`. `id` is a filename, not a path — reject anything that
+/// could escape `evidence_dir` rather than trusting the caller.
+async fn get_evidence_by_id<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<String>,
+) -> Response {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let path = state.evidence_dir.join(&id);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(err) => {
+            warn!("failed to read evidence artifact {}: {err}", path.display());
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct SearchQuery {
     q: String,
@@ -1272,6 +1332,7 @@ mod tests {
             pairing: Arc::new(PairingStore::new()),
             min_stake: None,
             action_fee: None,
+            evidence_dir: dir.join("evidence"),
         }
     }
 
@@ -1604,6 +1665,46 @@ mod tests {
 
             let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await;
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    #[test]
+    fn evidence_list_and_fetch_serve_the_evidence_dir_and_reject_path_traversal() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+
+            // No evidence directory yet just means no faults observed so far.
+            let resp = get_evidence_list(State(state.clone())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(json.as_array().unwrap().is_empty());
+
+            std::fs::create_dir_all(&state.evidence_dir).unwrap();
+            std::fs::write(state.evidence_dir.join("fault-1.json"), b"{\"ok\":true}").unwrap();
+
+            let resp = get_evidence_list(State(state.clone())).await;
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json.as_array().unwrap(), &["fault-1.json"]);
+
+            let resp = get_evidence_by_id(State(state.clone()), Path("fault-1.json".into())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], b"{\"ok\":true}");
+
+            let resp = get_evidence_by_id(State(state.clone()), Path("no-such-file.json".into())).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            let resp = get_evidence_by_id(State(state.clone()), Path("../secrets.json".into())).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         });
     }
 
