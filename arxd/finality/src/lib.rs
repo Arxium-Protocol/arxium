@@ -334,6 +334,21 @@ where
                                                 };
                                                 my_round_timeout_votes
                                                     .insert((vote.height, vote.round), vote.clone());
+
+                                                // Same local-loopback rule as
+                                                // precommit votes: tally our own
+                                                // timeout vote before gossip.
+                                                if let Err(err) = tally_round_timeout::<P>(
+                                                    &db,
+                                                    &mut round_timeout_tallies,
+                                                    &mut my_round_timeout_votes,
+                                                    vote.clone(),
+                                                ) {
+                                                    warn!(
+                                                        "finality: failed to process local round-timeout vote: {err}"
+                                                    );
+                                                }
+
                                                 if round_timeout_tx.send(vote).is_err() {
                                                     warn!(
                                                         "finality: round-timeout vote channel closed, stopping"
@@ -422,6 +437,17 @@ where
                     let vote =
                         PrecommitVote { height: block.height, block_hash: hash, voter: address.clone(), signature, ep };
                     my_votes.insert(vote.height, vote.clone());
+
+                    // Count our own signed vote locally before gossiping it.
+                    // Gossipsub publication is not a local loopback mechanism,
+                    // so waiting for VoteObserved would leave every validator
+                    // counting only its peers' votes.
+                    if let Err(err) =
+                        tally_vote(&db, &mut tallies, &mut my_votes, vote.clone())
+                    {
+                        warn!("finality: failed to process local precommit vote: {err}");
+                    }
+
                     if vote_tx.send(vote).is_err() {
                         warn!("finality: vote channel closed, stopping");
                         return;
@@ -1019,6 +1045,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn spawn_finality_tallies_its_local_precommit_before_gossip() {
+        let (db, dir) = open_test_db();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+        let peer = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        db.write_batches(&[
+            &xc_storage::BlsKeyRegistration {
+                address: addr.clone(),
+                pubkey: pk,
+                effective_height: 0,
+            },
+            &xc_storage::ValidatorSetSnapshot {
+                effective_height: 0,
+                validators: vec![addr.clone(), peer],
+            },
+        ])
+        .unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, vote_rx) = mpsc::channel();
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        spawn_finality::<()>(db.clone(), Some((addr.clone(), sk)), event_rx, vote_tx, round_timeout_tx);
+
+        event_tx
+            .send(FinalityEvent::BlockObserved(signed_block(
+                &SigningKey::from_bytes(&[9u8; 32]),
+                5,
+                100,
+            )))
+            .unwrap();
+        drop(event_tx);
+
+        let vote = vote_rx.recv_timeout(std::time::Duration::from_secs(2)).expect("expected a precommit vote");
+        let persisted = db.get_precommit_votes_from(0).unwrap();
+        assert_eq!(persisted.len(), 1, "the local vote must enter the tally without gossip loopback");
+        assert_eq!(persisted[0].voter, addr);
+        assert_eq!(persisted[0].height, vote.height);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A vote is only gossiped once, on observation. If that single message
     /// is lost, the height must not be stuck forever — the node should keep
     /// re-sending its own not-yet-finalized vote.
@@ -1269,6 +1337,43 @@ mod tests {
         assert_eq!(vote.height, 1); // last_progress starts at height 0, so next_height is 1
         assert_eq!(vote.round, 0);
         assert_eq!(vote.voter, addr);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn spawn_finality_tallies_its_local_round_timeout_before_gossip() {
+        let (db, dir) = open_test_db();
+        parent_block_for(&db, 0);
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+        let peer = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        db.write_batches(&[
+            &xc_storage::BlsKeyRegistration {
+                address: addr.clone(),
+                pubkey: pk,
+                effective_height: 0,
+            },
+            &xc_storage::ValidatorSetSnapshot {
+                effective_height: 0,
+                validators: vec![addr.clone(), peer],
+            },
+        ])
+        .unwrap();
+
+        let (_event_tx, event_rx) = mpsc::channel();
+        let (_vote_tx, _vote_rx) = mpsc::channel();
+        let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
+        spawn_finality::<()>(db.clone(), Some((addr.clone(), sk)), event_rx, _vote_tx, round_timeout_tx);
+
+        let vote = round_timeout_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a round-timeout vote");
+        let persisted = db.get_round_timeout_votes_from(0).unwrap();
+        assert_eq!(persisted.len(), 1, "the local timeout vote must enter the tally without gossip loopback");
+        assert_eq!(persisted[0].voter, addr);
+        assert_eq!(persisted[0].height, vote.height);
+        assert_eq!(persisted[0].round, vote.round);
 
         std::fs::remove_dir_all(&dir).ok();
     }
