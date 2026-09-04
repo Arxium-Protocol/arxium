@@ -87,6 +87,7 @@ pub fn produce_block<R: ChainRuntime>(
                 },
             )
         },
+        None,
     )?;
 
     // Same whole-block economics `accept_block` applies to a gossiped block
@@ -502,6 +503,7 @@ mod tests {
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                 )
             },
+            None,
         )
         .unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();

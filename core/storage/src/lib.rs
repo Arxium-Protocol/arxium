@@ -4,14 +4,13 @@
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
-    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey, AttestorKey,
+    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey,
     AttestorRecordKey, BlsKeyKey, GovernorKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey,
 };
 use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_META, CF_VALIDATORS};
@@ -48,6 +47,9 @@ pub enum StorageError {
         "database schema version {found} predates what this binary requires ({supported}) and no migration from {found} is implemented — wipe and resync, or run a binary built for version {found}"
     )]
     SchemaTooOld { found: u32, supported: u32 },
+
+    #[error("not a valid state root (expected \"0x\" + 64 hex chars): {0}")]
+    InvalidRoot(String),
 }
 
 /// Content-addressed Merkle-trie nodes (`B3`) — keyed by node hash, so a
@@ -101,51 +103,23 @@ fn is_state_key(key: &[u8]) -> bool {
     matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS)
 }
 
-fn hash_key(key: &[u8]) -> [u8; 32] {
-    Sha256::digest(key).into()
+/// Parses a `Block.state_root`-shaped string (`"0x"` + 64 hex chars, as
+/// produced by `compute_state_root`) back into the raw root `prove` and
+/// `trie_root_after` operate on.
+fn decode_root(root: &str) -> Result<[u8; 32], StorageError> {
+    let hex_part = root.strip_prefix("0x").unwrap_or(root);
+    let bytes = hex::decode(hex_part).map_err(|_| StorageError::InvalidRoot(root.to_string()))?;
+    bytes.try_into().map_err(|_| StorageError::InvalidRoot(root.to_string()))
 }
 
-/// Domain-separated from `internal_hash` (leading `0x00` vs `0x01`) so a
-/// leaf and an internal node can never collide in `CF_MERKLE`'s shared
-/// hash-keyed namespace.
-fn leaf_hash(key_hash: &[u8; 32], value: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x00]);
-    hasher.update(key_hash);
-    hasher.update(value);
-    hasher.finalize().into()
-}
-
-fn internal_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update([0x01]);
-    hasher.update(left);
-    hasher.update(right);
-    hasher.finalize().into()
-}
-
-/// Bit `level` (0 = most significant) of a 256-bit path — which child to
-/// descend into at that level of the trie.
-fn bit_at(hash: &[u8; 32], level: usize) -> u8 {
-    (hash[level / 8] >> (7 - level % 8)) & 1
-}
-
-/// `defaults[d]` is the root hash of a subtree of depth `d` containing no
-/// occupied leaves — `defaults[0]` is the canonical "empty leaf" sentinel,
-/// `defaults[d] = internal_hash(defaults[d-1], defaults[d-1])` for `d` up to
-/// 256 (an empty whole trie). Precomputed once per process: descending into
-/// an empty subtree checks against this table instead of touching
-/// `CF_MERKLE`, which is what keeps updating a mostly-empty trie cheap.
-fn default_hashes() -> &'static [[u8; 32]; 257] {
-    static DEFAULTS: OnceLock<[[u8; 32]; 257]> = OnceLock::new();
-    DEFAULTS.get_or_init(|| {
-        let mut table = [[0u8; 32]; 257];
-        for depth in 1..=256 {
-            table[depth] = internal_hash(&table[depth - 1], &table[depth - 1]);
-        }
-        table
-    })
-}
+// The trie's hash functions, default-subtree table, and proof
+// type/verification live in `xc_poe::state_trie` — not duplicated here — so
+// `arx-verify` and other no-RocksDB parties can check a proof this crate
+// produces without depending on `xc-storage` (see that module's doc
+// comment). Both directions of a proof round-trip (`prove` below builds one,
+// `xc_poe::state_trie::verify_proof` checks it) must use the exact same
+// hashing, which a shared definition guarantees.
+use xc_poe::state_trie::{InclusionProof, bit_at, default_hashes, hash_key, internal_hash, leaf_hash};
 
 /// Which column family a key belongs in, derived from its prefix rather than
 /// tracked separately at each call site — one place to keep in sync with the
@@ -384,12 +358,6 @@ impl ArxiumDb {
             }
             None => Ok(None),
         }
-    }
-
-    /// The chain's genesis-fixed attestor address, if configured — see
-    /// `Snapshot::attestor`.
-    pub fn get_attestor(&self) -> Result<Option<Address>, StorageError> {
-        KvRead::get(self, &AttestorKey)
     }
 
     /// One attestor's registry record, if `attestor` is currently registered.
@@ -769,6 +737,63 @@ impl ArxiumDb {
         Ok((left, right))
     }
 
+    /// Descends from `root` along `key_hash`'s 256-bit path, recording the
+    /// sibling at each level (index 0 = nearest the root) plus the node
+    /// found at the leaf level — either an actual leaf hash or
+    /// `default_hashes()[0]` if `key_hash` isn't present under `root`. Shared
+    /// by `trie_root_after` (which then climbs back up with a new leaf in
+    /// place) and `prove` (which stops here — the descent path *is* the
+    /// inclusion/non-inclusion proof).
+    fn descend(
+        &self,
+        root: [u8; 32],
+        key_hash: &[u8; 32],
+        overrides: &HashMap<[u8; 32], Vec<u8>>,
+    ) -> Result<([[u8; 32]; 256], [u8; 32]), StorageError> {
+        let defaults = default_hashes();
+        let mut siblings = [[0u8; 32]; 256];
+        let mut node = root;
+        for level in 0..256 {
+            let depth = 256 - level;
+            if node == defaults[depth] {
+                siblings[level] = defaults[depth - 1];
+                node = defaults[depth - 1];
+            } else {
+                let (left, right) = self.node_children(&node, overrides)?;
+                let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
+                siblings[level] = sibling;
+                node = child;
+            }
+        }
+        Ok((siblings, node))
+    }
+
+    /// Builds an inclusion (or non-inclusion) proof for `key` against `root`
+    /// — a hex-encoded root from a `Block.state_root`/`compute_state_root`
+    /// call, current or historical: nodes are content-addressed and never
+    /// pruned (see `CF_MERKLE`'s doc comment), so any root this node has ever
+    /// computed can still be proved against. Verify with
+    /// `xc_poe::state_trie::verify_proof` — this is Part 3 Stage 1's
+    /// prerequisite for both bisection (proving the handful of state keys a
+    /// disputed action touched) and a light wallet (proving its own balance
+    /// without trusting the node that reports it).
+    pub fn prove(&self, key: &[u8], root: &str) -> Result<InclusionProof, StorageError> {
+        let root_bytes = decode_root(root)?;
+        let key_hash = hash_key(key);
+        let (siblings, leaf_node) = self.descend(root_bytes, &key_hash, &HashMap::new())?;
+        let value = if leaf_node == default_hashes()[0] {
+            None
+        } else {
+            let content =
+                self.db.get_cf(self.cf(CF_MERKLE), leaf_node)?.ok_or(StorageError::CorruptedMeta)?;
+            if content.len() < 32 {
+                return Err(StorageError::CorruptedMeta);
+            }
+            Some(content[32..].to_vec())
+        };
+        Ok(InclusionProof { key_hash, value, siblings: siblings.to_vec() })
+    }
+
     /// Applies `changes` (key-hash -> new value, or `None` to delete) to the
     /// persisted trie and returns the resulting root. When `batch` is
     /// `Some`, every newly-created node (and the root pointer, if anything
@@ -788,25 +813,11 @@ impl ArxiumDb {
         let mut overrides: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
 
         for (key_hash, new_value) in changes {
-            // Descend from `root`, recording the sibling at each of the 256
-            // levels — `defaults[depth]` short-circuits an entirely-empty
-            // subtree without ever touching storage, which is what keeps an
-            // update to one key cheap regardless of how much of the trie is
-            // still empty.
-            let mut siblings = [[0u8; 32]; 256];
-            let mut node = root;
-            for level in 0..256 {
-                let depth = 256 - level;
-                if node == defaults[depth] {
-                    siblings[level] = defaults[depth - 1];
-                    node = defaults[depth - 1];
-                } else {
-                    let (left, right) = self.node_children(&node, &overrides)?;
-                    let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
-                    siblings[level] = sibling;
-                    node = child;
-                }
-            }
+            // `defaults[depth]` short-circuits an entirely-empty subtree
+            // without ever touching storage during descent, which is what
+            // keeps an update to one key cheap regardless of how much of the
+            // trie is still empty.
+            let (siblings, _leaf_node) = self.descend(root, key_hash, &overrides)?;
 
             // Climb back up, recomputing every node on the path with the new
             // leaf in place of the old one.
@@ -1252,11 +1263,10 @@ impl BatchWritable for Snapshot {
             bincode::serde::encode_to_vec(&genesis_validators, config)?,
         ));
         if let Some(attestor) = &self.attestor {
-            entries.push((AttestorKey.encode(), bincode::serde::encode_to_vec(attestor, config)?));
-            // Also seeds the multi-attestor registry with this chain-spec's
-            // legacy single attestor, so a spec written before the Trust
-            // Spectrum registry existed still grants a working attestor at
-            // genesis instead of silently having none.
+            // Seeds the multi-attestor registry with this chain-spec's
+            // legacy single attestor field, so a spec written before the
+            // Trust Spectrum registry existed still grants a working
+            // attestor at genesis instead of silently having none.
             let record = AttestorRecord { name: "genesis".to_string(), registered_at: self.height };
             entries.push((
                 AttestorRecordKey(attestor).encode(),
@@ -2411,12 +2421,14 @@ mod merkle_state_root_tests {
     use xc_primitives::AccountEntry;
 
     fn temp_path() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "arxium-test-merkle-{}",
+            "arxium-test-merkle-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
 
@@ -2489,6 +2501,60 @@ mod merkle_state_root_tests {
 
         db.write_batch(&accounts(&[(1, 100)])).unwrap();
         assert_eq!(db.compute_state_root(&[]).unwrap(), original);
+    }
+
+    /// `prove` (Part 3 Stage 1) must produce a proof `xc_poe::state_trie::verify_proof`
+    /// accepts against the exact root `compute_state_root` reports — a
+    /// prover and verifier that quietly disagree on the trie's shape would
+    /// make every downstream proof (bisection, a wallet's own balance) worth
+    /// nothing.
+    #[test]
+    fn a_proof_of_an_existing_account_verifies_against_the_current_root() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100), (2, 200)])).unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let root_bytes = decode_root(&root).unwrap();
+
+        let key = format!("account:{}", addr(1)).into_bytes();
+        let proof = db.prove(&key, &root).unwrap();
+        assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
+        assert_eq!(proof.value, Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap()));
+    }
+
+    /// A key that was never written proves as absent (non-inclusion) rather
+    /// than erroring — the sparse trie has no separate "does this key exist"
+    /// path, presence and absence are proved the same way.
+    #[test]
+    fn a_proof_of_a_never_written_key_is_non_inclusion() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100)])).unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let root_bytes = decode_root(&root).unwrap();
+
+        let key = format!("account:{}", addr(9)).into_bytes();
+        let proof = db.prove(&key, &root).unwrap();
+        assert_eq!(proof.value, None);
+        assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
+    }
+
+    /// `prove` isn't limited to the current tip's root — `CF_MERKLE` nodes
+    /// are content-addressed and never pruned, so a historical root a
+    /// dispute references must still be provable against even after the
+    /// trie has since moved on.
+    #[test]
+    fn a_historical_root_remains_provable_after_the_trie_moves_on() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100)])).unwrap();
+        let old_root = db.compute_state_root(&[]).unwrap();
+        let old_root_bytes = decode_root(&old_root).unwrap();
+
+        db.write_batch(&accounts(&[(1, 999), (2, 200)])).unwrap();
+        assert_ne!(db.compute_state_root(&[]).unwrap(), old_root);
+
+        let key = format!("account:{}", addr(1)).into_bytes();
+        let proof = db.prove(&key, &old_root).unwrap();
+        assert_eq!(proof.value, Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap()));
+        assert!(xc_poe::state_trie::verify_proof(old_root_bytes, &proof));
     }
 
     /// Deleting a stake allocation back out of the trie must return the root

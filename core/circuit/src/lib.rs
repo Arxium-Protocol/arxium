@@ -137,17 +137,6 @@ impl KeySpec for AccountAssetsKey<'_> {
     }
 }
 
-/// The chain's sole attestor address (genesis-fixed, see `Snapshot::attestor`)
-/// — the only sender `GrantAttestation`/`RevokeAttestation` accept.
-pub struct AttestorKey;
-impl KeySpec for AttestorKey {
-    const CF: &'static str = CF_META;
-    type Value = Address;
-    fn encode(&self) -> Vec<u8> {
-        b"meta:attestor".to_vec()
-    }
-}
-
 /// One registered attestor's registry record — `CF_ATTESTORS`, included in
 /// `is_state_key`, so an address's membership in the trusted set is
 /// merkleized and provable in the state root, not just a `CF_META` row a

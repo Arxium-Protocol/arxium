@@ -195,13 +195,17 @@ pub enum FinalityEvent<P> {
 /// finalizes without one, it just can't contribute a vote. `vote_tx` is
 /// where freshly-signed precommits go out to be gossiped; `round_timeout_tx`
 /// is the same for round-timeout votes; `events` carries locally-observed
-/// blocks and incoming peer votes/dissents/round-timeouts.
+/// blocks and incoming peer votes/dissents/round-timeouts. `dissent_tx` gets
+/// a copy of every dissent this node newly persists (whether it originated
+/// locally or arrived from a peer) — `arxd/node` uses it to emit the same
+/// evidence artifact for both paths, see `xc_evidence::EvidenceEvent`.
 pub fn spawn_finality<P>(
     db: ArxiumDb,
     bls_identity: Option<(Address, BlsSecretKey)>,
     events: Receiver<FinalityEvent<P>>,
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
+    dissent_tx: Sender<DissentRecord>,
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -396,9 +400,15 @@ where
                 if let Err(err) = db.delete_precommit_votes(height) {
                     warn!("finality: failed to prune persisted precommit votes for height {height}: {err}");
                 }
-                if let Err(err) = db.delete_dissents(height) {
-                    warn!("finality: failed to prune persisted dissents for height {height}: {err}");
-                }
+                // Dissents are deliberately *not* pruned on this schedule — see
+                // `TALLY_RETENTION_HEIGHTS`'s doc: that bound is justified for
+                // votes because an unfinalized height is never going to gain
+                // another one. A dissent is different — it's a signed claim a
+                // fault occurred, and heights that never finalize are exactly
+                // where dissents live (disagreement is often *why* quorum
+                // wasn't reached). Dissent volume on a healthy chain is ~zero,
+                // so unbounded retention isn't the unbounded-growth risk that
+                // motivated pruning votes in the first place.
             }
             tallies.retain(|height, _| *height >= cutoff);
             my_votes.retain(|height, _| *height >= cutoff);
@@ -459,7 +469,7 @@ where
                     }
                 }
                 FinalityEvent::DissentObserved(dissent) => {
-                    if let Err(err) = handle_dissent(&db, dissent) {
+                    if let Err(err) = handle_dissent(&db, dissent, &dissent_tx) {
                         warn!("finality: failed to process dissent: {err}");
                     }
                 }
@@ -662,10 +672,16 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
 
 /// Verifies a dissent's signature and validator membership, enforces one
 /// dissent per (height, voter) against what's already persisted, and — if
-/// it's new — persists it and bumps `arxium_dissent_total{reason}`. Never
-/// touches `tallies`: a dissent is not a precommit vote and never
-/// contributes to quorum, it's only recorded as evidence.
-fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::StorageError> {
+/// it's new — persists it, bumps `arxium_dissent_total{reason}`, and hands
+/// a copy to `dissent_tx` so `arxd/node` can emit an evidence artifact for
+/// it (see `spawn_finality`'s doc). Never touches `tallies`: a dissent is
+/// not a precommit vote and never contributes to quorum, it's only
+/// recorded as evidence.
+fn handle_dissent(
+    db: &ArxiumDb,
+    dissent: Dissent,
+    dissent_tx: &Sender<DissentRecord>,
+) -> Result<(), xc_storage::StorageError> {
     if db.get_finality_record(dissent.height)?.is_some() {
         return Ok(()); // already finalized; a late dissent proves nothing new
     }
@@ -712,6 +728,7 @@ fn handle_dissent(db: &ArxiumDb, dissent: Dissent) -> Result<(), xc_storage::Sto
     db.write_batches(&[&record])?;
     metrics::counter!("arxium_dissent_total", "reason" => reason).increment(1);
     info!("finality: recorded dissent from {} at height {} ({reason})", record.voter, record.height);
+    let _ = dissent_tx.send(record);
     Ok(())
 }
 
@@ -972,8 +989,9 @@ mod tests {
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xblockhash");
-        handle_dissent(&db, dissent).unwrap();
+        handle_dissent(&db, dissent, &dissent_tx).unwrap();
 
         let stored = db.get_dissent(5, &addr).unwrap().expect("dissent should be persisted");
         assert_eq!(stored.reason, "state_root_mismatch");
@@ -991,10 +1009,11 @@ mod tests {
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
-        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xblockhash")).unwrap();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xblockhash"), &dissent_tx).unwrap();
         // A second, differently-shaped dissent from the same voter at the
         // same height must not overwrite the first.
-        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash")).unwrap();
+        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash"), &dissent_tx).unwrap();
 
         let stored = db.get_dissent(5, &addr).unwrap().unwrap();
         assert_eq!(stored.block_hash, "0xblockhash", "the first dissent must win, not be overwritten");
@@ -1014,9 +1033,58 @@ mod tests {
             .unwrap();
 
         // Signed with a key that doesn't match the registered pubkey for `addr`.
-        handle_dissent(&db, dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash")).unwrap();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        handle_dissent(&db, dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash"), &dissent_tx).unwrap();
 
         assert!(db.get_dissent(5, &addr).unwrap().is_none(), "a forged dissent signature must not be persisted");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `TALLY_RETENTION_HEIGHTS` prunes unfinalized precommit tallies because
+    /// a vote that never reached quorum is noise — but a dissent is a signed
+    /// claim a fault occurred, and heights that never finalize are exactly
+    /// where dissents live. This drives `spawn_finality`'s real event loop
+    /// (not a standalone copy of the pruning logic) to prove the dissent
+    /// survives long after the vote-retention window for its height closes.
+    #[test]
+    fn a_dissent_survives_the_tip_advancing_past_its_vote_retention_window() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }])
+            .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
+            .unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, _vote_rx) = mpsc::channel();
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        // No bls_identity: this test only needs the loop's pruning step to
+        // run on every event, not for this node to vote.
+        let handle = spawn_finality::<()>(db.clone(), None, event_rx, vote_tx, round_timeout_tx, dissent_tx);
+
+        let dissent_height = 5;
+        event_tx
+            .send(FinalityEvent::DissentObserved(dissent_fixture(addr.clone(), &sk, dissent_height, "0xblockhash")))
+            .unwrap();
+
+        // Push the tip well past `dissent_height + TALLY_RETENTION_HEIGHTS` —
+        // this is what drives the pruning cutoff in the real loop.
+        for height in 1..=(dissent_height + TALLY_RETENTION_HEIGHTS + 10) {
+            event_tx
+                .send(FinalityEvent::BlockObserved(signed_block(&ed_key, height, 100 + height)))
+                .unwrap();
+        }
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
+
+        assert!(
+            db.get_dissent(dissent_height, &addr).unwrap().is_some(),
+            "a dissent must not be pruned once its height falls outside the vote retention window"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1030,12 +1098,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
             Some((addr.clone(), sk)),
             event_rx,
             vote_tx,
             round_timeout_tx,
+            dissent_tx,
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1076,12 +1146,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db.clone(),
             Some((addr.clone(), sk)),
             event_rx,
             vote_tx,
             round_timeout_tx,
+            dissent_tx,
         );
 
         event_tx
@@ -1121,12 +1193,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, vote_rx) = mpsc::channel();
         let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
             Some((addr.clone(), sk)),
             event_rx,
             vote_tx,
             round_timeout_tx,
+            dissent_tx,
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1363,12 +1437,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_vote_tx, _vote_rx) = mpsc::channel();
         let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
             Some((addr.clone(), sk)),
             event_rx,
             _vote_tx,
             round_timeout_tx,
+            dissent_tx,
         );
 
         let vote = round_timeout_rx
@@ -1406,12 +1482,14 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel();
         let (_vote_tx, _vote_rx) = mpsc::channel();
         let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db.clone(),
             Some((addr.clone(), sk)),
             event_rx,
             _vote_tx,
             round_timeout_tx,
+            dissent_tx,
         );
 
         let vote = round_timeout_rx

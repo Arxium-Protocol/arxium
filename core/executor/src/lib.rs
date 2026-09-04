@@ -464,7 +464,7 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch)?;
+    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None)?;
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
@@ -583,6 +583,24 @@ where
 /// function only owns the generic loop mechanics (signature check, overlay
 /// chaining, buffer-and-skip-on-error), not what any given payload variant
 /// means. `P` is the chain's action payload type.
+///
+/// `inter_action_roots`, when `Some`, gets one state root pushed after every
+/// input action (whether it applied or was dropped) — the state root the
+/// trie would report if committed right there, computed the same way
+/// `compute_state_root` previews a whole block's worth of changes but
+/// snapshotted action-by-action instead. This is PoE v5's "computed on
+/// demand during bisection", deliberately *not* stored in the EP or the
+/// block: hashing the trie after every action would put that cost on every
+/// block for a dispute that essentially never happens. Pass `None` (the
+/// normal block-production/sync path) and this costs nothing extra; a
+/// dispute-time caller re-executing an already-agreed action list to find
+/// where a proposer and dissenter diverged passes `Some(&mut vec![])` and
+/// gets back a vector of the same length as `actions`, in the same order —
+/// index `i` is the root just after `actions[i]` would land. Correctness
+/// depends on `actions` being replayed in the exact same order and
+/// producing the exact same overlay contents as the original execution: the
+/// `BTreeMap` discipline already in place for every overlay below is what
+/// makes that replay deterministic.
 pub fn execute_actions<P>(
     db: &ArxiumDb,
     actions: Vec<Action<P>>,
@@ -595,6 +613,7 @@ pub fn execute_actions<P>(
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
+    mut inter_action_roots: Option<&mut Vec<String>>,
 ) -> Result<
     (
         Vec<Action<P>>,
@@ -689,6 +708,20 @@ where
                 applied.push(action);
             }
             Err(err) => warn!("dropping action from {}: {err}", action.sender),
+        }
+
+        if let Some(roots) = inter_action_roots.as_deref_mut() {
+            let account_snapshot = AccountUpdates(overlay.clone());
+            let stake_snapshot = StakeUpdates {
+                allocations: stake_overlay.clone(),
+                validator_index: validator_index_overlay.clone(),
+            };
+            let asset_snapshot = AssetBalanceUpdates(asset_overlay.clone());
+            let mut snapshot_overlay: Vec<&dyn BatchWritable> =
+                vec![&account_snapshot, &stake_snapshot, &asset_snapshot];
+            snapshot_overlay.extend(attestor_registrations.iter().map(|r| r as &dyn BatchWritable));
+            snapshot_overlay.extend(attestor_deregistrations.iter().map(|d| d as &dyn BatchWritable));
+            roots.push(db.compute_state_root(&snapshot_overlay)?);
         }
     }
 
@@ -947,7 +980,7 @@ mod tests {
             _asset_registrations,
             _attestor_registrations,
             _attestor_deregistrations,
-        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch).unwrap();
+        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),
@@ -966,6 +999,63 @@ mod tests {
 
         let bob_after = db.get_account(&bob).unwrap().unwrap();
         assert_eq!(bob_after.balance, 50);
+    }
+
+    /// Part 3 Stage 1's `inter_action_roots` mode: bisection needs "the
+    /// state root after action i" for an already-agreed action list, without
+    /// that cost landing on every ordinary block. Verifies both that the
+    /// vector lines up 1:1 with the input actions and that each entry is
+    /// exactly the root a normal (non-recording) execution of that same
+    /// prefix would commit to — not just "some root", but the *right* one,
+    /// since a wrong root here would make bisection converge on the wrong
+    /// action.
+    #[test]
+    fn inter_action_roots_match_committing_each_prefix_one_block_at_a_time() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[3u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let bob = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            AccountEntry { balance: 100, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None },
+        )])))
+        .unwrap();
+
+        let actions = vec![
+            signed_transfer(&alice_key, &alice, 0, &bob, 40),
+            signed_transfer(&alice_key, &alice, 1, &bob, 10),
+            signed_transfer(&alice_key, &alice, 2, &bob, 5),
+        ];
+
+        let mut roots = Vec::new();
+        let (applied, updates, ..) =
+            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, Some(&mut roots)).unwrap();
+        assert_eq!(applied.len(), 3);
+        assert_eq!(roots.len(), 3, "one root per input action, in order");
+        db.write_batch(&updates).unwrap();
+
+        // Replay the same three actions one at a time against a fresh DB in
+        // the same starting state, committing after each — the root
+        // `execute_actions` reported for action i must match what actually
+        // got committed after applying just actions[0..=i] for real.
+        let reference_db = temp_db();
+        reference_db
+            .write_batch(&AccountUpdates(BTreeMap::from([(
+                alice.clone(),
+                AccountEntry { balance: 100, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None },
+            )])))
+            .unwrap();
+        for (i, action) in actions.into_iter().enumerate() {
+            let (_, prefix_updates, ..) =
+                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, None).unwrap();
+            reference_db.write_batch(&prefix_updates).unwrap();
+            assert_eq!(
+                roots[i],
+                reference_db.compute_state_root(&[]).unwrap(),
+                "inter_action_roots[{i}] must match the root actually committed after that many actions"
+            );
+        }
     }
 
     fn signed_stake(

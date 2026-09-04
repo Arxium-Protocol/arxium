@@ -106,6 +106,141 @@ pub fn tx_root<P: Serialize>(actions: &[Action<P>]) -> Result<[u8; 32], ActionEn
     Ok(level[0])
 }
 
+/// The sparse Merkle trie behind `xc_storage::ArxiumDb::compute_state_root`
+/// (`B3`) — hash functions, default-subtree table, and inclusion/
+/// non-inclusion proof verification, kept here (not in `core/storage`) so a
+/// party with no node — `arx-verify`, a light wallet — can check a proof
+/// without pulling in RocksDB. `core/storage` builds proofs by walking its
+/// persisted `CF_MERKLE` nodes; this module only ever recomputes a root from
+/// a proof already in hand, so it needs no storage backend of its own.
+pub mod state_trie {
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::sync::OnceLock;
+
+    pub fn hash_key(key: &[u8]) -> [u8; 32] {
+        Sha256::digest(key).into()
+    }
+
+    /// Domain-separated from `internal_hash` (leading `0x00` vs `0x01`) so a
+    /// leaf and an internal node can never collide in the trie's shared
+    /// hash-keyed namespace.
+    pub fn leaf_hash(key_hash: &[u8; 32], value: &[u8]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update([0x00]);
+        hasher.update(key_hash);
+        hasher.update(value);
+        hasher.finalize().into()
+    }
+
+    pub fn internal_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update([0x01]);
+        hasher.update(left);
+        hasher.update(right);
+        hasher.finalize().into()
+    }
+
+    /// Bit `level` (0 = most significant) of a 256-bit path — which child to
+    /// descend into at that level of the trie.
+    pub fn bit_at(hash: &[u8; 32], level: usize) -> u8 {
+        (hash[level / 8] >> (7 - level % 8)) & 1
+    }
+
+    /// `defaults[d]` is the root hash of a subtree of depth `d` containing no
+    /// occupied leaves — `defaults[0]` is the canonical "empty leaf" sentinel,
+    /// `defaults[d] = internal_hash(defaults[d-1], defaults[d-1])` for `d` up
+    /// to 256 (an empty whole trie). Precomputed once per process.
+    pub fn default_hashes() -> &'static [[u8; 32]; 257] {
+        static DEFAULTS: OnceLock<[[u8; 32]; 257]> = OnceLock::new();
+        DEFAULTS.get_or_init(|| {
+            let mut table = [[0u8; 32]; 257];
+            for depth in 1..=256 {
+                table[depth] = internal_hash(&table[depth - 1], &table[depth - 1]);
+            }
+            table
+        })
+    }
+
+    /// A key's membership (`value: Some`) or non-membership (`value: None`)
+    /// under a given root: the leaf's value plus the sibling at each of the
+    /// 256 levels from the root down to the leaf, in that order. Bisection
+    /// (Part 3 Stage 3) proves individual state-key reads/writes this way
+    /// without either party needing the full trie.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct InclusionProof {
+        pub key_hash: [u8; 32],
+        pub value: Option<Vec<u8>>,
+        pub siblings: Vec<[u8; 32]>,
+    }
+
+    /// Recomputes the root `proof` implies and checks it equals `root`. A
+    /// sparse Merkle tree proves absence the same way it proves presence: a
+    /// `None` value just means the path is expected to bottom out at the
+    /// canonical empty-leaf hash instead of a real leaf.
+    pub fn verify_proof(root: [u8; 32], proof: &InclusionProof) -> bool {
+        if proof.siblings.len() != 256 {
+            return false;
+        }
+        let defaults = default_hashes();
+        let mut current = match &proof.value {
+            Some(value) => leaf_hash(&proof.key_hash, value),
+            None => defaults[0],
+        };
+        for level in (0..256).rev() {
+            let sibling = proof.siblings[level];
+            let (left, right) =
+                if bit_at(&proof.key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+            current = internal_hash(&left, &right);
+        }
+        current == root
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn empty_trie_root_matches_the_all_default_path() {
+            // A proof of non-inclusion for any key against the canonical
+            // empty-trie root is just "every sibling is the matching default".
+            let key_hash = hash_key(b"nonexistent");
+            let defaults = default_hashes();
+            let siblings: Vec<[u8; 32]> = (0..256).map(|level| defaults[255 - level]).collect();
+            let proof = InclusionProof { key_hash, value: None, siblings };
+            assert!(verify_proof(defaults[256], &proof));
+        }
+
+        #[test]
+        fn a_tampered_value_fails_verification() {
+            let key_hash = hash_key(b"k");
+            let defaults = default_hashes();
+            let value = b"v".to_vec();
+            let leaf = leaf_hash(&key_hash, &value);
+            let mut current = leaf;
+            let mut siblings = vec![[0u8; 32]; 256];
+            for level in (0..256).rev() {
+                let sibling = defaults[255 - level];
+                siblings[level] = sibling;
+                let (left, right) = if bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                current = internal_hash(&left, &right);
+            }
+            let root = current;
+            let proof = InclusionProof { key_hash, value: Some(value), siblings };
+            assert!(verify_proof(root, &proof));
+
+            let tampered = InclusionProof { value: Some(b"different".to_vec()), ..proof };
+            assert!(!verify_proof(root, &tampered));
+        }
+
+        #[test]
+        fn wrong_sibling_count_is_rejected_rather_than_panicking() {
+            let proof = InclusionProof { key_hash: [0u8; 32], value: None, siblings: vec![[0u8; 32]; 3] };
+            assert!(!verify_proof([0u8; 32], &proof));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

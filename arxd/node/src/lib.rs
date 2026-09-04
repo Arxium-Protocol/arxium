@@ -31,7 +31,7 @@ use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
 use xc_rpc::spawn_http_ingest;
-use xc_storage::ArxiumDb;
+use xc_storage::{ArxiumDb, DissentRecord};
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
 const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
@@ -135,6 +135,95 @@ mod dissent_cross_crate_tests {
     }
 }
 
+/// Covers `dissent_record_to_evidence_event` — the piece that closes Part 2's
+/// gap: a peer's dissent, once persisted by `arxd/finality`, must produce the
+/// same evidence artifact a local rejection would, provided this node holds
+/// the disputed block.
+#[cfg(test)]
+mod dissent_evidence_bridge_tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn signed_block(key: &SigningKey, height: u64, timestamp: u64) -> Block<()> {
+        let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let mut block: Block<()> = Block::genesis(timestamp);
+        block.height = height;
+        block.sign(addr, key);
+        block
+    }
+
+    fn open_test_db() -> (ArxiumDb, std::path::PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-node-dissent-evidence-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        (ArxiumDb::open(&dir).expect("open test db"), dir)
+    }
+
+    fn sample_record(height: u64, block_hash: String, voter: Address) -> DissentRecord {
+        DissentRecord {
+            height,
+            block_hash,
+            state_root: "0xdisputed".to_string(),
+            header_commitment: [4u8; 32],
+            ep: [9u8; 32],
+            reason: "state_root_mismatch".to_string(),
+            voter,
+            signature: xc_bls::BlsSignature([3u8; 96]),
+        }
+    }
+
+    #[test]
+    fn builds_the_same_artifact_a_local_rejection_would_for_a_block_this_node_holds() {
+        let (db, dir) = open_test_db();
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let block = signed_block(&key, 5, 100);
+        db.write_batches(&[&block]).unwrap();
+
+        let voter = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: voter.clone(),
+            pubkey: pk,
+            effective_height: 0,
+        }])
+        .unwrap();
+
+        let record = sample_record(5, block.hash(), voter.clone());
+        let event = dissent_record_to_evidence_event::<()>(&db, record)
+            .expect("a locally-held block with a registered voter key must yield an artifact event");
+
+        match event {
+            EvidenceEvent::ExecutionDisagreement { proposed, dissent } => {
+                assert_eq!(proposed.hash(), block.hash());
+                assert_eq!(dissent.height, 5);
+                assert_eq!(dissent.voter, voter.to_string());
+                assert_eq!(dissent.reason, "state_root_mismatch");
+            }
+            EvidenceEvent::BlockObserved(_) => panic!("expected ExecutionDisagreement"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skips_without_panicking_when_the_disputed_block_is_not_held_locally() {
+        let (db, dir) = open_test_db();
+        let voter = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let record = sample_record(5, "0xnotheld".to_string(), voter);
+
+        assert!(
+            dissent_record_to_evidence_event::<()>(&db, record).is_none(),
+            "a block this node never received must not synthesize an artifact"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -215,6 +304,60 @@ struct SubsystemHandles<R: ChainRuntime> {
     on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
     payload_precheck: xc_mempool::PayloadPrecheck<R::Payload>,
     shutdown: Arc<AtomicBool>,
+}
+
+/// Turns a `DissentRecord` `arxd/finality` just persisted (whether signed
+/// locally or received over gossip) into the `ExecutionDisagreement`
+/// evidence event, by reading back the disputed block and the dissenter's
+/// registered BLS key from local storage. Returns `None` (and lets the
+/// caller decide whether to warn) when either read comes up empty — a node
+/// that never received the disputed block has nothing to build a
+/// `BlockAttestation` from, and synthesizing one from fields it didn't
+/// actually read would turn the artifact into an unverified guess.
+fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
+    db: &ArxiumDb,
+    record: DissentRecord,
+) -> Option<EvidenceEvent<P>> {
+    let proposed: Block<P> = match db.get_block(record.height) {
+        Ok(Some(block)) => block,
+        Ok(None) => {
+            warn!(
+                "dissent at height {} for a block not held locally, skipping evidence artifact",
+                record.height
+            );
+            return None;
+        }
+        Err(err) => {
+            warn!("failed to read block at height {} for dissent evidence: {err}", record.height);
+            return None;
+        }
+    };
+    let voter_pubkey = match db.get_bls_pubkey_at(&record.voter, record.height) {
+        Ok(Some(pubkey)) => pubkey,
+        Ok(None) => {
+            warn!(
+                "no registered BLS key for dissenter {} at height {}, skipping evidence artifact",
+                record.voter, record.height
+            );
+            return None;
+        }
+        Err(err) => {
+            warn!("failed to read BLS key for dissenter {}: {err}", record.voter);
+            return None;
+        }
+    };
+    let attestation = DissentAttestation {
+        height: record.height,
+        block_hash: record.block_hash,
+        state_root: record.state_root,
+        header_commitment: format!("0x{}", hex::encode(record.header_commitment)),
+        ep: format!("0x{}", hex::encode(record.ep)),
+        reason: record.reason,
+        voter: record.voter.to_string(),
+        voter_pubkey: format!("0x{}", hex::encode(voter_pubkey.0)),
+        signature: format!("0x{}", hex::encode(record.signature.0)),
+    };
+    Some(EvidenceEvent::ExecutionDisagreement { proposed, dissent: attestation })
 }
 
 /// Spawns every subsystem thread (evidence watcher, finality, the
@@ -300,6 +443,12 @@ fn spawn_subsystems<R: ChainRuntime>(
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
     let (finality_round_timeout_tx, finality_round_timeout_rx) =
         std_mpsc::channel::<RoundTimeoutVote>();
+    // Every dissent `spawn_finality` newly persists — whether signed
+    // locally or received from a peer — comes back out here so it can be
+    // turned into the same evidence artifact either way (see
+    // `dissent_evidence_bridge` below). Closes the gap where only the
+    // local-rejection path used to produce one.
+    let (dissent_recorded_tx, dissent_recorded_rx) = std_mpsc::channel::<DissentRecord>();
     // `on_block` below also needs the BLS key to sign dissents on execution
     // disagreement, so clone before `spawn_finality` consumes the original.
     let bls_identity_for_dissent = bls_identity.clone();
@@ -311,8 +460,29 @@ fn spawn_subsystems<R: ChainRuntime>(
             finality_event_rx,
             finality_vote_tx,
             finality_round_timeout_tx,
+            dissent_recorded_tx,
         ),
     );
+
+    // Turns a persisted `DissentRecord` into the same `ExecutionDisagreement`
+    // evidence artifact the local-rejection path emits below — the only
+    // difference is the disputed block is read back from local storage
+    // instead of being the block this node just rejected. If this node
+    // never received that block, it stays quiet rather than synthesizing a
+    // `BlockAttestation` from fields it never actually read (same principle
+    // as the parent-lookup fallback further down): the `DissentRecord` is
+    // still persisted either way, just without an artifact.
+    spawn_supervised("dissent_evidence_bridge", {
+        let db = db.clone();
+        let evidence_tx = evidence_tx.clone();
+        thread::spawn(move || {
+            for record in dissent_recorded_rx {
+                if let Some(event) = dissent_record_to_evidence_event::<R::Payload>(&db, record) {
+                    let _ = evidence_tx.send(event);
+                }
+            }
+        })
+    });
 
     let (precommit_tx, precommit_rx) = tokio::sync::mpsc::unbounded_channel::<PrecommitVote>();
     // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
