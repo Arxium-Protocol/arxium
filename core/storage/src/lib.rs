@@ -4,7 +4,8 @@
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
 use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use thiserror::Error;
@@ -1103,26 +1104,6 @@ impl ArxiumDb {
         Ok(results)
     }
 
-    /// Deletes every persisted dissent at `height` — mirrors
-    /// `delete_precommit_votes`, called once `height` ages out of
-    /// `TALLY_RETENTION_HEIGHTS`.
-    pub fn delete_dissents(&self, height: u64) -> Result<(), StorageError> {
-        let prefix = format!("meta:dissent:{height:020}:");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
-        let mut batch = WriteBatch::default();
-        for item in iter {
-            let (key, _value) = item?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            batch.delete_cf(self.cf(CF_META), key);
-        }
-        self.db.write(batch)?;
-        Ok(())
-    }
-
     /// Look up a block's height by its content hash.
     pub fn get_block_height_by_hash(&self, hash: &str) -> Result<Option<u64>, StorageError> {
         let key = format!("block_hash:{}", hash);
@@ -1747,21 +1728,57 @@ impl BatchWritable for AttestorDeregistration {
 pub struct BlockView<'a> {
     db: &'a ArxiumDb,
     entries: HashMap<Vec<u8>, Option<Vec<u8>>>,
+    /// `Some` only in recording mode (`new_recording`) — every Merkleized
+    /// key this view reads or writes gets logged here, so a caller building
+    /// a fraud proof after the fact (see `arxd/node`'s `BlockDivergence`
+    /// path) knows exactly which keys to fetch `ArxiumDb::prove` proofs
+    /// for. `None` in the normal (block-production) path: no bookkeeping
+    /// cost there at all, not even an empty-set allocation.
+    touched: Option<RefCell<BTreeSet<Vec<u8>>>>,
 }
 
 impl<'a> BlockView<'a> {
     pub fn new(db: &'a ArxiumDb) -> Self {
-        Self { db, entries: HashMap::new() }
+        Self { db, entries: HashMap::new(), touched: None }
+    }
+
+    /// Same as `new`, but logs every Merkleized key touched via `get`/
+    /// `put`/`delete` — see `touched_keys`. Non-Merkleized keys (`CF_META`,
+    /// filtered by `is_state_key`) aren't logged: they have no trie proof
+    /// to fetch, so recording them would just be noise for the caller.
+    pub fn new_recording(db: &'a ArxiumDb) -> Self {
+        Self { db, entries: HashMap::new(), touched: Some(RefCell::new(BTreeSet::new())) }
+    }
+
+    /// The Merkleized keys logged so far, in recording mode. Empty for a
+    /// view built with `new`.
+    pub fn touched_keys(&self) -> Vec<Vec<u8>> {
+        match &self.touched {
+            Some(touched) => touched.borrow().iter().cloned().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    fn record_touched(&self, raw_key: &[u8]) {
+        if let Some(touched) = &self.touched {
+            if is_state_key(raw_key) {
+                touched.borrow_mut().insert(raw_key.to_vec());
+            }
+        }
     }
 
     pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
+        let raw_key = key.encode();
+        self.record_touched(&raw_key);
         let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
-        self.entries.insert(key.encode(), Some(bytes));
+        self.entries.insert(raw_key, Some(bytes));
         Ok(())
     }
 
     pub fn delete<K: KeySpec>(&mut self, key: &K) {
-        self.entries.insert(key.encode(), None);
+        let raw_key = key.encode();
+        self.record_touched(&raw_key);
+        self.entries.insert(raw_key, None);
     }
 
     /// Folds a batch of account changes into the view — every entry is an
@@ -1821,7 +1838,9 @@ impl KvRead for BlockView<'_> {
     type Error = StorageError;
 
     fn get<K: KeySpec>(&self, key: &K) -> Result<Option<K::Value>, StorageError> {
-        match self.entries.get(&key.encode()) {
+        let raw_key = key.encode();
+        self.record_touched(&raw_key);
+        match self.entries.get(&raw_key) {
             Some(None) => Ok(None),
             Some(Some(bytes)) => {
                 let config = bincode::config::standard();

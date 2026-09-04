@@ -57,26 +57,35 @@ fn main() -> ExitCode {
             // comments. With `core-adjudicate` enabled and an ActionDivergence
             // artifact in hand, try to actually resolve it by re-executing.
             #[cfg(feature = "core-adjudicate")]
-            if matches!(artifact.fault, Fault::ActionDivergence { .. }) {
-                match core_adjudicate::adjudicate_action_divergence(&artifact) {
-                    Ok(core_adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey }) => {
-                        println!("VALID");
-                        println!("fault: {fault}");
-                        println!("genesis_hash: {}", artifact.genesis_hash);
-                        println!("culpable_pubkey: {culpable_pubkey}");
-                        return ExitCode::SUCCESS;
-                    }
-                    Ok(core_adjudicate::AdjudicationOutcome::Disagreement { reason }) => {
-                        println!("UNRESOLVED");
-                        println!("fault: {fault}");
-                        println!("genesis_hash: {}", artifact.genesis_hash);
-                        println!("parties: {}", parties.join(", "));
-                        println!("note: {reason}");
-                        return ExitCode::SUCCESS;
-                    }
-                    Err(err) => {
-                        println!("INVALID: {err}");
-                        return ExitCode::FAILURE;
+            {
+                let outcome = if matches!(artifact.fault, Fault::ActionDivergence { .. }) {
+                    Some(core_adjudicate::adjudicate_action_divergence(&artifact))
+                } else if matches!(artifact.fault, Fault::BlockDivergence { .. }) {
+                    Some(core_adjudicate::adjudicate_block_divergence(&artifact))
+                } else {
+                    None
+                };
+                if let Some(outcome) = outcome {
+                    match outcome {
+                        Ok(core_adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey }) => {
+                            println!("VALID");
+                            println!("fault: {fault}");
+                            println!("genesis_hash: {}", artifact.genesis_hash);
+                            println!("culpable_pubkey: {culpable_pubkey}");
+                            return ExitCode::SUCCESS;
+                        }
+                        Ok(core_adjudicate::AdjudicationOutcome::Disagreement { reason }) => {
+                            println!("UNRESOLVED");
+                            println!("fault: {fault}");
+                            println!("genesis_hash: {}", artifact.genesis_hash);
+                            println!("parties: {}", parties.join(", "));
+                            println!("note: {reason}");
+                            return ExitCode::SUCCESS;
+                        }
+                        Err(err) => {
+                            println!("INVALID: {err}");
+                            return ExitCode::FAILURE;
+                        }
                     }
                 }
             }

@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use libp2p::futures::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{Multiaddr, gossipsub, mdns};
+use libp2p::{Multiaddr, gossipsub, identify, mdns};
 use metrics::counter;
 use std::collections::HashMap;
 use std::path::Path;
@@ -38,7 +38,7 @@ use sync::{
     advance_stuck_tip, local_tip_height,
     send_sync_request,
 };
-use transport::{BehaviourEvent, build_swarm};
+use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
 /// A gossip publish can fail because nobody local is subscribed to the
 /// topic — expected on a devnet where not every peer subscribes to every
@@ -172,6 +172,8 @@ async fn run_swarm<P: Payload>(
             return;
         }
     };
+
+    let expected_identify_protocol = identify_protocol_version(chain_id);
 
     let actions_topic = gossipsub::IdentTopic::new(actions_topic(chain_id));
     let blocks_topic = gossipsub::IdentTopic::new(blocks_topic(chain_id));
@@ -344,6 +346,25 @@ async fn run_swarm<P: Payload>(
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                     dial_discovered(&mut swarm, peers);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                    peer_id,
+                    info,
+                    ..
+                })) => {
+                    // Unlike bad gossip (which gets a strike counter — a
+                    // burst of malformed messages can be transient), a
+                    // genesis mismatch is unambiguous: this peer is
+                    // permanently on a different chain, not just
+                    // temporarily confused. One strike.
+                    if info.protocol_version != expected_identify_protocol {
+                        warn!(
+                            "banning {peer_id}: genesis mismatch (peer speaks {:?}, we speak {expected_identify_protocol:?})",
+                            info.protocol_version
+                        );
+                        swarm.behaviour_mut().blocked_peers.block_peer(peer_id);
+                        counter!("arxium_genesis_mismatch_peers_banned_total").increment(1);
+                    }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,

@@ -1,16 +1,22 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-//! Payload-aware re-execution adjudicator for `Fault::ActionDivergence` —
-//! the first thing in `arx-verify` that isn't chain-agnostic (feature-gated
-//! for exactly that reason; see the crate's `Cargo.toml`).
+//! Payload-aware re-execution adjudicator for `Fault::ActionDivergence` and
+//! `Fault::BlockDivergence` — the first thing in `arx-verify` that isn't
+//! chain-agnostic (feature-gated for exactly that reason; see the crate's
+//! `Cargo.toml`).
 //!
-//! `xc_artifact::verify()` can confirm an `ActionDivergence` artifact is
-//! well-formed (both claims are validly signed, their proofs verify against
-//! their own `pre_state_root`s, and the post-roots genuinely differ) but it
-//! can't say *who's* wrong — that means decoding `action_bytes` as
-//! CoreChain's `ActionPayload` and replaying it, which is what this module
-//! does.
+//! `xc_artifact::verify()` can confirm either fault is well-formed (claims
+//! are validly signed, proofs verify against their claimed pre-state, and
+//! the two post-roots genuinely differ) but it can't say *who's* wrong —
+//! that means decoding the chain-specific action bytes as CoreChain's
+//! `ActionPayload` and replaying them, which is what this module does.
+//! [`adjudicate_action_divergence`] replays a single action;
+//! [`adjudicate_block_divergence`] replays a whole block's actions in
+//! sequence against a shared parent state (both sides agree on the
+//! parent, unlike `ActionDivergence`'s two separately-claimed pre-states)
+//! and additionally has to recompute `tx_root` from the dissenter-supplied
+//! action list before trusting it, since `verify()` never decodes it.
 //!
 //! ## Coverage
 //!
@@ -47,7 +53,7 @@
 //! (a schema change, like the `CF_ASSETS`/`CF_ATTESTORS` bumps already in
 //! this codebase's history), not writing more code here.
 
-use xc_artifact::{ActionClaim, EvidenceArtifact, Fault};
+use xc_artifact::{ActionClaim, EvidenceArtifact, Fault, StateProof};
 use xc_circuit::{AccountKey, AssetBalanceKey, AttestorRecordKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_poe::state_trie::{InclusionProof, ProofBackedTrie};
@@ -138,6 +144,133 @@ pub fn adjudicate_action_divergence(artifact: &EvidenceArtifact) -> Result<Adjud
     }
 }
 
+/// Re-executes a disputed *block* (all its actions, in order) against the
+/// dissenter's proven parent-state and compares the resulting root to both
+/// sides' claims. The counterpart to [`adjudicate_action_divergence`] for
+/// [`Fault::BlockDivergence`] — same replay-and-compare shape, but over a
+/// whole block instead of one action, and against a single shared
+/// pre-state (the block's parent root) instead of two separately-claimed
+/// pre-states, since both proposer and dissenter agree on the parent.
+///
+/// `xc_artifact::verify()` already confirms the artifact is well-formed
+/// (both signatures check out, the parent-state proofs verify, the two
+/// final roots genuinely differ) but — same as `ActionDivergence` — never
+/// decodes `actions`, so it can't confirm the dissenter's supplied action
+/// list is actually the one the proposer signed for. This function does
+/// that first, by recomputing `tx_root` and checking it against the
+/// header's signed value, before trusting anything replayed from it.
+pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<AdjudicationOutcome, AdjudicateError> {
+    xc_artifact::verify(artifact)?;
+    let Fault::BlockDivergence {
+        proposer_pubkey,
+        voter_pubkey,
+        height,
+        parent_state_root,
+        block_attestation,
+        actions,
+        dissent_claim,
+    } = &artifact.fault
+    else {
+        return Err(AdjudicateError::WrongFaultKind);
+    };
+
+    let config = bincode::config::standard();
+    let decoded_actions = actions
+        .iter()
+        .map(|a| {
+            let bytes = hex::decode(a.strip_prefix("0x").unwrap_or(a))?;
+            let (action, _): (arxd_runtime::ChainAction, usize) = bincode::serde::decode_from_slice(&bytes, config)
+                .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+            Ok(action)
+        })
+        .collect::<Result<Vec<arxd_runtime::ChainAction>, AdjudicateError>>()?;
+
+    let computed_tx_root =
+        xc_poe::tx_root(&decoded_actions).map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+    if computed_tx_root != decode_root(&block_attestation.header.tx_root)? {
+        return Ok(AdjudicationOutcome::Disagreement {
+            reason: "the supplied action list doesn't hash to the block header's signed tx_root".to_string(),
+        });
+    }
+
+    let parent_root = decode_root(parent_state_root)?;
+    let proofs = decode_proofs(&dissent_claim.proofs)?;
+    let mut trie = match ProofBackedTrie::from_proofs(parent_root, &proofs) {
+        Ok(trie) => trie,
+        Err(_) => return Ok(AdjudicationOutcome::Disagreement { reason: "a supplied proof does not verify".to_string() }),
+    };
+
+    let fail_closed = |_: &Address| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    let fail_closed_evidence = |_: u64, _: &Address| -> Result<bool, StorageError> { Err(StorageError::UnprovenRead) };
+    let fail_closed_bls =
+        |_: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+
+    for action in &decoded_actions {
+        if matches!(action.payload, arxd_runtime::ActionPayload::LeaveValidator { .. }) {
+            return Ok(AdjudicationOutcome::Disagreement {
+                reason: "LeaveValidator depends on the live validator set, which isn't provable as a single key"
+                    .to_string(),
+            });
+        }
+
+        let view = ProofBackedView { trie };
+        let updates = arxd_runtime::dispatch(
+            action,
+            &view,
+            &fail_closed,
+            &fail_closed_list,
+            &[],
+            *height,
+            &fail_closed_evidence,
+            &fail_closed_bls,
+        );
+        trie = view.trie;
+
+        let updates = match updates {
+            Ok(updates) => updates,
+            Err(err) => match err.downcast_ref::<StorageError>() {
+                Some(StorageError::UnprovenRead) => {
+                    return Ok(AdjudicationOutcome::Disagreement {
+                        reason: format!("this block's replay needs unprovable state: {err}"),
+                    });
+                }
+                // A real, deterministic rejection — dropped by `execute_actions`
+                // just like at the single-action level, so state is unchanged
+                // and replay simply moves on to the next action.
+                _ => continue,
+            },
+        };
+
+        for (key, value) in state_entries(&updates) {
+            match trie.apply(xc_poe::state_trie::hash_key(&key), value) {
+                Ok(_) => {}
+                Err(_) => {
+                    return Ok(AdjudicationOutcome::Disagreement {
+                        reason: "an update touches a key outside the proven set".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    let computed_root = trie.root();
+    let proposed_matches = computed_root == decode_root(&block_attestation.header.state_root)?;
+    let dissent_matches = computed_root == decode_root(&dissent_claim.computed_state_root)?;
+    match (proposed_matches, dissent_matches) {
+        (true, false) => Ok(AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey.clone() }),
+        (false, true) => Ok(AdjudicationOutcome::Culpable { culpable_pubkey: proposer_pubkey.clone() }),
+        // `verify()` already requires the two claimed roots to differ, so
+        // both matching independent replay is not reachable; kept as a
+        // `Disagreement` rather than `unreachable!()` so a bug upstream
+        // fails safe instead of panicking an adjudicator.
+        _ => Ok(AdjudicationOutcome::Disagreement {
+            reason: "neither party's claimed final state root matches independently replaying the block"
+                .to_string(),
+        }),
+    }
+}
+
 enum ReplayResult {
     Root([u8; 32]),
     Unprovable(String),
@@ -148,9 +281,8 @@ fn decode_root(root: &str) -> Result<[u8; 32], AdjudicateError> {
     bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(root.to_string()))
 }
 
-fn decode_proofs(claim: &ActionClaim) -> Result<Vec<InclusionProof>, AdjudicateError> {
-    claim
-        .proofs
+fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, AdjudicateError> {
+    proofs
         .iter()
         .map(|p| {
             let key_hash = hex::decode(p.key_hash.strip_prefix("0x").unwrap_or(&p.key_hash))?;
@@ -188,7 +320,7 @@ fn replay(action: &arxd_runtime::ChainAction, claim: &ActionClaim, height: u64) 
     }
 
     let pre_root = decode_root(&claim.pre_state_root)?;
-    let proofs = decode_proofs(claim)?;
+    let proofs = decode_proofs(&claim.proofs)?;
     let trie = match ProofBackedTrie::from_proofs(pre_root, &proofs) {
         Ok(trie) => trie,
         Err(_) => return Ok(ReplayResult::Unprovable("a supplied proof does not verify".to_string())),
@@ -584,6 +716,207 @@ mod tests {
         };
 
         let outcome = adjudicate_action_divergence(&artifact).unwrap();
+        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
+    }
+
+    /// Builds a real single-action `BlockDivergence` block: alice sends bob
+    /// `real_amount`, against a fresh `ArxiumDb`, with the proposer signing
+    /// the real result and the dissenter (BLS-)signing `dissent_amount`'s
+    /// result instead — same shape as `build_scenario` above, one level up.
+    fn build_block_scenario(dissent_amount: u128) -> (EvidenceArtifact, String, String) {
+        let db = temp_db();
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = xc_primitives::Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
+            (alice.clone(), entry(1_000_000_000)),
+            (bob.clone(), entry(0)),
+        ])))
+        .unwrap();
+        let parent_root = db.compute_state_root(&[]).unwrap();
+
+        let action: arxd_runtime::ChainAction = xc_primitives::Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: arxd_runtime::ActionPayload::Transfer { to: bob.clone(), amount: 40 },
+        };
+        let actions = vec![action.clone()];
+        let tx_root = xc_poe::tx_root(&actions).unwrap();
+
+        let view = xc_storage::BlockView::new(&db);
+        let real_updates = arxd_runtime::dispatch(
+            &action,
+            &view,
+            &no_operator,
+            &no_operator_validators,
+            &[],
+            5,
+            &evidence_never_processed,
+            &no_bls_owner,
+        )
+        .unwrap();
+        db.write_batch(&real_updates.accounts).unwrap();
+        let real_state_root = db.compute_state_root(&[]).unwrap();
+
+        let dissent_db = temp_db();
+        dissent_db
+            .write_batch(&AccountUpdates(std::collections::BTreeMap::from([
+                (alice.clone(), entry(1_000_000_000)),
+                (bob.clone(), entry(0)),
+            ])))
+            .unwrap();
+        let dissent_action: arxd_runtime::ChainAction = xc_primitives::Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: arxd_runtime::ActionPayload::Transfer { to: bob.clone(), amount: dissent_amount },
+        };
+        let dissent_view = xc_storage::BlockView::new(&dissent_db);
+        let dissent_updates = arxd_runtime::dispatch(
+            &dissent_action,
+            &dissent_view,
+            &no_operator,
+            &no_operator_validators,
+            &[],
+            5,
+            &evidence_never_processed,
+            &no_bls_owner,
+        )
+        .unwrap();
+        dissent_db.write_batch(&dissent_updates.accounts).unwrap();
+        let dissent_state_root = dissent_db.compute_state_root(&[]).unwrap();
+
+        let alice_key = format!("account:{alice}").into_bytes();
+        let bob_key = format!("account:{bob}").into_bytes();
+        let proofs = vec![
+            hex_proof(db.prove(&alice_key, &parent_root).unwrap()),
+            hex_proof(db.prove(&bob_key, &parent_root).unwrap()),
+        ];
+
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+
+        let header = xc_artifact::CanonicalHeader {
+            height: 5,
+            parent_hash: "0xparent".to_string(),
+            timestamp: 1234,
+            tx_root: format!("0x{}", hex::encode(tx_root)),
+            proposer: "arx1proposer".to_string(),
+            state_root: real_state_root,
+            round: 0,
+        };
+        let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
+        let block_attestation = xc_artifact::BlockAttestation {
+            header: header.clone(),
+            signature: format!("0x{}", hex::encode(proposer_key.sign(&header_bytes).to_bytes())),
+        };
+        let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
+        let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            5,
+            &header_commitment,
+            &parent_root,
+            &dissent_state_root,
+        );
+
+        let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
+        let proposer_pubkey = format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes()));
+
+        let artifact = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::BlockDivergence {
+                proposer_pubkey: proposer_pubkey.clone(),
+                voter_pubkey: voter_pubkey.clone(),
+                height: 5,
+                parent_state_root: parent_root,
+                block_attestation,
+                actions: vec![format!(
+                    "0x{}",
+                    hex::encode(bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap())
+                )],
+                dissent_claim: xc_artifact::BlockDissentClaim {
+                    computed_state_root: dissent_state_root,
+                    proofs,
+                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+                },
+            },
+            human_readable: serde_json::json!({}),
+        };
+
+        (artifact, proposer_pubkey, voter_pubkey)
+    }
+
+    /// The block-level counterpart to
+    /// `a_dissenter_with_a_wrong_claimed_amount_is_named_culpable`: a
+    /// dissenter claiming the wrong transfer amount for the whole block is
+    /// named culpable, using proofs and roots from a real `ArxiumDb`.
+    #[test]
+    fn a_dissenter_with_a_wrong_block_result_is_named_culpable() {
+        let (artifact, _proposer_pubkey, voter_pubkey) = build_block_scenario(999);
+        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey });
+    }
+
+    /// Same scenario, but this time the *proposer*'s claimed final root is
+    /// wrong (built by corrupting `block_attestation.header.state_root`
+    /// after signing — the same "attacker" trick a real malicious proposer
+    /// would need to pull off, i.e. none, since they can't forge a
+    /// signature over a root they didn't actually commit to; this just
+    /// exercises the comparison branch directly).
+    #[test]
+    fn a_proposer_with_a_wrong_block_result_is_named_culpable() {
+        // dissent_amount == the real amount, so the dissenter is honest;
+        // the proposer's claim is made wrong instead, below.
+        let (mut artifact, proposer_pubkey, _voter_pubkey) = build_block_scenario(40);
+        let Fault::BlockDivergence { parent_state_root, block_attestation, dissent_claim, .. } = &mut artifact.fault
+        else {
+            unreachable!()
+        };
+
+        let mut bogus_header = block_attestation.header.clone();
+        bogus_header.state_root = format!("0x{}", hex::encode([0xCCu8; 32]));
+        let bogus_bytes = xc_artifact::signing_bytes_for(&bogus_header).unwrap();
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        block_attestation.signature = format!("0x{}", hex::encode(proposer_key.sign(&bogus_bytes).to_bytes()));
+        block_attestation.header = bogus_header;
+
+        // Re-bind the (still honest, unchanged) dissent claim to the new
+        // header commitment so `verify()`'s signature check still passes.
+        let header_commitment: [u8; 32] = sha2::Sha256::digest(&bogus_bytes).into();
+        let (voter_sk, _) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            5,
+            &header_commitment,
+            parent_state_root,
+            &dissent_claim.computed_state_root,
+        );
+        dissent_claim.signature = format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0));
+
+        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: proposer_pubkey });
+    }
+
+    /// If the dissenter's supplied `actions` don't actually hash to the
+    /// block header's signed `tx_root`, that's a proof gap, not a verdict —
+    /// `xc_artifact::verify()` never decodes `actions` so it can't catch
+    /// this itself; must be checked before any replay happens.
+    #[test]
+    fn a_mismatched_action_list_resolves_to_disagreement() {
+        let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else { unreachable!() };
+        let other_action: arxd_runtime::ChainAction = xc_primitives::Action {
+            sender: xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
+            nonce: 0,
+            signature: None,
+            payload: arxd_runtime::ActionPayload::Transfer {
+                to: xc_primitives::Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
+                amount: 1,
+            },
+        };
+        actions[0] =
+            format!("0x{}", hex::encode(bincode::serde::encode_to_vec(&other_action, bincode::config::standard()).unwrap()));
+
+        let outcome = adjudicate_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 }

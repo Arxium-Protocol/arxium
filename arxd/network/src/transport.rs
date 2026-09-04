@@ -6,9 +6,19 @@ use libp2p::allow_block_list::{self, BlockedPeers};
 use libp2p::connection_limits::{self, ConnectionLimits};
 use libp2p::request_response::{self, ProtocolSupport, cbor};
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{PeerId, StreamProtocol, gossipsub, mdns, noise, tcp, yamux};
+use libp2p::{PeerId, StreamProtocol, gossipsub, identify, mdns, noise, tcp, yamux};
 
 use crate::sync::sync_protocol;
+
+/// `identify`'s own wire protocol (`/ipfs/id/1.0.0`) is fixed and un-scoped —
+/// unlike `sync_protocol`/gossip topics, two peers on different chains still
+/// negotiate it and exchange this string, which is the whole point: it's the
+/// one channel that runs *before* any chain-scoped protocol would even have a
+/// chance to fail, so a genesis mismatch can be caught and the peer banned
+/// immediately instead of just silently never syncing.
+pub(crate) fn identify_protocol_version(chain_id: &str) -> String {
+    format!("/arxium/id/1/{chain_id}")
+}
 
 /// gossipsub's own default (`65536` bytes) is close enough to this chain's
 /// worst-case block size (100 actions/block, and the larger action variants
@@ -41,6 +51,12 @@ pub(crate) struct Behaviour {
     /// blocked peer's redial is refused outright instead of getting a fresh
     /// connection to spam on.
     pub(crate) blocked_peers: allow_block_list::Behaviour<BlockedPeers>,
+    /// Exchanges `identify_protocol_version(chain_id)` with every peer as
+    /// soon as a connection opens — the one channel that runs before any
+    /// chain-scoped protocol (sync, gossip) would, so a peer on a different
+    /// chain can be caught and banned immediately instead of just quietly
+    /// never syncing or gossiping. See `run_swarm`'s `Identify::Received` arm.
+    pub(crate) identify: identify::Behaviour,
 }
 
 pub(crate) fn build_swarm(
@@ -50,6 +66,7 @@ pub(crate) fn build_swarm(
     let local_peer_id = PeerId::from(keypair.public());
     let sync_protocol = StreamProtocol::try_from_owned(sync_protocol(chain_id))
         .map_err(|e| anyhow::anyhow!("invalid chain id for sync protocol: {e}"))?;
+    let identify_protocol_version = identify_protocol_version(chain_id);
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -82,14 +99,34 @@ pub(crate) fn build_swarm(
                     .with_max_established_incoming(Some(200))
                     .with_max_pending_incoming(Some(100)),
             );
+            let identify = identify::Behaviour::new(
+                identify::Config::new(identify_protocol_version, keypair.public())
+                    .with_agent_version("arxium-node".to_string()),
+            );
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Behaviour {
                 mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?,
                 gossipsub,
                 sync,
                 limits,
                 blocked_peers: allow_block_list::Behaviour::default(),
+                identify,
             })
         })?
         .build();
     Ok(swarm)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identify_protocol_version;
+
+    #[test]
+    fn different_chains_get_different_identify_protocol_versions() {
+        assert_ne!(identify_protocol_version("chain-a"), identify_protocol_version("chain-b"));
+    }
+
+    #[test]
+    fn the_same_chain_id_is_stable() {
+        assert_eq!(identify_protocol_version("devnet"), identify_protocol_version("devnet"));
+    }
 }

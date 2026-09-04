@@ -179,6 +179,52 @@ pub fn dissent_signing_bytes(
     buf
 }
 
+const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v1";
+
+/// The exact bytes a dissenter signs to stake a claim on a whole block's
+/// final state root — `Fault::BlockDivergence`'s unilateral counterpart to
+/// `action_claim_signing_bytes`. Binds height, the disputed block (via
+/// `header_commitment` — `sha256(signing_bytes_for(header))`, same binding
+/// `DissentAttestation` uses and for the same reason: an opaque block hash
+/// can't be recomputed by a verifier holding only this artifact), the
+/// agreed starting root, and the dissenter's own claimed final root.
+pub fn block_divergence_signing_bytes(
+    height: u64,
+    header_commitment: &[u8; 32],
+    parent_state_root: &str,
+    computed_state_root: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_BLOCK_DIVERGENCE);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, header_commitment);
+    push_field(&mut buf, parent_state_root.as_bytes());
+    push_field(&mut buf, computed_state_root.as_bytes());
+    buf
+}
+
+/// A dissenter's signed claim that replaying a whole block from the agreed
+/// `parent_state_root` (see `Fault::BlockDivergence`) yields a different
+/// final root than the proposer signed — no proposer cooperation needed,
+/// unlike [`ActionClaim`]'s per-action commitment (see `Fault::ActionDivergence`'s
+/// doc comment for why that one can't be built unilaterally). `verify()`
+/// confirms the proofs are internally consistent against `parent_state_root`
+/// and the signature is genuine; it cannot confirm `computed_state_root` is
+/// what replaying the block's actions actually produces (that needs to
+/// decode and run them — exactly what a payload-aware adjudicator in
+/// `arx-verify` does).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockDissentClaim {
+    pub computed_state_root: String,
+    /// [`StateProof`]s for every state key read or written anywhere in the
+    /// block, each checked against `parent_state_root`.
+    pub proofs: Vec<StateProof>,
+    /// Hex-encoded (`0x...`) BLS signature over
+    /// `block_divergence_signing_bytes(height, header_commitment,
+    /// parent_state_root, computed_state_root)`.
+    pub signature: String,
+}
+
 const DOMAIN_ACTION_CLAIM: &[u8] = b"arxium/action_claim/v1";
 
 /// The exact bytes a party signs to stake a claim on one action's effect —
@@ -247,14 +293,16 @@ pub struct ActionClaim {
     pub signature: String,
 }
 
-/// Three fault kinds today: equivocation (a proposer double-signed),
+/// Four fault kinds today: equivocation (a proposer double-signed),
 /// execution disagreement (a dissenter's honest re-execution diverged from
 /// the proposer's claimed result but neither party has isolated *where*),
-/// and action divergence (Part 3 Stage 3's non-interactive bisection
-/// result — a dissenter has narrowed the disagreement to one specific
-/// action and both parties have staked a signed claim on its effect).
-/// Tagged so more fault types have an obvious place to land later without
-/// breaking these.
+/// action divergence (interactive bisection's non-interactive result — a
+/// dissenter has narrowed the disagreement to one specific action and both
+/// parties have staked a signed claim on its effect; unused until the
+/// bisection protocol itself lands, see the type's own doc comment), and
+/// block divergence (the unilateral full-block fraud proof used instead,
+/// today — see that type's doc comment for why). Tagged so more fault
+/// types have an obvious place to land later without breaking these.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "fault", rename_all = "snake_case")]
 pub enum Fault {
@@ -282,6 +330,16 @@ pub enum Fault {
     /// and deliberately lives outside this crate (a feature-gated
     /// adjudicator in `arx-verify`, per the plan's "first real crack in
     /// `arx-verify`'s chain-agnosticism").
+    ///
+    /// Built for the interactive bisection path: a proposer signs an
+    /// `ActionClaim` per action, on demand, and both sides narrow to the
+    /// first divergent one over `O(log n)` challenge/response rounds. That
+    /// protocol doesn't exist yet — a proposer signs only the block header
+    /// today, never a per-action commitment — so this variant currently has
+    /// no producer. `BlockDivergence` below is what's actually emitted in
+    /// the meantime; this stays in the codebase, already written and
+    /// tested, for when bisection lands as the size optimization over
+    /// `BlockDivergence`'s whole-block proofs.
     ActionDivergence {
         /// Hex-encoded (`0x...`) raw Ed25519 public key of the proposer.
         proposer_pubkey: String,
@@ -296,6 +354,40 @@ pub enum Fault {
         action_bytes: String,
         proposed_claim: ActionClaim,
         dissent_claim: ActionClaim,
+    },
+    /// A dissenter's unilateral fraud proof against a whole block: replaying
+    /// every action from the agreed `parent_state_root` yields a state root
+    /// different from the one the proposer actually signed in
+    /// `block_attestation`. No cooperation from the proposer is needed —
+    /// unlike `ActionDivergence`, the proposer's claim here is just their
+    /// ordinary signed block header, the one per-block commitment they
+    /// genuinely made. `verify()` alone can only confirm a genuine,
+    /// well-formed dispute (see `Verdict::Disagreement`); naming a culprit
+    /// means decoding and re-executing the block's actions against the
+    /// proven pre-state, chain-specific work that lives in `arx-verify`.
+    BlockDivergence {
+        /// Hex-encoded (`0x...`) raw Ed25519 public key of the proposer.
+        proposer_pubkey: String,
+        /// Hex-encoded (`0x...`) raw BLS12-381 public key (48 bytes) of the dissenter.
+        voter_pubkey: String,
+        height: u64,
+        /// Hex-encoded (`0x...`) state root both parties agree the block
+        /// started from — the dissenter's proofs are checked against this,
+        /// not against anything either party merely asserts about it.
+        parent_state_root: String,
+        /// The proposer's own signed block header — carries their claimed
+        /// final `state_root` inside `header`, so this doubles as their
+        /// claim; no separate `ActionClaim`-style signature is needed.
+        block_attestation: BlockAttestation,
+        /// Hex-encoded (`0x...`) bincode bytes of every action in the block,
+        /// in order — opaque to this crate, same as `ActionDivergence`'s
+        /// `action_bytes`. Not itself covered by any signature in this
+        /// artifact (`verify()` doesn't decode `P` to compute a tx_root);
+        /// a payload-aware adjudicator must recompute `tx_root` from these
+        /// and check it against `block_attestation.header.tx_root` before
+        /// trusting them as *the* actions the proposer signed for.
+        actions: Vec<String>,
+        dissent_claim: BlockDissentClaim,
     },
 }
 
@@ -367,6 +459,14 @@ pub enum VerifyError {
     ProposedClaimSignatureInvalid,
     #[error("dissent_claim signature does not verify against voter_pubkey")]
     DissentClaimSignatureInvalid,
+    #[error("fault claims height {claimed} but block_attestation's header is at height {actual}")]
+    BlockDivergenceHeightMismatch { claimed: u64, actual: u64 },
+    #[error("block_attestation signature does not verify against proposer_pubkey")]
+    BlockAttestationSignatureInvalid,
+    #[error("dissent_claim signature does not verify against voter_pubkey")]
+    BlockDissentSignatureInvalid,
+    #[error("dissent_claim's computed_state_root is identical to the proposer's signed state_root — not a divergence")]
+    BlockDivergenceNoDisagreement,
 }
 
 /// What a verified artifact proves, once `verify()` accepts it. Two shapes:
@@ -679,6 +779,71 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
 
             Ok(Verdict::Disagreement {
                 fault: "action_divergence",
+                parties: vec![proposer_pubkey.clone(), voter_pubkey.clone()],
+            })
+        }
+        Fault::BlockDivergence {
+            proposer_pubkey,
+            voter_pubkey,
+            height,
+            parent_state_root,
+            block_attestation,
+            actions: _,
+            dissent_claim,
+        } => {
+            let pubkey_bytes = decode_hex_32("proposer_pubkey", proposer_pubkey)?;
+            let verifying_key =
+                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
+            let voter_pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
+            let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
+            let bls_voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
+
+            if block_attestation.header.height != *height {
+                return Err(VerifyError::BlockDivergenceHeightMismatch {
+                    claimed: *height,
+                    actual: block_attestation.header.height,
+                });
+            }
+
+            let header_bytes = signing_bytes_for(&block_attestation.header)?;
+            let sig_bytes = decode_hex("block_attestation signature", &block_attestation.signature)?;
+            let sig_bytes: [u8; 64] = sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
+            verifying_key
+                .verify(&header_bytes, &Signature::from_bytes(&sig_bytes))
+                .map_err(|_| VerifyError::BlockAttestationSignatureInvalid)?;
+            let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
+
+            if block_attestation.header.state_root == dissent_claim.computed_state_root {
+                return Err(VerifyError::BlockDivergenceNoDisagreement);
+            }
+
+            let dissent_msg = block_divergence_signing_bytes(
+                *height,
+                &header_commitment,
+                parent_state_root,
+                &dissent_claim.computed_state_root,
+            );
+            let dissent_sig_bytes = decode_hex("dissent_claim signature", &dissent_claim.signature)?;
+            let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
+            xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
+                .map_err(|_| VerifyError::BlockDissentSignatureInvalid)?;
+
+            let parent_root = decode_hex_32("parent_state_root", parent_state_root)?;
+            for proof in &dissent_claim.proofs {
+                verify_state_proof(parent_root, proof)?;
+            }
+
+            Ok(Verdict::Disagreement {
+                fault: "block_divergence",
                 parties: vec![proposer_pubkey.clone(), voter_pubkey.clone()],
             })
         }
@@ -1028,7 +1193,7 @@ mod tests {
     mod action_divergence {
         use super::*;
 
-        fn default_hashes_for_tests() -> [[u8; 32]; 257] {
+        pub(super) fn default_hashes_for_tests() -> [[u8; 32]; 257] {
             let mut table = [[0u8; 32]; 257];
             for depth in 1..=256 {
                 table[depth] = sibling_internal_hash(&table[depth - 1], &table[depth - 1]);
@@ -1036,11 +1201,11 @@ mod tests {
             table
         }
 
-        fn empty_trie_root() -> [u8; 32] {
+        pub(super) fn empty_trie_root() -> [u8; 32] {
             default_hashes_for_tests()[256]
         }
 
-        fn empty_trie_state_proof(key_hash: [u8; 32]) -> StateProof {
+        pub(super) fn empty_trie_state_proof(key_hash: [u8; 32]) -> StateProof {
             let defaults = default_hashes_for_tests();
             StateProof {
                 key_hash: format!("0x{}", hex::encode(key_hash)),
@@ -1052,7 +1217,7 @@ mod tests {
         /// The root after writing `value` into an otherwise-empty trie at
         /// `key_hash` — every sibling on the path is the untouched default,
         /// same hand-computation `xc_poe::state_trie`'s own tests use.
-        fn root_after_writing(key_hash: [u8; 32], value: &[u8]) -> [u8; 32] {
+        pub(super) fn root_after_writing(key_hash: [u8; 32], value: &[u8]) -> [u8; 32] {
             let defaults = default_hashes_for_tests();
             let mut current = sibling_leaf_hash(&key_hash, value);
             for level in (0..256).rev() {
@@ -1064,7 +1229,7 @@ mod tests {
             current
         }
 
-        fn key_hash(seed: u8) -> [u8; 32] {
+        pub(super) fn key_hash(seed: u8) -> [u8; 32] {
             Sha256::digest([seed]).into()
         }
 
@@ -1285,6 +1450,212 @@ mod tests {
 
             assert!(matches!(
                 verify(&artifact_with(&fx, proposed, dissent)),
+                Err(VerifyError::StateProofDoesNotVerify)
+            ));
+        }
+    }
+
+    // `Fault::BlockDivergence` — the unilateral whole-block fraud proof.
+    // Reuses `action_divergence`'s trie helpers (empty-trie root/proofs,
+    // `key_hash`) since both build proofs against the same sparse-Merkle
+    // shape; only the claim/signing side differs.
+    mod block_divergence {
+        use super::action_divergence::{empty_trie_root, empty_trie_state_proof, key_hash, root_after_writing};
+        use super::*;
+
+        struct Fixture {
+            proposer_key: SigningKey,
+            voter_sk: xc_bls::BlsSecretKey,
+            voter_pk: xc_bls::BlsPublicKey,
+            height: u64,
+        }
+
+        fn fixture() -> Fixture {
+            let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+            Fixture { proposer_key: SigningKey::from_bytes(&[7u8; 32]), voter_sk, voter_pk, height: 5 }
+        }
+
+        fn block_header(fx: &Fixture, state_root: &str) -> CanonicalHeader {
+            CanonicalHeader {
+                height: fx.height,
+                parent_hash: "0xparent".to_string(),
+                timestamp: 1234,
+                tx_root: format!("0x{}", hex::encode([1u8; 32])),
+                proposer: "arx1proposer".to_string(),
+                state_root: state_root.to_string(),
+                round: 0,
+            }
+        }
+
+        fn block_attestation(fx: &Fixture, header: CanonicalHeader) -> BlockAttestation {
+            let bytes = signing_bytes_for(&header).unwrap();
+            let signature = fx.proposer_key.sign(&bytes);
+            BlockAttestation { header, signature: format!("0x{}", hex::encode(signature.to_bytes())) }
+        }
+
+        fn dissent_claim(
+            fx: &Fixture,
+            header: &CanonicalHeader,
+            parent_root: [u8; 32],
+            computed_root: [u8; 32],
+            proofs: Vec<StateProof>,
+            signer: &xc_bls::BlsSecretKey,
+        ) -> BlockDissentClaim {
+            let header_bytes = signing_bytes_for(header).unwrap();
+            let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
+            let parent_state_root = format!("0x{}", hex::encode(parent_root));
+            let computed_state_root = format!("0x{}", hex::encode(computed_root));
+            let msg = block_divergence_signing_bytes(fx.height, &header_commitment, &parent_state_root, &computed_state_root);
+            BlockDissentClaim {
+                computed_state_root,
+                proofs,
+                signature: format!("0x{}", hex::encode(xc_bls::sign(signer, &msg).0)),
+            }
+        }
+
+        fn artifact_with(
+            fx: &Fixture,
+            parent_state_root: String,
+            block_attestation: BlockAttestation,
+            dissent_claim: BlockDissentClaim,
+        ) -> EvidenceArtifact {
+            EvidenceArtifact {
+                artifact_version: ARTIFACT_VERSION,
+                genesis_hash: "0xgenesis".to_string(),
+                fault: Fault::BlockDivergence {
+                    proposer_pubkey: format!("0x{}", hex::encode(fx.proposer_key.verifying_key().as_bytes())),
+                    voter_pubkey: format!("0x{}", hex::encode(fx.voter_pk.0)),
+                    height: fx.height,
+                    parent_state_root,
+                    block_attestation,
+                    actions: vec!["0xaabbcc".to_string()],
+                    dissent_claim,
+                },
+                human_readable: serde_json::json!({}),
+            }
+        }
+
+        #[test]
+        fn valid_block_divergence_verifies_as_disagreement() {
+            let fx = fixture();
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+            let proposer_post = root_after_writing(key, b"proposer's block result");
+            let dissent_post = root_after_writing(key, b"dissenter's block result");
+
+            let header = block_header(&fx, &format!("0x{}", hex::encode(proposer_post)));
+            let attestation = block_attestation(&fx, header.clone());
+            let dissent = dissent_claim(
+                &fx, &header, parent, dissent_post, vec![empty_trie_state_proof(key)], &fx.voter_sk,
+            );
+
+            let verdict =
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)).unwrap();
+            assert!(matches!(verdict, Verdict::Disagreement { fault: "block_divergence", .. }));
+        }
+
+        #[test]
+        fn matching_final_roots_are_not_a_divergence() {
+            let fx = fixture();
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+            let post = root_after_writing(key, b"same result both sides");
+
+            let header = block_header(&fx, &format!("0x{}", hex::encode(post)));
+            let attestation = block_attestation(&fx, header.clone());
+            let dissent =
+                dissent_claim(&fx, &header, parent, post, vec![empty_trie_state_proof(key)], &fx.voter_sk);
+
+            assert!(matches!(
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                Err(VerifyError::BlockDivergenceNoDisagreement)
+            ));
+        }
+
+        #[test]
+        fn a_forged_block_attestation_signature_is_rejected() {
+            let fx = fixture();
+            let other_key = SigningKey::from_bytes(&[8u8; 32]);
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+
+            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let header_bytes = signing_bytes_for(&header).unwrap();
+            let forged_signature = other_key.sign(&header_bytes);
+            let attestation =
+                BlockAttestation { header: header.clone(), signature: format!("0x{}", hex::encode(forged_signature.to_bytes())) };
+            let dissent = dissent_claim(
+                &fx, &header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &fx.voter_sk,
+            );
+
+            assert!(matches!(
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                Err(VerifyError::BlockAttestationSignatureInvalid)
+            ));
+        }
+
+        #[test]
+        fn a_forged_dissent_claim_signature_is_rejected() {
+            let fx = fixture();
+            let (other_sk, _) = xc_bls::keygen_from_seed(&[22u8; 32]).unwrap();
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+
+            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let attestation = block_attestation(&fx, header.clone());
+            let dissent = dissent_claim(
+                &fx, &header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &other_sk,
+            );
+
+            assert!(matches!(
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                Err(VerifyError::BlockDissentSignatureInvalid)
+            ));
+        }
+
+        /// The exploit this binding closes: a dissent built for one block at
+        /// height H gets replayed against a *different* validly-signed block
+        /// at the same height (e.g. from an equivocation) — without
+        /// `header_commitment` folded into the signed message, `verify()`
+        /// would accept it as a divergence against a proposer the dissenter
+        /// never actually disputed.
+        #[test]
+        fn a_dissent_claim_signed_for_a_different_block_is_rejected() {
+            let fx = fixture();
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+
+            let real_header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let other_header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"z"))));
+            let attestation = block_attestation(&fx, real_header);
+            // Dissent signed against `other_header`'s commitment, paired with
+            // an attestation for `real_header`.
+            let dissent = dissent_claim(
+                &fx, &other_header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &fx.voter_sk,
+            );
+
+            assert!(matches!(
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                Err(VerifyError::BlockDissentSignatureInvalid)
+            ));
+        }
+
+        #[test]
+        fn a_state_proof_that_does_not_verify_against_parent_root_is_rejected() {
+            let fx = fixture();
+            let key = key_hash(1);
+            let parent = empty_trie_root();
+
+            let mut bad_proof = empty_trie_state_proof(key);
+            bad_proof.siblings[0] = format!("0x{}", hex::encode([0xFFu8; 32]));
+
+            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let attestation = block_attestation(&fx, header.clone());
+            let dissent =
+                dissent_claim(&fx, &header, parent, root_after_writing(key, b"y"), vec![bad_proof], &fx.voter_sk);
+
+            assert!(matches!(
+                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
                 Err(VerifyError::StateProofDoesNotVerify)
             ));
         }

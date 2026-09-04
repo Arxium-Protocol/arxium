@@ -193,12 +193,19 @@ pub enum AcceptBlockError {
         /// this path). Best-effort, for citing in a dissent; not compared
         /// against anything.
         local_state_root: String,
+        /// Merkleized keys read or written while locally executing this
+        /// block, against the parent state root — everything a
+        /// `Fault::BlockDivergence` fraud proof needs an `ArxiumDb::prove`
+        /// proof for. See `execute_actions`'s `record_touched_keys`.
+        touched_keys: Vec<Vec<u8>>,
     },
     #[error("block {height} claimed state root {claimed}, locally computed {expected} — proposer's state disagrees with ours")]
     StateRootMismatch {
         height: u64,
         expected: String,
         claimed: String,
+        /// See `ActionMismatch::touched_keys`.
+        touched_keys: Vec<Vec<u8>>,
     },
     #[error("on_block_sealed failed: {0}")]
     BlockSealed(String),
@@ -464,7 +471,8 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None)?;
+        touched_keys,
+    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
@@ -473,6 +481,7 @@ where
             claimed,
             executed: applied.len(),
             local_state_root,
+            touched_keys,
         });
     }
 
@@ -526,6 +535,7 @@ where
             height: block.height,
             expected: expected_state_root,
             claimed: block.state_root.clone(),
+            touched_keys,
         });
     }
 
@@ -614,6 +624,12 @@ pub fn execute_actions<P>(
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
     mut inter_action_roots: Option<&mut Vec<String>>,
+    // When true, `view` logs every Merkleized key it reads or writes (see
+    // `BlockView::new_recording`) — the returned key list is exactly what
+    // a `Fault::BlockDivergence` fraud proof needs `ArxiumDb::prove`
+    // proofs for, against the *parent* state root. `false` builds a plain,
+    // non-recording `BlockView` at no extra cost.
+    record_touched_keys: bool,
 ) -> Result<
     (
         Vec<Action<P>>,
@@ -627,6 +643,7 @@ pub fn execute_actions<P>(
         Vec<Asset>,
         Vec<AttestorRegistration>,
         Vec<AttestorDeregistration>,
+        Vec<Vec<u8>>,
     ),
     ExecutorError,
 >
@@ -652,7 +669,7 @@ where
     let mut attestor_deregistrations: Vec<AttestorDeregistration> =
         seed.attestor_deregistration.into_iter().collect();
 
-    let mut view = BlockView::new(db);
+    let mut view = if record_touched_keys { BlockView::new_recording(db) } else { BlockView::new(db) };
     view.apply_accounts(&AccountUpdates(overlay.clone()))?;
     view.apply_stakes(&StakeUpdates {
         allocations: stake_overlay.clone(),
@@ -743,6 +760,7 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
+        view.touched_keys(),
     ))
 }
 
@@ -980,7 +998,8 @@ mod tests {
             _asset_registrations,
             _attestor_registrations,
             _attestor_deregistrations,
-        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None).unwrap();
+            _touched_keys,
+        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),
@@ -1030,7 +1049,7 @@ mod tests {
 
         let mut roots = Vec::new();
         let (applied, updates, ..) =
-            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, Some(&mut roots)).unwrap();
+            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, Some(&mut roots), false).unwrap();
         assert_eq!(applied.len(), 3);
         assert_eq!(roots.len(), 3, "one root per input action, in order");
         db.write_batch(&updates).unwrap();
@@ -1048,7 +1067,7 @@ mod tests {
             .unwrap();
         for (i, action) in actions.into_iter().enumerate() {
             let (_, prefix_updates, ..) =
-                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, None).unwrap();
+                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, None, false).unwrap();
             reference_db.write_batch(&prefix_updates).unwrap();
             assert_eq!(
                 roots[i],

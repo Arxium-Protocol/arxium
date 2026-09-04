@@ -69,6 +69,7 @@ pub fn produce_block<R: ChainRuntime>(
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
+        _touched_keys,
     ) = execute_actions(
         db,
         actions,
@@ -88,6 +89,7 @@ pub fn produce_block<R: ChainRuntime>(
             )
         },
         None,
+        false,
     )?;
 
     // Same whole-block economics `accept_block` applies to a gossiped block
@@ -484,7 +486,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _, _, _, _, _, _, _) = execute_actions(
+        let (_, genesis_updates, _, _, _, _, _, _, _, _, _, _) = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -504,6 +506,7 @@ mod tests {
                 )
             },
             None,
+            false,
         )
         .unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();

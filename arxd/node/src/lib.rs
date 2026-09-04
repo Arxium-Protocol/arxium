@@ -234,6 +234,7 @@ mod dissent_evidence_bridge_tests {
                 assert_eq!(dissent.reason, "state_root_mismatch");
             }
             EvidenceEvent::BlockObserved(_) => panic!("expected ExecutionDisagreement"),
+            EvidenceEvent::BlockDivergence { .. } => panic!("expected ExecutionDisagreement"),
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -690,11 +691,11 @@ fn spawn_subsystems<R: ChainRuntime>(
                                 // without a matching arm here must not panic the
                                 // block-handling path: skip the dissent instead.
                                 let dissent_fields = match &err {
-                                    AcceptBlockError::StateRootMismatch { expected, .. } => {
-                                        Some((expected.clone(), DissentReason::StateRootMismatch))
+                                    AcceptBlockError::StateRootMismatch { expected, touched_keys, .. } => {
+                                        Some((expected.clone(), DissentReason::StateRootMismatch, touched_keys.clone()))
                                     }
-                                    AcceptBlockError::ActionMismatch { local_state_root, .. } => {
-                                        Some((local_state_root.clone(), DissentReason::ActionMismatch))
+                                    AcceptBlockError::ActionMismatch { local_state_root, touched_keys, .. } => {
+                                        Some((local_state_root.clone(), DissentReason::ActionMismatch, touched_keys.clone()))
                                     }
                                     _ => {
                                         warn!(
@@ -704,7 +705,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         None
                                     }
                                 };
-                                if let Some((state_root, reason)) = dissent_fields {
+                                if let Some((state_root, reason, touched_keys)) = dissent_fields {
                                 // A node that can't read its own parent stays quiet
                                 // instead of signing a dissent built on an EP it
                                 // never actually read — same principle that excludes
@@ -744,7 +745,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                 let dissent = Dissent {
                                     height,
                                     block_hash,
-                                    state_root,
+                                    state_root: state_root.clone(),
                                     header_commitment,
                                     ep,
                                     reason,
@@ -769,6 +770,59 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         proposed: candidate.clone(),
                                         dissent: attestation,
                                     });
+
+                                    // Alongside the plain dissent, try to build the
+                                    // stronger BlockDivergence fraud proof: a proof
+                                    // per touched key against parent_state_root lets
+                                    // arx-verify replay the block and name a culpable
+                                    // party instead of just recording disagreement.
+                                    // Proving can fail (key pruned, db error) — that
+                                    // just means no fraud proof this time, not a
+                                    // reason to skip the dissent already sent above.
+                                    let proofs: Result<Vec<xc_artifact::StateProof>, xc_storage::StorageError> =
+                                        touched_keys
+                                            .iter()
+                                            .map(|key| {
+                                                db.prove(key, &parent_state_root).map(|proof| xc_artifact::StateProof {
+                                                    key_hash: format!("0x{}", hex::encode(proof.key_hash)),
+                                                    value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
+                                                    siblings: proof
+                                                        .siblings
+                                                        .iter()
+                                                        .map(|s| format!("0x{}", hex::encode(s)))
+                                                        .collect(),
+                                                })
+                                            })
+                                            .collect();
+                                    match proofs {
+                                        Ok(proofs) => {
+                                            let claim_msg = xc_artifact::block_divergence_signing_bytes(
+                                                height,
+                                                &header_commitment,
+                                                &parent_state_root,
+                                                &state_root,
+                                            );
+                                            let claim_signature = xc_bls::sign(bls_key, &claim_msg);
+                                            let dissent_claim = xc_artifact::BlockDissentClaim {
+                                                computed_state_root: state_root.clone(),
+                                                proofs,
+                                                signature: format!("0x{}", hex::encode(claim_signature.0)),
+                                            };
+                                            let _ = evidence_tx.send(EvidenceEvent::BlockDivergence {
+                                                proposed: candidate.clone(),
+                                                parent_state_root: parent_state_root.clone(),
+                                                voter: address.to_string(),
+                                                voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                                                dissent_claim,
+                                            });
+                                        }
+                                        Err(err) => {
+                                            warn!(
+                                                "failed to prove a touched key for block divergence artifact — \
+                                                 sending plain dissent only: {err}"
+                                            );
+                                        }
+                                    }
                                 }
                                 }
                             }

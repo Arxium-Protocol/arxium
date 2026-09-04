@@ -11,7 +11,8 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{info, warn};
 use xc_artifact::{
-    BlockAttestation, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault, ARTIFACT_VERSION,
+    BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault,
+    ARTIFACT_VERSION,
 };
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
@@ -83,6 +84,23 @@ pub fn verify_equivocation<P: Serialize>(
 pub enum EvidenceEvent<P> {
     BlockObserved(Block<P>),
     ExecutionDisagreement { proposed: Block<P>, dissent: DissentAttestation },
+    /// Same trigger as `ExecutionDisagreement` (`arxd/node` rejected a block
+    /// on execution grounds) but paired with a whole-block fraud proof
+    /// instead of just a signed claim: `dissent_claim.proofs` covers every
+    /// Merkleized key `BlockView::new_recording` saw touched while locally
+    /// replaying the block, checked against `parent_state_root`. Unlike
+    /// `ExecutionDisagreement`, `arx-verify` can adjudicate this one to a
+    /// named culpable party — see `core_adjudicate::adjudicate_block_divergence`.
+    BlockDivergence {
+        proposed: Block<P>,
+        parent_state_root: String,
+        /// Bech32 address of the dissenting voter — used for the artifact's
+        /// filename, same role `DissentAttestation::voter` plays for
+        /// `ExecutionDisagreement`.
+        voter: String,
+        voter_pubkey: String,
+        dissent_claim: BlockDissentClaim,
+    },
 }
 
 /// Builds a self-describing evidence artifact (see `xc_artifact`) from a
@@ -216,6 +234,92 @@ fn write_disagreement_artifact<P: Serialize>(
     }
 }
 
+/// Builds and writes a `BlockDivergence` artifact — the fraud-proof
+/// counterpart to `write_disagreement_artifact`, to
+/// `<evidence_dir>/<height>-block-divergence-<voter>.json`. Unlike a plain
+/// disagreement, `arx-verify` can adjudicate this to a named culpable party
+/// once it lands, since `dissent_claim` carries proofs against
+/// `parent_state_root`, not just a signed assertion.
+fn write_block_divergence_artifact<P: Serialize>(
+    evidence_dir: &Path,
+    genesis_hash: [u8; 32],
+    proposer: &Address,
+    proposed: &Block<P>,
+    parent_state_root: &str,
+    voter: &str,
+    voter_pubkey: &str,
+    dissent_claim: &BlockDissentClaim,
+) {
+    let proposer_pubkey = match proposer.pubkey_bytes() {
+        Ok(bytes) => format!("0x{}", hex::encode(bytes)),
+        Err(err) => {
+            warn!("evidence: failed to encode proposer pubkey for block divergence artifact: {err}");
+            return;
+        }
+    };
+    let block_attestation = BlockAttestation {
+        header: CanonicalHeader {
+            height: proposed.height,
+            parent_hash: proposed.parent_hash.clone(),
+            timestamp: proposed.timestamp,
+            tx_root: format!("0x{}", hex::encode(proposed.tx_root)),
+            proposer: proposer.to_string(),
+            state_root: proposed.state_root.clone(),
+            round: proposed.round,
+        },
+        signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
+    };
+    let config = bincode::config::standard();
+    let actions = match proposed
+        .actions
+        .iter()
+        .map(|action| {
+            bincode::serde::encode_to_vec(action, config).map(|bytes| format!("0x{}", hex::encode(bytes)))
+        })
+        .collect::<Result<Vec<String>, bincode::error::EncodeError>>()
+    {
+        Ok(actions) => actions,
+        Err(err) => {
+            warn!("evidence: failed to encode actions for block divergence artifact: {err}");
+            return;
+        }
+    };
+
+    let artifact = EvidenceArtifact {
+        artifact_version: ARTIFACT_VERSION,
+        genesis_hash: format!("0x{}", hex::encode(genesis_hash)),
+        fault: Fault::BlockDivergence {
+            proposer_pubkey,
+            voter_pubkey: voter_pubkey.to_string(),
+            height: proposed.height,
+            parent_state_root: parent_state_root.to_string(),
+            block_attestation,
+            actions,
+            dissent_claim: dissent_claim.clone(),
+        },
+        human_readable: serde_json::json!({
+            "proposed": proposed,
+            "proposed_hash": proposed.hash(),
+        }),
+    };
+
+    if let Err(err) = std::fs::create_dir_all(evidence_dir) {
+        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        return;
+    }
+    let path = evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
+    match serde_json::to_vec_pretty(&artifact) {
+        Ok(bytes) => {
+            if let Err(err) = std::fs::write(&path, bytes) {
+                warn!("evidence: failed to write artifact {}: {err}", path.display());
+            } else {
+                info!("evidence: wrote artifact {}", path.display());
+            }
+        }
+        Err(err) => warn!("evidence: failed to encode block divergence artifact for {proposer}: {err}"),
+    }
+}
+
 /// Runs on its own thread, reacting to `events`. `build_evidence_action` is
 /// `None` on a non-validator node — it still detects and logs equivocation,
 /// it just has no funded/nonced account to sign a report with.
@@ -249,6 +353,26 @@ where
                         continue;
                     };
                     write_disagreement_artifact(&evidence_dir, genesis_hash, &proposer, &proposed, &dissent);
+                    continue;
+                }
+                EvidenceEvent::BlockDivergence { proposed, parent_state_root, voter, voter_pubkey, dissent_claim } => {
+                    let Some(proposer) = proposed.proposer.clone() else {
+                        warn!(
+                            "evidence: block divergence for unsigned block at height {}, skipping artifact",
+                            proposed.height
+                        );
+                        continue;
+                    };
+                    write_block_divergence_artifact(
+                        &evidence_dir,
+                        genesis_hash,
+                        &proposer,
+                        &proposed,
+                        &parent_state_root,
+                        &voter,
+                        &voter_pubkey,
+                        &dissent_claim,
+                    );
                     continue;
                 }
             };
@@ -421,6 +545,61 @@ mod tests {
 
         let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(matches!(artifact.fault, Fault::ExecutionDisagreement { height: 5, .. }));
+    }
+
+    /// Exercises the `BlockDivergence` event path: same trigger as
+    /// `ExecutionDisagreement`, but paired with a whole-block fraud proof.
+    /// The watcher only needs to write it to disk correctly — `arx-verify`
+    /// is what actually checks the proofs.
+    #[test]
+    fn spawn_evidence_watcher_writes_block_divergence_artifact() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-spawn-evidence-watcher-block-divergence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = ArxiumDb::open(&dir).expect("open test db");
+
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let proposed = signed_block(&key, 5, 100);
+        let dissent_claim = BlockDissentClaim {
+            computed_state_root: "0xdisputed".to_string(),
+            proofs: vec![],
+            signature: format!("0x{}", hex::encode([3u8; 96])),
+        };
+
+        let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        let evidence_dir = dir.join("evidence");
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            rx,
+            build_evidence_action,
+            evidence_dir.clone(),
+            [7u8; 32],
+        );
+
+        tx.send(EvidenceEvent::BlockDivergence {
+            proposed: proposed.clone(),
+            parent_state_root: "0xparent".to_string(),
+            voter: "arx1voter".to_string(),
+            voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
+            dissent_claim,
+        })
+        .unwrap();
+        drop(tx);
+
+        let path = evidence_dir.join(format!("{}-block-divergence-arx1voter.json", proposed.height));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !path.exists() {
+            assert!(std::time::Instant::now() < deadline, "block divergence artifact was never written");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(artifact.fault, Fault::BlockDivergence { height: 5, .. }));
     }
 
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real

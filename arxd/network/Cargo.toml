@@ -16,4 +16,4 @@ xc-wire = { workspace = true }
 xc-mempool = { workspace = true }
 xc-storage = { workspace = true }
 arxd-finality = { workspace = true }
-libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub", "request-response", "cbor"] }
+libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub", "request-response", "cbor", "identify"] }
