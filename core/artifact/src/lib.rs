@@ -38,7 +38,7 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 
 /// Frozen once shipped: an artifact written today must still verify in ten
 /// years, so this never changes meaning, only grows new `Fault` variants.
-pub const ARTIFACT_VERSION: u32 = 1;
+pub const ARTIFACT_VERSION: u32 = 2;
 
 /// The fields a proposer's signature actually covers (mirrors
 /// `xc_primitives::block::BlockSigningPayload` byte-for-byte, so
@@ -1005,8 +1005,8 @@ mod tests {
         let a = attestation(&key, header(5, 1, "arx1proposer"));
         let b = attestation(&key, header(5, 2, "arx1proposer"));
         let mut art = artifact(&key, [a, b], 5);
-        art.artifact_version = 2;
-        assert!(matches!(verify(&art), Err(VerifyError::UnsupportedVersion(2))));
+        art.artifact_version = 99;
+        assert!(matches!(verify(&art), Err(VerifyError::UnsupportedVersion(99))));
     }
 
     fn dissent_attestation(
