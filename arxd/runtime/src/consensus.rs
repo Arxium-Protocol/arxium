@@ -5,7 +5,7 @@ use xc_bls::BlsPublicKey;
 use xc_circuit::{KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
-use xc_storage::{BlockView, BlsKeyRegistration, EvidenceMarker, StorageError};
+use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
 
 use crate::{ChainAction, ChainBlock};
 use crate::staking::is_authorized;
@@ -31,8 +31,8 @@ pub(crate) fn validated_bls_pubkey(pubkey: &[u8]) -> anyhow::Result<[u8; 48]> {
 /// ordinary user. Anyone *could* submit one given the two blocks, but
 /// `xc_evidence::verify_equivocation` is what actually gates the slash, not
 /// who submitted it — so that's fine.
-pub(crate) fn submit_equivocation_evidence(
-    view: &BlockView<'_>,
+pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
+    view: &V,
     block_a: &ChainBlock,
     block_b: &ChainBlock,
     evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,

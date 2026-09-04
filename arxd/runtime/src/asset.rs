@@ -4,12 +4,12 @@
 use xc_circuit::{AssetKey, KvRead};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, Asset};
-use xc_storage::{BlockView, StorageError};
+use xc_storage::StorageError;
 
 use crate::ChainAction;
 
-pub(crate) fn register_asset(
-    view: &BlockView<'_>,
+pub(crate) fn register_asset<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     asset_id: &str,
     compliance_required: bool,
@@ -33,8 +33,8 @@ fn resolve_asset<V: KvRead<Error = StorageError>>(view: &V, asset_id: &str) -> a
         .ok_or_else(|| anyhow::anyhow!("asset {asset_id} is not registered"))
 }
 
-pub(crate) fn issue_asset(
-    view: &BlockView<'_>,
+pub(crate) fn issue_asset<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     asset_id: &str,
     amount: u128,
@@ -45,8 +45,8 @@ pub(crate) fn issue_asset(
     Ok(BlockUpdates { accounts, assets, ..Default::default() })
 }
 
-pub(crate) fn transfer_asset(
-    view: &BlockView<'_>,
+pub(crate) fn transfer_asset<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     asset_id: &str,
     to: &Address,
@@ -71,7 +71,7 @@ mod tests {
     use crate::{ActionPayload, ACTION_FEE};
     use std::collections::HashMap;
     use xc_primitives::Action;
-    use xc_storage::StorageError;
+    use xc_storage::{BlockView, StorageError};
 
     #[test]
     fn transfer_asset_fails_without_recipient_attestation_and_succeeds_after_grant() {

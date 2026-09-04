@@ -378,9 +378,9 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
 /// not any call site.
 pub const ACTION_FEE: u128 = 1_000_000;
 
-pub fn dispatch(
+pub fn dispatch<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
-    view: &BlockView<'_>,
+    view: &V,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
@@ -408,9 +408,9 @@ pub fn dispatch(
 /// change it made), otherwise fetches a fresh one via `view` so an action
 /// that never touches its own sender's account (e.g. `RegisterBlsKey`)
 /// still pays.
-fn charge_action_fee(
+fn charge_action_fee<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
-    view: &BlockView<'_>,
+    view: &V,
     updates: &mut BlockUpdates,
 ) -> anyhow::Result<()> {
     let mut entry = match updates.accounts.0.get(&action.sender) {
@@ -429,9 +429,9 @@ fn charge_action_fee(
     Ok(())
 }
 
-fn dispatch_inner(
+fn dispatch_inner<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
-    view: &BlockView<'_>,
+    view: &V,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],

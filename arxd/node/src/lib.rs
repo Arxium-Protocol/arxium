@@ -133,6 +133,36 @@ mod dissent_cross_crate_tests {
             ),
         );
     }
+
+    /// Same reasoning, for `xc_artifact::StateProof`'s duplicated sparse-Merkle
+    /// hash functions (`sibling_leaf_hash`/`sibling_internal_hash`/
+    /// `sibling_bit_at`) against `xc_poe::state_trie`'s canonical ones — a
+    /// `Fault::ActionDivergence` proof this crate builds must verify with
+    /// the exact hashes `xc-artifact` recomputes on the other end.
+    #[test]
+    fn action_divergence_hash_functions_match_across_crates() {
+        let key_hash = [3u8; 32];
+        let value = b"some account entry bytes";
+        assert_eq!(
+            xc_poe::state_trie::leaf_hash(&key_hash, value),
+            xc_artifact::sibling_leaf_hash(&key_hash, value),
+        );
+
+        let left = [1u8; 32];
+        let right = [2u8; 32];
+        assert_eq!(
+            xc_poe::state_trie::internal_hash(&left, &right),
+            xc_artifact::sibling_internal_hash(&left, &right),
+        );
+
+        for level in [0usize, 1, 7, 8, 128, 255] {
+            assert_eq!(
+                xc_poe::state_trie::bit_at(&key_hash, level),
+                xc_artifact::sibling_bit_at(&key_hash, level),
+                "bit_at disagreed at level {level}",
+            );
+        }
+    }
 }
 
 /// Covers `dissent_record_to_evidence_event` — the piece that closes Part 2's

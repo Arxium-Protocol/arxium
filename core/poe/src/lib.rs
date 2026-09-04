@@ -196,6 +196,155 @@ pub mod state_trie {
         current == root
     }
 
+    /// A key not covered by any proof this trie was built or updated from —
+    /// distinct from `Ok(None)` (proven absent). The whole point of a
+    /// proof-backed trie is to fail closed exactly here: silently treating
+    /// an unproven key as absent would let a party who "forgot" a proof (or
+    /// omitted one on purpose) pass off a wrong read as a right one.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+    #[error("state key not covered by any supplied proof")]
+    pub struct UnprovenKey;
+
+    /// A sparse Merkle trie reconstructed purely from a set of
+    /// [`InclusionProof`]s against one root — no database, no full trie,
+    /// just whatever paths the supplied proofs actually cover. Lets a party
+    /// holding only proofs (Part 3 Stage 3's bisection, or a light client)
+    /// replay a state update and recompute the resulting root exactly the
+    /// way `xc_storage::ArxiumDb::trie_root_after` would, checking the
+    /// result against a post-state root someone else claims — without ever
+    /// touching RocksDB or seeing the rest of the trie.
+    ///
+    /// Every proof handed to [`from_proofs`](Self::from_proofs) is verified
+    /// against `root` before anything is recorded, so importing bad proofs
+    /// can't corrupt the reconstructed shape — it just gets rejected.
+    pub struct ProofBackedTrie {
+        root: [u8; 32],
+        // Internal-node hash -> its (left, right) children — the same
+        // content `xc_storage::CF_MERKLE` would store for that node.
+        nodes: std::collections::HashMap<[u8; 32], ([u8; 32], [u8; 32])>,
+        // Leaf hash -> the value it commits to. Kept separately because a
+        // leaf hash is one-way: `nodes` alone can't answer "what value does
+        // this leaf hold", only "what are this internal node's children".
+        leaves: std::collections::HashMap<[u8; 32], Vec<u8>>,
+    }
+
+    impl ProofBackedTrie {
+        /// Rejects the whole batch if any single proof doesn't verify
+        /// against `root` — a partially-bad proof set is exactly as
+        /// untrustworthy as a wholly-bad one.
+        pub fn from_proofs(root: [u8; 32], proofs: &[InclusionProof]) -> Result<Self, UnprovenKey> {
+            let mut trie = Self { root, nodes: std::collections::HashMap::new(), leaves: std::collections::HashMap::new() };
+            for proof in proofs {
+                if !verify_proof(root, proof) {
+                    // A proof that fails verification is indistinguishable,
+                    // from this constructor's point of view, from one that
+                    // was never supplied — either way the key ends up
+                    // unproven.
+                    return Err(UnprovenKey);
+                }
+                trie.record_path(proof);
+            }
+            Ok(trie)
+        }
+
+        /// Walks one verified proof's path bottom-up, recording every
+        /// internal node's (left, right) pair (and the leaf's value, if
+        /// any) — the same climb `verify_proof` does to recompute the root,
+        /// just keeping the intermediate structure instead of discarding it.
+        fn record_path(&mut self, proof: &InclusionProof) {
+            let defaults = default_hashes();
+            let mut current = match &proof.value {
+                Some(value) => {
+                    let leaf = leaf_hash(&proof.key_hash, value);
+                    self.leaves.insert(leaf, value.clone());
+                    leaf
+                }
+                None => defaults[0],
+            };
+            for level in (0..256).rev() {
+                let sibling = proof.siblings[level];
+                let (left, right) =
+                    if bit_at(&proof.key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let parent = internal_hash(&left, &right);
+                self.nodes.insert(parent, (left, right));
+                current = parent;
+            }
+        }
+
+        fn children(&self, hash: &[u8; 32]) -> Result<([u8; 32], [u8; 32]), UnprovenKey> {
+            self.nodes.get(hash).copied().ok_or(UnprovenKey)
+        }
+
+        /// Same shape as `xc_storage::ArxiumDb`'s private `descend` — walks
+        /// `key_hash`'s 256-bit path from `self.root`, returning the sibling
+        /// at each level and the node found at the leaf level. Fails closed
+        /// (`UnprovenKey`) the instant the walk needs a node no supplied
+        /// proof covers, rather than guessing.
+        fn descend(&self, key_hash: &[u8; 32]) -> Result<([[u8; 32]; 256], [u8; 32]), UnprovenKey> {
+            let defaults = default_hashes();
+            let mut siblings = [[0u8; 32]; 256];
+            let mut node = self.root;
+            for level in 0..256 {
+                let depth = 256 - level;
+                if node == defaults[depth] {
+                    siblings[level] = defaults[depth - 1];
+                    node = defaults[depth - 1];
+                } else {
+                    let (left, right) = self.children(&node)?;
+                    let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
+                    siblings[level] = sibling;
+                    node = child;
+                }
+            }
+            Ok((siblings, node))
+        }
+
+        /// The value proven for `key_hash` under the trie's current root —
+        /// `Ok(None)` means proven absent, `Err(UnprovenKey)` means neither
+        /// presence nor absence is known from what's been supplied.
+        pub fn get(&self, key_hash: &[u8; 32]) -> Result<Option<Vec<u8>>, UnprovenKey> {
+            let (_, leaf_node) = self.descend(key_hash)?;
+            if leaf_node == default_hashes()[0] {
+                return Ok(None);
+            }
+            self.leaves.get(&leaf_node).cloned().map(Some).ok_or(UnprovenKey)
+        }
+
+        /// Updates `key_hash` to `new_value` (`None` deletes) and returns
+        /// the new root — mirrors `xc_storage::ArxiumDb::trie_root_after`'s
+        /// per-key descend-then-climb exactly, so replaying the same
+        /// sequence of `apply` calls a real execution made produces the
+        /// same root a real commit would, as long as every key touched was
+        /// covered by a proof (directly, or via a node an earlier `apply`
+        /// in this same trie already created).
+        pub fn apply(&mut self, key_hash: [u8; 32], new_value: Option<Vec<u8>>) -> Result<[u8; 32], UnprovenKey> {
+            let (siblings, _leaf) = self.descend(&key_hash)?;
+            let defaults = default_hashes();
+            let mut current = match &new_value {
+                Some(value) => {
+                    let leaf = leaf_hash(&key_hash, value);
+                    self.leaves.insert(leaf, value.clone());
+                    leaf
+                }
+                None => defaults[0],
+            };
+            for level in (0..256).rev() {
+                let sibling = siblings[level];
+                let (left, right) =
+                    if bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let parent = internal_hash(&left, &right);
+                self.nodes.insert(parent, (left, right));
+                current = parent;
+            }
+            self.root = current;
+            Ok(self.root)
+        }
+
+        pub fn root(&self) -> [u8; 32] {
+            self.root
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -237,6 +386,107 @@ pub mod state_trie {
         fn wrong_sibling_count_is_rejected_rather_than_panicking() {
             let proof = InclusionProof { key_hash: [0u8; 32], value: None, siblings: vec![[0u8; 32]; 3] };
             assert!(!verify_proof([0u8; 32], &proof));
+        }
+
+        fn empty_trie_proof(key_hash: [u8; 32], value: Option<Vec<u8>>) -> InclusionProof {
+            let defaults = default_hashes();
+            InclusionProof { key_hash, value, siblings: (0..256).map(|level| defaults[255 - level]).collect() }
+        }
+
+        /// `ProofBackedTrie::apply` must land on exactly the root a real
+        /// commit would — this is the property Part 3 Stage 3/4 rests on:
+        /// a verifier with only proofs has to reach the same answer a node
+        /// with the full trie would.
+        #[test]
+        fn apply_after_from_proofs_matches_a_hand_computed_root() {
+            let key_hash = hash_key(b"account:arx1...");
+            let empty_root = default_hashes()[256];
+            let mut trie =
+                ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)]).unwrap();
+
+            let value = b"balance=100".to_vec();
+            let new_root = trie.apply(key_hash, Some(value.clone())).unwrap();
+
+            // Hand-compute the expected root: a single leaf, every sibling
+            // on its path is the canonical empty-subtree hash.
+            let defaults = default_hashes();
+            let mut expected = leaf_hash(&key_hash, &value);
+            for level in (0..256).rev() {
+                let sibling = defaults[255 - level];
+                let (left, right) =
+                    if bit_at(&key_hash, level) == 0 { (expected, sibling) } else { (sibling, expected) };
+                expected = internal_hash(&left, &right);
+            }
+            assert_eq!(new_root, expected);
+            assert_eq!(trie.root(), expected);
+            assert_eq!(trie.get(&key_hash).unwrap(), Some(value));
+        }
+
+        /// A key genuinely absent (proven so) reads back as `Ok(None)`, not
+        /// an error — non-inclusion is a known fact, not a missing one.
+        #[test]
+        fn a_key_proven_absent_reads_as_none_not_an_error() {
+            let key_hash = hash_key(b"never-written");
+            let empty_root = default_hashes()[256];
+            let trie = ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)]).unwrap();
+            assert_eq!(trie.get(&key_hash).unwrap(), None);
+        }
+
+        /// A proof that doesn't verify against the claimed root must be
+        /// rejected outright — importing it would poison the trie with
+        /// nodes that don't actually chain up to `root`.
+        #[test]
+        fn from_proofs_rejects_a_proof_that_does_not_verify() {
+            let key_hash = hash_key(b"k");
+            let wrong_root = [0xAB; 32]; // not the real empty-trie root
+            let err = ProofBackedTrie::from_proofs(wrong_root, &[empty_trie_proof(key_hash, None)]);
+            assert!(err.is_err());
+        }
+
+        /// The fail-closed case that justifies this type's existence: two
+        /// leaves share every bit of their path except the very last one, so
+        /// proving key A necessarily exposes key B's leaf *hash* as a
+        /// sibling along the way — but the trie never learns B's actual
+        /// value (that's not part of A's proof), so a read of B must still
+        /// fail closed rather than silently resolving from the exposed hash.
+        #[test]
+        fn a_sibling_leaf_exposed_by_another_proof_still_reads_as_unproven() {
+            let key_hash_a = [0u8; 32];
+            let mut key_hash_b = [0u8; 32];
+            key_hash_b[31] = 1; // differs only in the last bit (level 255)
+
+            let value_a = b"a".to_vec();
+            let value_b = b"b".to_vec();
+            let leaf_a = leaf_hash(&key_hash_a, &value_a);
+            let leaf_b = leaf_hash(&key_hash_b, &value_b);
+            let defaults = default_hashes();
+
+            // Level 255: the only level at which a and b differ.
+            let mut current = internal_hash(&leaf_a, &leaf_b);
+            // Levels 254..0: a and b share every bit, so the sibling at
+            // each of these levels is the untouched default subtree.
+            for level in (0..255).rev() {
+                let sibling = defaults[255 - level];
+                let (left, right) =
+                    if bit_at(&key_hash_a, level) == 0 { (current, sibling) } else { (sibling, current) };
+                current = internal_hash(&left, &right);
+            }
+            let root = current;
+
+            let mut siblings_a = vec![[0u8; 32]; 256];
+            siblings_a[255] = leaf_b;
+            for level in 0..255 {
+                siblings_a[level] = defaults[255 - level];
+            }
+            let proof_a = InclusionProof { key_hash: key_hash_a, value: Some(value_a), siblings: siblings_a };
+            assert!(verify_proof(root, &proof_a), "test setup: proof_a must be valid");
+
+            let trie = ProofBackedTrie::from_proofs(root, &[proof_a]).unwrap();
+            assert_eq!(
+                trie.get(&key_hash_b),
+                Err(UnprovenKey),
+                "b's leaf hash is visible as a sibling, but its value was never proven"
+            );
         }
     }
 }

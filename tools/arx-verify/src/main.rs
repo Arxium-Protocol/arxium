@@ -8,10 +8,15 @@
 //! Usage: `arx-verify <evidence.json>`. Prints a verdict; exits 0 if the
 //! artifact is valid, 1 otherwise.
 
+#[cfg(feature = "core-adjudicate")]
+mod core_adjudicate;
+
 use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+#[cfg(feature = "core-adjudicate")]
+use xc_artifact::Fault;
 use xc_artifact::{EvidenceArtifact, Verdict};
 
 fn main() -> ExitCode {
@@ -46,10 +51,36 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Verdict::Disagreement { fault, parties }) => {
-            // Not a verdict — the artifact proves a genuine dispute exists,
-            // not who's at fault. Exit 0 because the artifact itself is
-            // well-formed and its signatures check out; it just doesn't
-            // resolve to a culprit the way an equivocation does.
+            // Structurally valid, but `xc_artifact::verify()` alone can only
+            // confirm a genuine dispute exists, not who's at fault — see
+            // `Fault::ExecutionDisagreement`/`Fault::ActionDivergence`'s doc
+            // comments. With `core-adjudicate` enabled and an ActionDivergence
+            // artifact in hand, try to actually resolve it by re-executing.
+            #[cfg(feature = "core-adjudicate")]
+            if matches!(artifact.fault, Fault::ActionDivergence { .. }) {
+                match core_adjudicate::adjudicate_action_divergence(&artifact) {
+                    Ok(core_adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey }) => {
+                        println!("VALID");
+                        println!("fault: {fault}");
+                        println!("genesis_hash: {}", artifact.genesis_hash);
+                        println!("culpable_pubkey: {culpable_pubkey}");
+                        return ExitCode::SUCCESS;
+                    }
+                    Ok(core_adjudicate::AdjudicationOutcome::Disagreement { reason }) => {
+                        println!("UNRESOLVED");
+                        println!("fault: {fault}");
+                        println!("genesis_hash: {}", artifact.genesis_hash);
+                        println!("parties: {}", parties.join(", "));
+                        println!("note: {reason}");
+                        return ExitCode::SUCCESS;
+                    }
+                    Err(err) => {
+                        println!("INVALID: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
             println!("UNRESOLVED");
             println!("fault: {fault}");
             println!("genesis_hash: {}", artifact.genesis_hash);

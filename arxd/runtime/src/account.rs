@@ -1,14 +1,15 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
+use xc_circuit::KvRead;
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
-use xc_storage::{BlockView, OperatorUpdates, StorageError};
+use xc_storage::{OperatorUpdates, StorageError};
 
 use crate::ChainAction;
 
-pub(crate) fn transfer(
-    view: &BlockView<'_>,
+pub(crate) fn transfer<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     to: &Address,
     amount: u128,

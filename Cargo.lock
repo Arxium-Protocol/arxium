@@ -377,8 +377,20 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 name = "arx-verify"
 version = "0.1.0"
 dependencies = [
+ "arxd-runtime",
+ "bincode",
+ "ed25519-dalek 3.0.0",
+ "hex",
  "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.19",
  "xc-artifact",
+ "xc-bls",
+ "xc-circuit",
+ "xc-executor",
+ "xc-poe",
+ "xc-primitives",
+ "xc-storage",
 ]
 
 [[package]]

@@ -5,7 +5,7 @@ use xc_bls::BlsPublicKey;
 use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, ValidatorChange, ValidatorEntry};
-use xc_storage::{BlockView, BlsKeyRegistration, StorageError};
+use xc_storage::{BlsKeyRegistration, StorageError};
 
 use crate::ChainAction;
 use crate::consensus::validated_bls_pubkey;
@@ -32,9 +32,9 @@ pub(crate) fn is_authorized(
     Ok(operator_lookup(validator)?.as_ref() == Some(sender))
 }
 
-pub(crate) fn join_validator(
+pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
-    view: &BlockView<'_>,
+    view: &V,
     validator: &Address,
     stake: u128,
     bls_pubkey: &[u8],
@@ -96,9 +96,9 @@ pub(crate) fn join_validator(
     })
 }
 
-pub(crate) fn leave_validator(
+pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
-    view: &BlockView<'_>,
+    view: &V,
     validator: &Address,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     validators: &[Address],
@@ -156,8 +156,8 @@ pub(crate) fn leave_validator(
 
 /// MW-signature-only stake into a validator's sub-account
 /// (`circuit_staking::stake_subaccount`). See `circuit_staking::apply_stake`.
-pub(crate) fn stake(
-    view: &BlockView<'_>,
+pub(crate) fn stake<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     validator: &Address,
     amount: u128,
@@ -179,8 +179,8 @@ pub(crate) fn stake(
 /// There is deliberately no `Slash` variant — slashing is never
 /// user-submitted, so it's unreachable from RPC/mempool by construction
 /// (see `circuit_staking::apply_slash`).
-pub(crate) fn unstake(
-    view: &BlockView<'_>,
+pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     validator: &Address,
     amount: u128,

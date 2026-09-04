@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use xc_circuit::{AccountKey, AttestorRecordKey, GovernorKey, KvRead};
 use xc_executor::BlockUpdates;
 use xc_primitives::{AccountEntry, Address, AttestorRecord};
-use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, BlockView};
+use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
 
 use crate::ChainAction;
 
@@ -18,7 +18,7 @@ use crate::ChainAction;
 /// Spectrum's multi-attestor model: more than one regulated KYC provider
 /// can hold this authority at once, rather than one chain-spec-fixed
 /// address for the whole chain's lifetime.
-fn require_attestor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Result<()> {
+fn require_attestor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
     if view.get(&AttestorRecordKey(&action.sender))?.is_none() {
         anyhow::bail!("{} is not a registered attestor", action.sender);
     }
@@ -31,7 +31,7 @@ fn require_attestor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Resul
 /// Deliberately a single fixed address for now, same walking-skeleton
 /// stage `require_attestor` used to be: a Compliance Committee
 /// (multi-sig/voting) is the deferred upgrade for this role.
-fn require_governor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Result<()> {
+fn require_governor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
     let governor = view
         .get(&GovernorKey)?
         .ok_or_else(|| anyhow::anyhow!("chain has no governor configured"))?;
@@ -43,8 +43,8 @@ fn require_governor(view: &BlockView<'_>, action: &ChainAction) -> anyhow::Resul
 
 /// Adds `attestor` to the trusted-attestor set. Rejected if already
 /// registered — deregister first to change `name`.
-pub(crate) fn register_attestor(
-    view: &BlockView<'_>,
+pub(crate) fn register_attestor<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     attestor: &Address,
     name: &str,
@@ -66,8 +66,8 @@ pub(crate) fn register_attestor(
 /// Removes `attestor` from the trusted-attestor set. Attestations it
 /// already granted are untouched — see `require_attestor`'s doc comment on
 /// who may revoke them.
-pub(crate) fn deregister_attestor(
-    view: &BlockView<'_>,
+pub(crate) fn deregister_attestor<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     attestor: &Address,
 ) -> anyhow::Result<BlockUpdates> {
@@ -86,8 +86,8 @@ pub(crate) fn deregister_attestor(
 /// accountability trail needed once more than one attestor can grant
 /// attestations (no slashing or dispute path on top of it yet).
 /// Creates a fresh account entry if `subject` has none yet.
-pub(crate) fn grant_attestation(
-    view: &BlockView<'_>,
+pub(crate) fn grant_attestation<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     subject: &Address,
     hash: &str,
@@ -111,8 +111,8 @@ pub(crate) fn grant_attestation(
 /// Reverses `grant_attestation` — clears `identity_hash` and
 /// `zk_identity_verified` (a revoked KYC status shouldn't leave a stale
 /// ZK-verified flag standing).
-pub(crate) fn revoke_attestation(
-    view: &BlockView<'_>,
+pub(crate) fn revoke_attestation<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     subject: &Address,
 ) -> anyhow::Result<BlockUpdates> {
@@ -142,8 +142,8 @@ pub(crate) fn identity_zk_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls
 /// verifying key — see `circuits/identity-zk`'s module docs for why the
 /// key isn't from a real trusted-setup ceremony. On success, marks
 /// `zk_identity_verified` on the sender's account.
-pub(crate) fn verify_identity_credential(
-    view: &BlockView<'_>,
+pub(crate) fn verify_identity_credential<V: KvRead<Error = StorageError>>(
+    view: &V,
     action: &ChainAction,
     proof: &[u8],
 ) -> anyhow::Result<BlockUpdates> {

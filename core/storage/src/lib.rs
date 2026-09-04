@@ -50,6 +50,16 @@ pub enum StorageError {
 
     #[error("not a valid state root (expected \"0x\" + 64 hex chars): {0}")]
     InvalidRoot(String),
+
+    /// Not produced by `ArxiumDb` itself — this is the sentinel a
+    /// proof-backed, database-free `KvRead` implementation (Part 3 Stage 4's
+    /// adjudicator) returns for a read it cannot answer either way: a key
+    /// outside the four Merkleized CFs, or one nobody supplied a proof for.
+    /// Distinct from `Ok(None)` (proven absent) — see `is_state_key`'s doc
+    /// comment for why silently treating the two as equivalent would be
+    /// actively wrong, not just incomplete.
+    #[error("state key not covered by any supplied proof")]
+    UnprovenRead,
 }
 
 /// Content-addressed Merkle-trie nodes (`B3`) — keyed by node hash, so a
@@ -99,7 +109,13 @@ const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
 
 /// Whether `key` is covered by the `B3` state trie / `compute_state_root` —
 /// `CF_ACCOUNTS`/`CF_VALIDATORS`/`CF_ASSETS`, i.e. every balance-bearing CF.
-fn is_state_key(key: &[u8]) -> bool {
+/// `pub` (not just crate-internal) because a proof-only adjudicator (Part 3
+/// Stage 4, `tools/arx-verify`'s `core-adjudicate` feature) needs this exact
+/// check too: a `Merkle proof for a `CF_META` key would either fail closed
+/// or — worse — silently "prove" non-inclusion for a key the trie never
+/// tracked in the first place, since a raw key outside these four CFs was
+/// never inserted into `CF_MERKLE` to begin with.
+pub fn is_state_key(key: &[u8]) -> bool {
     matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS)
 }
 
@@ -2555,6 +2571,61 @@ mod merkle_state_root_tests {
         let proof = db.prove(&key, &old_root).unwrap();
         assert_eq!(proof.value, Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap()));
         assert!(xc_poe::state_trie::verify_proof(old_root_bytes, &proof));
+    }
+
+    /// The actual property Part 3 Stage 3/4 depends on: a party holding only
+    /// `prove()`'s output — no database, no full trie — must be able to
+    /// replay a state change with `xc_poe::state_trie::ProofBackedTrie` and
+    /// land on exactly the root a real commit produces. If this ever
+    /// diverges, a proof-carrying dispute artifact would let an adjudicator
+    /// "verify" the wrong outcome.
+    #[test]
+    fn proof_backed_trie_apply_matches_a_real_commit_for_the_same_change() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100), (2, 200)])).unwrap();
+        let pre_root = db.compute_state_root(&[]).unwrap();
+        let pre_root_bytes = decode_root(&pre_root).unwrap();
+
+        let key1 = format!("account:{}", addr(1)).into_bytes();
+        let key2 = format!("account:{}", addr(2)).into_bytes();
+        let proof1 = db.prove(&key1, &pre_root).unwrap();
+        let proof2 = db.prove(&key2, &pre_root).unwrap();
+
+        let new_entry1 = entry(40);
+        let new_entry2 = entry(260);
+        let config = bincode::config::standard();
+        let new_value1 = bincode::serde::encode_to_vec(&new_entry1, config).unwrap();
+        let new_value2 = bincode::serde::encode_to_vec(&new_entry2, config).unwrap();
+
+        let mut trie = xc_poe::state_trie::ProofBackedTrie::from_proofs(pre_root_bytes, &[proof1, proof2]).unwrap();
+        trie.apply(xc_poe::state_trie::hash_key(&key1), Some(new_value1)).unwrap();
+        let proof_backed_root = trie.apply(xc_poe::state_trie::hash_key(&key2), Some(new_value2)).unwrap();
+
+        db.write_batch(&accounts(&[(1, 40), (2, 260)])).unwrap();
+        let real_root = decode_root(&db.compute_state_root(&[]).unwrap()).unwrap();
+
+        assert_eq!(
+            proof_backed_root, real_root,
+            "replaying the same two-key update via ProofBackedTrie must match the real commit"
+        );
+    }
+
+    /// Reading a key nobody supplied a proof for must fail closed — an
+    /// adjudicator that silently treated it as absent could be fed a
+    /// one-sided proof set and reach the wrong verdict.
+    #[test]
+    fn proof_backed_trie_read_of_an_unproven_key_fails_closed() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&accounts(&[(1, 100), (2, 200)])).unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let root_bytes = decode_root(&root).unwrap();
+
+        let key1 = format!("account:{}", addr(1)).into_bytes();
+        let proof1 = db.prove(&key1, &root).unwrap();
+        let trie = xc_poe::state_trie::ProofBackedTrie::from_proofs(root_bytes, &[proof1]).unwrap();
+
+        let key2_hash = xc_poe::state_trie::hash_key(&format!("account:{}", addr(2)).into_bytes());
+        assert_eq!(trie.get(&key2_hash), Err(xc_poe::state_trie::UnprovenKey));
     }
 
     /// Deleting a stake allocation back out of the trie must return the root

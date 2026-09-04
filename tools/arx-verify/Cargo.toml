@@ -8,6 +8,40 @@ license.workspace = true
 name = "arx-verify"
 path = "src/main.rs"
 
+[features]
+# Payload-aware re-execution adjudicator for CoreChain's `ActionPayload` —
+# resolves `Fault::ActionDivergence` to a named culprit for the action types
+# whose dispatch only reads Merkleized state (see `core_adjudicate`'s module
+# doc for exactly which, and why the rest stay `Disagreement`). Off by
+# default: it's the one thing in this binary that isn't chain-agnostic, and
+# it pulls in `arxd-runtime` + `xc-storage` (RocksDB as a build dependency,
+# though never opened) for it.
+core-adjudicate = [
+    "dep:arxd-runtime",
+    "dep:xc-storage",
+    "dep:xc-circuit",
+    "dep:xc-primitives",
+    "dep:xc-poe",
+    "dep:xc-executor",
+    "dep:xc-bls",
+    "dep:bincode",
+    "dep:thiserror",
+]
+
 [dependencies]
 xc-artifact = { workspace = true }
 serde_json = { workspace = true }
+hex = { workspace = true }
+arxd-runtime = { workspace = true, optional = true }
+xc-storage = { workspace = true, optional = true }
+xc-circuit = { workspace = true, optional = true }
+xc-primitives = { workspace = true, optional = true }
+xc-poe = { workspace = true, optional = true }
+xc-executor = { workspace = true, optional = true }
+xc-bls = { workspace = true, optional = true }
+bincode = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
