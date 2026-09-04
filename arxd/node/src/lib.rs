@@ -705,26 +705,23 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     }
                                 };
                                 if let Some((state_root, reason)) = dissent_fields {
-                                // TODO(security): a node that can't read its own
-                                // parent falls back to computing its EP from `""`
-                                // rather than staying quiet — safe for *agreement*
-                                // between honest nodes (every honest node hits the
-                                // same fallback, so quorum still forms), but once
-                                // dissent carries slashing consequences this is a
-                                // signed claim built on data the node never actually
-                                // read. Should go quiet here instead, same principle
-                                // that excludes `Storage` errors from
-                                // `is_execution_disagreement` in the first place.
+                                // A node that can't read its own parent stays quiet
+                                // instead of signing a dissent built on an EP it
+                                // never actually read — same principle that excludes
+                                // `Storage` errors from `is_execution_disagreement`
+                                // in the first place. Ok(None) (genesis, no parent)
+                                // is a legitimate empty EP, not a read failure.
                                 let parent_state_root =
                                     match db.get_block::<R::Payload>(height.saturating_sub(1)) {
                                         Ok(Some(parent)) => parent.state_root,
                                         Ok(None) => String::new(),
                                         Err(err) => {
                                             warn!(
-                                                "failed to read parent block {} for dissent EP: {err}",
+                                                "failed to read parent block {} for dissent EP — \
+                                                 staying quiet instead of dissenting on unread data: {err}",
                                                 height.saturating_sub(1)
                                             );
-                                            String::new()
+                                            return false;
                                         }
                                     };
                                 let block_hash = candidate.hash();
