@@ -8,3 +8,8 @@ license.workspace = true
 clap = { workspace = true }
 dirs = { workspace = true }
 xc-primitives = { workspace = true }
+
+[features]
+# Never enabled by default and never part of a production build — see
+# RunArgs::inject_fault_at_height's doc comment.
+fault-injection = []

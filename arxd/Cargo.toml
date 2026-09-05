@@ -11,3 +11,6 @@ tracing-subscriber = { workspace = true }
 
 arxd-node = { path = "node" }
 arxd-runtime = { workspace = true }
+
+[features]
+fault-injection = ["arxd-node/fault-injection"]

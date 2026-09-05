@@ -19,6 +19,13 @@ use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, eligible_proposer, quorum};
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
+/// Height this node is armed to corrupt its own state_root at, set once
+/// (if at all) from `run()`'s devnet-only fault-injection flag. Only
+/// compiled in with `--features fault-injection`; see
+/// `xc_cli::RunArgs::inject_fault_at_height`'s doc comment.
+#[cfg(feature = "fault-injection")]
+pub(crate) static INJECT_FAULT_AT_HEIGHT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
 /// Build, execute, and store the next block using whatever actions are provided.
 /// The stored block only lists the actions that were actually applied — see
 /// `execute_actions` for why a subset can be dropped.
@@ -147,6 +154,23 @@ pub fn produce_block<R: ChainRuntime>(
     let sr_start = Instant::now();
     let state_root = db.compute_state_root(&state_root_overlay)?;
     histogram!("arxium_state_root_nanos").record(sr_start.elapsed().as_nanos() as f64);
+
+    // Fault injection: only ever runs if this binary was built with
+    // `--features fault-injection` AND armed via the devnet-only CLI flag
+    // (see `run()`) — a normal build has neither the flag nor this branch's
+    // condition ever true. Flips one bit so the signed block's state_root
+    // is wrong in a way `accept_block` on every honest peer will reject,
+    // exercising the real dissent/adjudication/slash path end to end.
+    #[cfg(feature = "fault-injection")]
+    let state_root = if INJECT_FAULT_AT_HEIGHT.get() == Some(&next_height) {
+        let hex_part = state_root.strip_prefix("0x").unwrap_or(&state_root);
+        let mut bytes = hex::decode(hex_part).expect("state_root is always valid hex");
+        bytes[0] ^= 0x01;
+        warn!(height = next_height, "fault-injection: corrupted this block's state_root for an acceptance test");
+        format!("0x{}", hex::encode(bytes))
+    } else {
+        state_root
+    };
 
     // `tx_root` is signed as part of the block header (see
     // `xc_primitives::Block::signing_bytes`) — computed once here and reused

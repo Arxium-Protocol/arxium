@@ -936,6 +936,36 @@ fn spawn_subsystems<R: ChainRuntime>(
     })
 }
 
+/// A fault-injection build must refuse to arm on any chain but exactly
+/// "devnet" — a mistyped `--chain` or a copy-pasted systemd unit is the
+/// realistic way this flag reaches a real chain, and there it wouldn't be a
+/// test, it would be a validator lying about its own state to peers.
+#[cfg(feature = "fault-injection")]
+fn ensure_fault_injection_allowed(chain_name: &str) -> Result<()> {
+    anyhow::ensure!(
+        chain_name == "devnet",
+        "fault injection is devnet-only, refusing to start on chain {chain_name:?}"
+    );
+    Ok(())
+}
+
+#[cfg(all(test, feature = "fault-injection"))]
+mod fault_injection_tests {
+    use super::ensure_fault_injection_allowed;
+
+    #[test]
+    fn devnet_is_allowed() {
+        assert!(ensure_fault_injection_allowed("devnet").is_ok());
+    }
+
+    #[test]
+    fn anything_else_is_refused() {
+        assert!(ensure_fault_injection_allowed("mainnet").is_err());
+        assert!(ensure_fault_injection_allowed("").is_err());
+        assert!(ensure_fault_injection_allowed("DEVNET").is_err());
+    }
+}
+
 pub fn run<R: ChainRuntime>() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1133,6 +1163,8 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "fault-injection")]
+    let inject_fault_at_height = cli.run.inject_fault_at_height;
     let config = cli.run.into_config();
     info!("{:?}", config);
 
@@ -1148,6 +1180,19 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
     } = new_partial::<R>(&config)?;
     let chain_id = hex::encode(genesis_hash);
     info!("booted chain={chain_name} genesis={chain_id}");
+
+    #[cfg(feature = "fault-injection")]
+    if let Some(height) = inject_fault_at_height {
+        ensure_fault_injection_allowed(&chain_name)?;
+        produce::INJECT_FAULT_AT_HEIGHT
+            .set(height)
+            .expect("set exactly once, before any block is produced");
+        warn!(
+            height,
+            "FAULT INJECTION ARMED — this node will corrupt its own state_root when it \
+             produces this height. Never use outside a devnet acceptance test."
+        );
+    }
 
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the

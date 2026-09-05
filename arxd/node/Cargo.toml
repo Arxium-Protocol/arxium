@@ -43,3 +43,6 @@ xc-artifact = { workspace = true }
 # what let a toy-chain node inherit a `pair` subcommand it couldn't
 # decode) — tests still exercise the concrete CoreChainRuntime.
 arxd-runtime = { workspace = true }
+
+[features]
+fault-injection = ["xc-cli/fault-injection"]
