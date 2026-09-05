@@ -1086,4 +1086,131 @@ mod tests {
         let outcome = adjudicate_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
+
+    /// Diagnostic, not a correctness check: measures how big a real
+    /// `BlockDivergence` artifact's on-chain `artifact_json`
+    /// (`SubmitExecutionFault`'s payload — see `arxd/node`'s
+    /// `build_execution_fault_action`) actually gets for a busy-but-ordinary
+    /// block, against `xc_primitives::MAX_WIRE_MESSAGE_SIZE` (the cap
+    /// `arxd/network` gossips under). `dissent_claim.proofs` carries one
+    /// `StateProof` per Merkleized key touched anywhere in the block — each
+    /// one 256 hex-encoded 32-byte siblings, ~17KB of JSON on its own — so
+    /// this is dominated by proof count, not action count or JSON/hex
+    /// overhead on the action list. Touched keys come from a real
+    /// `BlockView::new_recording` replay, not a hand-picked count.
+    ///
+    /// Measured 2026-09-05: 3,659,890 bytes for 100 actions / 200 uniquely
+    /// touched keys — 3.5x over the 1 MiB cap (see
+    /// Implementation_log_2026-09-05.md #3). No hard assertion here on
+    /// purpose: this documents a real, already-confirmed-oversized risk,
+    /// not something this change fixes, so it shouldn't fail CI.
+    ///
+    /// Retire this test — delete the `println!`, add
+    /// `assert!(artifact_json.len() <= xc_primitives::MAX_WIRE_MESSAGE_SIZE)`
+    /// — once the artifact encoding is actually fixed: `artifact_json`
+    /// moves from a JSON string to bincode bytes, `dissent_claim.proofs`
+    /// moves from full 256-sibling proofs to bitmap + non-default-sibling
+    /// compression (core/poe's default-subtree table already knows which
+    /// siblings are defaults; ~8,192 bytes → ~288 bytes per proof), and
+    /// `human_readable` stops riding on the wire and becomes a
+    /// verifier-side derivation instead. Until all of that lands, this
+    /// print is the only signal that the gap is closing.
+    #[test]
+    fn block_divergence_artifact_json_size_for_a_busy_block() {
+        let db = temp_db();
+        let num_actions = 100usize;
+        let addrs: Vec<Address> = (0..num_actions * 2)
+            .map(|i| Address::from_pubkey_bytes(&[(i % 256) as u8; 32]).unwrap())
+            .collect();
+        db.write_batch(&AccountUpdates(
+            addrs.iter().cloned().map(|a| (a, entry(1_000_000_000))).collect(),
+        ))
+        .unwrap();
+        let parent_root = db.compute_state_root(&[]).unwrap();
+
+        let view = xc_storage::BlockView::new_recording(&db);
+        let mut actions: Vec<crate::ChainAction> = Vec::new();
+        for i in 0..num_actions {
+            let action: crate::ChainAction = xc_primitives::Action {
+                sender: addrs[2 * i].clone(),
+                nonce: 0,
+                signature: Some(hex::encode([0xABu8; 64])),
+                payload: crate::ActionPayload::Transfer { to: addrs[2 * i + 1].clone(), amount: 1 },
+            };
+            crate::dispatch(&action, &view, &no_operator, &no_operator_validators, &[], 0, &no_bls_owner).unwrap();
+            actions.push(action);
+        }
+        let touched_keys = view.touched_keys();
+
+        let proofs: Vec<StateProof> = touched_keys
+            .iter()
+            .map(|key| hex_proof(db.prove(key, &parent_root).unwrap()))
+            .collect();
+        let tx_root = xc_poe::tx_root(&actions).unwrap();
+        let block = xc_primitives::Block::<crate::ActionPayload> {
+            height: 1000,
+            parent_hash: format!("0x{}", hex::encode([0u8; 32])),
+            timestamp: 0,
+            actions,
+            tx_root,
+            proposer: Some(addrs[0].clone()),
+            signature: Some(hex::encode([0xCDu8; 64])),
+            state_root: parent_root.clone(),
+            round: 0,
+            round_certificate: None,
+        };
+        let action_bytes: Vec<String> = block
+            .actions
+            .iter()
+            .map(|a| {
+                format!(
+                    "0x{}",
+                    hex::encode(bincode::serde::encode_to_vec(a, bincode::config::standard()).unwrap())
+                )
+            })
+            .collect();
+
+        let artifact = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: format!("0x{}", hex::encode([0u8; 32])),
+            fault: Fault::BlockDivergence {
+                proposer_pubkey: format!("0x{}", hex::encode([0u8; 32])),
+                voter_pubkey: format!("0x{}", hex::encode([0u8; 48])),
+                height: block.height,
+                parent_state_root: parent_root.clone(),
+                block_attestation: xc_artifact::BlockAttestation {
+                    header: xc_artifact::CanonicalHeader {
+                        height: block.height,
+                        parent_hash: block.parent_hash.clone(),
+                        timestamp: block.timestamp,
+                        tx_root: format!("0x{}", hex::encode(block.tx_root)),
+                        proposer: addrs[0].to_string(),
+                        state_root: block.state_root.clone(),
+                        round: block.round,
+                    },
+                    signature: format!("0x{}", block.signature.clone().unwrap()),
+                },
+                actions: action_bytes,
+                dissent_claim: xc_artifact::BlockDissentClaim {
+                    computed_state_root: block.state_root.clone(),
+                    proofs,
+                    signature: format!("0x{}", hex::encode([0xEFu8; 96])),
+                },
+            },
+            human_readable: serde_json::json!({
+                "proposed": block,
+                "proposed_hash": block.hash(),
+            }),
+        };
+
+        let artifact_json = serde_json::to_string(&artifact).unwrap();
+        println!(
+            "block_divergence artifact_json: {} bytes for {num_actions} actions / {} uniquely touched keys \
+             (MAX_WIRE_MESSAGE_SIZE = {} bytes, ratio = {:.1}x)",
+            artifact_json.len(),
+            touched_keys.len(),
+            xc_primitives::MAX_WIRE_MESSAGE_SIZE,
+            artifact_json.len() as f64 / xc_primitives::MAX_WIRE_MESSAGE_SIZE as f64,
+        );
+    }
 }
