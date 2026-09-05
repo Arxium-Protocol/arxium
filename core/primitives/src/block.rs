@@ -74,6 +74,22 @@ pub struct RawBlock {
     pub round_certificate: Option<RoundCertificate>,
 }
 
+impl RawBlock {
+    /// Same hash `Block::hash` would produce for the same wire bytes — usable
+    /// without knowing `P` or successfully decoding every action's payload,
+    /// since `RawBlock`'s fields (including each action's raw payload bytes)
+    /// serialize identically to `Block<P>`'s. A tolerant reader that drops
+    /// unrecognized actions must hash the `RawBlock` it decoded from, never a
+    /// truncated `Block<P>` — hashing the truncated struct would silently
+    /// produce a hash that doesn't match the real on-chain block.
+    pub fn hash(&self) -> String {
+        let bytes = bincode::serde::encode_to_vec(self, crate::wire_config())
+            .expect("block encoding should never fail");
+        let digest = Sha256::digest(&bytes);
+        format!("0x{}", hex::encode(digest))
+    }
+}
+
 /// What actually gets signed: everything but the signature itself (it can't
 /// sign itself). Mirrors `Action`'s `SigningPayload`.
 ///
@@ -119,9 +135,8 @@ impl<P: Serialize> Block<P> {
 
     /// Deterministic hash of this block's content
     pub fn hash(&self) -> String {
-        let config = bincode::config::standard();
-        let bytes =
-            bincode::serde::encode_to_vec(self, config).expect("block encoding should never fail");
+        let bytes = bincode::serde::encode_to_vec(self, crate::wire_config())
+            .expect("block encoding should never fail");
         let digest = Sha256::digest(&bytes);
         format!("0x{}", hex::encode(digest))
     }
@@ -140,7 +155,7 @@ impl<P: Serialize> Block<P> {
             state_root: &self.state_root,
             round: self.round,
         };
-        bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        bincode::serde::encode_to_vec(&payload, crate::wire_config())
             .expect("signing payload encoding should never fail")
     }
 

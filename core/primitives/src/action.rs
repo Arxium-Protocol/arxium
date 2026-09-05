@@ -37,9 +37,8 @@ struct ActionWire<Payload> {
 
 impl<P: Serialize> Serialize for Action<P> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let payload_bytes =
-            bincode::serde::encode_to_vec(&self.payload, bincode::config::standard())
-                .map_err(S::Error::custom)?;
+        let payload_bytes = bincode::serde::encode_to_vec(&self.payload, crate::wire_config())
+            .map_err(S::Error::custom)?;
         ActionWire {
             sender: self.sender.clone(),
             nonce: self.nonce,
@@ -53,9 +52,12 @@ impl<P: Serialize> Serialize for Action<P> {
 impl<'de, P: serde::de::DeserializeOwned> Deserialize<'de> for Action<P> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let wire: ActionWire<Vec<u8>> = ActionWire::deserialize(deserializer)?;
-        let (payload, _): (P, usize) =
-            bincode::serde::decode_from_slice(&wire.payload, bincode::config::standard())
+        let (payload, consumed): (P, usize) =
+            bincode::serde::decode_from_slice(&wire.payload, crate::wire_config())
                 .map_err(D::Error::custom)?;
+        if consumed != wire.payload.len() {
+            return Err(D::Error::custom("trailing bytes after action payload"));
+        }
         Ok(Action {
             sender: wire.sender,
             nonce: wire.nonce,
@@ -112,7 +114,7 @@ impl<P: Serialize> Action<P> {
             nonce: self.nonce,
             payload: &self.payload,
         };
-        bincode::serde::encode_to_vec(&payload, bincode::config::standard())
+        bincode::serde::encode_to_vec(&payload, crate::wire_config())
             .expect("signing payload encoding should never fail")
     }
 
@@ -138,5 +140,58 @@ impl<P: Serialize> Action<P> {
         verifying_key
             .verify(&self.signing_bytes(), &signature)
             .map_err(|_| SignatureError::Invalid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_action() -> Action<u64> {
+        Action {
+            sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
+            nonce: 1,
+            signature: None,
+            payload: 42,
+        }
+    }
+
+    /// A padded payload blob (one trailing byte appended inside the
+    /// length-prefixed payload bytes, after the canonical encoding of `P`)
+    /// must be rejected, not silently accepted — see
+    /// `Implementation_log_2026-09-05.md`. Accepting it would mean the
+    /// decoded `Action<P>` re-encodes to different bytes than arrived on the
+    /// wire, breaking `xc_poe::tx_root` and fault adjudication for any peer
+    /// that pads a payload by even one byte.
+    #[test]
+    fn trailing_bytes_inside_payload_blob_are_rejected() {
+        let action = test_action();
+        let mut payload_bytes =
+            bincode::serde::encode_to_vec(&action.payload, crate::wire_config()).unwrap();
+        payload_bytes.push(0xff);
+        let wire = ActionWire {
+            sender: action.sender,
+            nonce: action.nonce,
+            signature: action.signature,
+            payload: payload_bytes,
+        };
+        let bytes = bincode::serde::encode_to_vec(&wire, crate::wire_config()).unwrap();
+        let result: Result<(Action<u64>, usize), _> =
+            bincode::serde::decode_from_slice(&bytes, crate::wire_config());
+        assert!(result.is_err());
+    }
+
+    /// A declared payload length far beyond `MAX_WIRE_MESSAGE_SIZE` must fail
+    /// fast via the configured byte limit instead of attempting a huge
+    /// allocation — the gossip path decodes `Action<P>`'s payload bytes
+    /// before any signature check runs, so this must be checked before the
+    /// bytes are even read, not just bounded by the message that carried it.
+    #[test]
+    fn oversized_declared_length_is_rejected_before_allocating() {
+        let huge_len_prefix =
+            bincode::serde::encode_to_vec(&(u64::MAX / 2), bincode::config::standard()).unwrap();
+        let result: Result<(Vec<u8>, usize), _> =
+            bincode::serde::decode_from_slice(&huge_len_prefix, crate::wire_config());
+        assert!(result.is_err());
     }
 }

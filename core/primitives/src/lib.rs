@@ -22,6 +22,24 @@ pub use state::{
     Snapshot, StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
 };
 
+/// Ceiling for any single bincode-decoded value read from untrusted bytes
+/// (gossip, sync responses, fault evidence) before a signature check has run.
+/// Matches `arxd_network::transport::MAX_GOSSIP_TRANSMIT_SIZE` — kept here
+/// (not there) so every decode site in both `arxd` and downstream readers
+/// (e.g. Retracer) shares one number instead of picking limits independently.
+/// `arxd_network` re-exports its constant as this value so the two can never
+/// drift apart.
+pub const MAX_WIRE_MESSAGE_SIZE: usize = 1024 * 1024;
+
+/// Standard bincode config for decoding untrusted bytes: same as
+/// `bincode::config::standard()` but with `MAX_WIRE_MESSAGE_SIZE` applied, so
+/// a peer can't force a huge allocation by declaring an oversized
+/// length-prefixed field (e.g. `Action<P>`'s payload `Vec<u8>`) before the
+/// read actually fails.
+pub fn wire_config() -> impl bincode::config::Config {
+    bincode::config::standard().with_limit::<MAX_WIRE_MESSAGE_SIZE>()
+}
+
 #[derive(Debug)]
 pub struct NodeConfig {
     pub base_path: PathBuf,

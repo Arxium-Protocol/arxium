@@ -27,7 +27,11 @@ pub(crate) fn identify_protocol_version(chain_id: &str) -> String {
 /// real headroom instead of relying on the tight default — 1 MiB is in line
 /// with other chains' gossip caps (e.g. Cosmos ~4 MiB, Ethereum consensus
 /// 10 MiB) while still bounding message size against abuse.
-const MAX_GOSSIP_TRANSMIT_SIZE: usize = 1024 * 1024;
+///
+/// Same value as `xc_primitives::MAX_WIRE_MESSAGE_SIZE` — re-exported from
+/// there (not defined independently here) so gossipsub's transmit cap and
+/// every bincode decode's byte limit can never drift apart.
+const MAX_GOSSIP_TRANSMIT_SIZE: usize = xc_primitives::MAX_WIRE_MESSAGE_SIZE;
 
 /// Combined behaviour for this node. mDNS handles same-LAN discovery; gossipsub
 /// carries Actions between peers. An explicit `--bootnodes` list is dialed

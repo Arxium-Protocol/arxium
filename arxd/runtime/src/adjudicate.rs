@@ -143,10 +143,14 @@ pub fn adjudicate_action_divergence(artifact: &EvidenceArtifact) -> Result<Adjud
     let _ = action_index; // bound into the claims' signatures, already checked by verify()
 
     let action_bytes = hex::decode(action_bytes.strip_prefix("0x").unwrap_or(action_bytes))?;
-    let config = bincode::config::standard();
-    let (action, _): (crate::ChainAction, usize) =
-        bincode::serde::decode_from_slice(&action_bytes, config)
+    let (action, consumed): (crate::ChainAction, usize) =
+        bincode::serde::decode_from_slice(&action_bytes, xc_primitives::wire_config())
             .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+    if consumed != action_bytes.len() {
+        return Err(AdjudicateError::BadAction(
+            "trailing bytes after action".to_string(),
+        ));
+    }
 
     let proposed_result = replay(&action, proposed_claim, *height)?;
     let dissent_result = replay(&action, dissent_claim, *height)?;
@@ -215,13 +219,18 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         });
     }
 
-    let config = bincode::config::standard();
     let decoded_actions = actions
         .iter()
         .map(|a| {
             let bytes = hex::decode(a.strip_prefix("0x").unwrap_or(a))?;
-            let (action, _): (crate::ChainAction, usize) = bincode::serde::decode_from_slice(&bytes, config)
-                .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+            let (action, consumed): (crate::ChainAction, usize) =
+                bincode::serde::decode_from_slice(&bytes, xc_primitives::wire_config())
+                    .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+            if consumed != bytes.len() {
+                return Err(AdjudicateError::BadAction(
+                    "trailing bytes after action".to_string(),
+                ));
+            }
             Ok(action)
         })
         .collect::<Result<Vec<crate::ChainAction>, AdjudicateError>>()?;
@@ -498,8 +507,13 @@ impl KvRead for ProofBackedView {
         let key_hash = xc_poe::state_trie::hash_key(&raw_key);
         match self.trie.get(&key_hash) {
             Ok(Some(bytes)) => {
-                let config = bincode::config::standard();
-                let (value, _) = bincode::serde::decode_from_slice(&bytes, config)?;
+                let (value, consumed) =
+                    bincode::serde::decode_from_slice(&bytes, xc_primitives::wire_config())?;
+                if consumed != bytes.len() {
+                    return Err(StorageError::Decode(bincode::error::DecodeError::Other(
+                        "trailing bytes after proof-backed value",
+                    )));
+                }
                 Ok(Some(value))
             }
             Ok(None) => Ok(None),

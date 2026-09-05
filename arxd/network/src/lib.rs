@@ -40,6 +40,20 @@ use sync::{
 };
 use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
+/// Decodes an untrusted, peer-supplied byte slice (gossip message or sync
+/// payload, always read before any signature check) — bounded by
+/// `xc_primitives::MAX_WIRE_MESSAGE_SIZE` so a peer can't force a huge
+/// allocation via a declared length, and rejecting trailing bytes so a
+/// padded message can't silently round-trip to something other than what
+/// arrived on the wire.
+fn decode_wire<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
+    let (value, consumed) = bincode::serde::decode_from_slice(bytes, xc_primitives::wire_config())?;
+    if consumed != bytes.len() {
+        return Err(bincode::error::DecodeError::Other("trailing bytes after decoded value"));
+    }
+    Ok(value)
+}
+
 /// A gossip publish can fail because nobody local is subscribed to the
 /// topic — expected on a devnet where not every peer subscribes to every
 /// topic (e.g. an indexer that only follows blocks), harmless since the
@@ -260,7 +274,7 @@ async fn run_swarm<P: Payload>(
                     // Sender side (RPC ingest) is gone — nothing left to publish.
                     continue;
                 };
-                match bincode::serde::encode_to_vec(&action, bincode::config::standard()) {
+                match bincode::serde::encode_to_vec(&action, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(actions_topic.clone(), bytes) {
                             log_publish_error("action", &err);
@@ -274,7 +288,7 @@ async fn run_swarm<P: Payload>(
                     // Sender side (block-production loop) is gone — nothing left to publish.
                     continue;
                 };
-                match bincode::serde::encode_to_vec(&block, bincode::config::standard()) {
+                match bincode::serde::encode_to_vec(&block, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(blocks_topic.clone(), bytes) {
                             log_publish_error("block", &err);
@@ -288,7 +302,7 @@ async fn run_swarm<P: Payload>(
                     // Sender side (finality subsystem) is gone — nothing left to publish.
                     continue;
                 };
-                match bincode::serde::encode_to_vec(&vote, bincode::config::standard()) {
+                match bincode::serde::encode_to_vec(&vote, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(precommits_topic.clone(), bytes) {
                             log_publish_error("precommit vote", &err);
@@ -302,7 +316,7 @@ async fn run_swarm<P: Payload>(
                     // Sender side (finality/node subsystem) is gone — nothing left to publish.
                     continue;
                 };
-                match bincode::serde::encode_to_vec(&dissent, bincode::config::standard()) {
+                match bincode::serde::encode_to_vec(&dissent, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(dissents_topic.clone(), bytes) {
                             log_publish_error("dissent", &err);
@@ -316,7 +330,7 @@ async fn run_swarm<P: Payload>(
                     // Sender side (finality subsystem) is gone — nothing left to publish.
                     continue;
                 };
-                match bincode::serde::encode_to_vec(&round_timeout_vote, bincode::config::standard()) {
+                match bincode::serde::encode_to_vec(&round_timeout_vote, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(round_timeouts_topic.clone(), bytes) {
                             log_publish_error("round-timeout vote", &err);
@@ -371,11 +385,8 @@ async fn run_swarm<P: Payload>(
                     message,
                     ..
                 })) if message.topic == actions_topic.hash() => {
-                    let action: Action<P> = match bincode::serde::decode_from_slice(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((action, _)) => action,
+                    let action: Action<P> = match decode_wire(&message.data) {
+                        Ok(action) => action,
                         Err(err) => {
                             record_bad_gossip(
                                 &mut swarm,
@@ -434,11 +445,8 @@ async fn run_swarm<P: Payload>(
                     message,
                     ..
                 })) if message.topic == blocks_topic.hash() => {
-                    let block: Block<P> = match bincode::serde::decode_from_slice(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((block, _)) => block,
+                    let block: Block<P> = match decode_wire(&message.data) {
+                        Ok(block) => block,
                         Err(err) => {
                             record_bad_gossip(
                                 &mut swarm,
@@ -467,11 +475,8 @@ async fn run_swarm<P: Payload>(
                     message,
                     ..
                 })) if message.topic == precommits_topic.hash() => {
-                    let vote: PrecommitVote = match bincode::serde::decode_from_slice(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((vote, _)) => vote,
+                    let vote: PrecommitVote = match decode_wire(&message.data) {
+                        Ok(vote) => vote,
                         Err(err) => {
                             record_bad_gossip(
                                 &mut swarm,
@@ -491,11 +496,8 @@ async fn run_swarm<P: Payload>(
                     message,
                     ..
                 })) if message.topic == dissents_topic.hash() => {
-                    let dissent: Dissent = match bincode::serde::decode_from_slice(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((dissent, _)) => dissent,
+                    let dissent: Dissent = match decode_wire(&message.data) {
+                        Ok(dissent) => dissent,
                         Err(err) => {
                             record_bad_gossip(
                                 &mut swarm,
@@ -515,11 +517,8 @@ async fn run_swarm<P: Payload>(
                     message,
                     ..
                 })) if message.topic == round_timeouts_topic.hash() => {
-                    let vote: RoundTimeoutVote = match bincode::serde::decode_from_slice(
-                        &message.data,
-                        bincode::config::standard(),
-                    ) {
-                        Ok((vote, _)) => vote,
+                    let vote: RoundTimeoutVote = match decode_wire(&message.data) {
+                        Ok(vote) => vote,
                         Err(err) => {
                             record_bad_gossip(
                                 &mut swarm,
@@ -586,11 +585,8 @@ async fn run_swarm<P: Payload>(
                     ..
                 })) => match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        let sync_request: SyncRequest = match bincode::serde::decode_from_slice(
-                            &request,
-                            bincode::config::standard(),
-                        ) {
-                            Ok((req, _)) => req,
+                        let sync_request: SyncRequest = match decode_wire(&request) {
+                            Ok(req) => req,
                             Err(err) => {
                                 warn!("failed to decode sync request from {peer}: {err}");
                                 continue;
@@ -654,7 +650,7 @@ async fn run_swarm<P: Payload>(
                                 SyncResponse::<Block<P>>::Hashes(hashes)
                             }
                         };
-                        match bincode::serde::encode_to_vec(&response, bincode::config::standard()) {
+                        match bincode::serde::encode_to_vec(&response, xc_primitives::wire_config()) {
                             Ok(bytes) => {
                                 if swarm.behaviour_mut().sync.send_response(channel, bytes).is_err() {
                                     warn!("failed to send sync response to {peer}: channel closed");
@@ -664,11 +660,8 @@ async fn run_swarm<P: Payload>(
                         }
                     }
                     request_response::Message::Response { response, .. } => {
-                        let sync_response: SyncResponse<Block<P>> = match bincode::serde::decode_from_slice(
-                            &response,
-                            bincode::config::standard(),
-                        ) {
-                            Ok((resp, _)) => resp,
+                        let sync_response: SyncResponse<Block<P>> = match decode_wire(&response) {
+                            Ok(resp) => resp,
                             Err(err) => {
                                 warn!("failed to decode sync response from {peer}: {err}");
                                 continue;
