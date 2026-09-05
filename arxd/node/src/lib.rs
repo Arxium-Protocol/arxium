@@ -25,7 +25,7 @@ use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{identity, spawn_p2p_node};
-use xc_artifact::{DissentAttestation, EvidenceArtifact};
+use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault};
 use xc_cli::{Cli, Command};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
@@ -461,19 +461,39 @@ fn spawn_subsystems<R: ChainRuntime>(
         let address = address.clone();
         let key = key.clone();
         let db = db.clone();
-        Some(move |artifact: EvidenceArtifact| -> Action<R::Payload> {
+        Some(move |artifact: EvidenceArtifact| -> Option<Action<R::Payload>> {
+            let artifact_json = serde_json::to_string(&artifact).expect("artifact always encodes");
+            // The node writing this artifact is, by construction, the
+            // dissenting party in it — if its own execution is the buggy
+            // one, submitting unconditionally would name and slash itself.
+            // Re-adjudicate locally (proof-backed replay, decoupled from
+            // whatever live-execution path produced the dissent claim) and
+            // only submit if it names someone else culpable.
+            let culpable_pubkey = R::locally_adjudicate_execution_fault(&artifact_json)?;
+            let voter_pubkey = match &artifact.fault {
+                Fault::BlockDivergence { voter_pubkey, .. } => voter_pubkey,
+                _ => return None,
+            };
+            if &culpable_pubkey == voter_pubkey {
+                error!(
+                    "evidence: local re-adjudication names this node itself as culpable for the block \
+                     divergence it just reported — not submitting SubmitExecutionFault against ourselves \
+                     (this points at a local execution bug, not the proposer)"
+                );
+                return None;
+            }
+
             let nonce = db
                 .get_account(&address)
                 .ok()
                 .flatten()
                 .map(|entry| entry.nonce)
                 .unwrap_or(0);
-            let artifact_json = serde_json::to_string(&artifact).expect("artifact always encodes");
             let mut action = R::build_execution_fault_action(artifact_json, &address, nonce)
                 .expect("probed Some for this runtime at startup");
             let signature = key.sign(&action.signing_bytes());
             action.signature = Some(hex::encode(signature.to_bytes()));
-            action
+            Some(action)
         })
     });
     spawn_supervised(

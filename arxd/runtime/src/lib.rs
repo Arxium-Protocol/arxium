@@ -322,6 +322,19 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         })
     }
 
+    fn locally_adjudicate_execution_fault(artifact_json: &str) -> Option<String> {
+        let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json).ok()?;
+        let outcome = match &artifact.fault {
+            xc_artifact::Fault::ActionDivergence { .. } => adjudicate::adjudicate_action_divergence(&artifact).ok()?,
+            xc_artifact::Fault::BlockDivergence { .. } => adjudicate::adjudicate_block_divergence(&artifact).ok()?,
+            xc_artifact::Fault::Equivocation { .. } | xc_artifact::Fault::ExecutionDisagreement { .. } => return None,
+        };
+        match outcome {
+            adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey } => Some(culpable_pubkey),
+            adjudicate::AdjudicationOutcome::Disagreement { .. } => None,
+        }
+    }
+
     fn pair(seed: &[u8; 32], sender: &Address, node: &str, token: Option<&str>, revoke: bool) -> anyhow::Result<()> {
         pair::run(seed, sender, node, token, revoke)
     }
@@ -627,6 +640,7 @@ mod tests {
     use super::*;
     use test_support::*;
     use std::collections::BTreeMap;
+    use xc_runtime_api::ChainRuntime;
     use xc_storage::{AccountUpdates, BlsKeyRegistration, OperatorUpdates, ValidatorSetSnapshot};
 
     // admission_precheck runs against a real ArxiumDb (unlike the
@@ -781,6 +795,55 @@ mod tests {
 
         admission_precheck(&action, &db)
             .expect("operator authorized via AuthorizeOperator should be allowed to join");
+    }
+
+    #[test]
+    fn locally_adjudicate_execution_fault_rejects_malformed_json() {
+        assert_eq!(CoreChainRuntime::locally_adjudicate_execution_fault("not json"), None);
+    }
+
+    #[test]
+    fn locally_adjudicate_execution_fault_has_no_path_for_equivocation() {
+        // Equivocation is context-free (verify() alone names the culprit),
+        // so this hook — which exists for the two replay-adjudicated fault
+        // kinds — has nothing to do with it and returns `None`.
+        let artifact = xc_artifact::EvidenceArtifact {
+            artifact_version: xc_artifact::ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: xc_artifact::Fault::Equivocation {
+                proposer_pubkey: format!("0x{}", hex::encode([1u8; 32])),
+                height: 1,
+                blocks: [
+                    xc_artifact::BlockAttestation {
+                        header: xc_artifact::CanonicalHeader {
+                            height: 1,
+                            parent_hash: "0xp".to_string(),
+                            timestamp: 0,
+                            tx_root: format!("0x{}", hex::encode([0u8; 32])),
+                            proposer: "arx1x".to_string(),
+                            state_root: "0xa".to_string(),
+                            round: 0,
+                        },
+                        signature: "0xsig".to_string(),
+                    },
+                    xc_artifact::BlockAttestation {
+                        header: xc_artifact::CanonicalHeader {
+                            height: 1,
+                            parent_hash: "0xp".to_string(),
+                            timestamp: 0,
+                            tx_root: format!("0x{}", hex::encode([0u8; 32])),
+                            proposer: "arx1x".to_string(),
+                            state_root: "0xb".to_string(),
+                            round: 0,
+                        },
+                        signature: "0xsig".to_string(),
+                    },
+                ],
+            },
+            human_readable: serde_json::json!({}),
+        };
+        let artifact_json = serde_json::to_string(&artifact).unwrap();
+        assert_eq!(CoreChainRuntime::locally_adjudicate_execution_fault(&artifact_json), None);
     }
 }
 

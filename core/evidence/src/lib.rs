@@ -345,7 +345,7 @@ pub fn spawn_evidence_watcher<P, F, G>(
 where
     P: Serialize + DeserializeOwned + Send + 'static,
     F: Fn(EquivocationEvidence<P>) -> Action<P> + Send + 'static,
-    G: Fn(EvidenceArtifact) -> Action<P> + Send + 'static,
+    G: Fn(EvidenceArtifact) -> Option<Action<P>> + Send + 'static,
 {
     thread::spawn(move || {
         for event in events {
@@ -387,12 +387,17 @@ where
                     if let (Some(artifact), Some(build_execution_fault_action)) =
                         (artifact, &build_execution_fault_action)
                     {
-                        let action = build_execution_fault_action(artifact);
-                        let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
-                        match guard.push(action) {
-                            Ok(()) => info!("evidence: submitted block divergence fault against {proposer}"),
-                            Err(err) => {
-                                warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
+                        // `build_execution_fault_action` returns `None` when it
+                        // isn't safe to submit — e.g. the node's own local,
+                        // proof-backed re-adjudication names this node itself
+                        // as culpable (see `ChainRuntime::locally_adjudicate_execution_fault`).
+                        if let Some(action) = build_execution_fault_action(artifact) {
+                            let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                            match guard.push(action) {
+                                Ok(()) => info!("evidence: submitted block divergence fault against {proposer}"),
+                                Err(err) => {
+                                    warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
+                                }
                             }
                         }
                     }
@@ -546,7 +551,7 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Action<()>> = None;
+        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
@@ -596,11 +601,13 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
-        let build_execution_fault_action = Some(|_artifact: EvidenceArtifact| Action {
-            sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
-            nonce: 0,
-            signature: None,
-            payload: (),
+        let build_execution_fault_action = Some(|_artifact: EvidenceArtifact| {
+            Some(Action {
+                sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
+                nonce: 0,
+                signature: None,
+                payload: (),
+            })
         });
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
@@ -672,7 +679,7 @@ mod tests {
             signature: None,
             payload: (),
         });
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Action<()>> = None;
+        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),

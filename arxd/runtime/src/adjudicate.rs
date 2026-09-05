@@ -62,6 +62,36 @@ use xc_poe::state_trie::{InclusionProof, ProofBackedTrie};
 use xc_primitives::Address;
 use xc_storage::StorageError;
 
+/// Caps how many actions a `BlockDivergence` artifact's action list may
+/// contain before replay is even attempted. Without this, `verify()`'s
+/// well-formedness check (signatures, proofs, differing roots) is the only
+/// gate, and it never looks at the action list's length — an attacker-sized
+/// artifact makes every adjudicating node replay an arbitrarily long list.
+/// The real chain caps actions per block already (mempool/block-building);
+/// this just refuses to replay an artifact claiming to exceed what any real
+/// block could ever contain.
+const MAX_ADJUDICATED_ACTIONS: usize = 4096;
+
+/// `SubmitExecutionFault` and `SubmitEquivocationEvidence` are refused
+/// before replay, in both [`replay`] (single-action) and
+/// [`adjudicate_block_divergence`] (whole-block): a `ChainAction` decoded
+/// from a claim's `actions` list is fed straight into `crate::dispatch`,
+/// and `SubmitExecutionFault` dispatches straight back into
+/// `adjudicate_action_divergence`/`adjudicate_block_divergence` — an
+/// artifact whose disputed action/block itself contains a nested
+/// `SubmitExecutionFault` would recurse without bound, and every validator
+/// executing the *real* block containing the original `SubmitExecutionFault`
+/// would blow its stack the same way. `SubmitEquivocationEvidence` doesn't
+/// recurse, but gets the same treatment for the same reason `LeaveValidator`
+/// does: a fault-submission action isn't a provable single-key economic
+/// action, so replaying it here can't be trusted to mean anything.
+fn is_unreplayable_fault_submission(payload: &crate::ActionPayload) -> bool {
+    matches!(
+        payload,
+        crate::ActionPayload::SubmitExecutionFault { .. } | crate::ActionPayload::SubmitEquivocationEvidence { .. }
+    )
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdjudicateError {
     #[error("not an ActionDivergence fault")]
@@ -176,6 +206,15 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         return Err(AdjudicateError::WrongFaultKind);
     };
 
+    if actions.len() > MAX_ADJUDICATED_ACTIONS {
+        return Ok(AdjudicationOutcome::Disagreement {
+            reason: format!(
+                "action list ({} actions) exceeds MAX_ADJUDICATED_ACTIONS ({MAX_ADJUDICATED_ACTIONS}), refusing to replay",
+                actions.len()
+            ),
+        });
+    }
+
     let config = bincode::config::standard();
     let decoded_actions = actions
         .iter()
@@ -211,6 +250,13 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         if matches!(action.payload, crate::ActionPayload::LeaveValidator { .. }) {
             return Ok(AdjudicationOutcome::Disagreement {
                 reason: "LeaveValidator depends on the live validator set, which isn't provable as a single key"
+                    .to_string(),
+            });
+        }
+        if is_unreplayable_fault_submission(&action.payload) {
+            return Ok(AdjudicationOutcome::Disagreement {
+                reason: "a fault-submission action (SubmitExecutionFault/SubmitEquivocationEvidence) cannot itself \
+                         be replayed during adjudication"
                     .to_string(),
             });
         }
@@ -316,6 +362,13 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
     if matches!(action.payload, crate::ActionPayload::LeaveValidator { .. }) {
         return Ok(ReplayResult::Unprovable(
             "LeaveValidator depends on the live validator set, which isn't provable as a single key".to_string(),
+        ));
+    }
+    if is_unreplayable_fault_submission(&action.payload) {
+        return Ok(ReplayResult::Unprovable(
+            "a fault-submission action (SubmitExecutionFault/SubmitEquivocationEvidence) cannot itself be replayed \
+             during adjudication"
+                .to_string(),
         ));
     }
 
@@ -911,6 +964,110 @@ mod tests {
         };
         actions[0] =
             format!("0x{}", hex::encode(bincode::serde::encode_to_vec(&other_action, bincode::config::standard()).unwrap()));
+
+        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
+    }
+
+    /// The recursion guard: a `BlockDivergence` artifact whose disputed
+    /// block contains a `SubmitExecutionFault` action would, without the
+    /// `is_unreplayable_fault_submission` check, get replayed straight into
+    /// `crate::dispatch` → `submit_execution_fault` → back into this module —
+    /// unbounded recursion for the cost of one artifact. This asserts it
+    /// resolves to `Disagreement` (and, implicitly, returns at all — a
+    /// regression here hangs or stack-overflows the test process instead of
+    /// failing an assertion).
+    #[test]
+    fn a_nested_submit_execution_fault_action_resolves_to_disagreement_not_recursion() {
+        let db = temp_db();
+        let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = xc_primitives::Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
+            (alice.clone(), entry(1_000_000_000)),
+            (bob.clone(), entry(0)),
+        ])))
+        .unwrap();
+        let parent_root = db.compute_state_root(&[]).unwrap();
+
+        // The nested action: a well-formed `SubmitExecutionFault` carrying
+        // another (never-decoded, since the guard fires first) artifact.
+        let nested_action: crate::ChainAction = xc_primitives::Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::SubmitExecutionFault { artifact_json: "{}".to_string() },
+        };
+        let actions = vec![nested_action.clone()];
+        let tx_root = xc_poe::tx_root(&actions).unwrap();
+
+        let alice_key = format!("account:{alice}").into_bytes();
+        let bob_key = format!("account:{bob}").into_bytes();
+        let proofs = vec![
+            hex_proof(db.prove(&alice_key, &parent_root).unwrap()),
+            hex_proof(db.prove(&bob_key, &parent_root).unwrap()),
+        ];
+
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        // Two different (fabricated) post-roots — only their difference
+        // matters, to pass verify()'s "must actually diverge" check; the
+        // guard fires long before either would ever need to be reproduced.
+        let fake_post_a = format!("0x{}", hex::encode([0xAAu8; 32]));
+        let fake_post_b = format!("0x{}", hex::encode([0xBBu8; 32]));
+
+        let header = xc_artifact::CanonicalHeader {
+            height: 5,
+            parent_hash: "0xparent".to_string(),
+            timestamp: 1234,
+            tx_root: format!("0x{}", hex::encode(tx_root)),
+            proposer: "arx1proposer".to_string(),
+            state_root: fake_post_a,
+            round: 0,
+        };
+        let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
+        let block_attestation = xc_artifact::BlockAttestation {
+            header: header.clone(),
+            signature: format!("0x{}", hex::encode(proposer_key.sign(&header_bytes).to_bytes())),
+        };
+        let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
+        let dissent_msg =
+            xc_artifact::block_divergence_signing_bytes(5, &header_commitment, &parent_root, &fake_post_b);
+
+        let artifact = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::BlockDivergence {
+                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                voter_pubkey: format!("0x{}", hex::encode(voter_pk.0)),
+                height: 5,
+                parent_state_root: parent_root,
+                block_attestation,
+                actions: vec![format!(
+                    "0x{}",
+                    hex::encode(bincode::serde::encode_to_vec(&nested_action, bincode::config::standard()).unwrap())
+                )],
+                dissent_claim: xc_artifact::BlockDissentClaim {
+                    computed_state_root: fake_post_b,
+                    proofs,
+                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+                },
+            },
+            human_readable: serde_json::json!({}),
+        };
+
+        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
+    }
+
+    /// [`MAX_ADJUDICATED_ACTIONS`]: a `BlockDivergence` artifact claiming
+    /// more actions than any real block could ever contain is refused
+    /// before decoding a single one of them.
+    #[test]
+    fn an_oversized_action_list_resolves_to_disagreement_without_decoding() {
+        let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else { unreachable!() };
+        // Not valid encodings — proves the cap is checked before decoding.
+        *actions = vec!["0xnot-a-real-action".to_string(); MAX_ADJUDICATED_ACTIONS + 1];
 
         let outcome = adjudicate_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));

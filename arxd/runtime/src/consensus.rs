@@ -89,6 +89,12 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
 /// ponytail: `artifact.genesis_hash` isn't checked against this chain's
 /// real genesis — same open design question already deferred at
 /// `arxd/node/src/lib.rs:1057`; wire both together when that's resolved.
+/// Concrete shape of the hole while it's open: a validator running the same
+/// keys on two Arxium chains (e.g. mainnet + a testnet) can be slashed here
+/// for a fault actually committed on the *other* chain — nothing currently
+/// stops an artifact genuinely produced against chain B's genesis from being
+/// replayed and adjudicated against chain A's live state, since `dispatch`
+/// only depends on the action bytes and proofs, never on `genesis_hash`.
 pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     view: &V,
     artifact_json: &str,

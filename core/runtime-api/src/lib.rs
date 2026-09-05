@@ -123,6 +123,31 @@ pub trait ChainRuntime: Send + Sync + 'static {
         None
     }
 
+    /// Locally replays a `BlockDivergence`/`ActionDivergence` evidence
+    /// artifact exactly the way on-chain adjudication would (see
+    /// `arxd_runtime::adjudicate`), without touching the mempool or a live
+    /// database — used by the node to decide whether it's actually safe to
+    /// auto-submit the `SubmitExecutionFault` it just built for its own
+    /// detected divergence.
+    ///
+    /// This matters because the node that writes a `BlockDivergence`
+    /// artifact is, by construction, the dissenting party in it: if *its
+    /// own* execution is the buggy one, submitting unconditionally would
+    /// name and slash itself. A pre-check can't just re-run the same
+    /// live-execution path that produced the dissent claim — that would
+    /// tautologically agree with itself — so this replays from the
+    /// artifact's Merkle proofs instead (the same deterministic,
+    /// proof-backed path on-chain adjudication uses), which is decoupled
+    /// from whatever live-execution bug produced the original mismatch.
+    ///
+    /// Returns the resolved culpable pubkey on `Culpable`, or `None` for
+    /// `Disagreement`, a decode/replay error, or (via the default impl) a
+    /// chain with no adjudication path at all — in every `None` case the
+    /// caller should treat the fault as unsafe to auto-submit.
+    fn locally_adjudicate_execution_fault(_artifact_json: &str) -> Option<String> {
+        None
+    }
+
     /// Implements `arxd pair` / `arxd pair --revoke`: signs and submits this
     /// chain's operator-authorization action over HTTP. `seed`/`sender` are
     /// the validator's already-loaded signing key material (chain-agnostic,
