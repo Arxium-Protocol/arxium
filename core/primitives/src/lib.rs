@@ -10,9 +10,9 @@ mod block;
 mod consensus;
 mod state;
 
-pub use action::{Action, SignatureError};
+pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
-pub use block::Block;
+pub use block::{Block, RawBlock};
 pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, quorum,
     round_timeout_signing_bytes,

@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::action::{Action, SignatureError};
+use crate::action::{Action, RawAction, SignatureError};
 use crate::address::Address;
 use crate::consensus::RoundCertificate;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -9,7 +9,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// `P` is the chain-specific action payload — see `Action<P>`.
+// `Action<P>`'s `Deserialize` needs `P: DeserializeOwned` (it decodes P from
+// an already-extracted owned byte buffer, not a borrow of the deserializer's
+// own input) — stricter than the plain `P: Deserialize<'de>` bound the
+// derive would otherwise infer from `actions: Vec<Action<P>>`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(bound(deserialize = "P: serde::de::DeserializeOwned"))]
 pub struct Block<P> {
     pub height: u64,
     pub parent_hash: String,
@@ -45,6 +50,27 @@ pub struct Block<P> {
     /// this height for the first time) can still validate it, and two nodes
     /// with different locally-held certificates always agree on the same
     /// verdict. See `Arxium_OpenItems.md` §7 (B1c).
+    pub round_certificate: Option<RoundCertificate>,
+}
+
+/// Same wire shape [`Block<P>`] always serializes as, but `actions` is
+/// captured as [`RawAction`] instead of `Action<P>` — decodes any chain's
+/// block without knowing its payload type `P` at all. For an external
+/// reader whose payload enum may lag the producing chain's: decode as
+/// `RawBlock` first (always succeeds structurally), then attempt each
+/// action's own payload bytes against the reader's own payload type,
+/// skipping the ones that don't decode instead of failing the whole block.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawBlock {
+    pub height: u64,
+    pub parent_hash: String,
+    pub timestamp: u64,
+    pub actions: Vec<RawAction>,
+    pub tx_root: [u8; 32],
+    pub proposer: Option<Address>,
+    pub signature: Option<String>,
+    pub state_root: String,
+    pub round: u32,
     pub round_certificate: Option<RoundCertificate>,
 }
 
