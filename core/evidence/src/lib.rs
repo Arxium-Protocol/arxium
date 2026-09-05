@@ -9,7 +9,7 @@ use std::thread;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use xc_artifact::{
     BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault,
     ARTIFACT_VERSION,
@@ -395,6 +395,17 @@ where
                             let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
                             match guard.push(action) {
                                 Ok(()) => info!("evidence: submitted block divergence fault against {proposer}"),
+                                Err(err @ xc_mempool::MempoolError::TooLarge { .. }) => {
+                                    // The fault loop looks alive (this fires every time, not
+                                    // just once) but this fault never reaches anyone — no
+                                    // amount of retrying shrinks the artifact. See
+                                    // Implementation_log_2026-09-05.md #3.
+                                    metrics::counter!("arxium_evidence_rejected_oversized_total").increment(1);
+                                    error!(
+                                        "evidence: block divergence fault against {proposer} rejected, \
+                                         too large to submit: {err}"
+                                    );
+                                }
                                 Err(err) => {
                                     warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
                                 }

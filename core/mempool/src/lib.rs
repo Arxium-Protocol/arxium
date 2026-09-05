@@ -24,6 +24,14 @@ pub enum MempoolError {
     Full,
     #[error("duplicate action for {sender} at nonce {nonce}")]
     Duplicate { sender: Address, nonce: u64 },
+    // Checked here rather than left to fail at gossip-encode time: a
+    // locally-built action that never goes through gossip at all (e.g. the
+    // evidence watcher pushing straight into the mempool — see
+    // `core/evidence`'s `spawn_evidence_watcher`) would otherwise sit in the
+    // mempool looking accepted and only ever fail silently, three layers
+    // away, when something eventually tries to encode it for the wire.
+    #[error("action is {size} bytes, over the {max}-byte wire limit")]
+    TooLarge { size: usize, max: usize },
 }
 
 /// Everything an action must pass before it's allowed anywhere near the
@@ -122,6 +130,9 @@ impl<P: Serialize> Mempool<P> {
             return Err(MempoolError::Full);
         }
         let size = Self::encoded_size(&action);
+        if size > xc_primitives::MAX_WIRE_MESSAGE_SIZE {
+            return Err(MempoolError::TooLarge { size, max: xc_primitives::MAX_WIRE_MESSAGE_SIZE });
+        }
         if self.total_bytes + size > MAX_PENDING_BYTES {
             return Err(MempoolError::Full);
         }
@@ -238,6 +249,25 @@ mod tests {
         };
         assert!(matches!(mempool.push(overflow), Err(MempoolError::Full)));
         assert_eq!(mempool.len(), 10, "the 11th action must not have been queued");
+    }
+
+    /// A single over-cap action must be rejected at push, not accepted into
+    /// the mempool and left to fail later at gossip-encode time — the
+    /// aggregate `MAX_PENDING_BYTES` budget alone wouldn't catch this (one
+    /// action, well under the aggregate budget, still over the per-message
+    /// wire limit).
+    #[test]
+    fn push_rejects_a_single_action_over_the_wire_size_limit() {
+        let mut mempool: Mempool<Vec<u8>> = Mempool::new();
+        let oversized = Action {
+            sender: addr(1),
+            nonce: 0,
+            signature: Some("sig-0".to_string()),
+            payload: vec![0u8; xc_primitives::MAX_WIRE_MESSAGE_SIZE + 1],
+        };
+
+        assert!(matches!(mempool.push(oversized), Err(MempoolError::TooLarge { .. })));
+        assert!(mempool.is_empty(), "an oversized action must not have been queued");
     }
 
     #[test]

@@ -5172,6 +5172,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek 3.0.0",
  "hex",
+ "metrics",
  "serde",
  "serde_json",
  "thiserror 2.0.19",

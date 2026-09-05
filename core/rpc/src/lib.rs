@@ -520,6 +520,11 @@ async fn submit_action<P: Payload>(
             warn!("rejected action from {sender}: {err}");
             (StatusCode::CONFLICT, err.to_string()).into_response()
         }
+        Err(err @ MempoolError::TooLarge { .. }) => {
+            metrics::counter!("arxium_mempool_rejected_oversized_total").increment(1);
+            warn!("rejected action from {sender}: {err}");
+            (StatusCode::PAYLOAD_TOO_LARGE, err.to_string()).into_response()
+        }
     }
 }
 

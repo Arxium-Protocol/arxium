@@ -437,6 +437,10 @@ async fn run_swarm<P: Payload>(
                             info!("admitted gossiped action from {propagation_source}");
                         }
                         Err(xc_mempool::MempoolError::Duplicate { .. }) => {}
+                        Err(err @ xc_mempool::MempoolError::TooLarge { .. }) => {
+                            counter!("arxium_mempool_rejected_oversized_total").increment(1);
+                            warn!("failed to queue gossiped action: {err}");
+                        }
                         Err(err) => warn!("failed to queue gossiped action: {err}"),
                     }
                 }
