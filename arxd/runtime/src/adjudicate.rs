@@ -1108,8 +1108,8 @@ mod tests {
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
-    /// Diagnostic, not a correctness check: measures how big a real
-    /// `BlockDivergence` artifact's on-chain `artifact_json`
+    /// Regression guard, formerly a diagnostic-only print: measures how big
+    /// a real `BlockDivergence` artifact's on-chain `artifact_json`
     /// (`SubmitExecutionFault`'s payload — see `arxd/node`'s
     /// `build_execution_fault_action`) actually gets for a busy-but-ordinary
     /// block, against `xc_primitives::MAX_WIRE_MESSAGE_SIZE` (the cap
@@ -1120,22 +1120,19 @@ mod tests {
     /// overhead on the action list. Touched keys come from a real
     /// `BlockView::new_recording` replay, not a hand-picked count.
     ///
-    /// Measured 2026-09-05: 3,659,890 bytes for 100 actions / 200 uniquely
-    /// touched keys — 3.5x over the 1 MiB cap (see
-    /// Implementation_log_2026-09-05.md #3). No hard assertion here on
-    /// purpose: this documents a real, already-confirmed-oversized risk,
-    /// not something this change fixes, so it shouldn't fail CI.
+    /// Measured 2026-09-05, before `StateProof` compression: 3,659,890
+    /// bytes for 100 actions / 200 uniquely touched keys — 3.5x over the
+    /// 1 MiB cap (see Implementation_log_2026-09-05.md #3).
     ///
-    /// Retire this test — delete the `println!`, add
-    /// `assert!(artifact_json.len() <= xc_primitives::MAX_WIRE_MESSAGE_SIZE)`
-    /// — once the artifact encoding is actually fixed: `artifact_json`
-    /// moves from a JSON string to bincode bytes, `dissent_claim.proofs`
-    /// moves from full 256-sibling proofs to bitmap + non-default-sibling
-    /// compression (core/poe's default-subtree table already knows which
-    /// siblings are defaults; ~8,192 bytes → ~288 bytes per proof), and
-    /// `human_readable` stops riding on the wire and becomes a
-    /// verifier-side derivation instead. Until all of that lands, this
-    /// print is the only signal that the gap is closing.
+    /// Measured again after `InclusionProof::compress`/`StateProof`'s
+    /// bitmap + non-default-siblings wire shape landed (#4): 254,821 bytes
+    /// for the same block — 0.2x, comfortably under, as a JSON string with
+    /// no other change. Retired to a hard assertion below rather than a
+    /// print now that there's real margin to hold it to. `artifact_json`
+    /// still isn't bincode and `human_readable` still duplicates the whole
+    /// block on the wire — either would buy more headroom — but compression
+    /// alone already closed the immediate risk, so neither is load-bearing
+    /// for this cap the way the proof format was.
     #[test]
     fn block_divergence_artifact_json_size_for_a_busy_block() {
         let db = temp_db();
@@ -1232,6 +1229,13 @@ mod tests {
             touched_keys.len(),
             xc_primitives::MAX_WIRE_MESSAGE_SIZE,
             artifact_json.len() as f64 / xc_primitives::MAX_WIRE_MESSAGE_SIZE as f64,
+        );
+        assert!(
+            artifact_json.len() <= xc_primitives::MAX_WIRE_MESSAGE_SIZE,
+            "a busy-but-ordinary block's fault artifact must fit under the wire cap: \
+             {} bytes > {} bytes",
+            artifact_json.len(),
+            xc_primitives::MAX_WIRE_MESSAGE_SIZE,
         );
     }
 }
