@@ -12,6 +12,7 @@
 //! chain's runtime.
 
 mod account;
+pub mod adjudicate;
 mod asset;
 mod consensus;
 mod identity;
@@ -213,6 +214,18 @@ pub enum ActionPayload {
     DeregisterAttestor {
         attestor: Address,
     },
+    /// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
+    /// artifact (JSON-serialized `xc_artifact::EvidenceArtifact`) for
+    /// on-chain adjudication and slashing — the counterpart to
+    /// `SubmitEquivocationEvidence` for the two fault kinds that need
+    /// chain-specific replay (see `adjudicate`) rather than a
+    /// context-free signature/proof check to name a culprit. Anyone may
+    /// submit one, same as equivocation evidence — `adjudicate::*` and the
+    /// artifact's own signatures are what gate the slash, not who
+    /// submitted it.
+    SubmitExecutionFault {
+        artifact_json: String,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -293,6 +306,19 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
                 block_a: Box::new(evidence.block_a),
                 block_b: Box::new(evidence.block_b),
             },
+        })
+    }
+
+    fn build_execution_fault_action(
+        artifact_json: String,
+        sender: &Address,
+        nonce: u64,
+    ) -> Option<ChainAction> {
+        Some(Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload: ActionPayload::SubmitExecutionFault { artifact_json },
         })
     }
 
@@ -501,6 +527,9 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         }
         ActionPayload::TransferAsset { asset_id, to, amount } => {
             asset::transfer_asset(view, action, asset_id, to, *amount)
+        }
+        ActionPayload::SubmitExecutionFault { artifact_json } => {
+            consensus::submit_execution_fault(view, artifact_json, current_height, bls_pubkey_owner_lookup)
         }
     }
 }

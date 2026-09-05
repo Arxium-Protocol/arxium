@@ -48,6 +48,7 @@ const DOWNTIME_SLASH_BPS: u128 = 1;
 pub enum SlashReason {
     DoubleSign,
     Downtime,
+    ExecutionFault,
 }
 
 #[derive(Error, Debug)]

@@ -249,12 +249,12 @@ fn write_block_divergence_artifact<P: Serialize>(
     voter: &str,
     voter_pubkey: &str,
     dissent_claim: &BlockDissentClaim,
-) {
+) -> Option<EvidenceArtifact> {
     let proposer_pubkey = match proposer.pubkey_bytes() {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(err) => {
             warn!("evidence: failed to encode proposer pubkey for block divergence artifact: {err}");
-            return;
+            return None;
         }
     };
     let block_attestation = BlockAttestation {
@@ -281,7 +281,7 @@ fn write_block_divergence_artifact<P: Serialize>(
         Ok(actions) => actions,
         Err(err) => {
             warn!("evidence: failed to encode actions for block divergence artifact: {err}");
-            return;
+            return None;
         }
     };
 
@@ -305,18 +305,23 @@ fn write_block_divergence_artifact<P: Serialize>(
 
     if let Err(err) = std::fs::create_dir_all(evidence_dir) {
         warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
-        return;
+        return None;
     }
     let path = evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
     match serde_json::to_vec_pretty(&artifact) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(&path, bytes) {
                 warn!("evidence: failed to write artifact {}: {err}", path.display());
+                None
             } else {
                 info!("evidence: wrote artifact {}", path.display());
+                Some(artifact)
             }
         }
-        Err(err) => warn!("evidence: failed to encode block divergence artifact for {proposer}: {err}"),
+        Err(err) => {
+            warn!("evidence: failed to encode block divergence artifact for {proposer}: {err}");
+            None
+        }
     }
 }
 
@@ -328,17 +333,19 @@ fn write_block_divergence_artifact<P: Serialize>(
 /// no async I/O (just DB reads and a channel recv), so a dedicated tokio
 /// runtime here would be needless machinery. Unlike `spawn_p2p_node`/
 /// `spawn_http_ingest`, which do real async I/O and need one.
-pub fn spawn_evidence_watcher<P, F>(
+pub fn spawn_evidence_watcher<P, F, G>(
     db: ArxiumDb,
     mempool: Arc<Mutex<Mempool<P>>>,
     events: Receiver<EvidenceEvent<P>>,
     build_evidence_action: Option<F>,
+    build_execution_fault_action: Option<G>,
     evidence_dir: PathBuf,
     genesis_hash: [u8; 32],
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
     F: Fn(EquivocationEvidence<P>) -> Action<P> + Send + 'static,
+    G: Fn(EvidenceArtifact) -> Action<P> + Send + 'static,
 {
     thread::spawn(move || {
         for event in events {
@@ -363,7 +370,7 @@ where
                         );
                         continue;
                     };
-                    write_block_divergence_artifact(
+                    let artifact = write_block_divergence_artifact(
                         &evidence_dir,
                         genesis_hash,
                         &proposer,
@@ -373,6 +380,22 @@ where
                         &voter_pubkey,
                         &dissent_claim,
                     );
+                    // ponytail: no local dedup — `submit_execution_fault`'s
+                    // on-chain `EvidenceMarkerKey` check (Stage 2) rejects a
+                    // resubmission, so at worst a duplicate wastes one mempool
+                    // slot rather than double-slashing.
+                    if let (Some(artifact), Some(build_execution_fault_action)) =
+                        (artifact, &build_execution_fault_action)
+                    {
+                        let action = build_execution_fault_action(artifact);
+                        let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                        match guard.push(action) {
+                            Ok(()) => info!("evidence: submitted block divergence fault against {proposer}"),
+                            Err(err) => {
+                                warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
+                            }
+                        }
+                    }
                     continue;
                 }
             };
@@ -523,12 +546,14 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Action<()>> = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
             mempool.clone(),
             rx,
             build_evidence_action,
+            build_execution_fault_action,
             evidence_dir.clone(),
             [7u8; 32],
         );
@@ -571,12 +596,19 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        let build_execution_fault_action = Some(|_artifact: EvidenceArtifact| Action {
+            sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
+            nonce: 0,
+            signature: None,
+            payload: (),
+        });
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
             mempool.clone(),
             rx,
             build_evidence_action,
+            build_execution_fault_action,
             evidence_dir.clone(),
             [7u8; 32],
         );
@@ -600,6 +632,12 @@ mod tests {
 
         let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(matches!(artifact.fault, Fault::BlockDivergence { height: 5, .. }));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mempool.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "block divergence fault was never submitted to mempool");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real
@@ -634,12 +672,14 @@ mod tests {
             signature: None,
             payload: (),
         });
+        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Action<()>> = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
             mempool.clone(),
             rx,
             build_evidence_action,
+            build_execution_fault_action,
             evidence_dir.clone(),
             [7u8; 32],
         );

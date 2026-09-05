@@ -109,6 +109,20 @@ pub trait ChainRuntime: Send + Sync + 'static {
         nonce: u64,
     ) -> Option<Action<Self::Payload>>;
 
+    /// Builds the action that submits an `ActionDivergence`/`BlockDivergence`
+    /// evidence artifact for on-chain adjudication and slashing, or `None`
+    /// if this chain has no such adjudication path — in which case the node
+    /// still writes the artifact to disk but never auto-submits it.
+    /// CoreChain returns `Some` (see `ActionPayload::SubmitExecutionFault`);
+    /// `toy-chain` returns `None`.
+    fn build_execution_fault_action(
+        _artifact_json: String,
+        _sender: &Address,
+        _nonce: u64,
+    ) -> Option<Action<Self::Payload>> {
+        None
+    }
+
     /// Implements `arxd pair` / `arxd pair --revoke`: signs and submits this
     /// chain's operator-authorization action over HTTP. `seed`/`sender` are
     /// the validator's already-loaded signing key material (chain-agnostic,

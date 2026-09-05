@@ -25,7 +25,7 @@ use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{identity, spawn_p2p_node};
-use xc_artifact::DissentAttestation;
+use xc_artifact::{DissentAttestation, EvidenceArtifact};
 use xc_cli::{Cli, Command};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
@@ -453,6 +453,29 @@ fn spawn_subsystems<R: ChainRuntime>(
             action
         })
     });
+    // Same probe-once-at-startup pattern as `build_evidence_action` above,
+    // for `BlockDivergence` faults (see `ChainRuntime::build_execution_fault_action`).
+    let build_execution_fault_action = identity.as_ref().and_then(|(address, key)| {
+        R::build_execution_fault_action(String::new(), address, 0)?;
+
+        let address = address.clone();
+        let key = key.clone();
+        let db = db.clone();
+        Some(move |artifact: EvidenceArtifact| -> Action<R::Payload> {
+            let nonce = db
+                .get_account(&address)
+                .ok()
+                .flatten()
+                .map(|entry| entry.nonce)
+                .unwrap_or(0);
+            let artifact_json = serde_json::to_string(&artifact).expect("artifact always encodes");
+            let mut action = R::build_execution_fault_action(artifact_json, &address, nonce)
+                .expect("probed Some for this runtime at startup");
+            let signature = key.sign(&action.signing_bytes());
+            action.signature = Some(hex::encode(signature.to_bytes()));
+            action
+        })
+    });
     spawn_supervised(
         "evidence",
         spawn_evidence_watcher(
@@ -460,6 +483,7 @@ fn spawn_subsystems<R: ChainRuntime>(
             mempool.clone(),
             evidence_rx,
             build_evidence_action,
+            build_execution_fault_action,
             config.base_path.join(chain_name).join("evidence"),
             genesis_hash,
         ),

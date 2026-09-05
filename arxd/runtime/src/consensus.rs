@@ -78,6 +78,105 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     })
 }
 
+/// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
+/// artifact for adjudication and slashing — the counterpart to
+/// `submit_equivocation_evidence` for the two fault kinds that can't name a
+/// culprit from signatures/proofs alone and need chain-specific replay
+/// (`crate::adjudicate`) instead. `Fault::Equivocation` artifacts are
+/// rejected here — that kind goes through `SubmitEquivocationEvidence` with
+/// the real blocks, not a JSON artifact.
+///
+/// ponytail: `artifact.genesis_hash` isn't checked against this chain's
+/// real genesis — same open design question already deferred at
+/// `arxd/node/src/lib.rs:1057`; wire both together when that's resolved.
+pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
+    view: &V,
+    artifact_json: &str,
+    current_height: u64,
+    bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
+) -> anyhow::Result<BlockUpdates> {
+    let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json)
+        .map_err(|err| anyhow::anyhow!("malformed evidence artifact JSON: {err}"))?;
+
+    let (outcome, height, proposer_pubkey, voter_pubkey) = match &artifact.fault {
+        xc_artifact::Fault::ActionDivergence { proposer_pubkey, voter_pubkey, height, .. } => {
+            let outcome = crate::adjudicate::adjudicate_action_divergence(&artifact)
+                .map_err(|err| anyhow::anyhow!("adjudication failed: {err}"))?;
+            (outcome, *height, proposer_pubkey.clone(), voter_pubkey.clone())
+        }
+        xc_artifact::Fault::BlockDivergence { proposer_pubkey, voter_pubkey, height, .. } => {
+            let outcome = crate::adjudicate::adjudicate_block_divergence(&artifact)
+                .map_err(|err| anyhow::anyhow!("adjudication failed: {err}"))?;
+            (outcome, *height, proposer_pubkey.clone(), voter_pubkey.clone())
+        }
+        xc_artifact::Fault::Equivocation { .. } => {
+            anyhow::bail!(
+                "Equivocation evidence must be submitted via SubmitEquivocationEvidence, not SubmitExecutionFault"
+            );
+        }
+        // A plain signed assertion with no cryptographic culpability
+        // resolution — there is nothing for `adjudicate::*` to replay.
+        xc_artifact::Fault::ExecutionDisagreement { .. } => {
+            anyhow::bail!("ExecutionDisagreement has no on-chain adjudication path");
+        }
+    };
+
+    let culpable_pubkey = match outcome {
+        crate::adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey } => culpable_pubkey,
+        crate::adjudicate::AdjudicationOutcome::Disagreement { reason } => {
+            anyhow::bail!("adjudication could not name a culprit: {reason}");
+        }
+    };
+
+    // The proposer signs with their Ed25519 chain key, so their pubkey
+    // converts to an `Address` directly; the dissenting voter signs with
+    // their BLS finality key, which must instead be resolved to the
+    // `Address` it was registered under (`RegisterBlsKey`/`JoinValidator`) —
+    // there is no direct BLS-pubkey-to-`Address` derivation.
+    let culprit = if culpable_pubkey == proposer_pubkey {
+        let bytes = hex::decode(proposer_pubkey.strip_prefix("0x").unwrap_or(&proposer_pubkey))?;
+        Address::from_pubkey_bytes(&bytes)?
+    } else if culpable_pubkey == voter_pubkey {
+        let bytes = hex::decode(voter_pubkey.strip_prefix("0x").unwrap_or(&voter_pubkey))?;
+        let bytes: [u8; 48] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))?;
+        bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
+            .ok_or_else(|| anyhow::anyhow!("no registered owner for the culpable BLS pubkey"))?
+    } else {
+        anyhow::bail!("adjudicator named a pubkey that matches neither party in the artifact");
+    };
+
+    if view.get(&EvidenceMarkerKey { height, proposer: &culprit })?.is_some() {
+        anyhow::bail!("execution fault evidence for {culprit} at height {height} already processed");
+    }
+
+    let masters = view.get(&StakeByValidatorKey(&culprit))?.unwrap_or_default();
+    let master = masters
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{culprit} has no stake to slash for an execution fault"))?;
+    let allocation = view
+        .get(&StakeKey { master: &master, validator: &culprit })?
+        .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
+    let total = allocation.active_amount
+        + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+
+    let (accounts, stakes) = circuit_staking::apply_slash(
+        view,
+        &culprit,
+        xc_evidence::slash_amount(total),
+        circuit_staking::SlashReason::ExecutionFault,
+        current_height,
+    )?;
+    Ok(BlockUpdates {
+        accounts,
+        stakes,
+        evidence: Some(EvidenceMarker { height, proposer: culprit }),
+        ..Default::default()
+    })
+}
+
 /// Registers `validator`'s BLS pubkey for finality-certificate
 /// precommit voting (`arxd/finality`). Any address may be registered —
 /// the key is only meaningful once/if that address is also in the
