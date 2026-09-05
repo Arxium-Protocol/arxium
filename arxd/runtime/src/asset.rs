@@ -71,7 +71,7 @@ mod tests {
     use crate::{ActionPayload, ACTION_FEE};
     use std::collections::HashMap;
     use xc_primitives::Action;
-    use xc_storage::{BlockView, StorageError};
+    use xc_storage::BlockView;
 
     #[test]
     fn transfer_asset_fails_without_recipient_attestation_and_succeeds_after_grant() {
@@ -95,7 +95,6 @@ mod tests {
                 &operator_validators_lookup,
                 &[],
                 0,
-                &|_, _| Ok::<bool, StorageError>(false),
                 &no_bls_owner,
             )
         }

@@ -19,3 +19,4 @@ hex = { workspace = true }
 [dev-dependencies]
 circuit-account = { workspace = true }
 ed25519-dalek = { workspace = true }
+xc-circuit = { workspace = true }

@@ -204,7 +204,6 @@ mod tests {
     use crate::{ACTION_FEE, ActionPayload};
     use std::collections::HashMap;
     use xc_primitives::{Action, StakeAllocation};
-    use xc_storage::StorageError;
 
     #[test]
     fn leave_validator_rejected_when_sender_is_the_last_validator() {
@@ -225,7 +224,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         ) {
             Err(err) => err,
@@ -258,7 +256,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice.clone(), bob],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -292,7 +289,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -349,7 +345,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice.clone()],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -391,7 +386,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -424,7 +418,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -458,7 +451,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice.clone(), bob],
             5,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -529,7 +521,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice.clone(), bob],
             5,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -560,7 +551,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -596,7 +586,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -668,7 +657,6 @@ mod tests {
             &operator_validators_lookup,
             &[alice.clone(), bob.clone()],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -711,7 +699,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -755,7 +742,6 @@ mod tests {
                 &operator_validators_lookup,
                 &[],
                 10,
-                &|_, _| Ok::<bool, StorageError>(false),
                 &no_bls_owner,
             );
             assert!(
@@ -796,7 +782,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .expect("a well-formed join must succeed");

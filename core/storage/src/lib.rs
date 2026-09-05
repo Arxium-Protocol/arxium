@@ -12,9 +12,10 @@ use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey,
-    AttestorRecordKey, BlsKeyKey, GovernorKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey,
+    AttestorRecordKey, BlsKeyKey, EvidenceMarkerKey, GovernorKey, KeySpec, KvRead,
+    StakeByValidatorKey, StakeKey,
 };
-use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_META, CF_VALIDATORS};
+use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_META, CF_VALIDATORS};
 use xc_primitives::{
     stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation,
 };
@@ -68,8 +69,8 @@ pub enum StorageError {
 /// gated by `SCHEMA_VERSION` below rather than a runtime probe.
 const CF_MERKLE: &str = "merkle";
 
-const COLUMN_FAMILIES: [&str; 7] =
-    [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS];
+const COLUMN_FAMILIES: [&str; 8] =
+    [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS, CF_EVIDENCE];
 
 /// On-disk layout version this binary understands — covers column-family
 /// layout and key encoding (`cf_for_key`, `Block`'s bincode shape, etc; NOT
@@ -103,7 +104,15 @@ const COLUMN_FAMILIES: [&str; 7] =
 /// `GrantAttestation`/`RevokeAttestation`, so it has to be provable in the
 /// state root from the moment it becomes runtime-mutable, same "wipe and
 /// resync" policy as the prior two bumps.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// Bumped 4 -> 5 for two more `CF_META` rows joining the state trie: the
+/// asset registry record (`CF_ASSETS`, `asset_record:{id}` — previously
+/// `meta:asset:{id}`) whose `compliance_required` gates every transfer, and
+/// the evidence replay marker (`CF_EVIDENCE`, new CF) that gates whether a
+/// repeat slash for the same fault is allowed and that the proof-only
+/// adjudicator could not previously read at all. Same "wipe and resync"
+/// policy as the prior bumps — still no forward migration runner.
+pub const SCHEMA_VERSION: u32 = 5;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -117,7 +126,7 @@ const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
 /// tracked in the first place, since a raw key outside these four CFs was
 /// never inserted into `CF_MERKLE` to begin with.
 pub fn is_state_key(key: &[u8]) -> bool {
-    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS)
+    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS | CF_EVIDENCE)
 }
 
 /// Parses a `Block.state_root`-shaped string (`"0x"` + 64 hex chars, as
@@ -159,10 +168,12 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_BLOCKS
     } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
         CF_VALIDATORS
-    } else if key.starts_with(b"asset_balance:") {
+    } else if key.starts_with(b"asset_balance:") || key.starts_with(b"asset_record:") {
         CF_ASSETS
     } else if key.starts_with(b"attestor_record:") {
         CF_ATTESTORS
+    } else if key.starts_with(b"evidence:") {
+        CF_EVIDENCE
     } else if key.len() == 32 {
         CF_MERKLE
     } else {
@@ -293,8 +304,7 @@ impl ArxiumDb {
     /// `ActionPayload::SubmitEquivocationEvidence`, since the same pair of
     /// conflicting blocks could otherwise be resubmitted for a repeat slash.
     pub fn evidence_processed(&self, height: u64, proposer: &Address) -> Result<bool, StorageError> {
-        let key = format!("meta:evidence:{height:020}:{proposer}");
-        Ok(self.get(key.as_bytes())?.is_some())
+        Ok(self.get(&EvidenceMarkerKey { height, proposer }.encode())?.is_some())
     }
 
     /// A validator's *currently* registered BLS pubkey, if any — set via
@@ -1344,7 +1354,7 @@ pub struct EvidenceMarker {
 
 impl BatchWritable for EvidenceMarker {
     fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-        let key = format!("meta:evidence:{:020}:{}", self.height, self.proposer).into_bytes();
+        let key = EvidenceMarkerKey { height: self.height, proposer: &self.proposer }.encode();
         Ok(vec![(key, vec![1u8])])
     }
 }
@@ -1818,6 +1828,15 @@ impl<'a> BlockView<'a> {
             self.put(&AssetBalanceKey { asset_id, owner }, balance)?;
         }
         Ok(())
+    }
+
+    /// Folds a `RegisterAsset`/`IssueAsset` write into the view — see
+    /// `apply_attestor_registration` below for why this goes through the
+    /// view instead of a deferred `Vec`: without it, a same-block
+    /// `RegisterAsset` followed by `IssueAsset` or a duplicate
+    /// `RegisterAsset` reads stale (pre-block) state.
+    pub fn apply_asset_registration(&mut self, asset: &Asset) -> Result<(), StorageError> {
+        self.put(&AssetKey(&asset.asset_id), asset)
     }
 
     /// Folds a `RegisterAttestor` write into the view — see `put`/`delete`
@@ -2678,5 +2697,57 @@ mod merkle_state_root_tests {
         })
         .unwrap();
         assert_eq!(db.compute_state_root(&[]).unwrap(), before);
+    }
+
+    fn asset(id: &str, issuer: Address, compliance_required: bool) -> Asset {
+        Asset { asset_id: id.to_string(), issuer, compliance_required }
+    }
+
+    /// Stage 1A: registering an asset moves the state root (it's in
+    /// `CF_ASSETS` now, not `CF_META`), and registering the identical record
+    /// again is a no-op on the trie.
+    #[test]
+    fn registering_an_asset_moves_the_root_once_not_twice() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let before = db.compute_state_root(&[]).unwrap();
+
+        let gold = asset("gold", addr(1), true);
+        db.write_batch(&gold).unwrap();
+        let after_first = db.compute_state_root(&[]).unwrap();
+        assert_ne!(after_first, before);
+
+        db.write_batch(&gold).unwrap();
+        assert_eq!(db.compute_state_root(&[]).unwrap(), after_first);
+    }
+
+    /// `db.prove()` must produce a verifiable inclusion proof for the new
+    /// `asset_record:` key, same as any other merkleized key.
+    #[test]
+    fn an_asset_record_proves_and_verifies() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let gold = asset("gold", addr(1), true);
+        db.write_batch(&gold).unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let root_bytes = decode_root(&root).unwrap();
+
+        let key = format!("asset_record:{}", gold.asset_id).into_bytes();
+        let proof = db.prove(&key, &root).unwrap();
+        assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
+        assert_eq!(
+            proof.value,
+            Some(bincode::serde::encode_to_vec(&gold, bincode::config::standard()).unwrap())
+        );
+    }
+
+    /// An asset id whose `asset_record:{id}` key happens to total exactly 32
+    /// bytes must still resolve to `CF_ASSETS` via its explicit prefix arm,
+    /// not fall through to the `key.len() == 32` `CF_MERKLE` branch that
+    /// `cf_for_key` uses for raw trie-node hashes.
+    #[test]
+    fn a_32_byte_asset_record_key_still_routes_to_assets_not_merkle() {
+        // "asset_record:" is 13 bytes, so a 19-byte id makes a 32-byte key.
+        let id = "1234567890123456789";
+        assert_eq!(format!("asset_record:{id}").len(), 32);
+        assert_eq!(cf_for_key(format!("asset_record:{id}").as_bytes()), CF_ASSETS);
     }
 }

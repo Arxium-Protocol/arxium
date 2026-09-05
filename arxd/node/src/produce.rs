@@ -131,6 +131,12 @@ pub fn produce_block<R: ChainRuntime>(
         for deregistration in &attestor_deregistrations {
             overlay.push(deregistration);
         }
+        for asset in &asset_registrations {
+            overlay.push(asset);
+        }
+        for marker in &evidence_markers {
+            overlay.push(marker);
+        }
         overlay
     };
     // The denominator against which PoE cost must be judged: this rescans
@@ -499,9 +505,6 @@ mod tests {
                     operator_validators_lookup,
                     validators,
                     0,
-                    &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
-                        std::result::Result::Ok(false)
-                    },
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                 )
             },
@@ -639,9 +642,6 @@ mod tests {
                         dispatch(
                             action, view, operator_lookup,
                             operator_validators_lookup, vals, height,
-                            &|_, _| -> std::result::Result<bool, xc_storage::StorageError> {
-                                std::result::Result::Ok(false)
-                            },
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                         )
                     },

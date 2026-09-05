@@ -39,7 +39,7 @@ pub struct BlockUpdates {
     /// kept separate from `accounts` (the native token) so compliance gating
     /// never touches fees/staking. See `circuits/rwa-asset`.
     pub assets: AssetBalanceUpdates,
-    /// Set only by `RegisterAsset` — a new `meta:asset:{id}` registry entry.
+    /// Set only by `RegisterAsset` — a new `CF_ASSETS` (`asset_record:{id}`) registry entry.
     pub asset_registration: Option<Asset>,
     /// Set only by `RegisterAttestor` — a new `CF_ATTESTORS` entry.
     pub attestor_registration: Option<AttestorRegistration>,
@@ -517,15 +517,24 @@ where
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
-        // Unlike `asset_registrations` below, attestor-set membership lives
-        // in `CF_ATTESTORS` (merkleized, see `is_state_key`) rather than
-        // `CF_META` — it gates who may grant/revoke attestations, so it has
-        // to move the root the same way balances do.
+        // Attestor-set membership lives in `CF_ATTESTORS` (merkleized, see
+        // `is_state_key`) — it gates who may grant/revoke attestations, so
+        // it has to move the root the same way balances do.
         for registration in &attestor_registrations {
             overlay.push(registration);
         }
         for deregistration in &attestor_deregistrations {
             overlay.push(deregistration);
+        }
+        // Asset registry records (`CF_ASSETS`) gate the KYC check on every
+        // transfer, and evidence markers (`CF_EVIDENCE`) gate whether a
+        // repeat slash for the same fault is allowed — both must be provable
+        // in the state root for the same reason attestor membership is.
+        for asset in &asset_registrations {
+            overlay.push(asset);
+        }
+        for marker in &evidence_markers {
+            overlay.push(marker);
         }
         overlay
     };
@@ -713,6 +722,9 @@ where
                 operator_index_overlay.extend(updates.operator.operator_index);
                 asset_overlay.extend(updates.assets.0.clone());
                 view.apply_asset_balances(&updates.assets)?;
+                if let Some(registration) = &updates.asset_registration {
+                    view.apply_asset_registration(registration)?;
+                }
                 asset_registrations.extend(updates.asset_registration);
                 if let Some(registration) = &updates.attestor_registration {
                     view.apply_attestor_registration(registration)?;
@@ -771,6 +783,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+    use xc_circuit::{AssetKey, KvRead};
     use xc_primitives::{AccountEntry, StakeAllocation, expected_proposer};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -778,6 +791,8 @@ mod tests {
         Transfer { to: Address, amount: u128 },
         Join,
         Stake { validator: Address, amount: u128 },
+        RegisterAsset { id: String, compliance_required: bool },
+        IssueAsset { id: String },
     }
 
     fn dispatch(
@@ -814,6 +829,28 @@ mod tests {
                 )),
                 ..Default::default()
             }),
+            // Mirrors `arxd_runtime::asset::{register_asset, resolve_asset}`'s
+            // duplicate-check/lookup, without the private runtime code: what's
+            // under test here is whether a same-block registration is visible
+            // through `view`, not the registration logic itself.
+            TestPayload::RegisterAsset { id, compliance_required } => {
+                if view.get(&AssetKey(id))?.is_some() {
+                    anyhow::bail!("asset {id} already registered");
+                }
+                Ok(BlockUpdates {
+                    asset_registration: Some(Asset {
+                        asset_id: id.clone(),
+                        issuer: action.sender.clone(),
+                        compliance_required: *compliance_required,
+                    }),
+                    ..Default::default()
+                })
+            }
+            TestPayload::IssueAsset { id } => {
+                view.get(&AssetKey(id))?
+                    .ok_or_else(|| anyhow::anyhow!("asset {id} not registered"))?;
+                Ok(BlockUpdates::default())
+            }
         }
     }
 
@@ -1018,6 +1055,61 @@ mod tests {
 
         let bob_after = db.get_account(&bob).unwrap().unwrap();
         assert_eq!(bob_after.balance, 50);
+    }
+
+    fn signed_action(key: &SigningKey, sender: &Address, nonce: u64, payload: TestPayload) -> Action<TestPayload> {
+        let mut action = Action { sender: sender.clone(), nonce, signature: None, payload };
+        let signature = key.sign(&action.signing_bytes());
+        action.signature = Some(hex::encode(signature.to_bytes()));
+        action
+    }
+
+    /// Stage 1A: before routing `asset_registration` through `view`, a
+    /// same-block `RegisterAsset` followed by `IssueAsset` for the same id
+    /// would fail — `IssueAsset` resolved the asset through `view`, which
+    /// hadn't seen the pending registration yet (only the deferred `Vec`
+    /// had). This is the regression test for that fix.
+    #[test]
+    fn same_block_register_then_issue_asset_succeeds() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+
+        let actions = vec![
+            signed_action(&alice_key, &alice, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: true }),
+            signed_action(&alice_key, &alice, 1, TestPayload::IssueAsset { id: "gold".into() }),
+        ];
+
+        let (applied, ..) =
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+        assert_eq!(applied.len(), 2, "IssueAsset must see the same-block registration");
+    }
+
+    /// Stage 1A: two `RegisterAsset` for the same id in one block used to
+    /// both "succeed" (the duplicate check read through `view`, which
+    /// hadn't seen the first registration), letting the second silently
+    /// overwrite the first's `issuer`/`compliance_required` — an issuer
+    /// hijack inside a block window. Now the second is rejected and the
+    /// first's fields survive.
+    #[test]
+    fn same_block_duplicate_register_asset_second_rejected_first_survives() {
+        let db = temp_db();
+        let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let mallory_key = SigningKey::from_bytes(&[2u8; 32]);
+        let mallory = Address::from_pubkey_bytes(mallory_key.verifying_key().as_bytes()).unwrap();
+
+        let actions = vec![
+            signed_action(&alice_key, &alice, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: true }),
+            signed_action(&mallory_key, &mallory, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
+        ];
+
+        let (applied, .., asset_registrations, _attestor_registrations, _attestor_deregistrations, _touched_keys) =
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+        assert_eq!(applied.len(), 1, "the duplicate registration must be dropped");
+        assert_eq!(asset_registrations.len(), 1);
+        assert_eq!(asset_registrations[0].issuer, alice, "first registration's issuer must survive");
+        assert!(asset_registrations[0].compliance_required);
     }
 
     /// Part 3 Stage 1's `inter_action_roots` mode: bisection needs "the

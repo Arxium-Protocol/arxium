@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{EvidenceMarkerKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
@@ -35,7 +35,6 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     view: &V,
     block_a: &ChainBlock,
     block_b: &ChainBlock,
-    evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let evidence = xc_evidence::EquivocationEvidence {
@@ -44,7 +43,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     };
     let equivocator = xc_evidence::verify_equivocation(&evidence)
         .map_err(|err| anyhow::anyhow!("invalid equivocation evidence: {err}"))?;
-    if evidence_processed(block_a.height, &equivocator)? {
+    if view.get(&EvidenceMarkerKey { height: block_a.height, proposer: &equivocator })?.is_some() {
         anyhow::bail!(
             "equivocation evidence for {equivocator} at height {} already processed",
             block_a.height
@@ -171,7 +170,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -199,7 +197,9 @@ mod tests {
         let block_b = signed_chain_block(&key, 5, 200);
 
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::new(), HashMap::new());
+        let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
+        view.put(&EvidenceMarkerKey { height: 5, proposer: &equivocator }, &())
+            .unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -217,7 +217,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(true),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -247,7 +246,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -281,7 +279,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &owned_by_bob,
         )
         .unwrap_err();
@@ -312,7 +309,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &owned_by_self,
         )
         .expect("re-registering your own key should stay a no-op success");
@@ -341,7 +337,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();

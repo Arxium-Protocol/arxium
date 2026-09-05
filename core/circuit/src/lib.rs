@@ -22,6 +22,7 @@ pub const CF_ACCOUNTS: &str = "accounts";
 pub const CF_VALIDATORS: &str = "validators";
 pub const CF_ASSETS: &str = "assets";
 pub const CF_ATTESTORS: &str = "attestors";
+pub const CF_EVIDENCE: &str = "evidence";
 
 /// A typed storage key: which column family it lives in, what value it
 /// decodes to, and how to encode itself to the raw bytes RocksDB stores.
@@ -73,13 +74,15 @@ impl KeySpec for BlsKeyKey<'_> {
 }
 
 /// The registry record for a regulated asset — `issuer`/`compliance_required`,
-/// not its balances (see `AssetBalanceKey`).
+/// not its balances (see `AssetBalanceKey`). Lives in `CF_ASSETS` (included in
+/// `is_state_key`) so `compliance_required` is merkleized and provable to a
+/// light client instead of sitting in `CF_META`.
 pub struct AssetKey<'a>(pub &'a str);
 impl KeySpec for AssetKey<'_> {
-    const CF: &'static str = CF_META;
+    const CF: &'static str = CF_ASSETS;
     type Value = Asset;
     fn encode(&self) -> Vec<u8> {
-        format!("meta:asset:{}", self.0).into_bytes()
+        format!("asset_record:{}", self.0).into_bytes()
     }
 }
 
@@ -100,14 +103,12 @@ impl KeySpec for AssetBalanceKey<'_> {
 
 /// Every registered asset id, as one list.
 ///
-/// A maintained index rather than a prefix scan over `meta:asset:`, for the
+/// A maintained index rather than a prefix scan over `asset_record:`, for the
 /// same reason `meta:operator_index:` exists: listing is a read path and the
 /// codebase resolves column families by key *prefix* (`cf_for_key`), not by
-/// `KeySpec::CF`. `meta:asset:{id}` is 11 bytes plus the id, so a 21-byte
-/// asset id lands on the `key.len() == 32` arm and is filed under `CF_MERKLE`
-/// instead of `CF_META`. It still round-trips — reads take the same arm — but
-/// a scan of `CF_META` would silently skip exactly those assets. An index has
-/// no such hole, and is a single read besides.
+/// `KeySpec::CF`. An index is a single read regardless, and this one lives in
+/// `CF_META` since nothing dispatches on it (see `AssetIndexKey`'s exclusion
+/// from `is_state_key`).
 pub struct AssetIndexKey;
 impl KeySpec for AssetIndexKey {
     const CF: &'static str = CF_META;
@@ -147,6 +148,35 @@ impl KeySpec for AttestorRecordKey<'_> {
     type Value = AttestorRecord;
     fn encode(&self) -> Vec<u8> {
         format!("attestor_record:{}", self.0).into_bytes()
+    }
+}
+
+/// Replay-protection marker for a slashed equivocation/fault at `height` by
+/// `proposer` — `CF_EVIDENCE`, included in `is_state_key`, so the
+/// proof-only adjudicator can read it through `KvRead` like everything else
+/// instead of needing a fail-closed stub. Zero-padded height preserves
+/// lexicographic range-scan order.
+pub struct EvidenceMarkerKey<'a> {
+    pub height: u64,
+    pub proposer: &'a Address,
+}
+impl KeySpec for EvidenceMarkerKey<'_> {
+    const CF: &'static str = CF_EVIDENCE;
+    type Value = ();
+    fn encode(&self) -> Vec<u8> {
+        format!("evidence:{:020}:{}", self.height, self.proposer).into_bytes()
+    }
+}
+
+/// This chain's genesis hash, seeded once at genesis — reuses `CF_EVIDENCE`
+/// so it is merkleized and provable, letting `dispatch` check a submitted
+/// fault artifact's `genesis_hash` against the chain it's actually running on.
+pub struct GenesisHashKey;
+impl KeySpec for GenesisHashKey {
+    const CF: &'static str = CF_EVIDENCE;
+    type Value = String;
+    fn encode(&self) -> Vec<u8> {
+        b"evidence:genesis_hash".to_vec()
     }
 }
 

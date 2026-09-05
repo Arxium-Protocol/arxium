@@ -35,7 +35,7 @@ pub enum RwaError {
 /// equal `asset.issuer` — issuance is self-minting, not a transfer of
 /// existing supply. `asset` is caller-resolved (not looked up here) so this
 /// stays agnostic to whether the caller backs it with a real registry
-/// (`arxd/runtime`'s `RegisterAsset`/`meta:asset:{id}`) or a fixed in-memory
+/// (`arxd/runtime`'s `RegisterAsset`/`asset_record:{id}`) or a fixed in-memory
 /// one (`examples/toy-chain`, which has no registry at all).
 ///
 /// Mints into `AssetBalanceKey`, not `AccountEntry.balance` — that's the

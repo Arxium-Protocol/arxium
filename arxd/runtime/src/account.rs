@@ -101,7 +101,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -135,7 +134,6 @@ mod tests {
             &operator_validators_lookup_after,
             &[],
             10,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();

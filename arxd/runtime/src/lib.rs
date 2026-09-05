@@ -249,7 +249,6 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             ctx.operator_validators_lookup,
             ctx.validators,
             ctx.height,
-            &|h, p| ctx.db.evidence_processed(h, p),
             &|pk: &BlsPublicKey| ctx.db.bls_pubkey_owner(pk),
         )
     }
@@ -385,7 +384,6 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
     current_height: u64,
-    evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
     let mut updates = dispatch_inner(
@@ -395,7 +393,6 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
         operator_validators_lookup,
         validators,
         current_height,
-        evidence_processed,
         bls_pubkey_owner_lookup,
     )?;
     charge_action_fee(action, view, &mut updates)?;
@@ -436,7 +433,6 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
     operator_validators_lookup: &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     validators: &[Address],
     current_height: u64,
-    evidence_processed: &dyn Fn(u64, &Address) -> Result<bool, StorageError>,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
@@ -466,13 +462,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             staking::unstake(view, action, validator, *amount, current_height)
         }
         ActionPayload::SubmitEquivocationEvidence { block_a, block_b } => {
-            consensus::submit_equivocation_evidence(
-                view,
-                block_a,
-                block_b,
-                evidence_processed,
-                current_height,
-            )
+            consensus::submit_equivocation_evidence(view, block_a, block_b, current_height)
         }
         ActionPayload::RegisterBlsKey { validator, pubkey } => consensus::register_bls_key(
             action,

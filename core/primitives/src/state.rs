@@ -116,10 +116,12 @@ pub enum ValidatorChange {
 }
 
 /// A registered regulated asset (`ActionPayload::RegisterAsset`) — the
-/// record lives in `CF_META` (`meta:asset:{asset_id}`), separate from its
-/// balances (`CF_ASSETS`, one entry per `(asset_id, owner)`), which is what
-/// makes asset issuance/transfer a compliance-gated overlay on top of the
-/// native token rather than a replacement for it.
+/// record lives in `CF_ASSETS` (`asset_record:{asset_id}`), separate from its
+/// balances (also `CF_ASSETS`, one entry per `(asset_id, owner)`), which is
+/// what makes asset issuance/transfer a compliance-gated overlay on top of the
+/// native token rather than a replacement for it. Merkleized like balances,
+/// since `compliance_required` gates every transfer and must be provable in
+/// the state root, not just agreed on by full nodes reading local state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Asset {
     pub asset_id: String,
@@ -128,12 +130,10 @@ pub struct Asset {
 }
 
 /// A registered KYC provider (`ActionPayload::RegisterAttestor`) — the
-/// Trust Spectrum's multi-attestor model. Lives in `CF_ATTESTORS`, which
-/// (unlike `Asset`'s `CF_META` registry record) *is* merkleized: whether an
-/// address belongs to the trusted-attestor set gates every
-/// `GrantAttestation`/`RevokeAttestation`, so membership must be provable in
-/// the state root the same way balances are, not just agreed on by
-/// full nodes reading `CF_META`.
+/// Trust Spectrum's multi-attestor model. Lives in `CF_ATTESTORS`, which is
+/// merkleized: whether an address belongs to the trusted-attestor set gates
+/// every `GrantAttestation`/`RevokeAttestation`, so membership must be
+/// provable in the state root the same way balances are.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestorRecord {
     pub name: String,

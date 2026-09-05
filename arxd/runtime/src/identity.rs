@@ -182,7 +182,6 @@ mod tests {
     use ark_serialize::CanonicalSerialize;
     use std::collections::HashMap;
     use xc_primitives::{Action, Address};
-    use xc_storage::StorageError;
 
     #[test]
     fn grant_attestation_then_verify_identity_credential_succeeds_end_to_end() {
@@ -221,7 +220,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -246,7 +244,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -291,7 +288,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap();
@@ -327,7 +323,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();
@@ -373,7 +368,6 @@ mod tests {
             &operator_validators_lookup,
             &[],
             0,
-            &|_, _| Ok::<bool, StorageError>(false),
             &no_bls_owner,
         )
         .unwrap_err();

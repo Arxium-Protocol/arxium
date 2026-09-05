@@ -5190,6 +5190,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "xc-bls",
+ "xc-circuit",
  "xc-poe",
  "xc-primitives",
  "xc-storage",

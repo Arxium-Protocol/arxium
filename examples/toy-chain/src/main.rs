@@ -24,7 +24,7 @@ use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
 /// toy-chain has no `RegisterAsset` action or registry — there is exactly
 /// one implicit asset, constructed fresh on every dispatch rather than
 /// looked up. `circuits/rwa-asset` takes a caller-resolved `&Asset` for
-/// exactly this reason: CoreChain backs it with a real `meta:asset:{id}`
+/// exactly this reason: CoreChain backs it with a real `asset_record:{id}`
 /// registry, toy-chain doesn't need one.
 fn toy_asset(issuer: &Address) -> Asset {
     Asset { asset_id: "toy".into(), issuer: issuer.clone(), compliance_required: true }

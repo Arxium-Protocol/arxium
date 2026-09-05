@@ -202,7 +202,6 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
 
     let fail_closed = |_: &Address| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
     let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
-    let fail_closed_evidence = |_: u64, _: &Address| -> Result<bool, StorageError> { Err(StorageError::UnprovenRead) };
     let fail_closed_bls =
         |_: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
 
@@ -222,7 +221,6 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
             &fail_closed_list,
             &[],
             *height,
-            &fail_closed_evidence,
             &fail_closed_bls,
         );
         trie = view.trie;
@@ -329,7 +327,6 @@ fn replay(action: &arxd_runtime::ChainAction, claim: &ActionClaim, height: u64) 
 
     let fail_closed = |_: &Address| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
     let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
-    let fail_closed_evidence = |_: u64, _: &Address| -> Result<bool, StorageError> { Err(StorageError::UnprovenRead) };
     let fail_closed_bls =
         |_: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
 
@@ -340,7 +337,6 @@ fn replay(action: &arxd_runtime::ChainAction, claim: &ActionClaim, height: u64) 
         &fail_closed_list,
         &[],
         height,
-        &fail_closed_evidence,
         &fail_closed_bls,
     );
 
@@ -490,10 +486,6 @@ mod tests {
     fn no_operator_validators(_: &Address) -> Result<Vec<Address>, StorageError> {
         Ok(Vec::new())
     }
-    fn evidence_never_processed(_: u64, _: &Address) -> Result<bool, StorageError> {
-        Ok(false)
-    }
-
     /// Builds a real `Transfer` dispute: alice sends bob 40, funded via a
     /// real `ArxiumDb` so the proofs and roots are genuine, not hand-waved.
     /// `dissent_amount` lets a test claim the dissenter computed a
@@ -532,7 +524,6 @@ mod tests {
             &no_operator_validators,
             &[],
             0,
-            &evidence_never_processed,
             &no_bls_owner,
         )
         .unwrap();
@@ -563,7 +554,6 @@ mod tests {
             &no_operator_validators,
             &[],
             0,
-            &evidence_never_processed,
             &no_bls_owner,
         )
         .unwrap();
@@ -752,7 +742,6 @@ mod tests {
             &no_operator_validators,
             &[],
             5,
-            &evidence_never_processed,
             &no_bls_owner,
         )
         .unwrap();
@@ -780,7 +769,6 @@ mod tests {
             &no_operator_validators,
             &[],
             5,
-            &evidence_never_processed,
             &no_bls_owner,
         )
         .unwrap();
