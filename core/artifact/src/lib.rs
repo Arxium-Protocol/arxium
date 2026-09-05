@@ -585,7 +585,7 @@ fn default_hashes() -> &'static [[u8; 32]; 257] {
 /// raw bytes. Expands `siblings_bitmap` + `siblings` back to the full
 /// 256-entry array (defaults filled in from `default_hashes()`) before
 /// running the same root computation as before compression existed.
-fn verify_state_proof(root: [u8; 32], proof: &StateProof) -> Result<(), VerifyError> {
+pub fn verify_state_proof(root: [u8; 32], proof: &StateProof) -> Result<(), VerifyError> {
     let key_hash = decode_hex_32("key_hash", &proof.key_hash)?;
     let bitmap = decode_hex_32("siblings_bitmap", &proof.siblings_bitmap)?;
     let defaults = default_hashes();

@@ -573,6 +573,40 @@ mod tests {
         }
     }
 
+    /// The bitmap convention (`255 - level`, `7 - level % 8`) is duplicated
+    /// three times — `xc_poe::InclusionProof::compress`, this module's
+    /// `decode_proofs`, and `xc_artifact::verify_state_proof` — because
+    /// `core/artifact` deliberately can't depend on `xc_poe`. Nothing else
+    /// pins them together: if one drifts, a proof compresses one way and
+    /// expands another, `core/artifact`'s verifier and the on-chain decoder
+    /// disagree on who's guilty, and that's exactly the externally
+    /// unverifiable attribution this product exists to preclude. This test
+    /// compresses a real proof once and checks both independent expansion
+    /// paths reproduce it.
+    #[test]
+    fn the_three_bitmap_expansions_agree_with_each_other() {
+        let db = temp_db();
+        let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(alice.clone(), entry(500))])))
+            .unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let alice_key = format!("account:{alice}").into_bytes();
+        let raw_proof = db.prove(&alice_key, &root).unwrap();
+        let state_proof = hex_proof(raw_proof.clone());
+
+        let expanded = decode_proofs(std::slice::from_ref(&state_proof)).unwrap();
+        assert_eq!(
+            expanded[0].siblings, raw_proof.siblings,
+            "arxd-runtime's decode_proofs must expand a compressed proof back to the exact \
+             siblings xc_poe::compress started from"
+        );
+
+        let root_bytes: [u8; 32] =
+            hex::decode(root.strip_prefix("0x").unwrap()).unwrap().try_into().unwrap();
+        xc_artifact::verify_state_proof(root_bytes, &state_proof)
+            .expect("xc_artifact::verify_state_proof must accept the same compressed proof against the real root");
+    }
+
     fn no_bls_owner(_: &xc_bls::BlsPublicKey) -> Result<Option<Address>, StorageError> {
         Ok(None)
     }
