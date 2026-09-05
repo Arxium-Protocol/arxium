@@ -174,6 +174,33 @@ pub mod state_trie {
         pub siblings: Vec<[u8; 32]>,
     }
 
+    impl InclusionProof {
+        /// Reduces the 256 always-present siblings to a 256-bit bitmap plus
+        /// just the siblings that aren't the empty-subtree default for
+        /// their depth. A real trie is astronomically sparse, so almost
+        /// every level's sibling subtree is empty by construction — and
+        /// `default_hashes` already knows exactly which hash that is at
+        /// every depth, so there's no reason to spend 32 bytes repeating it
+        /// up to 256 times per proof. Wire callers (`arxd/node`'s
+        /// `BlockDivergence` evidence path, `core/artifact`'s `StateProof`)
+        /// use this instead of carrying `siblings` raw. Returns `(bitmap,
+        /// non_default_siblings)`; bit `level` set means `siblings[level]`
+        /// is real and present in `non_default_siblings`, in level order.
+        pub fn compress(&self) -> ([u8; 32], Vec<[u8; 32]>) {
+            debug_assert_eq!(self.siblings.len(), 256);
+            let defaults = default_hashes();
+            let mut bitmap = [0u8; 32];
+            let mut non_default = Vec::new();
+            for (level, sibling) in self.siblings.iter().enumerate() {
+                if *sibling != defaults[255 - level] {
+                    bitmap[level / 8] |= 1 << (7 - level % 8);
+                    non_default.push(*sibling);
+                }
+            }
+            (bitmap, non_default)
+        }
+    }
+
     /// Recomputes the root `proof` implies and checks it equals `root`. A
     /// sparse Merkle tree proves absence the same way it proves presence: a
     /// `None` value just means the path is expected to bottom out at the

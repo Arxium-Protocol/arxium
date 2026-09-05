@@ -827,14 +827,17 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         touched_keys
                                             .iter()
                                             .map(|key| {
-                                                db.prove(key, &parent_state_root).map(|proof| xc_artifact::StateProof {
-                                                    key_hash: format!("0x{}", hex::encode(proof.key_hash)),
-                                                    value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
-                                                    siblings: proof
-                                                        .siblings
-                                                        .iter()
-                                                        .map(|s| format!("0x{}", hex::encode(s)))
-                                                        .collect(),
+                                                db.prove(key, &parent_state_root).map(|proof| {
+                                                    let (bitmap, non_default) = proof.compress();
+                                                    xc_artifact::StateProof {
+                                                        key_hash: format!("0x{}", hex::encode(proof.key_hash)),
+                                                        value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
+                                                        siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
+                                                        siblings: non_default
+                                                            .iter()
+                                                            .map(|s| format!("0x{}", hex::encode(s)))
+                                                            .collect(),
+                                                    }
                                                 })
                                             })
                                             .collect();

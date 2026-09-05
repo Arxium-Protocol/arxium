@@ -30,6 +30,8 @@
 //! thing the verdict is about. If a field is load-bearing for a verdict and
 //! isn't recomputable, the signing payload needs to change so it is.
 
+use std::sync::OnceLock;
+
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -267,7 +269,20 @@ pub struct StateProof {
     pub key_hash: String,
     /// `None` = a non-inclusion proof (the key is proven absent).
     pub value: Option<String>,
-    /// 256 hex-encoded (`0x...`) 32-byte siblings, root-to-leaf order.
+    /// Hex-encoded (`0x...`) 256-bit bitmap: bit `level` set means
+    /// `siblings` carries a real (non-default) hash for that level; unset
+    /// means that level's sibling subtree is empty and the hash is the
+    /// canonical default for its depth, reconstructed from this crate's own
+    /// `default_hashes()` instead of carried on the wire. A real trie is
+    /// astronomically sparse, so almost every level is default — this takes
+    /// an ordinary proof from 256 x 32 bytes to a 32-byte bitmap plus a
+    /// handful of real siblings (see `xc_poe::state_trie::InclusionProof::compress`,
+    /// which this mirrors without depending on that crate — see this
+    /// struct's doc comment above). Breaking wire change: a `StateProof`
+    /// from before this field existed cannot be read as one after.
+    pub siblings_bitmap: String,
+    /// Only the non-default siblings, root-to-leaf (level) order — one
+    /// entry per bit set in `siblings_bitmap`, in ascending level order.
     pub siblings: Vec<String>,
 }
 
@@ -547,25 +562,58 @@ pub fn sibling_bit_at(hash: &[u8; 32], level: usize) -> u8 {
     (hash[level / 8] >> (7 - level % 8)) & 1
 }
 
+/// The empty-subtree hash at each of the 256 depths, `defaults[0]` being an
+/// empty leaf and `defaults[256]` the empty-trie root — must stay
+/// byte-for-byte identical to `xc_poe::state_trie::default_hashes()`, same
+/// duplication rationale as `sibling_leaf_hash`/`sibling_internal_hash`
+/// above (see `StateProof`'s doc comment). Used to reconstruct the siblings
+/// a compressed [`StateProof`] omits.
+fn default_hashes() -> &'static [[u8; 32]; 257] {
+    static DEFAULTS: OnceLock<[[u8; 32]; 257]> = OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let mut table = [[0u8; 32]; 257];
+        for depth in 1..=256 {
+            table[depth] = sibling_internal_hash(&table[depth - 1], &table[depth - 1]);
+        }
+        table
+    })
+}
+
 /// Recomputes the root a [`StateProof`] implies and checks it equals
 /// `root` — the same check as `xc_poe::state_trie::verify_proof`, just
-/// operating on this crate's hex-encoded wire shape instead of raw bytes.
+/// operating on this crate's hex-encoded, compressed wire shape instead of
+/// raw bytes. Expands `siblings_bitmap` + `siblings` back to the full
+/// 256-entry array (defaults filled in from `default_hashes()`) before
+/// running the same root computation as before compression existed.
 fn verify_state_proof(root: [u8; 32], proof: &StateProof) -> Result<(), VerifyError> {
-    if proof.siblings.len() != 256 {
+    let key_hash = decode_hex_32("key_hash", &proof.key_hash)?;
+    let bitmap = decode_hex_32("siblings_bitmap", &proof.siblings_bitmap)?;
+    let defaults = default_hashes();
+    let mut non_default = proof.siblings.iter();
+    let mut siblings = [[0u8; 32]; 256];
+    for (level, slot) in siblings.iter_mut().enumerate() {
+        *slot = if (bitmap[level / 8] >> (7 - level % 8)) & 1 == 1 {
+            decode_hex_32("proof sibling", non_default.next().ok_or(VerifyError::BadProofShape)?)?
+        } else {
+            defaults[255 - level]
+        };
+    }
+    if non_default.next().is_some() {
+        // More siblings than bits set in the bitmap — malformed, not just
+        // sparse.
         return Err(VerifyError::BadProofShape);
     }
-    let key_hash = decode_hex_32("key_hash", &proof.key_hash)?;
+
     let mut current = match &proof.value {
         Some(value) => sibling_leaf_hash(&key_hash, &decode_hex("proof value", value)?),
-        // The all-zero 32-byte sentinel, matching `xc_poe::state_trie`'s
-        // `default_hashes()[0]` — a leaf hash can never legitimately equal
-        // it (it's the output of a hash function, astronomically unlikely
-        // to land on all-zero), so this is safe to hardcode rather than
-        // recomputing the 257-entry default table just for index 0.
+        // The all-zero 32-byte sentinel, matching `default_hashes()[0]` — a
+        // leaf hash can never legitimately equal it (it's the output of a
+        // hash function, astronomically unlikely to land on all-zero), so
+        // this is safe to hardcode rather than indexing the table for it.
         None => [0u8; 32],
     };
     for level in (0..256).rev() {
-        let sibling = decode_hex_32("proof sibling", &proof.siblings[level])?;
+        let sibling = siblings[level];
         let (left, right) =
             if sibling_bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
         current = sibling_internal_hash(&left, &right);
@@ -1193,24 +1241,19 @@ mod tests {
     mod action_divergence {
         use super::*;
 
-        pub(super) fn default_hashes_for_tests() -> [[u8; 32]; 257] {
-            let mut table = [[0u8; 32]; 257];
-            for depth in 1..=256 {
-                table[depth] = sibling_internal_hash(&table[depth - 1], &table[depth - 1]);
-            }
-            table
-        }
-
         pub(super) fn empty_trie_root() -> [u8; 32] {
-            default_hashes_for_tests()[256]
+            default_hashes()[256]
         }
 
+        /// A fully-default proof (an empty trie has no non-default
+        /// siblings anywhere) — the degenerate case for the compressed
+        /// `StateProof` shape: an all-zero bitmap and an empty `siblings`.
         pub(super) fn empty_trie_state_proof(key_hash: [u8; 32]) -> StateProof {
-            let defaults = default_hashes_for_tests();
             StateProof {
                 key_hash: format!("0x{}", hex::encode(key_hash)),
                 value: None,
-                siblings: (0..256).map(|level| format!("0x{}", hex::encode(defaults[255 - level]))).collect(),
+                siblings_bitmap: format!("0x{}", hex::encode([0u8; 32])),
+                siblings: Vec::new(),
             }
         }
 
@@ -1218,7 +1261,7 @@ mod tests {
         /// `key_hash` — every sibling on the path is the untouched default,
         /// same hand-computation `xc_poe::state_trie`'s own tests use.
         pub(super) fn root_after_writing(key_hash: [u8; 32], value: &[u8]) -> [u8; 32] {
-            let defaults = default_hashes_for_tests();
+            let defaults = default_hashes();
             let mut current = sibling_leaf_hash(&key_hash, value);
             for level in (0..256).rev() {
                 let sibling = defaults[255 - level];
@@ -1435,7 +1478,10 @@ mod tests {
             let pre = empty_trie_root();
 
             let mut bad_proof = empty_trie_state_proof(key);
-            bad_proof.siblings[0] = format!("0x{}", hex::encode([0xFFu8; 32]));
+            let mut bitmap0 = [0u8; 32];
+            bitmap0[0] = 0x80;
+            bad_proof.siblings_bitmap = format!("0x{}", hex::encode(bitmap0));
+            bad_proof.siblings = vec![format!("0x{}", hex::encode([0xFFu8; 32]))];
 
             let proposed = claim(
                 &fx, pre, root_after_writing(key, b"x"),
@@ -1647,7 +1693,10 @@ mod tests {
             let parent = empty_trie_root();
 
             let mut bad_proof = empty_trie_state_proof(key);
-            bad_proof.siblings[0] = format!("0x{}", hex::encode([0xFFu8; 32]));
+            let mut bitmap0 = [0u8; 32];
+            bitmap0[0] = 0x80;
+            bad_proof.siblings_bitmap = format!("0x{}", hex::encode(bitmap0));
+            bad_proof.siblings = vec![format!("0x{}", hex::encode([0xFFu8; 32]))];
 
             let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
             let attestation = block_attestation(&fx, header.clone());

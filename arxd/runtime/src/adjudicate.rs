@@ -336,7 +336,12 @@ fn decode_root(root: &str) -> Result<[u8; 32], AdjudicateError> {
     bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(root.to_string()))
 }
 
+/// Expands a compressed [`StateProof`] (`siblings_bitmap` + only the
+/// non-default `siblings`) back to `xc_poe`'s full 256-entry shape, filling
+/// in the defaults `StateProof::compress` omitted. See that method's doc
+/// comment and Implementation_log_2026-09-05.md #4.
 fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, AdjudicateError> {
+    let defaults = xc_poe::state_trie::default_hashes();
     proofs
         .iter()
         .map(|p| {
@@ -344,14 +349,28 @@ fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, Adjudicat
             let key_hash: [u8; 32] =
                 key_hash.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(p.key_hash.clone()))?;
             let value = p.value.as_deref().map(|v| hex::decode(v.strip_prefix("0x").unwrap_or(v))).transpose()?;
-            let siblings = p
-                .siblings
-                .iter()
-                .map(|s| {
+
+            let bitmap = hex::decode(p.siblings_bitmap.strip_prefix("0x").unwrap_or(&p.siblings_bitmap))?;
+            let bitmap: [u8; 32] =
+                bitmap.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(p.siblings_bitmap.clone()))?;
+            let mut non_default = p.siblings.iter();
+            let mut siblings = Vec::with_capacity(256);
+            for level in 0..256 {
+                let sibling = if (bitmap[level / 8] >> (7 - level % 8)) & 1 == 1 {
+                    let s = non_default
+                        .next()
+                        .ok_or_else(|| AdjudicateError::BadRoot(p.siblings_bitmap.clone()))?;
                     let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
-                    bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(s.clone()))
-                })
-                .collect::<Result<Vec<[u8; 32]>, AdjudicateError>>()?;
+                    bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(s.clone()))?
+                } else {
+                    defaults[255 - level]
+                };
+                siblings.push(sibling);
+            }
+            if non_default.next().is_some() {
+                return Err(AdjudicateError::BadRoot(p.siblings_bitmap.clone()));
+            }
+
             Ok(InclusionProof { key_hash, value, siblings })
         })
         .collect()
@@ -545,10 +564,12 @@ mod tests {
     }
 
     fn hex_proof(proof: xc_poe::state_trie::InclusionProof) -> StateProof {
+        let (bitmap, non_default) = proof.compress();
         StateProof {
             key_hash: format!("0x{}", hex::encode(proof.key_hash)),
             value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
-            siblings: proof.siblings.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
+            siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
+            siblings: non_default.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
         }
     }
 
