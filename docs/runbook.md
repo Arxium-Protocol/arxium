@@ -510,43 +510,65 @@ extra RPC probing on a handful of runs to pin down what's actually
 happening. Two distinct, non-overlapping failure shapes showed up, plus one
 clean pass that wasn't a real test of anything:
 
-- **Asymmetric stall, no crash (1 run, not yet reproduced cleanly since):**
-  2 of 3 honest nodes stuck at tip height 4 exactly as in the n=2 case, the
-  3rd reached height 11, zero panics in any of the four logs. A first pass
-  at this called it "a sync/gossip convergence gap" — that was premature. A
-  reviewer correctly pushed back: this protocol isn't continuous-quorum BFT
-  (`core/executor/src/lib.rs:420-442` only requires a quorum-backed
-  `RoundCertificate` at the *specific height* where a round advances past 0;
-  every later height is unilateral re-execution, needing no live quorum at
-  all), so "1 node needs 3 live co-signers at every height 5-11" is not the
-  right model and doesn't by itself prove something is broken — but it also
-  means the 2-stuck-1-advanced split has no confirmed explanation yet in
-  either direction. It has not been reproduced again since (see below), so
-  it remains open and should be treated as an unresolved anomaly, not
-  written off.
-- **Symmetric stall, caused by a crash (reproduced multiple times):** a
+- **Asymmetric stall, no crash logged (1 run, likely not a distinct bug —
+  see below).** 2 of 3 honest nodes logged "stuck at tip height 4" exactly
+  as in the n=2 case, the 3rd reached height 11, zero panics in any of the
+  four logs. A first pass called this "a sync/gossip convergence gap" —
+  premature, and a reviewer correctly pushed back twice on it, each time
+  cheaply and correctly:
+  - First, on the arithmetic: this protocol isn't continuous-quorum BFT.
+    `core/executor/src/lib.rs:420-442` only requires a quorum-backed
+    `RoundCertificate` at the *specific height* a round advances past 0;
+    every later height is unilateral re-execution needing no live quorum. So
+    "1 node needs 3 live co-signers at every height 5-11" was never the
+    right model — that argument doesn't hold, in either direction.
+  - Second, on what "stuck" actually means: the log line is
+    `arxd/network/src/lib.rs:758`, and reading its surrounding code shows
+    it's explicitly per-peer, not per-node — `"giving up on {peer} until it
+    reconnects or another peer reports progress"`. A node that gives up on
+    one peer can still advance via a different peer or its own production.
+    Confirmed this live: in one run a node logged "stuck at 4" early on and
+    the harness's own default 58s `CHAIN_TIMEOUT` later reported it at
+    height 10 (one short of the target) — i.e. it had recovered and kept
+    going well past the point its log made it look permanently wedged.
+    That makes the original 2-stuck-1-advanced result far less likely to be
+    a distinct bug: it's the more mundane explanation that a fixed,
+    short test timeout caught two recovering nodes mid-recovery, not that
+    they were stuck forever. Not fully proven (never reproduced the exact
+    original case again to confirm those two specific nodes would have
+    caught up given more time), but enough to stop calling this an open
+    anomaly needing a separate fix.
+- **Symmetric stall, caused by a crash (reproduced multiple times, and now
+  root-caused to the actual assertion, not guessed at).** A
   `libp2p-request-response-0.29.0` internal panic
   (`assertion left == right failed`, `lib.rs:678`) kills the networking task
   on whichever node it hits — including, in one run, node 0 itself within
   milliseconds of startup, before it ever got to propose anything, and in
   another, an honest node partway through the run. When it takes out one
   honest node's networking, the remaining live honest count drops to 2,
-  below `quorum(4) = 3`, and everyone left standing stalls permanently —
-  which is a real, arithmetic-grounded liveness failure, just one caused by
-  a crash rather than by anything in the finality logic. This appears to be
-  a previously-latent bug in the p2p dependency that the original two-node
-  harness never had enough connection churn to trip; it now fires often
-  enough (several times across ~15 runs, at unpredictable points including
-  immediately at startup) that it dominates most n=4 attempts and makes
-  repeated runs unreliable. Likely root cause, not yet fixed or deeply
-  verified: `arxd/network/src/lib.rs:592-597` drops a sync request's
-  `ResponseChannel` on a decode failure via `continue` without ever calling
-  the library's own response/cancel API on it — exactly the kind of
-  unacknowledged channel that could desync `libp2p-request-response`'s
-  internal per-connection bookkeeping. `bad6330` (the wire-size-limit commit)
-  made that decode-failure path newly reachable in practice, ahead of when
-  this panic started showing up — worth checking as the trigger before
-  looking elsewhere.
+  below `quorum(4) = 3`, and everyone left standing stalls for the rest of
+  the run — a real, arithmetic-grounded liveness failure, just one caused by
+  a crash rather than by anything in the finality logic. It fires often
+  enough (multiple times across ~25 runs total, at unpredictable points
+  including immediately at startup) to dominate most n=4 attempts.
+  Captured a full `RUST_BACKTRACE=full` of it: the panic is inside
+  `libp2p_request_response::Behaviour::on_connection_closed`, called
+  directly from an ordinary `SwarmEvent::ConnectionClosed` — i.e. entirely
+  inside the upstream library's own per-connection bookkeeping, triggered by
+  a plain disconnect. **This retracts the earlier guess** that
+  `arxd/network/src/lib.rs:592-597`'s dropped `ResponseChannel` on a decode
+  failure was the cause — a reviewer correctly pointed out that dropping a
+  channel is explicit, legal `libp2p-request-response` API surface (it
+  becomes an `InboundFailure` on the peer's side, not a panic), and the
+  backtrace confirms the crash has nothing to do with that code path.
+  Checked whether a dependency bump sidesteps it: `libp2p = "0.56.0"` (a
+  `^0.56.0` constraint) is already the latest 0.56.x per
+  `cargo update -p libp2p --dry-run` (zero updates available), and
+  `cargo search libp2p` shows 0.56.0 is the latest published release full
+  stop — there is no newer version to bump to right now. This is a live,
+  unfixed bug in the current latest release of a core dependency; fixing it
+  means either an upstream issue/patch or working around the specific
+  connection-close path in `arxd/network`, not a version bump.
 - One run had all 3 honest nodes converge cleanly to height 11 while node 0
   sat at height 0 — but node 0's own log showed the same libp2p panic in the
   first half-second after startup, before `ARXD_INJECT_FAULT_AT_HEIGHT` ever
@@ -559,20 +581,64 @@ clean pass that wasn't a real test of anything:
   run so far has had a crash or a preempted-fault confound in it too, so
   this hasn't been isolated as the sole cause yet either.
 
-**Net: still neither the original "reorg/rollback required" framing nor a
-clean counter-proof. The n=2 result is fully explained by quorum
-degeneracy. The n=4 result surfaced a real, apparently-frequent networking
-crash that plausibly explains one class of stall via ordinary quorum
-arithmetic (crash → honest count below quorum → stall), but does *not*
-explain the one asymmetric, crash-free split observed — that one is still
-unresolved. The reviewer's proposed check (pull `/blocks/{height}` for
-heights 5-11 from an advancing node and count distinct `round_certificate`
-signers) is the right next diagnostic and has not been done yet — every
-attempt to reproduce a clean, crash-free divergent run for it either hit the
-libp2p panic or didn't trigger the fault at all. Fix the libp2p panic first
-(it's now the biggest obstacle to getting any trustworthy repeated n=4 run),
-then re-attempt the signer-count check on a genuine asymmetric case before
-drawing any conclusion about finality-logic correctness.**
+**Update: got a clean pass. The libp2p panic is a `debug_assert` — build
+`--release` and it's gone, and that unblocked a real signal today.**
+
+The panic is `rust-libp2p`'s own known, open, unfixed issue — not ours.
+Matches two upstream reports: **#4773** (open since 2023-10-31, same
+assertion at the same `on_connection_closed` site, triggered by multiple
+in-flight dials with some denied — our mDNS-plus-explicit-bootnode topology
+fits this) and **#6601** (opened 2026-09-03, a PR fixing a connection-
+tracking desync when a sibling `NetworkBehaviour` denies a connection that
+`request-response` already recorded — matches our backtrace's call site
+exactly, and is unreleased). Both name the panicking check as a
+`debug_assert_eq!`, meaning it **compiles out entirely in release builds**.
+Confirmed directly: `cargo build --release -p arxd --features
+fault-injection`, then 14 n=4 harness runs against the release binary — zero
+panics, versus a roughly-40% crash rate across ~25 debug-build runs
+beforehand. Important caveat from the upstream report itself: `--release`
+hides the check, it doesn't fix the underlying inconsistent connection
+state — request-response's internal bookkeeping is still wrong when this
+fires, silently, in production. This unblocks trustworthy testing; it is
+not a networking-layer fix. No local dependency fix is available today
+(`cargo update -p libp2p --dry-run` and `cargo search libp2p` both confirm
+`0.56.0` is the current latest release) — the real fix is upstream (#6601
+merging) or a local `[patch.crates-io]` to its branch if that's worth the
+risk before it ships.
+
+With the crash out of the way, one release-mode run finally completed the
+full adversarial scenario for the first time: real dissent, real gossip
+propagation, no crash, chain reached height 11. It also caught a bug in the
+**harness itself**: the "node 0 did not fabricate a counter-accusation"
+check asserted node 0's `/evidence` directory was empty, and this run
+correctly failed that assertion — node 0 had accumulated three
+`<height>-disagreement-<voter>.json` files. Reading `core/evidence/src/lib.rs:352`
+showed why that's expected, not a violation: the evidence-watcher writes a
+local copy of *any* `ExecutionDisagreement` it observes, regardless of who
+authored the underlying dissent — so once gossip actually propagates the
+three honest validators' dissent network-wide, node 0 (still a live peer)
+receives and locally records copies of it too, same as everyone else. The
+actual security property the recursion guard cares about — no honest
+validator ends up slashed by node 0's own fabricated action — is already
+covered by the adjacent "honest nodes' stakes are untouched" check, so the
+flawed assertion was removed from `scripts/two-node-fault-harness.sh` rather
+than reworked. It had simply never been exercised against a run with full
+dissent propagation before today.
+
+That same clean run also reproduced the evidence-resubmission dedup bug
+cleanly for the first time: node 0's stake was only partially reduced
+(`active_amount` dropped, `updated_at` advanced, but not zeroed) and no
+honest node's evidence endpoint ever accumulated a complete
+`SubmitExecutionFault`, consistent with `core/evidence/src/lib.rs:383`'s
+known resubmission-collision gap. **Net: the n=2 result is fully explained
+by quorum degeneracy; the asymmetric n=4 split is very likely explained by
+the per-peer "stuck" semantics plus a short test timeout, not a finality
+bug; the libp2p panic is upstream and dodged via `--release`; and the one
+remaining, now cleanly reproducible blocker to a full Stage 3 pass is the
+evidence-resubmission dedup gap.** Use the release binary
+(`cargo build --release -p arxd --features fault-injection`, then point the
+harness's `BIN` at `target/release/arxd`) for any further n=4 runs until
+the upstream libp2p issue ships.
 
 ## Known limitations worth an operator's awareness
 
