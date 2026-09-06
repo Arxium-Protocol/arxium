@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::thread;
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use arxd_finality::{Dissent, PrecommitVote, RoundTimeoutVote, verify_finality_record};
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
@@ -282,6 +282,23 @@ async fn run_swarm<P: Payload>(
                         continue;
                     }
                     send_sync_request(&mut swarm, &peer, &SyncRequest::Status);
+
+                    // Walk the watermark up to the tip. Blocks arrive by sync;
+                    // certificates only ever arrive as live precommit gossip,
+                    // and the votes behind them are deleted on finalization —
+                    // so every height this node caught up on by syncing has a
+                    // block and no certificate, and without this the watermark
+                    // stays below that gap for the life of the chain. Never
+                    // while a recovery conversation with this peer is open.
+                    if !recovering.contains_key(&peer) && !halted_below_watermark {
+                        let watermark = db.get_final_watermark().unwrap_or(0);
+                        if watermark < local_tip_height(&db) {
+                            recovering.insert(peer, RecoveryStep::BackfillingCertificate(watermark + 1));
+                            send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate {
+                                height: watermark + 1,
+                            });
+                        }
+                    }
                 }
             }
             action = gossip_rx.recv() => {
@@ -749,7 +766,10 @@ async fn run_swarm<P: Payload>(
                             // this node verifies it against its own validator
                             // set.
                             SyncResponse::Certificate { height, record } => {
-                                let Some(RecoveryStep::AwaitingCertificate(expected)) = recovering.remove(&peer) else {
+                                let step = recovering.remove(&peer);
+                                let backfill = matches!(step, Some(RecoveryStep::BackfillingCertificate(_)));
+                                let Some(expected) = step.and_then(RecoveryStep::awaited_certificate_height)
+                                else {
                                     warn!("unsolicited certificate response from {peer}, ignoring");
                                     continue;
                                 };
@@ -761,7 +781,14 @@ async fn run_swarm<P: Payload>(
                                     .as_deref()
                                     .and_then(|bytes| decode_wire::<FinalityRecord>(bytes).ok())
                                 else {
-                                    warn!("peer {peer} has no usable certificate at {height}; its claim about this node's chain stays a claim, giving up on it");
+                                    // Ordinary during a backfill: the heights
+                                    // nearest the tip simply aren't certified
+                                    // yet, which is where every walk ends.
+                                    if backfill {
+                                        debug!("peer {peer} has no certificate at {height} yet; watermark backfill pauses here");
+                                    } else {
+                                        warn!("peer {peer} has no usable certificate at {height}; its claim about this node's chain stays a claim, giving up on it");
+                                    }
                                     continue;
                                 };
                                 if record.height != height || !verify_finality_record(&db, &record) {
@@ -770,7 +797,47 @@ async fn run_swarm<P: Payload>(
                                 }
                                 let local_hash = db.get_block::<P>(height).ok().flatten().map(|block| block.hash());
                                 if local_hash.as_deref() == Some(record.block_hash.as_str()) {
-                                    warn!("certificate from {peer} at {height} certifies the block this node already holds; no rollback warranted");
+                                    // The peer's certified block is the one we
+                                    // hold: nothing to roll back, and the
+                                    // certificate is worth keeping. Persisting
+                                    // it is what advances the watermark, so
+                                    // this is the whole backfill.
+                                    match db.get_finality_record(height) {
+                                        Ok(Some(stored)) if stored.block_hash != record.block_hash => {
+                                            // Two certificates, both verified,
+                                            // naming different blocks at one
+                                            // height. Quorums overlap, so this
+                                            // cannot happen without an
+                                            // equivocating quorum — a fault far
+                                            // above this node's pay grade, and
+                                            // never a reason to pick one.
+                                            counter!("arxium_conflicting_certificates_total").increment(1);
+                                            halted_below_watermark = true;
+                                            error!("HALT: two verified finality certificates at height {height} name different blocks ({} stored, {} from {peer}). That requires an equivocating quorum; this node will not choose between them. State preserved, automatic recovery disabled for this process.", stored.block_hash, record.block_hash);
+                                            continue;
+                                        }
+                                        Ok(Some(_)) => {}
+                                        Ok(None) => {
+                                            if let Err(err) = db.write_batch(&record) {
+                                                warn!("failed to persist verified certificate at {height}: {err}");
+                                                continue;
+                                            }
+                                        }
+                                        Err(err) => {
+                                            warn!("failed to read stored certificate at {height}: {err}");
+                                            continue;
+                                        }
+                                    }
+                                    // Keep walking while there is still a gap;
+                                    // this converges at round-trip speed rather
+                                    // than one height per status tick.
+                                    let watermark = db.get_final_watermark().unwrap_or(0);
+                                    if watermark < local_tip_height(&db) {
+                                        recovering.insert(peer, RecoveryStep::BackfillingCertificate(watermark + 1));
+                                        send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate {
+                                            height: watermark + 1,
+                                        });
+                                    }
                                     continue;
                                 }
                                 let watermark = match db.get_final_watermark() {

@@ -53,6 +53,26 @@ pub(crate) fn first_divergent_height(
 pub(crate) enum RecoveryStep {
     AwaitingHashes,
     AwaitingCertificate(u64),
+    /// Not a divergence at all: this node holds blocks it has no certificate
+    /// for, and is walking its watermark up to its tip one height at a time.
+    /// Sync carries blocks but not certificates, and the precommit votes a
+    /// certificate is built from are deleted once the height finalizes and are
+    /// never re-gossiped — so a node that caught up by syncing has no way to
+    /// certify what it just downloaded, and its watermark would otherwise sit
+    /// below the gap forever. Same request, same verification, same persist
+    /// path as a divergence; only the reason for asking differs.
+    BackfillingCertificate(u64),
+}
+
+impl RecoveryStep {
+    /// The height a `Certificate` response from this step must answer for.
+    pub(crate) fn awaited_certificate_height(self) -> Option<u64> {
+        match self {
+            RecoveryStep::AwaitingCertificate(height)
+            | RecoveryStep::BackfillingCertificate(height) => Some(height),
+            RecoveryStep::AwaitingHashes => None,
+        }
+    }
 }
 
 /// What to do about a divergence at `divergent`, given this node's watermark.

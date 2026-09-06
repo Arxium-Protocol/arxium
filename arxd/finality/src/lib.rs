@@ -796,10 +796,20 @@ mod tests {
     }
 
     fn open_test_db() -> (ArxiumDb, std::path::PathBuf) {
+        // The counter is the load-bearing part, not the timestamp: `cargo
+        // test` runs these on parallel threads in one process, and two
+        // threads reading `SystemTime::now()` close enough together get the
+        // same nanos value. That put two tests on one RocksDB path, where the
+        // second one saw the first's `FinalityRecord`/`RoundCertificate` and
+        // short-circuited its own tally — surfacing as roughly one failure
+        // per six full-suite runs, on whichever test lost the race, and
+        // always passing in isolation.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "arxium-test-finality-{}-{}",
+            "arxium-test-finality-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         (ArxiumDb::open(&dir).expect("open test db"), dir)
     }
