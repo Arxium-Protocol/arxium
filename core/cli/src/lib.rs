@@ -195,13 +195,16 @@ pub struct RunArgs {
     #[arg(long, env = "ARXD_RPC_BIND", default_value = "127.0.0.1")]
     pub rpc_bind: String,
 
-    /// DEVNET ONLY, and only compiled in at all with `--features
+    /// Harness-only, and only compiled in at all with `--features
     /// fault-injection` (never present in a normal build): corrupt this
     /// node's own computed state_root by one bit the next time it produces
     /// the block at this height, so a two-node acceptance test can exercise
     /// the dissent/adjudication/slash path against a real disagreeing
-    /// executor instead of a mocked one. Refused at startup on any chain
-    /// other than exactly "devnet" — see docs/runbook.md.
+    /// executor instead of a mocked one. Refused at startup unless the
+    /// resolved chain spec's `chain_name` is exactly
+    /// "arxium-fault-injection-harness" — never the real `--chain devnet`
+    /// preset, which is a shared network with real boot nodes. See
+    /// docs/runbook.md and scripts/two-node-fault-harness.sh.
     #[cfg(feature = "fault-injection")]
     #[arg(long, env = "ARXD_INJECT_FAULT_AT_HEIGHT")]
     pub inject_fault_at_height: Option<u64>,

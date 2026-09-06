@@ -936,33 +936,41 @@ fn spawn_subsystems<R: ChainRuntime>(
     })
 }
 
-/// A fault-injection build must refuse to arm on any chain but exactly
-/// "devnet" — a mistyped `--chain` or a copy-pasted systemd unit is the
-/// realistic way this flag reaches a real chain, and there it wouldn't be a
-/// test, it would be a validator lying about its own state to peers.
+/// The one `chain_name` a fault-injection build is allowed to arm on. Not
+/// the built-in `--chain devnet` preset — that preset's spec (`devnet.json`)
+/// names itself `"corechain"` and its `boot_nodes` point at real public
+/// IPs, so it's a shared network, not a local sandbox. A harness chain spec
+/// must set `"chain_name": "arxium-fault-injection-harness"` explicitly, so
+/// a mistyped `--chain` or a copy-pasted systemd unit can't ever satisfy
+/// this by accident — anywhere else, this flag wouldn't be a test, it would
+/// be a validator lying about its own state to real peers.
+#[cfg(feature = "fault-injection")]
+const FAULT_INJECTION_CHAIN_NAME: &str = "arxium-fault-injection-harness";
+
 #[cfg(feature = "fault-injection")]
 fn ensure_fault_injection_allowed(chain_name: &str) -> Result<()> {
     anyhow::ensure!(
-        chain_name == "devnet",
-        "fault injection is devnet-only, refusing to start on chain {chain_name:?}"
+        chain_name == FAULT_INJECTION_CHAIN_NAME,
+        "fault injection requires chain_name {FAULT_INJECTION_CHAIN_NAME:?}, refusing to start on {chain_name:?}"
     );
     Ok(())
 }
 
 #[cfg(all(test, feature = "fault-injection"))]
 mod fault_injection_tests {
-    use super::ensure_fault_injection_allowed;
+    use super::{FAULT_INJECTION_CHAIN_NAME, ensure_fault_injection_allowed};
 
     #[test]
-    fn devnet_is_allowed() {
-        assert!(ensure_fault_injection_allowed("devnet").is_ok());
+    fn the_harness_chain_name_is_allowed() {
+        assert!(ensure_fault_injection_allowed(FAULT_INJECTION_CHAIN_NAME).is_ok());
     }
 
     #[test]
-    fn anything_else_is_refused() {
+    fn anything_else_is_refused_including_the_real_devnet_preset() {
         assert!(ensure_fault_injection_allowed("mainnet").is_err());
         assert!(ensure_fault_injection_allowed("").is_err());
-        assert!(ensure_fault_injection_allowed("DEVNET").is_err());
+        // devnet.json's actual chain_name — must never pass.
+        assert!(ensure_fault_injection_allowed("corechain").is_err());
     }
 }
 

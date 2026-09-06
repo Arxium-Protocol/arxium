@@ -435,11 +435,74 @@ required to check it:
 4. Run `arx-verify <file>` (see `tools/arx-verify/README.md`) to check the
    signatures and get a `VALID`/`UNRESOLVED` verdict.
 
+## Two-node fault-injection acceptance harness
+
+`scripts/two-node-fault-harness.sh` boots two local validators from a
+throwaway genesis and corrupts one node's own state_root at a fixed height,
+to exercise the dissent/evidence/slash path against two real processes
+instead of a mocked executor. It needs nothing installed beyond `jq` and
+`curl`; everything else (keys, genesis, both nodes) is generated into a
+`mktemp -d` scratch directory it cleans up on success and leaves behind (path
+printed) on failure.
+
+```sh
+scripts/two-node-fault-harness.sh                 # fault at height 5 (default)
+FAULT_HEIGHT=20 scripts/two-node-fault-harness.sh  # override
+```
+
+**The flag it exercises does not exist in a normal build.** `arxd`'s
+`--inject-fault-at-height` / `ARXD_INJECT_FAULT_AT_HEIGHT` is compiled in
+only with `cargo build --features fault-injection`, and even then the node
+refuses to start unless the resolved chain spec's `chain_name` is exactly
+`arxium-fault-injection-harness` — not `devnet` (the real `--chain devnet`
+preset resolves to `chain_name: "corechain"` with real public boot nodes; it
+is a shared network, not a sandbox, so a literal `"devnet"` check would have
+been the wrong guard). The harness's own throwaway genesis is the only spec
+that can ever satisfy this.
+
+**The validator-key gotcha applies here too.** `arxd keys --base-path <dir>
+--json` must be run once per node *before* that node's first start, writing
+`validator.key`/`validator.bls.key` into that exact `--base-path` — the
+harness script does this itself for both nodes and merges both `ValidatorEntry`
+outputs straight into the genesis JSON's `validators` map. If you're adapting
+the script (different base paths, reusing a directory from a previous run,
+etc.), regenerating keys against a *different* base-path than the one the
+node is later started with reproduces the single most common silent failure
+in this codebase: RPC comes up, P2P listens, genesis writes, and the tip
+never advances, with nothing logged — see "Check the validator address
+before starting" above.
+
+**Run 2026-09-06 finding: the chain deadlocks instead of slashing.** A live
+run confirmed fault injection, dissent, and evidence-artifact generation all
+fire correctly — node A rejects B's corrupted block 5
+(`StateRootMismatch`), signs a dissent, and successfully pushes a
+`SubmitExecutionFault` action into its own mempool. But A's tip then sticks
+at height 4 permanently: it has no local block 5 to build on (it rejected
+the only one offered), round-timeout votes for height 6 are dropped for
+lacking a parent at 5, and there's no reorg/rollback to let a different
+proposer retry height 5. B's fault action sits in A's mempool forever,
+never mined, so the on-chain slash never lands. This is not a harness bug —
+it's the exact gap the harness was built to surface: **Stage 3 (culprit
+resolution → slash) is unreachable in practice until reorg/rollback across a
+disputed height is implemented**, because the honest node has no path
+forward past the disagreement to include its own accusation. Re-run this
+harness once reorg/rollback lands; a pass then is the actual acceptance
+signal Stage 3 was waiting on.
+
 ## Known limitations worth an operator's awareness
 
 From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,
 but relevant once this runs multi-node or faces adversarial peers:
 
+- **No reorg/rollback across a disputed height.** A node that rejects the
+  block at the tip+1 height (e.g. `StateRootMismatch`) has no way to accept
+  an alternative and no way to retry that height with a different proposer —
+  it sticks at its current tip permanently while the disagreeing peer keeps
+  re-offering the same rejected block. Confirmed live via
+  `scripts/two-node-fault-harness.sh` (see above): this is also why a
+  `SubmitExecutionFault` action can sit forever in the honest node's own
+  mempool without ever reaching a block, so a validator fault currently
+  produces a permanent chain stall rather than a slash.
 - Reconnecting a peer clears its bad-gossip/sync-failure penalty counters —
   a peer that's about to hit the ban threshold can reconnect and keep
   spamming indefinitely (ban is per-connection, not per-`PeerId`).
