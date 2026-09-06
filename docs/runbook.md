@@ -670,14 +670,28 @@ round of review on the item 11 fixes:
   only a runbook instruction) — a debug build is no longer an option a
   future run of this script can silently pick.
 
-**Net: every open question from items 7-11 is now resolved or closed.** n=2
+**Two more corrections landed on top of this, from a second round of
+review.** The local dedup guard was keyed on height alone — wrong, because
+a round change can put a *different* proposer at the same height, and the
+chain-level `EvidenceMarkerKey` (`core/circuit/src/lib.rs`) keys on
+`(height, proposer)` for exactly that reason; a local guard stricter than
+the chain accepts would silently and permanently drop a second, legitimate
+fault report. Fixed to match. Separately, re-verifying that fix surfaced
+that the harness's fixed 58s `CHAIN_TIMEOUT` was undersized for the actual
+disputed-height recovery case (needs at least one full production
+`ROUND_TIMEOUT`, 8s, plus real gossip propagation) — sized for the
+no-dispute case, not the one this harness exists to test. Confirmed with a
+240s-vs-58s comparison (10/10 clean at 240s, most triggered runs timing out
+at 58s) and fixed to a flat 240s.
+
+**Net: every open question from items 7-13 is now resolved or closed.** n=2
 is quorum degeneracy, not a missing feature. The n=4 asymmetric split is
 very likely the per-peer "stuck" semantics plus a short timeout. The libp2p
 panic is upstream, dodged via `--release` (now baked into the harness). The
 evidence pipeline works end-to-end once validators are actually funded to
-pay for their own fault reports, confirmed with a 100% pass rate across
-every run where the injected fault fired. `scripts/two-node-fault-harness.sh`
-is the acceptance signal Stage 3 was waiting on, and it now passes.
+pay for their own fault reports and the dedup guard matches the chain's own
+notion of "the same fault." `scripts/two-node-fault-harness.sh` is the
+acceptance signal Stage 3 was waiting on, and it now passes reliably.
 
 ## Known limitations worth an operator's awareness
 

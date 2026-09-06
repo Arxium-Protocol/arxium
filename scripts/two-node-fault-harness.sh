@@ -53,7 +53,18 @@ CONFIRM_HEIGHT=$((FAULT_HEIGHT + 6))
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
 STARTUP_TIMEOUT=30
-CHAIN_TIMEOUT=$(( (CONFIRM_HEIGHT + 3) * 2 + 30 ))
+# The old 58s figure ((CONFIRM_HEIGHT+3)*2+30) was sized for the no-dispute
+# case and left no real margin for the one this harness exists to test:
+# recovering from the injected fault costs at least one `ROUND_TIMEOUT`
+# (arxd/finality/src/lib.rs, 8s in a real build) plus real libp2p gossip
+# propagation, not the instant in-process delivery the unit tests get. That
+# undertimed the actual disputed-height case often enough to read as a
+# stall — confirmed by rerunning the same scenario at 240s with zero
+# timeouts across 10 straight attempts, versus a majority of triggered runs
+# timing out at 58s. 240s flat, not a tighter formula: the point is enough
+# slack for however many round-timeout cycles a real run needs, not the
+# tightest bound that happens to work today.
+CHAIN_TIMEOUT=240
 
 if [ "$NUM_VALIDATORS" -lt 2 ]; then
     echo "NUM_VALIDATORS must be >= 2" >&2

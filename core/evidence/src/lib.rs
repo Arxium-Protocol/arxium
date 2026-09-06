@@ -358,7 +358,20 @@ where
         // slot. The chain-level `EvidenceMarkerKey` check (Stage 2) already
         // makes a resubmission harmless once it reaches a block; this just
         // stops the local mempool churn and log noise before that point.
-        let mut fault_attempted: HashSet<u64> = HashSet::new();
+        //
+        // Keyed `(height, proposer)`, not height alone, to match
+        // `EvidenceMarkerKey` (core/circuit/src/lib.rs) — a round change can
+        // put a *different* proposer at the same height, which is a
+        // separate fault the chain-level key would still accept. Keying on
+        // height alone would silently and permanently suppress reporting
+        // the second one; this must never be stricter than the chain.
+        //
+        // Never pruned: only genuine divergences insert, so on any node
+        // that isn't itself faulty this stays empty for its whole run, and
+        // a fault-injected/actually-faulty node's growth here is bounded by
+        // however many disputed heights ever occur — accepted as
+        // unbounded-in-principle, not an oversight, given that ceiling.
+        let mut fault_attempted: HashSet<(u64, Address)> = HashSet::new();
         for event in events {
             let block = match event {
                 EvidenceEvent::BlockObserved(block) => block,
@@ -395,7 +408,7 @@ where
                     // (still useful bookkeeping/relay even on a resubmit) but
                     // only the first one attempts an on-chain submission —
                     // see the HashSet comment at the top of this thread.
-                    let already_attempted = !fault_attempted.insert(proposed.height);
+                    let already_attempted = !fault_attempted.insert((proposed.height, proposer.clone()));
                     if let (false, Some(artifact), Some(build_execution_fault_action)) =
                         (already_attempted, artifact, &build_execution_fault_action)
                     {
@@ -756,6 +769,78 @@ mod tests {
         // the dedup were broken, then confirm it never did.
         thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(mempool.lock().unwrap().len(), 1, "second dissent for the same height must not resubmit");
+    }
+
+    /// A round change can put a *different* proposer at the same height —
+    /// `EvidenceMarkerKey` (core/circuit/src/lib.rs) keys on `(height,
+    /// proposer)` for exactly this reason, so a fault by proposer B at
+    /// round 1 of height 5 is a separate, chain-acceptable report from a
+    /// fault by proposer A at round 0 of height 5. The local dedup guard
+    /// must agree — keying on height alone would silently and permanently
+    /// suppress the second, real, chain-acceptable fault report.
+    #[test]
+    fn spawn_evidence_watcher_submits_separately_for_different_proposers_at_the_same_height() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-spawn-evidence-watcher-block-divergence-round-change-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = ArxiumDb::open(&dir).expect("open test db");
+
+        let key_a = SigningKey::from_bytes(&[9u8; 32]);
+        let key_b = SigningKey::from_bytes(&[10u8; 32]);
+        let proposed_a = signed_block(&key_a, 5, 100);
+        let proposed_b = signed_block(&key_b, 5, 100);
+        let dissent_claim = BlockDissentClaim {
+            computed_state_root: "0xdisputed".to_string(),
+            proofs: vec![],
+            signature: format!("0x{}", hex::encode([3u8; 96])),
+        };
+
+        let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        let next_nonce = std::sync::atomic::AtomicU64::new(0);
+        let build_execution_fault_action = Some(move |_artifact: EvidenceArtifact| {
+            Some(Action {
+                sender: Address::from_pubkey_bytes(&[11u8; 32]).unwrap(),
+                nonce: next_nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                signature: None,
+                payload: (),
+            })
+        });
+        let evidence_dir = dir.join("evidence");
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            rx,
+            build_evidence_action,
+            build_execution_fault_action,
+            evidence_dir.clone(),
+            [7u8; 32],
+        );
+
+        for proposed in [proposed_a, proposed_b] {
+            tx.send(EvidenceEvent::BlockDivergence {
+                proposed,
+                parent_state_root: "0xparent".to_string(),
+                voter: "arx1voter".to_string(),
+                voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
+                dissent_claim: dissent_claim.clone(),
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mempool.lock().unwrap().len() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected two separate submissions (one per proposer), got {}",
+                mempool.lock().unwrap().len()
+            );
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real
