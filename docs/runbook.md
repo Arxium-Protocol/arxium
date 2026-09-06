@@ -504,39 +504,75 @@ missing is the honest majority driving a round/view change to re-propose
 height 5 itself, which is a different (and already-implemented) code path.**
 
 **Re-run 2026-09-06 at 4 validators (3 honest, 1 fault-injected) —
-inconclusive, and it surfaced a separate real bug.** The harness (now
-`NUM_VALIDATORS`-parametrized) was re-run repeatedly at n=4. Findings:
+inconclusive, and it surfaced a separate, more disruptive bug.** The harness
+(now `NUM_VALIDATORS`-parametrized) was re-run roughly 15 times at n=4, with
+extra RPC probing on a handful of runs to pin down what's actually
+happening. Two distinct, non-overlapping failure shapes showed up, plus one
+clean pass that wasn't a real test of anything:
 
-- In one run, 2 of the 3 honest nodes stuck at tip height 4 exactly as in
-  the n=2 case, while the 3rd reached height 11 — i.e. the honest majority's
-  round/view-change path *did* let a different proposer re-mine height 5 for
-  at least one node, but the other two never synced that chain from their
-  peers. Not yet root-caused; plausibly a sync/gossip convergence gap rather
-  than a finality-logic bug (the finality code's round-timeout/vote-height
-  arithmetic is internally consistent — see `arxd/finality/src/lib.rs:317-331`).
-- Across 5 more attempts (both a full-mesh-bootnodes topology and the
-  original star-through-node-0 topology), 3 crashed one or more honest nodes
-  with a `libp2p-request-response-0.29.0` internal panic
-  (`assertion left == right failed`, `lib.rs:678`), independent of bootnode
-  topology — i.e. a previously-latent bug in the p2p dependency that the
-  two-node harness never had enough connection churn to trip. This blocks a
-  clean n=4 acceptance run until it's understood; not investigated further
-  here.
-- No run reached a slash: even the run that hit height 11, the honest
-  reference node's evidence directory was empty. This is at least partly the
-  known evidence-resubmission dedup gap (`core/evidence/src/lib.rs:383`,
-  `ponytail:`-flagged, see item 3 in the implementation log) causing
-  duplicate-nonce rejections — a distinct bug from the deadlock, not
-  evidence that reorg/rollback is the blocker.
+- **Asymmetric stall, no crash (1 run, not yet reproduced cleanly since):**
+  2 of 3 honest nodes stuck at tip height 4 exactly as in the n=2 case, the
+  3rd reached height 11, zero panics in any of the four logs. A first pass
+  at this called it "a sync/gossip convergence gap" — that was premature. A
+  reviewer correctly pushed back: this protocol isn't continuous-quorum BFT
+  (`core/executor/src/lib.rs:420-442` only requires a quorum-backed
+  `RoundCertificate` at the *specific height* where a round advances past 0;
+  every later height is unilateral re-execution, needing no live quorum at
+  all), so "1 node needs 3 live co-signers at every height 5-11" is not the
+  right model and doesn't by itself prove something is broken — but it also
+  means the 2-stuck-1-advanced split has no confirmed explanation yet in
+  either direction. It has not been reproduced again since (see below), so
+  it remains open and should be treated as an unresolved anomaly, not
+  written off.
+- **Symmetric stall, caused by a crash (reproduced multiple times):** a
+  `libp2p-request-response-0.29.0` internal panic
+  (`assertion left == right failed`, `lib.rs:678`) kills the networking task
+  on whichever node it hits — including, in one run, node 0 itself within
+  milliseconds of startup, before it ever got to propose anything, and in
+  another, an honest node partway through the run. When it takes out one
+  honest node's networking, the remaining live honest count drops to 2,
+  below `quorum(4) = 3`, and everyone left standing stalls permanently —
+  which is a real, arithmetic-grounded liveness failure, just one caused by
+  a crash rather than by anything in the finality logic. This appears to be
+  a previously-latent bug in the p2p dependency that the original two-node
+  harness never had enough connection churn to trip; it now fires often
+  enough (several times across ~15 runs, at unpredictable points including
+  immediately at startup) that it dominates most n=4 attempts and makes
+  repeated runs unreliable. Likely root cause, not yet fixed or deeply
+  verified: `arxd/network/src/lib.rs:592-597` drops a sync request's
+  `ResponseChannel` on a decode failure via `continue` without ever calling
+  the library's own response/cancel API on it — exactly the kind of
+  unacknowledged channel that could desync `libp2p-request-response`'s
+  internal per-connection bookkeeping. `bad6330` (the wire-size-limit commit)
+  made that decode-failure path newly reachable in practice, ahead of when
+  this panic started showing up — worth checking as the trigger before
+  looking elsewhere.
+- One run had all 3 honest nodes converge cleanly to height 11 while node 0
+  sat at height 0 — but node 0's own log showed the same libp2p panic in the
+  first half-second after startup, before `ARXD_INJECT_FAULT_AT_HEIGHT` ever
+  had a chance to fire. That's 3 honest validators reaching quorum with no
+  adversary actually present, not a pass of the fault-injection scenario.
+- No run reached a slash. Even the cleanest run, the reference node's
+  evidence directory stayed empty — consistent with the known
+  evidence-resubmission dedup gap (`core/evidence/src/lib.rs:383`,
+  `ponytail:`-flagged, see item 3 in the implementation log), but every n=4
+  run so far has had a crash or a preempted-fault confound in it too, so
+  this hasn't been isolated as the sole cause yet either.
 
-**Net: neither the original "reorg/rollback required" framing nor a clean
-counter-proof survives this round. The n=2 result is fully explained by
-quorum degeneracy and doesn't confirm a gap; the n=4 result is blocked by an
-unrelated crash and a known evidence-dedup bug before it can confirm or
-refute one. Re-run `scripts/two-node-fault-harness.sh` at n=4 once the
-libp2p panic and evidence-dedup issues are fixed — a clean pass or a
-reproducible stall then is the actual acceptance signal Stage 3 is waiting
-on.**
+**Net: still neither the original "reorg/rollback required" framing nor a
+clean counter-proof. The n=2 result is fully explained by quorum
+degeneracy. The n=4 result surfaced a real, apparently-frequent networking
+crash that plausibly explains one class of stall via ordinary quorum
+arithmetic (crash → honest count below quorum → stall), but does *not*
+explain the one asymmetric, crash-free split observed — that one is still
+unresolved. The reviewer's proposed check (pull `/blocks/{height}` for
+heights 5-11 from an advancing node and count distinct `round_certificate`
+signers) is the right next diagnostic and has not been done yet — every
+attempt to reproduce a clean, crash-free divergent run for it either hit the
+libp2p panic or didn't trigger the fault at all. Fix the libp2p panic first
+(it's now the biggest obstacle to getting any trustworthy repeated n=4 run),
+then re-attempt the signer-count check on a genuine asymmetric case before
+drawing any conclusion about finality-logic correctness.**
 
 ## Known limitations worth an operator's awareness
 
