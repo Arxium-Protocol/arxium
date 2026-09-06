@@ -625,20 +625,59 @@ flawed assertion was removed from `scripts/two-node-fault-harness.sh` rather
 than reworked. It had simply never been exercised against a run with full
 dissent propagation before today.
 
-That same clean run also reproduced the evidence-resubmission dedup bug
-cleanly for the first time: node 0's stake was only partially reduced
-(`active_amount` dropped, `updated_at` advanced, but not zeroed) and no
-honest node's evidence endpoint ever accumulated a complete
-`SubmitExecutionFault`, consistent with `core/evidence/src/lib.rs:383`'s
-known resubmission-collision gap. **Net: the n=2 result is fully explained
-by quorum degeneracy; the asymmetric n=4 split is very likely explained by
-the per-peer "stuck" semantics plus a short test timeout, not a finality
-bug; the libp2p panic is upstream and dodged via `--release`; and the one
-remaining, now cleanly reproducible blocker to a full Stage 3 pass is the
-evidence-resubmission dedup gap.** Use the release binary
-(`cargo build --release -p arxd --features fault-injection`, then point the
-harness's `BIN` at `target/release/arxd`) for any further n=4 runs until
-the upstream libp2p issue ships.
+That same clean run also reproduced the partial-slash symptom described
+here previously — node 0's `active_amount` dropped but didn't reach zero,
+no honest node's evidence endpoint showed a complete `SubmitExecutionFault`
+— and that earlier write-up attributed it entirely to
+`core/evidence/src/lib.rs:383`'s missing local dedup. **That diagnosis was
+incomplete.** Tracing the actual mempool errors (`insufficient balance for
+the action fee`, immediately preceding every `duplicate action ... at nonce
+0`) back to the harness's genesis showed `accounts: {}` — every validator
+had stake but zero *spendable* balance, and `SubmitExecutionFault` costs
+`ACTION_FEE` (`arxd/runtime/src/lib.rs:417`, 1,000,000 IUM) like any other
+action. The very first evidence submission was never mined for lack of
+funds, which pinned its nonce forever and made every honest validator's
+own resubmission look like a self-inflicted collision — a bug-shaped
+symptom of a test-fixture gap, not a resubmission storm.
+
+**Funding each validator's account in genesis
+(`scripts/two-node-fault-harness.sh`, 100x `ACTION_FEE`) produced the
+harness's first fully green run**, and it wasn't a fluke: 4 clean passes
+across every run where the fault actually triggered (node 0 has to land
+the height-5 proposer slot for the fault to fire at all — roughly 1-in-4 to
+1-in-8 of runs, depending on validator address ordering that run). A real
+local-dedup fix was still added to `core/evidence/src/lib.rs`'s
+`spawn_evidence_watcher` (a `BlockDivergence` event fires once per
+dissenting peer observed, not once per height, so without it a healthy
+network still submits one redundant on-chain report per extra dissenter)
+— covered by
+`spawn_evidence_watcher_only_submits_once_per_height_despite_repeat_divergence_events`,
+verified to actually fail without the guard before being accepted. But it
+was never the release-blocking gap; the funding was.
+
+Three more harness corrections landed alongside this, all from a second
+round of review on the item 11 fixes:
+- The self-incrimination guard now checks the right thing: it scans mined
+  blocks (`/blocks/{height}`) for a `SubmitExecutionFault` sent by node 0,
+  rather than the harness's earlier proxy checks. "Honest nodes' stakes are
+  untouched" only covers culprit resolution, not this — they're different
+  properties, and the `PASS` message was overclaiming both.
+- `PASS` no longer claims the recursion guard held. Nothing in this
+  single-fault scenario nests a fault inside a fault, so it's never
+  exercised here; a real failure there would show up as stack exhaustion,
+  not a stake or action-level symptom this harness could catch.
+- The harness now builds and runs `--release` itself (previously this was
+  only a runbook instruction) — a debug build is no longer an option a
+  future run of this script can silently pick.
+
+**Net: every open question from items 7-11 is now resolved or closed.** n=2
+is quorum degeneracy, not a missing feature. The n=4 asymmetric split is
+very likely the per-peer "stuck" semantics plus a short timeout. The libp2p
+panic is upstream, dodged via `--release` (now baked into the harness). The
+evidence pipeline works end-to-end once validators are actually funded to
+pay for their own fault reports, confirmed with a 100% pass rate across
+every run where the injected fault fired. `scripts/two-node-fault-harness.sh`
+is the acceptance signal Stage 3 was waiting on, and it now passes.
 
 ## Known limitations worth an operator's awareness
 

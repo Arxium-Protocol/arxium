@@ -8,20 +8,29 @@
 # majority's independent re-execution must disagree with node 0's block,
 # submit fault evidence, and drive node 0's stake to zero via on-chain
 # adjudication — all without node 0 ever landing a counter-slash against an
-# honest validator. That's the recursion guard, culprit resolution, and the
-# slash landing, exercised against real processes instead of one test binary.
+# honest validator. This exercises three separate guards against real
+# processes instead of one test binary, and only two of them are actually
+# checked below:
+#   - Culprit resolution — checked: "honest nodes' stakes are untouched".
+#   - Self-incrimination (node 0 must not *submit* a fault action naming an
+#     honest validator) — checked at the action level below, by scanning
+#     mined blocks for a `SubmitExecutionFault` sent by node 0.
+#   - Recursion guard (a fault nested inside a fault) — NOT exercised by
+#     this scenario at all; nothing here ever produces a fault-inside-a-fault
+#     to trip it. If it ever failed, expect a node dying on stack exhaustion,
+#     not a stake or action-level symptom — this harness would not catch it.
 #
-# ponytail: the recursion guard is checked by "honest nodes' stakes are
-# untouched" below, not by node 0's /evidence directory being empty. Once
-# dissent actually propagates over gossip (needs a real n-validator run,
-# not the mocked single-process tests), node 0 legitimately accumulates
-# local copies of the *honest* validators' dissent artifacts too — its
-# evidence-watcher fires on any `ExecutionDisagreement` it locally observes,
-# regardless of who authored the underlying dissent (core/evidence/src/lib.rs:352).
-# A non-empty /evidence on node 0 is normal gossip-relay bookkeeping, not
-# proof it fabricated anything — an earlier version of this harness asserted
-# the directory was empty and failed the first time a run actually completed
-# with full dissent propagation.
+# ponytail: node 0's /evidence directory being non-empty is not itself proof
+# of anything — once dissent actually propagates over gossip (needs a real
+# n-validator run, not the mocked single-process tests), node 0 legitimately
+# accumulates local copies of the *honest* validators' dissent artifacts
+# too. Its evidence-watcher fires on any `ExecutionDisagreement` it locally
+# observes, regardless of who authored the underlying dissent
+# (core/evidence/src/lib.rs:352). An earlier version of this harness
+# asserted that directory was empty and failed the first time a run
+# actually completed with full dissent propagation — removed in favor of
+# the action-level self-incrimination check below, which tests the actual
+# property (nothing submitted, not nothing observed).
 #
 # NUM_VALIDATORS matters: quorum(n) = 2n/3 + 1, so at n=2 the faulty node's
 # own vote is required for any quorum and the chain cannot advance past the
@@ -72,13 +81,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "building arxd with fault-injection..."
-cargo build -p arxd --features fault-injection >"$ROOT/build.log" 2>&1 \
+# --release is not just for speed: the debug build hits a debug_assert in
+# libp2p-request-response's connection-close handling (upstream rust-libp2p
+# #4773 / #6601, both open, both confirmed debug_assert) at roughly a 40%
+# rate under this harness's connection churn — enough to make most debug
+# runs report a stall or crash that has nothing to do with this chain's own
+# logic. Release compiles that check out. It does not fix the underlying
+# inconsistent connection state upstream is tracking, only this harness's
+# ability to get a signal past it — see docs/runbook.md.
+echo "building arxd with fault-injection (--release; see comment above)..."
+cargo build --release -p arxd --features fault-injection >"$ROOT/build.log" 2>&1 \
     || { echo "build failed, see $ROOT/build.log" >&2; exit 1; }
-BIN="$REPO_ROOT/target/debug/arxd"
+BIN="$REPO_ROOT/target/release/arxd"
 
 echo "generating $NUM_VALIDATORS node identities and validator keys..."
 VALIDATORS='{}'
+ACCOUNTS='{}'
+# Genesis validators have stake but, absent this, zero spendable balance —
+# every action (including a validator's own SubmitExecutionFault) costs
+# ACTION_FEE (arxd/runtime/src/lib.rs:417, 1,000,000 IUM), so with no
+# balance every evidence submission gets silently dropped at dispatch
+# ("insufficient balance for the action fee"), not just deduped. This
+# funded every honest evidence-report attempt into the same nonce-0 mempool
+# slot forever and looked identical to a resubmission-storm bug. 100x the
+# fee is comfortably more than a short test run needs.
+ACCOUNT_FUNDING=$((100 * 1000000))
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DIRS[$i]="$ROOT/node-$i"
     mkdir -p "${DIRS[$i]}"
@@ -87,14 +114,16 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     entry="$("$BIN" keys --base-path "${DIRS[$i]}" --json)"
     ADDRS[$i]="$(echo "$entry" | jq -r 'keys[0]')"
     VALIDATORS="$(jq -s '.[0] * .[1]' <(echo "$VALIDATORS") <(echo "$entry"))"
+    ACCOUNTS="$(jq --arg addr "${ADDRS[$i]}" --argjson balance "$ACCOUNT_FUNDING" \
+        '. + {($addr): {balance: $balance, nonce: 0, identity_hash: null}}' <(echo "$ACCOUNTS"))"
 done
 PEER_0="$("$BIN" node-key --base-path "${DIRS[0]}")"
 
-jq -n --argjson validators "$VALIDATORS" '{
+jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
     genesis_format: "plain",
     height: 0,
     chain_name: "arxium-fault-injection-harness",
-    accounts: {},
+    accounts: $accounts,
     validators: $validators,
     boot_nodes: []
 }' > "$ROOT/genesis.json"
@@ -169,6 +198,12 @@ else
     pass=false
 fi
 
+# ponytail: this check is vacuous on its own — it passes trivially when no
+# slash lands at all, which is exactly today's state under the evidence
+# resubmission dedup gap (core/evidence/src/lib.rs:383). It only starts
+# distinguishing "correctly not slashed" from "nothing happened" once node
+# 0's stake check above actually reaches zero and `pass` is still riding on
+# this one too — a lone "ok" here proves nothing by itself.
 echo "checking honest nodes' stakes were left alone (culprit resolved to node 0 only)..."
 for i in $(seq 1 $((NUM_VALIDATORS - 1))); do
     stake_status=$(curl -s -o "$ROOT/stake_$i.json" -w '%{http_code}' "http://127.0.0.1:$RPC_HONEST/accounts/${ADDRS[$i]}/stake")
@@ -189,9 +224,34 @@ else
     pass=false
 fi
 
+# The actual self-incrimination property: node 0 must never *submit* a
+# SubmitExecutionFault action (any sender may submit one — see
+# ActionPayload::SubmitExecutionFault's doc comment — but in this scenario
+# only node 0 has diverged, so any such action node 0 sends can only be a
+# false accusation; a correct node re-adjudicates locally before submitting
+# and refuses to name someone else when it itself is culpable — see
+# arxd/node/src/lib.rs's build_execution_fault_action). Checked at the
+# action level, not via node 0's /evidence directory (see the ponytail
+# above this script's header comment for why that directory proves nothing).
+echo "checking node 0 never submitted a fault action naming another validator (self-incrimination guard)..."
+self_incrimination=0
+for h in $(seq 1 "$tip"); do
+    block="$(curl -sf "http://127.0.0.1:$RPC_HONEST/blocks/$h")"
+    hits="$(echo "$block" | jq --arg addr "${ADDRS[0]}" '[.actions[]? | select(.sender == $addr) | select(.payload | has("SubmitExecutionFault"))]')"
+    if [ "$(echo "$hits" | jq 'length')" -gt 0 ]; then
+        echo "  FAIL: node 0 submitted a SubmitExecutionFault action at height $h: $hits"
+        self_incrimination=1
+        pass=false
+    fi
+done
+if [ "$self_incrimination" = 0 ]; then
+    echo "  ok: node 0 never submitted a fault action"
+fi
+
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — recursion guard, culprit resolution, and the slash landing all held."
+    echo "PASS — culprit resolution, self-incrimination, and the slash landing all held."
+    echo "(Recursion guard not exercised by this scenario — see header comment.)"
     rm -rf "$ROOT"
     exit 0
 else

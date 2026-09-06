@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -348,6 +349,16 @@ where
     G: Fn(EvidenceArtifact) -> Option<Action<P>> + Send + 'static,
 {
     thread::spawn(move || {
+        // Heights this node has already attempted a `SubmitExecutionFault`
+        // for, regardless of outcome. `BlockDivergence` fires once per
+        // gossiped dissent this node observes about the dispute — every
+        // honest validator's own dissent re-triggers it — so without this,
+        // a single disputed height generates one submission attempt per
+        // dissenting peer, all racing for the same (sender, nonce) mempool
+        // slot. The chain-level `EvidenceMarkerKey` check (Stage 2) already
+        // makes a resubmission harmless once it reaches a block; this just
+        // stops the local mempool churn and log noise before that point.
+        let mut fault_attempted: HashSet<u64> = HashSet::new();
         for event in events {
             let block = match event {
                 EvidenceEvent::BlockObserved(block) => block,
@@ -380,12 +391,13 @@ where
                         &voter_pubkey,
                         &dissent_claim,
                     );
-                    // ponytail: no local dedup — `submit_execution_fault`'s
-                    // on-chain `EvidenceMarkerKey` check (Stage 2) rejects a
-                    // resubmission, so at worst a duplicate wastes one mempool
-                    // slot rather than double-slashing.
-                    if let (Some(artifact), Some(build_execution_fault_action)) =
-                        (artifact, &build_execution_fault_action)
+                    // First dissent at this height writes the artifact above
+                    // (still useful bookkeeping/relay even on a resubmit) but
+                    // only the first one attempts an on-chain submission —
+                    // see the HashSet comment at the top of this thread.
+                    let already_attempted = !fault_attempted.insert(proposed.height);
+                    if let (false, Some(artifact), Some(build_execution_fault_action)) =
+                        (already_attempted, artifact, &build_execution_fault_action)
                     {
                         // `build_execution_fault_action` returns `None` when it
                         // isn't safe to submit — e.g. the node's own local,
@@ -656,6 +668,94 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "block divergence fault was never submitted to mempool");
             thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// A real network fires `BlockDivergence` for the same disputed height
+    /// once per dissenting peer this node observes, not once — see the
+    /// `HashSet` comment in `spawn_evidence_watcher`. Each attempt reads the
+    /// account's *current* nonce, so if an unrelated action mines between
+    /// attempts (mimicked here with an incrementing nonce), a second
+    /// attempt at the same disputed height would not collide in the mempool
+    /// and would happily submit a second, redundant on-chain report. This
+    /// asserts the dedup guard stops that at the source rather than relying
+    /// on the mempool or `EvidenceMarkerKey` (Stage 2) to reject it later.
+    #[test]
+    fn spawn_evidence_watcher_only_submits_once_per_height_despite_repeat_divergence_events() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-spawn-evidence-watcher-block-divergence-dedup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = ArxiumDb::open(&dir).expect("open test db");
+
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let proposed = signed_block(&key, 5, 100);
+        let dissent_claim = BlockDissentClaim {
+            computed_state_root: "0xdisputed".to_string(),
+            proofs: vec![],
+            signature: format!("0x{}", hex::encode([3u8; 96])),
+        };
+
+        let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
+        // A fresh nonce per call, as if each attempt re-read an account
+        // whose nonce had genuinely advanced since the last one — the
+        // scenario where the mempool's own (sender, nonce) dedup can't help.
+        let next_nonce = std::sync::atomic::AtomicU64::new(0);
+        let build_execution_fault_action = Some(move |_artifact: EvidenceArtifact| {
+            Some(Action {
+                sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
+                nonce: next_nonce.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                signature: None,
+                payload: (),
+            })
+        });
+        let evidence_dir = dir.join("evidence");
+        spawn_evidence_watcher(
+            db.clone(),
+            mempool.clone(),
+            rx,
+            build_evidence_action,
+            build_execution_fault_action,
+            evidence_dir.clone(),
+            [7u8; 32],
+        );
+
+        // Two different dissenting voters reporting the same disputed
+        // height — exactly what a real n-validator network gossips.
+        for voter in ["arx1voter-a", "arx1voter-b"] {
+            tx.send(EvidenceEvent::BlockDivergence {
+                proposed: proposed.clone(),
+                parent_state_root: "0xparent".to_string(),
+                voter: voter.to_string(),
+                voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
+                dissent_claim: dissent_claim.clone(),
+            })
+            .unwrap();
+        }
+        drop(tx);
+
+        // Both artifacts still get written (local bookkeeping is cheap and
+        // per-voter) — only the mempool submission is deduped.
+        for voter in ["arx1voter-a", "arx1voter-b"] {
+            let path = evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !path.exists() {
+                assert!(std::time::Instant::now() < deadline, "artifact for {voter} was never written");
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while mempool.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "block divergence fault was never submitted to mempool");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Give the second event's (would-be) submission a moment to land if
+        // the dedup were broken, then confirm it never did.
+        thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(mempool.lock().unwrap().len(), 1, "second dissent for the same height must not resubmit");
     }
 
     /// Exercises the same path `arxd/node`'s `on_block` triggers on a real
