@@ -578,11 +578,9 @@ where
     }
     writables.push(&operator_updates);
     writables.push(&block);
-    if sync {
-        db.write_batches_unsynced(&writables)?;
-    } else {
-        db.write_batches(&writables)?;
-    }
+    // One batch, and the undo record for it: the block, its state changes, and
+    // the ability to roll all of it back have to land together or not at all.
+    db.write_block_batches(block.height, &writables, !sync)?;
     Ok(block)
 }
 

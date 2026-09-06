@@ -649,11 +649,21 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
         None
     });
 
+    // The one field a wallet asking "is my transfer settled" can actually act
+    // on: `finalized_height` is the highest *certified* height and may sit
+    // above an uncertified gap, while this is the floor below which nothing
+    // will ever be reverted. See `ArxiumDb::get_final_watermark`.
+    let final_watermark = state.db.get_final_watermark().unwrap_or_else(|err| {
+        warn!("failed to read final watermark for /status: {err}");
+        0
+    });
+
     Json(serde_json::json!({
         "chain_name": chain_name,
         "tip_height": tip_height,
         "tip_hash": tip_hash,
         "finalized_height": finalized_height,
+        "final_watermark": final_watermark,
     }))
     .into_response()
 }
@@ -985,6 +995,14 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         None => None,
     };
 
+    let final_watermark = match state.db.get_final_watermark() {
+        Ok(watermark) => watermark,
+        Err(err) => {
+            warn!("failed to read final watermark: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
     let required = quorum(validators.len());
     Json(serde_json::json!({
         // null rather than absent: a client must be able to tell "nothing has
@@ -996,6 +1014,10 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         // How far behind the tip finality is running. Growing steadily means
         // votes are being produced but not reaching quorum.
         "blocks_behind_tip": finalized_height.map(|h| tip_height.saturating_sub(h)),
+        // Irreversibility floor, as opposed to `finalized_height`'s highest
+        // certificate: everything at or below this is contiguously certified
+        // and no node will roll it back.
+        "final_watermark": final_watermark,
         "validators": validators.len(),
         "validators_with_bls_key": voters,
         "quorum": required,
@@ -1932,6 +1954,7 @@ mod tests {
                     block_hash: genesis.hash(),
                     signers: vec![Address::from_pubkey_bytes(&[9u8; 32]).unwrap()],
                     aggregate_signature: xc_bls::BlsSignature([3u8; 96]),
+                    ep: [0u8; 32],
                 })
                 .unwrap();
 

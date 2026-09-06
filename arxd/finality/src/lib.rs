@@ -37,6 +37,54 @@ pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> 
     buf
 }
 
+/// Whether `record` is a finality certificate this node can independently
+/// verify against its own view of the chain at `record.height`: a quorum of
+/// that height's validator set, each a distinct member, signing the same
+/// `(height, block_hash, ep)` message under the BLS key that was valid at that
+/// height.
+///
+/// This is the whole basis on which a node is allowed to roll its own chain
+/// back (see `arxd/network`'s divergence recovery). Everything here is checked
+/// against local state — the validator set, the keys, the quorum threshold —
+/// so a peer cannot make a certificate valid by asserting anything about it.
+/// A certificate that fails this is a claim, not evidence, and is worth
+/// exactly nothing.
+pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
+    let validators = match db.get_validator_set_at(record.height) {
+        Ok(validators) => validators,
+        Err(err) => {
+            warn!("finality: cannot verify certificate at {}: {err}", record.height);
+            return false;
+        }
+    };
+
+    // Distinct, and members: a certificate listing the same validator twice
+    // would otherwise clear the threshold with half the actual support.
+    let unique: std::collections::BTreeSet<&Address> = record.signers.iter().collect();
+    if unique.len() != record.signers.len() {
+        return false;
+    }
+    if !unique.iter().all(|signer| validators.contains(signer)) {
+        return false;
+    }
+    if record.signers.len() < quorum(validators.len()) {
+        return false;
+    }
+
+    let mut pubkeys = Vec::with_capacity(record.signers.len());
+    for signer in &record.signers {
+        match db.get_bls_pubkey_at(signer, record.height) {
+            Ok(Some(pubkey)) => pubkeys.push(pubkey),
+            // A signer whose key this node doesn't know makes the aggregate
+            // uncheckable, which is a verification failure, not a pass.
+            _ => return false,
+        }
+    }
+
+    let msg = precommit_signing_bytes(record.height, &record.block_hash, &record.ep);
+    xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).is_ok()
+}
+
 /// Exact bytes a dissenting validator signs. Must match
 /// `xc_artifact::dissent_signing_bytes` byte-for-byte — that crate can't
 /// depend on this one, so it carries its own copy. Pinned by
@@ -561,6 +609,7 @@ fn tally_vote(
         block_hash: vote.block_hash.clone(),
         signers: signers.keys().cloned().collect(),
         aggregate_signature,
+        ep: vote.ep,
     };
     db.write_batches(&[&record])?;
     if let Err(err) = db.delete_precommit_votes(vote.height) {

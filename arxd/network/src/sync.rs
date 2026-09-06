@@ -113,6 +113,7 @@ pub(crate) fn send_sync_request(
         SyncRequest::Blocks { .. } => "blocks",
         SyncRequest::NodeInfo => "node_info",
         SyncRequest::Hashes { .. } => "hashes",
+        SyncRequest::Certificate { .. } => "certificate",
     };
     match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
         Ok(bytes) => {

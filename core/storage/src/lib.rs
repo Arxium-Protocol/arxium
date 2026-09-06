@@ -62,6 +62,26 @@ pub enum StorageError {
     /// actively wrong, not just incomplete.
     #[error("state key not covered by any supplied proof")]
     UnprovenRead,
+
+    /// The safety rule of divergence recovery, enforced at the one place it
+    /// can be: a node may never rewrite history the network has certified
+    /// contiguously. Reaching this means the divergence is below the
+    /// watermark, which is a fault in *this* node — see `revert_to`.
+    #[error("refusing to revert to height {height}: below the contiguous finalized watermark {watermark}")]
+    RevertBelowWatermark { height: u64, watermark: u64 },
+
+    #[error("cannot revert through height {0}: no undo record (pre-v6 block, or one written outside write_block_batches)")]
+    MissingUndoRecord(u64),
+
+    #[error("cannot revert to height {0}: no block stored at that height")]
+    MissingBlock(u64),
+
+    /// The self-check the immutable, never-pruned trie makes possible: after
+    /// unwinding to `height`, the restored root must equal what the stored
+    /// header at that height committed to. A mismatch means the undo log and
+    /// the chain disagree, so the revert is abandoned rather than half-applied.
+    #[error("revert to height {height} produced state root {actual}, but the stored header commits to {expected}")]
+    RevertRootMismatch { height: u64, expected: String, actual: String },
 }
 
 /// Content-addressed Merkle-trie nodes (`B3`) — keyed by node hash, so a
@@ -112,10 +132,65 @@ const COLUMN_FAMILIES: [&str; 8] =
 /// repeat slash for the same fault is allowed and that the proof-only
 /// adjudicator could not previously read at all. Same "wipe and resync"
 /// policy as the prior bumps — still no forward migration runner.
-pub const SCHEMA_VERSION: u32 = 5;
+///
+/// Bumped 5 -> 6 for divergence recovery: every block now writes a
+/// `meta:undo:{height}` record (see `write_block_batches`) without which
+/// `revert_to` cannot roll that height back, and `FinalityRecord` gained the
+/// `ep` field a peer needs to verify a certificate it didn't tally itself.
+/// A version-5 DB has neither, so it's refused rather than being left in a
+/// state where the one operation that needs the undo log silently can't run —
+/// same "wipe and resync" policy as the prior bumps.
+pub const SCHEMA_VERSION: u32 = 6;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
+
+/// Highest height H such that every height in `1..=H` has a finality
+/// certificate — the floor below which this node will not revert. See
+/// `get_final_watermark`.
+const FINAL_WATERMARK_KEY: &[u8] = b"meta:final_watermark";
+
+/// Per-block undo record key. 30 bytes, so it can never collide with
+/// `cf_for_key`'s 32-byte `CF_MERKLE` shape check.
+fn undo_key(height: u64) -> Vec<u8> {
+    format!("meta:undo:{height:020}").into_bytes()
+}
+
+/// Records one key of a staged batch: into `touched` when an undo record is
+/// being built, and into `certified` when it is a finality certificate (whose
+/// height then feeds the contiguous-watermark advance).
+fn note_write(
+    touched: &mut BTreeSet<Vec<u8>>,
+    certified: &mut BTreeMap<u64, String>,
+    key: &[u8],
+    value: Option<&[u8]>,
+    recording: bool,
+) {
+    if recording {
+        touched.insert(key.to_vec());
+    }
+    let Some(digits) = key.strip_prefix(b"meta:finality:".as_slice()) else {
+        return;
+    };
+    let Some(height) = std::str::from_utf8(digits).ok().and_then(|d| d.parse::<u64>().ok()) else {
+        return;
+    };
+    // Decoded here rather than re-read after the write, because the watermark
+    // has to be decided inside the same batch that adds the certificate.
+    if let Some(value) = value {
+        if let Ok((record, _len)) = bincode::serde::decode_from_slice::<FinalityRecord, _>(
+            value,
+            bincode::config::standard(),
+        ) {
+            certified.insert(height, record.block_hash);
+        }
+    }
+}
+
+/// Prior on-disk values for every key one block's write batch touched —
+/// `None` for a key that did not exist before that block. Applying these in
+/// descending height order is exactly `revert_to`.
+type UndoRecord = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 /// Whether `key` is covered by the `B3` state trie / `compute_state_root` —
 /// `CF_ACCOUNTS`/`CF_VALIDATORS`/`CF_ASSETS`, i.e. every balance-bearing CF.
@@ -596,42 +671,255 @@ impl ArxiumDb {
     /// tip ahead of durable data (which would violate the "tip block must
     /// exist" invariant on restart, see arxd/node/src/produce.rs).
     pub fn write_batches(&self, items: &[&dyn BatchWritable]) -> Result<(), StorageError> {
-        self.write_batches_opt(items, true)
+        self.write_batches_opt(items, None, true)
     }
 
-    /// Same as `write_batches` but skips the fsync — for replaying a run of
-    /// already-finalized blocks during sync catch-up, where a crash just
-    /// means re-fetching and re-applying the same page from a peer rather
-    /// than losing anything, so paying one fsync per block (vs. one per
-    /// ~100-block page, see `arxd/network`'s sync handler) is pure overhead.
-    /// Callers on this path must still call `flush_wal` once per page so the
-    /// tip is actually durable before it's reported to peers/RPC callers.
-    pub fn write_batches_unsynced(&self, items: &[&dyn BatchWritable]) -> Result<(), StorageError> {
-        self.write_batches_opt(items, false)
+    /// `write_batches`, plus the per-block undo record `revert_to` needs.
+    ///
+    /// Use this for the one batch that commits block `height` — the block
+    /// record and every state/index change it caused. The undo record captures
+    /// the prior on-disk value of every key in this batch, which is what makes
+    /// the rollback cover derived `CF_META` indexes (`meta:asset_index`,
+    /// `meta:account_assets`, `meta:operator_index`, `meta:blskey*`) for free:
+    /// they are undone because the block wrote them, not because anything here
+    /// knows what they mean. Keys the block never wrote can't have been changed
+    /// by it, so they need no entry.
+    ///
+    /// It is deliberately part of the same atomic batch: an undo record that
+    /// could be written separately from its block would let a crash in between
+    /// produce a node that cannot roll back through exactly the height it needs
+    /// to.
+    ///
+    /// `CF_MERKLE` nodes are never captured — they're content-addressed and
+    /// shared across every root that references them, so deleting them would
+    /// corrupt history rather than restore it. Only the root *pointer*
+    /// (`MERKLE_ROOT_KEY`) moves back.
+    ///
+    /// `sync = false` skips the fsync, for replaying a run of already-finalized
+    /// blocks during sync catch-up: a crash there just means re-fetching the
+    /// same page from a peer, so one fsync per block (vs. one per ~100-block
+    /// page) is pure overhead. Callers on that path must still call `flush_wal`
+    /// once per page before the tip is reported to peers or RPC.
+    pub fn write_block_batches(
+        &self,
+        height: u64,
+        items: &[&dyn BatchWritable],
+        sync: bool,
+    ) -> Result<(), StorageError> {
+        self.write_batches_opt(items, Some(height), sync)
     }
 
-    fn write_batches_opt(&self, items: &[&dyn BatchWritable], sync: bool) -> Result<(), StorageError> {
+    fn write_batches_opt(
+        &self,
+        items: &[&dyn BatchWritable],
+        undo_height: Option<u64>,
+        sync: bool,
+    ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
+        let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut certified: BTreeMap<u64, String> = BTreeMap::new();
         for item in items {
             for (key, value) in item.batch_entries()? {
                 if is_state_key(&key) {
                     state_changes.insert(hash_key(&key), Some(value.clone()));
                 }
+                note_write(&mut touched, &mut certified, &key, Some(&value), undo_height.is_some());
                 batch.put_cf(self.cf(cf_for_key(&key)), key, value);
             }
             for key in item.batch_deletes()? {
                 if is_state_key(&key) {
                     state_changes.insert(hash_key(&key), None);
                 }
+                note_write(&mut touched, &mut certified, &key, None, undo_height.is_some());
                 batch.delete_cf(self.cf(cf_for_key(&key)), key);
             }
         }
+
+        // Read every prior value *before* staging the trie work, so nothing
+        // read here can already reflect this batch.
+        if let Some(height) = undo_height {
+            let mut record: UndoRecord = Vec::with_capacity(touched.len() + 1);
+            for key in touched {
+                let prior = self.db.get_cf(self.cf(cf_for_key(&key)), &key)?;
+                record.push((key, prior));
+            }
+            record.push((
+                MERKLE_ROOT_KEY.to_vec(),
+                self.db.get_cf(self.cf(CF_META), MERKLE_ROOT_KEY)?,
+            ));
+            let value = bincode::serde::encode_to_vec(&record, bincode::config::standard())?;
+            batch.put_cf(self.cf(CF_META), undo_key(height), value);
+        }
+
         if !state_changes.is_empty() {
             self.trie_root_after(&state_changes, Some(&mut batch))?;
         }
+        if !certified.is_empty() || undo_height.is_some() {
+            self.stage_watermark_advance(&certified, &mut batch)?;
+        }
         let mut opts = rocksdb::WriteOptions::default();
         opts.set_sync(sync);
+        self.db.write_opt(batch, &opts)?;
+        Ok(())
+    }
+
+    /// Advances `FINAL_WATERMARK_KEY` as far as contiguity allows, given the
+    /// certificates already on disk plus `incoming` (the heights certified by
+    /// the batch being staged, which aren't readable yet). Out-of-order
+    /// certificates simply don't move it; they get absorbed later when the gap
+    /// they left ahead of the watermark fills in.
+    ///
+    /// Undo records at or below the new watermark are dropped in the same
+    /// batch — the watermark is the revert floor, so they can never be needed
+    /// again, and this is what stops the log growing without bound.
+    fn stage_watermark_advance(
+        &self,
+        incoming: &BTreeMap<u64, String>,
+        batch: &mut WriteBatch,
+    ) -> Result<(), StorageError> {
+        let start = self.get_final_watermark()?;
+        let mut watermark = start;
+        loop {
+            let next = watermark + 1;
+            let certified = match incoming.get(&next) {
+                Some(block_hash) => block_hash.clone(),
+                None => match self.get_finality_record(next)? {
+                    Some(record) => record.block_hash,
+                    None => break,
+                },
+            };
+            // A certificate says what the *network* finalized. The watermark
+            // has to say what this node may not revert, which is only the same
+            // thing where this node actually holds the certified block. A node
+            // that voted for its own diverged block at `next` writes the
+            // quorum's certificate too, and must not thereby mark its own
+            // wrong block irreversible — that would turn the safety floor into
+            // a lock on being wrong forever. `block_hash:` is the local index,
+            // so this is a point lookup, not a block decode.
+            if self.get_block_height_by_hash(&certified)? != Some(next) {
+                break;
+            }
+            watermark = next;
+        }
+        if watermark == start {
+            return Ok(());
+        }
+        batch.put_cf(self.cf(CF_META), FINAL_WATERMARK_KEY, watermark.to_be_bytes());
+        for height in start + 1..=watermark {
+            batch.delete_cf(self.cf(CF_META), undo_key(height));
+        }
+        Ok(())
+    }
+
+    /// Unwinds this node's chain back to `height`, atomically.
+    ///
+    /// The safety rule the whole divergence-recovery path exists to enforce:
+    /// a node may revert only to a height at or above its contiguous finalized
+    /// watermark. Below that the node has committed to something the network
+    /// certified against, which is a fault in *this* node — it gets
+    /// `RevertBelowWatermark` and is expected to halt loudly and preserve its
+    /// state for forensics, not reshape itself to match whoever spoke last.
+    ///
+    /// Mechanically this is just the per-block undo records (see
+    /// `write_block_batches`) replayed from the tip down, in one batch. Block
+    /// records, `meta:tip_height`, the hash and action indexes, and the derived
+    /// `CF_META` read indexes all come back because the block's own batch wrote
+    /// them. What the block batch never wrote is handled explicitly:
+    ///
+    /// * `meta:precommit`/`meta:roundcert`/`meta:roundtimeout` above `height`
+    ///   are deleted — they are round state for blocks that no longer exist.
+    /// * `meta:finality` is **kept**. A certificate is a fact about what the
+    ///   network finalized at a height, not about which block this node
+    ///   happens to hold there, and the watermark already cross-checks the two
+    ///   (see `stage_watermark_advance`). Deleting it would throw away the
+    ///   verified evidence and leave the watermark permanently stuck behind a
+    ///   gap it can never refill: the precommit votes it was built from are
+    ///   deleted on finalization and never come back.
+    /// * `meta:dissent` is **kept**. It is the forensic record of the very
+    ///   divergence that caused the rollback; deleting it would destroy the
+    ///   evidence about the event.
+    /// * `meta:chain_name`/`meta:schema_version`/`meta:governor`/`meta:height`
+    ///   are genesis-scoped and untouched.
+    /// * `CF_MERKLE` is untouched — see `write_block_batches`.
+    ///
+    /// Then it verifies before committing: the restored trie root must equal
+    /// the `state_root` in the stored header at `height`. This is free because
+    /// the trie is immutable and never pruned, and it is non-optional — on
+    /// mismatch nothing is written at all, so a node with a broken undo log
+    /// refuses to continue rather than silently running on corrupt state.
+    ///
+    /// Reverting to the current tip (or above it) is a no-op, not an error.
+    pub fn revert_to<P: DeserializeOwned>(&self, height: u64) -> Result<(), StorageError> {
+        let tip = self.get_tip_height()?.unwrap_or(0);
+        if height >= tip {
+            return Ok(());
+        }
+        let watermark = self.get_final_watermark()?;
+        if height < watermark {
+            return Err(StorageError::RevertBelowWatermark { height, watermark });
+        }
+        let target = self.get_block::<P>(height)?.ok_or(StorageError::MissingBlock(height))?;
+
+        let mut batch = WriteBatch::default();
+        // Descending, so the value that survives for any key touched by
+        // several reverted blocks is the oldest one — its value as of
+        // `height`. `restored_root` follows the same rule.
+        let mut restored_root: Option<Option<Vec<u8>>> = None;
+        for h in (height + 1..=tip).rev() {
+            let bytes = self.get(&undo_key(h))?.ok_or(StorageError::MissingUndoRecord(h))?;
+            let (record, _len): (UndoRecord, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+            for (key, prior) in record {
+                if key == MERKLE_ROOT_KEY {
+                    restored_root = Some(prior.clone());
+                }
+                let cf = self.cf(cf_for_key(&key));
+                match prior {
+                    Some(value) => batch.put_cf(cf, &key, value),
+                    None => batch.delete_cf(cf, &key),
+                }
+            }
+            batch.delete_cf(self.cf(CF_META), undo_key(h));
+        }
+
+        for prefix in [
+            b"meta:precommit:".as_slice(),
+            b"meta:roundcert:".as_slice(),
+            b"meta:roundtimeout:".as_slice(),
+        ] {
+            let seek = [prefix, format!("{:020}", height + 1).as_bytes()].concat();
+            let iter = self
+                .db
+                .iterator_cf(self.cf(CF_META), IteratorMode::From(&seek, Direction::Forward));
+            for item in iter {
+                let (key, _value) = item?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                batch.delete_cf(self.cf(CF_META), key);
+            }
+        }
+
+        // A block above `height` that changed no Merkleized state leaves the
+        // root pointer untouched, so "no undo record mentioned it" means the
+        // current root is already the one `height` committed to.
+        let root = match restored_root {
+            Some(Some(value)) => value,
+            Some(None) => default_hashes()[256].to_vec(),
+            None => self.merkle_root()?.to_vec(),
+        };
+        let actual = format!("0x{}", hex::encode(&root));
+        if actual != target.state_root {
+            return Err(StorageError::RevertRootMismatch {
+                height,
+                expected: target.state_root,
+                actual,
+            });
+        }
+
+        let mut opts = rocksdb::WriteOptions::default();
+        opts.set_sync(true);
         self.db.write_opt(batch, &opts)?;
         Ok(())
     }
@@ -676,8 +964,8 @@ impl ArxiumDb {
     }
 
     /// Fsyncs the WAL for every write since the last sync — pairs with
-    /// `write_batches_unsynced` to turn a page of deferred-fsync block
-    /// writes into one durable commit instead of zero.
+    /// `write_block_batches(.., sync: false)` to turn a page of deferred-fsync
+    /// block writes into one durable commit instead of zero.
     pub fn flush_wal(&self) -> Result<(), StorageError> {
         self.db.flush_wal(true)?;
         Ok(())
@@ -956,6 +1244,29 @@ impl ArxiumDb {
         Ok(Vec::new())
     }
 
+    /// The contiguous finalized watermark: the highest H for which every
+    /// height in `1..=H` carries a finality certificate. Genesis (0) is final
+    /// by definition and is never certified by a vote, so 0 is both the
+    /// default and the hard floor.
+    ///
+    /// This is the irreversibility guarantee, and the *only* correct answer to
+    /// "is my transfer settled": `get_finalized_height` reports the highest
+    /// height that happens to be certified, which can sit above an uncertified
+    /// gap, so it is not a floor. `revert_to` refuses to go below this value
+    /// and nothing else in the codebase is allowed to move it backwards.
+    ///
+    /// Advanced only on contiguity, inside the same atomic batch that writes a
+    /// finality certificate (see `write_batches_opt`).
+    pub fn get_final_watermark(&self) -> Result<u64, StorageError> {
+        match self.get(FINAL_WATERMARK_KEY)? {
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes.try_into().map_err(|_| StorageError::CorruptedMeta)?;
+                Ok(u64::from_be_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Highest height with a finality certificate, if any.
     ///
     /// Found by seeking backwards over the `meta:finality:` prefix rather than
@@ -967,7 +1278,9 @@ impl ArxiumDb {
     /// Certificates are written as quorums complete, which is not necessarily in
     /// height order, so this is the highest *certified* height and not
     /// automatically a watermark below which everything is final. Callers that
-    /// need a contiguous guarantee should check the heights they care about.
+    /// need a contiguous guarantee want `get_final_watermark` instead — the two
+    /// answer different questions and both have callers, so neither should be
+    /// collapsed into the other by a well-meaning refactor.
     pub fn get_finalized_height(&self) -> Result<Option<u64>, StorageError> {
         let prefix = b"meta:finality:";
         // u64::MAX zero-padded: seeks past every real key, so Reverse starts at
@@ -1446,12 +1759,20 @@ impl BatchWritable for OperatorUpdates {
 /// than a `Block<P>` field — it's produced in a second round after the
 /// block already propagated, so embedding it would mean mutating an
 /// already-gossiped/stored block.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityRecord {
     pub height: u64,
     pub block_hash: String,
     pub signers: Vec<Address>,
     pub aggregate_signature: BlsSignature,
+    /// The execution-proof commitment every signer signed over, alongside
+    /// `height`/`block_hash` (see `arxd_finality::precommit_signing_bytes`).
+    /// Carried here because without it a node that did not tally these votes
+    /// itself cannot reconstruct the signed message, and so cannot check the
+    /// aggregate — which is exactly what a peer must do before it will
+    /// consider rolling its own chain back. It needs no independent trust:
+    /// a wrong `ep` simply fails the aggregate check.
+    pub ep: [u8; 32],
 }
 
 /// One validator's persisted precommit vote for `height`/`block_hash`, so a
@@ -2751,3 +3072,282 @@ mod merkle_state_root_tests {
         assert_eq!(cf_for_key(format!("asset_record:{id}").as_bytes()), CF_ASSETS);
     }
 }
+
+#[cfg(test)]
+mod divergence_recovery_tests {
+    use super::*;
+    use xc_primitives::AccountEntry;
+
+    fn temp_path() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "arxium-test-revert-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn addr(n: u8) -> Address {
+        Address::from_pubkey_bytes(&[n; 32]).unwrap()
+    }
+
+    fn entry(balance: u128) -> AccountEntry {
+        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
+    }
+
+    /// Commits one block that sets `holder`'s balance, the same way the
+    /// executor does: state changes and block record in one undo-logged batch.
+    fn commit(db: &ArxiumDb, height: u64, holder: u8, balance: u128) -> Block<()> {
+        let updates = AccountUpdates(BTreeMap::from([(addr(holder), entry(balance))]));
+        let state_root = db.compute_state_root(&[&updates]).unwrap();
+        let parent_hash = db
+            .get_block::<()>(height.saturating_sub(1))
+            .unwrap()
+            .map(|b| b.hash())
+            .unwrap_or_default();
+        let block = Block::<()> {
+            height,
+            parent_hash,
+            timestamp: height,
+            actions: Vec::new(),
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root,
+            round: 0,
+            round_certificate: None,
+        };
+        db.write_block_batches(height, &[&updates, &block], true).unwrap();
+        block
+    }
+
+    /// Certifies the block this node actually holds at `height` — the normal
+    /// case. `certify_hash` covers the case where the network certified
+    /// something else.
+    fn certify(db: &ArxiumDb, height: u64) {
+        let block_hash = db.get_block::<()>(height).unwrap().expect("block to certify").hash();
+        certify_hash(db, height, &block_hash);
+    }
+
+    fn certify_hash(db: &ArxiumDb, height: u64, block_hash: &str) {
+        db.write_batch(&FinalityRecord {
+            height,
+            block_hash: block_hash.to_string(),
+            signers: vec![addr(9)],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        })
+        .unwrap();
+    }
+
+    /// Stage 1's whole point: certificates arrive as quorums complete, not in
+    /// height order, so the watermark must move only when the run below it is
+    /// gapless — otherwise it isn't a floor and nothing can be built on it.
+    #[test]
+    fn the_watermark_only_moves_on_contiguity() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        assert_eq!(db.get_final_watermark().unwrap(), 0, "genesis is final by definition");
+        for height in 0..=4 {
+            commit(&db, height, 1, height as u128);
+        }
+
+        certify(&db, 1);
+        assert_eq!(db.get_final_watermark().unwrap(), 1);
+
+        // Out of order: 3 and 4 land while 2 is still missing.
+        certify(&db, 3);
+        certify(&db, 4);
+        assert_eq!(db.get_final_watermark().unwrap(), 1, "a gap at 2 blocks the watermark");
+        assert_eq!(db.get_finalized_height().unwrap(), Some(4), "but 4 is certified");
+
+        // Filling the gap absorbs everything already certified above it.
+        certify(&db, 2);
+        assert_eq!(db.get_final_watermark().unwrap(), 4);
+    }
+
+    /// Stage 2: an undo record restores prior values and removes keys the
+    /// block created.
+    #[test]
+    fn one_block_undoes_to_exactly_its_prior_state() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        commit(&db, 0, 1, 100);
+        let root_at_0 = db.compute_state_root(&[]).unwrap();
+        // Block 1 changes an existing account and creates a new one.
+        let updates = AccountUpdates(BTreeMap::from([(addr(1), entry(50)), (addr(2), entry(7))]));
+        let state_root = db.compute_state_root(&[&updates]).unwrap();
+        let block = Block::<()> {
+            height: 1,
+            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash(),
+            timestamp: 1,
+            actions: Vec::new(),
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root,
+            round: 0,
+            round_certificate: None,
+        };
+        db.write_block_batches(1, &[&updates, &block], true).unwrap();
+        assert_eq!(db.get_account(&addr(2)).unwrap().unwrap().balance, 7);
+
+        db.revert_to::<()>(0).unwrap();
+        assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 100, "prior value restored");
+        assert!(db.get_account(&addr(2)).unwrap().is_none(), "key the block created is gone");
+        assert_eq!(db.compute_state_root(&[]).unwrap(), root_at_0);
+        assert!(db.get_block::<()>(1).unwrap().is_none());
+        assert_eq!(db.get_tip_height().unwrap(), Some(0));
+    }
+
+    /// Stage 3's acceptance test: 20 blocks, revert to 10, the restored root
+    /// matches height 10's own header, then a different chain extends from
+    /// there cleanly.
+    #[test]
+    fn a_twenty_block_chain_reverts_to_ten_and_re_extends_along_another_path() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=20 {
+            commit(&db, height, 1, height as u128 * 10);
+        }
+        let header_10 = db.get_block::<()>(10).unwrap().unwrap();
+
+        db.revert_to::<()>(10).unwrap();
+
+        assert_eq!(db.get_tip_height().unwrap(), Some(10));
+        assert_eq!(db.compute_state_root(&[]).unwrap(), header_10.state_root);
+        assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 100);
+        assert!(db.get_block::<()>(11).unwrap().is_none());
+        assert!(
+            db.get_block_height_by_hash(&db.get_block::<()>(10).unwrap().unwrap().hash()).unwrap().is_some(),
+            "the surviving tip keeps its hash index"
+        );
+
+        // Different path from the same fork point.
+        for height in 11..=20 {
+            commit(&db, height, 2, height as u128);
+        }
+        assert_eq!(db.get_tip_height().unwrap(), Some(20));
+        assert_eq!(db.get_account(&addr(2)).unwrap().unwrap().balance, 20);
+        assert_eq!(
+            db.get_block::<()>(20).unwrap().unwrap().state_root,
+            db.compute_state_root(&[]).unwrap()
+        );
+    }
+
+    /// The safety property. A node that would revert below its watermark has
+    /// found a fault in itself; it must refuse rather than rewrite history the
+    /// network contiguously certified.
+    #[test]
+    fn reverting_below_the_watermark_is_refused_and_changes_nothing() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=5 {
+            commit(&db, height, 1, height as u128);
+        }
+        for height in 1..=3 {
+            certify(&db, height);
+        }
+        assert_eq!(db.get_final_watermark().unwrap(), 3);
+
+        let err = db.revert_to::<()>(2).unwrap_err();
+        assert!(matches!(err, StorageError::RevertBelowWatermark { height: 2, watermark: 3 }), "{err}");
+        assert_eq!(db.get_tip_height().unwrap(), Some(5), "state untouched");
+        assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 5);
+
+        // At the watermark is allowed — the floor is inclusive.
+        db.revert_to::<()>(3).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(3));
+    }
+
+    /// Stage 4: the derived `CF_META` read indexes are not merkleized, so
+    /// nothing would catch them silently disagreeing with state after a
+    /// revert — an explorer and a wallet would just show assets the chain no
+    /// longer thinks exist. They come back because the block's own batch wrote
+    /// them, which this pins.
+    #[test]
+    fn derived_indexes_follow_state_back_on_revert() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        commit(&db, 0, 1, 100);
+
+        let gold = Asset {
+            asset_id: "gold".to_string(),
+            issuer: addr(1),
+            compliance_required: false,
+        };
+        let balances = AssetBalanceUpdates(BTreeMap::from([(("gold".to_string(), addr(1)), 5u128)]));
+        let index = db.asset_index_updates(std::slice::from_ref(&gold), &balances).unwrap();
+        let state_root = db.compute_state_root(&[&gold, &balances]).unwrap();
+        let block = Block::<()> {
+            height: 1,
+            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash(),
+            timestamp: 1,
+            actions: Vec::new(),
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root,
+            round: 0,
+            round_certificate: None,
+        };
+        db.write_block_batches(1, &[&gold, &balances, &index, &block], true).unwrap();
+        assert_eq!(db.list_asset_ids().unwrap(), vec!["gold".to_string()]);
+        assert_eq!(db.get_account_assets(&addr(1)).unwrap(), vec!["gold".to_string()]);
+
+        db.revert_to::<()>(0).unwrap();
+
+        assert!(db.get_asset("gold").unwrap().is_none(), "merkleized registry record is gone");
+        assert!(db.list_asset_ids().unwrap().is_empty(), "and so is the index that pointed at it");
+        assert!(db.get_account_assets(&addr(1)).unwrap().is_empty());
+    }
+
+    /// Undo records below the watermark can never be needed — the watermark is
+    /// the revert floor — so they must not accumulate forever.
+    #[test]
+    fn undo_records_are_pruned_once_the_watermark_passes_them() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=5 {
+            commit(&db, height, 1, height as u128);
+        }
+        assert!(db.get(&undo_key(3)).unwrap().is_some());
+
+        for height in 1..=4 {
+            certify(&db, height);
+        }
+        assert_eq!(db.get_final_watermark().unwrap(), 4);
+        for height in 1..=4 {
+            assert!(db.get(&undo_key(height)).unwrap().is_none(), "undo {height} should be pruned");
+        }
+        assert!(db.get(&undo_key(5)).unwrap().is_some(), "above the watermark, still needed");
+    }
+
+    /// The case that makes the watermark a floor on *this node's* history
+    /// rather than a report about the network: a diverged node tallies the
+    /// quorum's votes too, so it writes a certificate for a block it doesn't
+    /// hold. If that moved its watermark it would have locked itself into its
+    /// own wrong block permanently — the one state from which recovery is
+    /// impossible.
+    #[test]
+    fn a_certificate_for_a_block_this_node_does_not_hold_does_not_move_the_watermark() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=3 {
+            commit(&db, height, 1, height as u128);
+        }
+        certify(&db, 1);
+        assert_eq!(db.get_final_watermark().unwrap(), 1);
+
+        // The network finalized a different block at height 2.
+        certify_hash(&db, 2, "0xsomebodyelses-block");
+        certify(&db, 3);
+        assert_eq!(db.get_final_watermark().unwrap(), 1, "our block at 2 is not the certified one");
+
+        // So rolling back through 2 stays permitted — this is exactly the
+        // recovery the watermark must not block.
+        db.revert_to::<()>(1).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        // And the certificates survive the revert, so re-syncing the certified
+        // block at 2 is all it takes for the watermark to move again.
+        assert!(db.get_finality_record(2).unwrap().is_some());
+        assert!(db.get_finality_record(3).unwrap().is_some());
+    }
+}
+

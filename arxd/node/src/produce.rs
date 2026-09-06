@@ -250,7 +250,9 @@ pub fn produce_block<R: ChainRuntime>(
     }
     writables.push(&operator_updates);
     writables.push(&new_block);
-    db.write_batches(&writables)?;
+    // Undo-logged like the accept path — a proposer diverges from the network
+    // exactly as easily as a follower does, so it needs the same rollback.
+    db.write_block_batches(new_block.height, &writables, true)?;
 
     Ok(new_block)
 }

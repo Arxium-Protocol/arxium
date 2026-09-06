@@ -36,8 +36,9 @@ pub fn sync_protocol(chain_id: &str) -> String {
 /// Incremented whenever a variant is appended, so peers can tell each other
 /// apart within one `SYNC_PROTOCOL` generation.
 ///
-/// 1 = `Status` + `Blocks`. 2 = adds `NodeInfo` and `Hashes`.
-pub const WIRE_VERSION: u32 = 2;
+/// 1 = `Status` + `Blocks`. 2 = adds `NodeInfo` and `Hashes`. 3 = adds
+/// `Certificate`.
+pub const WIRE_VERSION: u32 = 3;
 
 /// `Blocks` returns at most the responder's page size (see
 /// [`NodeInfo::max_page_size`]) starting at `from`, capped at its local tip —
@@ -62,6 +63,16 @@ pub enum SyncRequest {
         from: u64,
         to: u64,
     },
+    /// The responder's finality certificate at `height`, if it has one.
+    ///
+    /// Exists for divergence recovery. A peer's *claim* that its chain is the
+    /// right one is worth nothing; a certificate the asker can verify against
+    /// the validator set it independently holds at that height is the only
+    /// thing that justifies rewriting local history, so it has to be
+    /// fetchable on its own rather than inferred from block bodies.
+    Certificate {
+        height: u64,
+    },
 }
 
 /// Generic over the *block* type, not the payload inside it. The protocol only
@@ -77,6 +88,15 @@ pub enum SyncResponse<B> {
     /// `(height, hash)` ascending. Truncated to the responder's page size, and
     /// silently short where it has no block — absence is not an error here.
     Hashes(Vec<(u64, String)>),
+    /// Answer to [`SyncRequest::Certificate`]. `record` is a bincode-encoded
+    /// finality certificate, opaque here so this crate stays free of chain
+    /// crypto types; `None` means the responder has no certificate at that
+    /// height, which is not an error. The asker must verify what it decodes —
+    /// nothing about arriving over this protocol makes a certificate valid.
+    Certificate {
+        height: u64,
+        record: Option<Vec<u8>>,
+    },
 }
 
 /// A peer's self-description.

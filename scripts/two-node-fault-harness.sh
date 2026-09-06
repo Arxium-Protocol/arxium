@@ -259,9 +259,100 @@ if [ "$self_incrimination" = 0 ]; then
     echo "  ok: node 0 never submitted a fault action"
 fi
 
+# --- Divergence recovery -----------------------------------------------------
+#
+# The injected fault is a genuine divergence, not just a bad block: node 0
+# commits its own corrupted block at FAULT_HEIGHT, the honest majority times the
+# round out and finalizes a different block at that same height, and from then
+# on node 0 rejects every block the majority serves because the parent hash
+# never matches. Before divergence recovery existed this is exactly where node 0
+# stopped forever with "needs manual intervention" in its log.
+#
+# A partition-and-heal split can't produce this on a single validator set —
+# neither side of a 2+2 split can reach quorum, so neither advances and nothing
+# diverges (the quorum-degeneracy point in this script's header). The
+# fault-injection path is the scenario the machinery actually has to survive,
+# and it is already running above.
+#
+# Four assertions, not one, because three of the four failure modes here are
+# silent: converging on the wrong height, converging on a different state, and
+# losing the reverted blocks' actions all look like success from the outside.
+echo
+echo "checking the diverged node recovered by rolling back..."
+RPC_FAULTY="${RPC_PORTS[0]}"
+
+echo "waiting for node 0 to catch back up to the honest chain (timeout ${CHAIN_TIMEOUT}s)..."
+deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+faulty_tip=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    faulty_tip="$(curl -sf "http://127.0.0.1:$RPC_FAULTY/status" | jq -r '.tip_height // 0')"
+    [ "$faulty_tip" -ge "$CONFIRM_HEIGHT" ] && break
+    sleep 2
+done
+
+# 1. It reverted at all, and to a height it was allowed to revert to.
+if grep -q "reverted from height" "$ROOT/node-0.log"; then
+    echo "  ok: $(grep -o 'reverted from height.*' "$ROOT/node-0.log" | head -n 1)"
+else
+    echo "  FAIL: node 0 never reverted (tip $faulty_tip); last lines:"
+    tail -n 20 "$ROOT/node-0.log"
+    pass=false
+fi
+
+# 2. It converged on the majority's chain, byte for byte — same block hash and
+#    same state root at the same height, read from both nodes independently.
+honest_block="$(curl -sf "http://127.0.0.1:$RPC_HONEST/blocks/$CONFIRM_HEIGHT" || echo '{}')"
+faulty_block="$(curl -sf "http://127.0.0.1:$RPC_FAULTY/blocks/$CONFIRM_HEIGHT" || echo '{}')"
+honest_root="$(echo "$honest_block" | jq -r '.state_root // "honest-missing"')"
+faulty_root="$(echo "$faulty_block" | jq -r '.state_root // "faulty-missing"')"
+if [ "$honest_root" = "$faulty_root" ]; then
+    echo "  ok: node 0 agrees with the majority at height $CONFIRM_HEIGHT (state_root $honest_root)"
+else
+    echo "  FAIL: state roots differ at height $CONFIRM_HEIGHT: honest $honest_root vs node 0 $faulty_root"
+    pass=false
+fi
+
+# 3. Nothing was dropped on the floor. Actions in the blocks node 0 threw away
+#    go back to its mempool and must end up confirmed on the chain it adopted —
+#    the failure mode here is silent by construction: the transactions just
+#    vanish and nothing logs an error.
+missing_actions=0
+for h in $(seq 1 "$CONFIRM_HEIGHT"); do
+    sigs="$(curl -sf "http://127.0.0.1:$RPC_HONEST/blocks/$h" | jq -r '.actions[]?.signature // empty')"
+    for sig in $sigs; do
+        if ! curl -sf "http://127.0.0.1:$RPC_FAULTY/actions/$sig" >/dev/null; then
+            # 404 is the loss condition: node 0 knows the action neither as
+            # confirmed nor as pending, so it went in the bin with the block.
+            echo "  FAIL: action $sig (honest height $h) is unknown to node 0 — neither confirmed nor pending"
+            missing_actions=1
+            pass=false
+        fi
+    done
+done
+if [ "$missing_actions" = 0 ]; then
+    echo "  ok: no action from the honest chain went missing on node 0"
+fi
+
+# 4. Nobody rewrote history below its own watermark. That path refuses to touch
+#    state and logs "HALT:" — its presence anywhere is a failure of the safety
+#    rule, not of recovery.
+halted=0
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+    if grep -q "HALT:" "$ROOT/node-$i.log"; then
+        echo "  FAIL: node $i halted below its watermark:"
+        grep -m 1 "HALT:" "$ROOT/node-$i.log"
+        halted=1
+        pass=false
+    fi
+done
+if [ "$halted" = 0 ]; then
+    echo "  ok: no node reverted below its finalized watermark"
+fi
+
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — culprit resolution, self-incrimination, and the slash landing all held."
+    echo "PASS — culprit resolution, self-incrimination, the slash landing, and"
+    echo "the diverged node's automatic rollback and reconvergence all held."
     echo "(Recursion guard not exercised by this scenario — see header comment.)"
     rm -rf "$ROOT"
     exit 0

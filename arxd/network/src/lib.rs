@@ -4,6 +4,7 @@
 pub mod identity;
 mod discovery;
 mod gossip;
+mod recovery;
 mod sync;
 mod transport;
 
@@ -20,16 +21,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::thread;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
-use arxd_finality::{Dissent, PrecommitVote, RoundTimeoutVote};
+use arxd_finality::{Dissent, PrecommitVote, RoundTimeoutVote, verify_finality_record};
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
-use xc_storage::ArxiumDb;
+use xc_storage::{ArxiumDb, FinalityRecord};
 
 use discovery::{dial_bootnodes, dial_discovered};
+use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use gossip::{
     actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip, round_timeouts_topic,
 };
@@ -252,10 +255,22 @@ async fn run_swarm<P: Payload>(
     let mut status_interval = tokio::time::interval(STATUS_INTERVAL);
     // Tracks (height, consecutive rounds without progress) so a sync loop
     // that keeps re-fetching the same block(s) `on_block` keeps rejecting
-    // (state genuinely diverged from this peer — there's no reorg/rollback
-    // in this codebase to recover automatically) logs once loudly instead
-    // of an unbounded `warn!` every `STATUS_INTERVAL` forever.
+    // (state genuinely diverged from this peer) logs once loudly instead of
+    // an unbounded `warn!` every `STATUS_INTERVAL` forever — and now also
+    // triggers divergence recovery once, at the cap. See `recovery`.
     let mut stuck_tip: Option<(u64, u32)> = None;
+    // Peers whose `Hashes`/`Certificate` responses this node actually asked
+    // for, as part of divergence recovery. An unsolicited one is still
+    // ignored — a peer must not be able to start a rollback conversation this
+    // node didn't open.
+    let mut recovering: HashMap<PeerId, RecoveryStep> = HashMap::new();
+    // When the last automatic revert happened — see `recovery::REVERT_COOLDOWN`.
+    let mut last_revert: Option<Instant> = None;
+    // Latched once this node learns, from a certificate it verified itself,
+    // that it committed to something the network certified against below its
+    // own watermark. Recovery never runs again after that: the state is
+    // preserved as-is for forensics rather than reshaped.
+    let mut halted_below_watermark = false;
 
     loop {
         tokio::select! {
@@ -653,6 +668,23 @@ async fn run_swarm<P: Payload>(
                                     .collect();
                                 SyncResponse::<Block<P>>::Hashes(hashes)
                             }
+                            // Serving this is what lets a diverged peer check
+                            // our claim instead of taking it on faith — see
+                            // `recovery`.
+                            SyncRequest::Certificate { height } => {
+                                let record = db
+                                    .get_finality_record(height)
+                                    .unwrap_or_else(|err| {
+                                        warn!("failed to read finality record at {height} for {peer}: {err}");
+                                        None
+                                    })
+                                    .and_then(|record| {
+                                        bincode::serde::encode_to_vec(&record, xc_primitives::wire_config())
+                                            .map_err(|err| warn!("failed to encode finality record at {height}: {err}"))
+                                            .ok()
+                                    });
+                                SyncResponse::<Block<P>>::Certificate { height, record }
+                            }
                         };
                         match bincode::serde::encode_to_vec(&response, xc_primitives::wire_config()) {
                             Ok(bytes) => {
@@ -679,6 +711,7 @@ async fn run_swarm<P: Payload>(
                             SyncResponse::Blocks(_) => "blocks",
                             SyncResponse::NodeInfo(_) => "node_info",
                             SyncResponse::Hashes(_) => "hashes",
+                            SyncResponse::Certificate { .. } => "certificate",
                         };
                         counter!("arxium_sync_responses_total", "kind" => kind).increment(1);
                         match sync_response {
@@ -686,8 +719,115 @@ async fn run_swarm<P: Payload>(
                             // followers. Receiving one means a peer answered a
                             // question we didn't ask, so note it and move on
                             // rather than treating it as protocol breakage.
-                            SyncResponse::NodeInfo(_) | SyncResponse::Hashes(_) => {
+                            SyncResponse::NodeInfo(_) => {
                                 warn!("unsolicited {kind} response from {peer}, ignoring");
+                            }
+                            // Step one of divergence recovery: locate the
+                            // first height where this peer's chain and ours
+                            // disagree. Only meaningful if we asked.
+                            SyncResponse::Hashes(hashes) => {
+                                if recovering.remove(&peer) != Some(RecoveryStep::AwaitingHashes) {
+                                    warn!("unsolicited hashes response from {peer}, ignoring");
+                                    continue;
+                                }
+                                let divergent = first_divergent_height(&hashes, |height| {
+                                    db.get_block::<P>(height).ok().flatten().map(|block| block.hash())
+                                });
+                                match divergent {
+                                    Some(height) => {
+                                        info!("divergence with {peer} first appears at height {height}, asking for its certificate there");
+                                        recovering.insert(peer, RecoveryStep::AwaitingCertificate(height));
+                                        send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate { height });
+                                    }
+                                    None => warn!(
+                                        "peer {peer} serves blocks this node rejects but agrees with it everywhere from the watermark to the tip — not a fork this node can roll back to; giving up on {peer}"
+                                    ),
+                                }
+                            }
+                            // Step two: the only input in this whole path that
+                            // is allowed to move local state, and only after
+                            // this node verifies it against its own validator
+                            // set.
+                            SyncResponse::Certificate { height, record } => {
+                                let Some(RecoveryStep::AwaitingCertificate(expected)) = recovering.remove(&peer) else {
+                                    warn!("unsolicited certificate response from {peer}, ignoring");
+                                    continue;
+                                };
+                                if expected != height {
+                                    warn!("peer {peer} answered with a certificate for height {height}, not the {expected} we asked about; ignoring");
+                                    continue;
+                                }
+                                let Some(record) = record
+                                    .as_deref()
+                                    .and_then(|bytes| decode_wire::<FinalityRecord>(bytes).ok())
+                                else {
+                                    warn!("peer {peer} has no usable certificate at {height}; its claim about this node's chain stays a claim, giving up on it");
+                                    continue;
+                                };
+                                if record.height != height || !verify_finality_record(&db, &record) {
+                                    warn!("certificate from {peer} at {height} does not verify against this node's validator set; ignoring it and giving up on {peer}");
+                                    continue;
+                                }
+                                let local_hash = db.get_block::<P>(height).ok().flatten().map(|block| block.hash());
+                                if local_hash.as_deref() == Some(record.block_hash.as_str()) {
+                                    warn!("certificate from {peer} at {height} certifies the block this node already holds; no rollback warranted");
+                                    continue;
+                                }
+                                let watermark = match db.get_final_watermark() {
+                                    Ok(watermark) => watermark,
+                                    Err(err) => {
+                                        warn!("failed to read final watermark: {err}");
+                                        continue;
+                                    }
+                                };
+                                match plan(height, watermark) {
+                                    Recovery::HaltBelowWatermark => {
+                                        counter!("arxium_divergence_below_watermark_total").increment(1);
+                                        // ponytail: latch + loud log, not a
+                                        // process-level halt — stopping the
+                                        // node needs a shutdown channel into
+                                        // `arxd/node` that doesn't exist yet.
+                                        // The part that matters now is that
+                                        // state is preserved untouched and
+                                        // never self-modified after this.
+                                        halted_below_watermark = true;
+                                        error!(
+                                            "HALT: this node's block at height {height} contradicts a finality certificate it verified itself (local {local_hash:?}, certified {}). The network finalized against this node at or below its own watermark {watermark} — this is a fault in this node, not in {peer}. State is preserved untouched for forensics; automatic recovery is now disabled for this process.",
+                                            record.block_hash
+                                        );
+                                    }
+                                    Recovery::RevertTo(target) => {
+                                        if !allow_revert(&mut last_revert, Instant::now()) {
+                                            warn!("revert to {target} suppressed by the cooldown; will retry after it expires");
+                                            continue;
+                                        }
+                                        let tip = local_tip_height(&db);
+                                        // Read the actions off before the
+                                        // blocks stop existing. Losing them is
+                                        // a silent failure — users see dropped
+                                        // transactions and nothing logs.
+                                        let orphaned: Vec<Action<P>> = (target + 1..=tip)
+                                            .filter_map(|h| db.get_block::<P>(h).ok().flatten())
+                                            .flat_map(|block| block.actions)
+                                            .collect();
+                                        match db.revert_to::<P>(target) {
+                                            Ok(()) => {
+                                                let mut restored = 0usize;
+                                                if let Ok(mut mempool) = mempool.lock() {
+                                                    for action in orphaned {
+                                                        if mempool.push(action).is_ok() {
+                                                            restored += 1;
+                                                        }
+                                                    }
+                                                }
+                                                counter!("arxium_reverts_total").increment(1);
+                                                error!("reverted from height {tip} to {target} in favour of {peer}'s certified chain (divergence at {height}); {restored} action(s) returned to the mempool");
+                                                send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from: target + 1 });
+                                            }
+                                            Err(err) => error!("revert to {target} failed and was not applied: {err}"),
+                                        }
+                                    }
+                                }
                             }
                             SyncResponse::Status { tip_height } => {
                                 peer_tips.insert(peer, tip_height);
@@ -754,9 +894,31 @@ async fn run_swarm<P: Payload>(
                                 // it exactly like any other sync failure.
                                 if stuck_rounds >= MAX_CONSECUTIVE_SYNC_FAILURES {
                                     if stuck_rounds == MAX_CONSECUTIVE_SYNC_FAILURES {
+                                        // A real divergence, not transient lag.
+                                        // Ask the peer to describe its chain
+                                        // over the only range a rollback could
+                                        // legally target — watermark..=tip.
+                                        // Nothing it answers is trusted; the
+                                        // hashes only locate the disagreement,
+                                        // and a certificate this node verifies
+                                        // itself is what decides whether to act
+                                        // on it. See `recovery`.
+                                        let watermark = db.get_final_watermark().unwrap_or_else(|err| {
+                                            warn!("failed to read final watermark: {err}");
+                                            local_tip
+                                        });
                                         error!(
-                                            "local tip stuck at {local_tip} after {stuck_rounds} sync rounds — peer {peer} keeps serving a block this node rejects (state has diverged; no automatic reorg/rollback exists, needs manual intervention); giving up on {peer} until it reconnects or another peer reports progress"
+                                            "local tip stuck at {local_tip} after {stuck_rounds} sync rounds — peer {peer} keeps serving a block this node rejects; attempting divergence recovery over {watermark}..={local_tip}"
                                         );
+                                        if halted_below_watermark {
+                                            warn!("divergence recovery is latched off after a below-watermark fault; not retrying");
+                                        } else {
+                                            recovering.insert(peer, RecoveryStep::AwaitingHashes);
+                                            send_sync_request(&mut swarm, &peer, &SyncRequest::Hashes {
+                                                from: watermark,
+                                                to: local_tip,
+                                            });
+                                        }
                                     }
                                     sync_failures.insert(peer, MAX_CONSECUTIVE_SYNC_FAILURES);
                                 } else if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
