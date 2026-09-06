@@ -437,18 +437,26 @@ required to check it:
 
 ## Two-node fault-injection acceptance harness
 
-`scripts/two-node-fault-harness.sh` boots two local validators from a
-throwaway genesis and corrupts one node's own state_root at a fixed height,
-to exercise the dissent/evidence/slash path against two real processes
-instead of a mocked executor. It needs nothing installed beyond `jq` and
-`curl`; everything else (keys, genesis, both nodes) is generated into a
-`mktemp -d` scratch directory it cleans up on success and leaves behind (path
-printed) on failure.
+`scripts/two-node-fault-harness.sh` boots `NUM_VALIDATORS` (default 4) local
+validators from a throwaway genesis and corrupts one node's own state_root at
+a fixed height, to exercise the dissent/evidence/slash path against real
+processes instead of a mocked executor. It needs nothing installed beyond
+`jq` and `curl`; everything else (keys, genesis, all nodes) is generated into
+a `mktemp -d` scratch directory it cleans up on success and leaves behind
+(path printed) on failure.
 
 ```sh
-scripts/two-node-fault-harness.sh                 # fault at height 5 (default)
-FAULT_HEIGHT=20 scripts/two-node-fault-harness.sh  # override
+scripts/two-node-fault-harness.sh                 # 4 validators, fault at height 5 (defaults)
+NUM_VALIDATORS=2 scripts/two-node-fault-harness.sh  # original two-node case
+FAULT_HEIGHT=20 scripts/two-node-fault-harness.sh  # override the fault height
 ```
+
+**Why 4, not 2, by default.** `quorum(n) = 2n/3 + 1` (`core/primitives/src/consensus.rs:20`)
+is 2 at n=2 — the faulty node's own vote is required for any quorum, so a
+two-node run can never demonstrate the honest side outvoting a faulty one.
+At n=4, quorum is 3 and the three honest nodes can reach it without the
+faulty node. See the 2026-09-06 re-run below for what that did and didn't
+settle.
 
 **The flag it exercises does not exist in a normal build.** `arxd`'s
 `--inject-fault-at-height` / `ARXD_INJECT_FAULT_AT_HEIGHT` is compiled in
@@ -472,37 +480,81 @@ in this codebase: RPC comes up, P2P listens, genesis writes, and the tip
 never advances, with nothing logged — see "Check the validator address
 before starting" above.
 
-**Run 2026-09-06 finding: the chain deadlocks instead of slashing.** A live
-run confirmed fault injection, dissent, and evidence-artifact generation all
-fire correctly — node A rejects B's corrupted block 5
+**Run 2026-09-06, two validators: the chain deadlocks instead of slashing.**
+A live run confirmed fault injection, dissent, and evidence-artifact
+generation all fire correctly — node A rejects B's corrupted block 5
 (`StateRootMismatch`), signs a dissent, and successfully pushes a
 `SubmitExecutionFault` action into its own mempool. But A's tip then sticks
 at height 4 permanently: it has no local block 5 to build on (it rejected
 the only one offered), round-timeout votes for height 6 are dropped for
 lacking a parent at 5, and there's no reorg/rollback to let a different
-proposer retry height 5. B's fault action sits in A's mempool forever,
-never mined, so the on-chain slash never lands. This is not a harness bug —
-it's the exact gap the harness was built to surface: **Stage 3 (culprit
-resolution → slash) is unreachable in practice until reorg/rollback across a
-disputed height is implemented**, because the honest node has no path
-forward past the disagreement to include its own accusation. Re-run this
-harness once reorg/rollback lands; a pass then is the actual acceptance
-signal Stage 3 was waiting on.
+proposer retry height 5. B's fault action sits in A's mempool forever, never
+mined, so the on-chain slash never lands.
+
+**This was originally logged as "Stage 3 unreachable without
+reorg/rollback." That claim was too strong — `quorum(2) = 2` means both
+validators, including the faulty one, must agree before *anything* advances
+past height 5; the deadlock is required by the math at n=2 regardless of
+reorg/rollback. It says nothing about whether Stage 3 is reachable when the
+honest side has an actual quorum majority (n=4, quorum 3), which is the case
+that matters. Also worth separating: A never *committed* height 5, it
+rejected the proposal outright — so "reorg/rollback," which undoes an
+already-committed block, was never the applicable mechanism here. What was
+missing is the honest majority driving a round/view change to re-propose
+height 5 itself, which is a different (and already-implemented) code path.**
+
+**Re-run 2026-09-06 at 4 validators (3 honest, 1 fault-injected) —
+inconclusive, and it surfaced a separate real bug.** The harness (now
+`NUM_VALIDATORS`-parametrized) was re-run repeatedly at n=4. Findings:
+
+- In one run, 2 of the 3 honest nodes stuck at tip height 4 exactly as in
+  the n=2 case, while the 3rd reached height 11 — i.e. the honest majority's
+  round/view-change path *did* let a different proposer re-mine height 5 for
+  at least one node, but the other two never synced that chain from their
+  peers. Not yet root-caused; plausibly a sync/gossip convergence gap rather
+  than a finality-logic bug (the finality code's round-timeout/vote-height
+  arithmetic is internally consistent — see `arxd/finality/src/lib.rs:317-331`).
+- Across 5 more attempts (both a full-mesh-bootnodes topology and the
+  original star-through-node-0 topology), 3 crashed one or more honest nodes
+  with a `libp2p-request-response-0.29.0` internal panic
+  (`assertion left == right failed`, `lib.rs:678`), independent of bootnode
+  topology — i.e. a previously-latent bug in the p2p dependency that the
+  two-node harness never had enough connection churn to trip. This blocks a
+  clean n=4 acceptance run until it's understood; not investigated further
+  here.
+- No run reached a slash: even the run that hit height 11, the honest
+  reference node's evidence directory was empty. This is at least partly the
+  known evidence-resubmission dedup gap (`core/evidence/src/lib.rs:383`,
+  `ponytail:`-flagged, see item 3 in the implementation log) causing
+  duplicate-nonce rejections — a distinct bug from the deadlock, not
+  evidence that reorg/rollback is the blocker.
+
+**Net: neither the original "reorg/rollback required" framing nor a clean
+counter-proof survives this round. The n=2 result is fully explained by
+quorum degeneracy and doesn't confirm a gap; the n=4 result is blocked by an
+unrelated crash and a known evidence-dedup bug before it can confirm or
+refute one. Re-run `scripts/two-node-fault-harness.sh` at n=4 once the
+libp2p panic and evidence-dedup issues are fixed — a clean pass or a
+reproducible stall then is the actual acceptance signal Stage 3 is waiting
+on.**
 
 ## Known limitations worth an operator's awareness
 
 From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,
 but relevant once this runs multi-node or faces adversarial peers:
 
-- **No reorg/rollback across a disputed height.** A node that rejects the
-  block at the tip+1 height (e.g. `StateRootMismatch`) has no way to accept
-  an alternative and no way to retry that height with a different proposer —
-  it sticks at its current tip permanently while the disagreeing peer keeps
-  re-offering the same rejected block. Confirmed live via
-  `scripts/two-node-fault-harness.sh` (see above): this is also why a
-  `SubmitExecutionFault` action can sit forever in the honest node's own
-  mempool without ever reaching a block, so a validator fault currently
-  produces a permanent chain stall rather than a slash.
+- **Two-validator chains cannot outvote a faulty validator (not a bug —
+  `quorum(2) = 2`).** With only 2 validators, quorum requires both, so a
+  node that rejects its peer's block has no way to make progress no matter
+  what machinery exists — this is arithmetic, not a missing feature. Confirmed
+  live via `scripts/two-node-fault-harness.sh`; see above for what running at
+  4 validators (honest majority, quorum outvotes the faulty node) did and
+  didn't settle. Whether an honest quorum majority can itself recover from a
+  rejected proposal via round/view-change (as opposed to reorg/rollback of an
+  already-committed block, which doesn't apply here — nothing was committed)
+  is still open, blocked on an unrelated libp2p crash found during the n=4
+  re-run (see above) and the evidence-resubmission dedup gap in
+  `core/evidence/src/lib.rs:383` (item 3 in the implementation log).
 - Reconnecting a peer clears its bad-gossip/sync-failure penalty counters —
   a peer that's about to hit the ban threshold can reconnect and keep
   spamming indefinitely (ban is per-connection, not per-`PeerId`).
