@@ -38,7 +38,7 @@ use gossip::{
     actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip, round_timeouts_topic,
 };
 use sync::{
-    MAX_CONSECUTIVE_SYNC_FAILURES, NodeInfo, STATUS_INTERVAL, SyncRequest, SyncResponse,
+    MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse,
     advance_stuck_tip, local_tip_height,
     send_sync_request,
 };
@@ -686,81 +686,7 @@ async fn run_swarm<P: Payload>(
                                 continue;
                             }
                         };
-                        let response = match sync_request {
-                            SyncRequest::Status => SyncResponse::<Block<P>>::Status {
-                                tip_height: local_tip_height(&db),
-                            },
-                            SyncRequest::Blocks { from } => {
-                                let tip_height = local_tip_height(&db);
-                                let blocks = db
-                                    .get_block_range::<P>(from, tip_height)
-                                    .unwrap_or_else(|err| {
-                                        warn!(
-                                            "failed to read blocks {from}..={tip_height} for sync response to {peer}: {err}"
-                                        );
-                                        Vec::new()
-                                    });
-                                SyncResponse::Blocks(blocks)
-                            }
-                            // Everything a follower would otherwise have to
-                            // hardcode or guess: the page size it must match,
-                            // how far finality has actually got, and which
-                            // wire generation we speak.
-                            SyncRequest::NodeInfo => {
-                                let tip_height = local_tip_height(&db);
-                                let tip_hash = db
-                                    .get_block_range::<P>(tip_height, tip_height)
-                                    .ok()
-                                    .and_then(|blocks| blocks.first().map(|b| b.hash()));
-                                SyncResponse::<Block<P>>::NodeInfo(NodeInfo {
-                                    wire_version: xc_wire::WIRE_VERSION,
-                                    tip_height,
-                                    tip_hash,
-                                    finalized_height: db
-                                        .get_finalized_height()
-                                        .unwrap_or_else(|err| {
-                                            warn!("failed to read finalized height: {err}");
-                                            None
-                                        }),
-                                    max_page_size: xc_storage::MAX_PAGE_SIZE as u32,
-                                })
-                            }
-                            // Hashes without bodies, so a follower resolving a
-                            // fork can binary-search for the common ancestor
-                            // instead of downloading one block per round trip.
-                            SyncRequest::Hashes { from, to } => {
-                                let to = to.min(local_tip_height(&db));
-                                let hashes = db
-                                    .get_block_range::<P>(from, to)
-                                    .unwrap_or_else(|err| {
-                                        warn!(
-                                            "failed to read blocks {from}..={to} for hash response to {peer}: {err}"
-                                        );
-                                        Vec::new()
-                                    })
-                                    .into_iter()
-                                    .map(|block| (block.height, block.hash()))
-                                    .collect();
-                                SyncResponse::<Block<P>>::Hashes(hashes)
-                            }
-                            // Serving this is what lets a diverged peer check
-                            // our claim instead of taking it on faith — see
-                            // `recovery`.
-                            SyncRequest::Certificate { height } => {
-                                let record = db
-                                    .get_finality_record(height)
-                                    .unwrap_or_else(|err| {
-                                        warn!("failed to read finality record at {height} for {peer}: {err}");
-                                        None
-                                    })
-                                    .and_then(|record| {
-                                        bincode::serde::encode_to_vec(&record, xc_primitives::wire_config())
-                                            .map_err(|err| warn!("failed to encode finality record at {height}: {err}"))
-                                            .ok()
-                                    });
-                                SyncResponse::<Block<P>>::Certificate { height, record }
-                            }
-                        };
+                        let response = sync::build_sync_response::<P>(&db, peer, sync_request);
                         match bincode::serde::encode_to_vec(&response, xc_primitives::wire_config()) {
                             Ok(bytes) => {
                                 if swarm.behaviour_mut().sync.send_response(channel, bytes).is_err() {

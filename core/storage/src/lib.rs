@@ -976,6 +976,62 @@ impl ArxiumDb {
         Ok(())
     }
 
+    /// Deletes block bodies strictly below `cutoff`, clamped to the
+    /// contiguous finalized watermark — `revert_to` can never target below
+    /// the watermark (`RevertBelowWatermark`), so nothing at or above it is
+    /// ever eligible for pruning, and this makes that a hard floor rather
+    /// than a caller convention. Superseded `validator_set:` snapshots below
+    /// the cutoff are dropped too, except the newest one at or before it,
+    /// which `get_validator_set_at`'s reverse-seek still needs to answer for
+    /// every retained height.
+    ///
+    /// `CF_MERKLE` is untouched — `revert_to`'s root self-check documents it
+    /// as immutable and never pruned, and this function doesn't get to
+    /// relitigate that invariant. A fresh node should sync via
+    /// `export_checkpoint`/`ArxiumDb::open` on a snapshot instead of replay
+    /// once blocks this old are gone.
+    ///
+    /// ponytail: leaves `action:{signature}` replay-index entries pointing
+    /// at pruned heights dangling — `get_action_block_height` still returns
+    /// the height, `get_block` for it then returns `None`. Harmless today
+    /// (replay protection only needs "did I see this signature", not the
+    /// block itself); revisit with a per-block action list if a caller ever
+    /// needs the two to agree.
+    pub fn prune<P: DeserializeOwned + Serialize>(&self, cutoff: u64) -> Result<(), StorageError> {
+        let cutoff = cutoff.min(self.get_final_watermark()?);
+        let mut batch = WriteBatch::default();
+
+        let prefix = b"validator_set:";
+        let seek_key = format!("validator_set:{cutoff:020}");
+        let newest_kept = self
+            .db
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(seek_key.as_bytes(), Direction::Reverse))
+            .filter_map(|item| item.ok())
+            .take_while(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key.to_vec())
+            .next();
+        for (key, _) in self
+            .db
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward))
+            .filter_map(|item| item.ok())
+            .take_while(|(key, _)| key.starts_with(prefix))
+        {
+            if key.as_ref() < seek_key.as_bytes() && Some(key.to_vec()) != newest_kept {
+                batch.delete_cf(self.cf(CF_VALIDATORS), &key);
+            }
+        }
+
+        for height in 0..cutoff {
+            if let Some(block) = self.get_block::<P>(height)? {
+                batch.delete_cf(self.cf(CF_BLOCKS), format!("block:{height:020}"));
+                batch.delete_cf(self.cf(CF_BLOCKS), format!("block_hash:{}", block.hash()));
+            }
+        }
+
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     /// Dumps every `(column_family, key, value)` triple currently on disk —
     /// used by the genesis-artifact generator to snapshot a freshly-written
     /// scratch DB into a raw artifact, rather than re-deriving keys/values
@@ -3432,6 +3488,67 @@ mod divergence_recovery_tests {
         // block at 2 is all it takes for the watermark to move again.
         assert!(db.get_finality_record(2).unwrap().is_some());
         assert!(db.get_finality_record(3).unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_deletes_blocks_and_their_hash_index_strictly_below_the_watermark_clamped_cutoff() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let mut hashes = Vec::new();
+        for height in 0..=5 {
+            hashes.push(commit(&db, height, 1, height as u128).hash());
+        }
+        for height in 1..=3 {
+            certify(&db, height);
+        }
+        assert_eq!(db.get_final_watermark().unwrap(), 3);
+
+        // Asked to prune past the watermark, but the watermark clamps it —
+        // nothing above height 3 may be touched, watermark or not.
+        db.prune::<()>(10).unwrap();
+
+        for height in 0..3 {
+            assert!(db.get_block::<()>(height).unwrap().is_none(), "height {height} pruned");
+            assert!(db.get_block_height_by_hash(&hashes[height as usize]).unwrap().is_none());
+        }
+        for height in 3..=5 {
+            assert!(db.get_block::<()>(height).unwrap().is_some(), "height {height} retained");
+            assert_eq!(db.get_block_height_by_hash(&hashes[height as usize]).unwrap(), Some(height));
+        }
+        // State and revert are untouched by pruning blocks — only sync-from-
+        // genesis replay loses the ability to walk through the pruned range.
+        assert_eq!(db.get_tip_height().unwrap(), Some(5));
+        db.revert_to::<()>(3).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(3));
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_validator_set_snapshot_at_or_before_the_cutoff() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=5 {
+            commit(&db, height, 1, height as u128);
+        }
+        for height in 1..=4 {
+            certify(&db, height);
+        }
+        assert_eq!(db.get_final_watermark().unwrap(), 4);
+
+        db.write_batch(&ValidatorSetSnapshot { effective_height: 0, validators: vec![addr(1)] }).unwrap();
+        db.write_batch(&ValidatorSetSnapshot { effective_height: 2, validators: vec![addr(1), addr(2)] }).unwrap();
+        db.write_batch(&ValidatorSetSnapshot { effective_height: 5, validators: vec![addr(3)] }).unwrap();
+
+        db.prune::<()>(4).unwrap();
+
+        // The snapshot effective at 0 is superseded by the one at 2 (also
+        // below the cutoff) and is gone with it — only retained heights
+        // (>= the cutoff) are guaranteed answerable after pruning. The one
+        // effective at 2 survives because it's still the answer for every
+        // retained height up to 4.
+        let mut at_4 = db.get_validator_set_at(4).unwrap();
+        at_4.sort();
+        let mut expected = vec![addr(1), addr(2)];
+        expected.sort();
+        assert_eq!(at_4, expected);
+        assert_eq!(db.get_validator_set_at(5).unwrap(), vec![addr(3)]);
     }
 }
 

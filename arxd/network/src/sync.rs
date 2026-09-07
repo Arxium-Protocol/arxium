@@ -5,8 +5,10 @@ use libp2p::PeerId;
 use metrics::counter;
 use std::time::Duration;
 use tracing::warn;
+use xc_primitives::Block;
 use xc_storage::ArxiumDb;
 
+use crate::gossip::Payload;
 use crate::transport::Behaviour;
 
 /// Request/response protocol a node uses to catch up on blocks it missed
@@ -37,6 +39,80 @@ pub(crate) use xc_wire::{NodeInfo, SyncRequest, SyncResponse};
 
 pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
     db.get_tip_height().ok().flatten().unwrap_or(0)
+}
+
+/// Answers one inbound `SyncRequest` by reading `db` — the part of the sync
+/// protocol's request handling that doesn't touch the swarm or a response
+/// channel, pulled out so it's a plain function a test can drive directly
+/// instead of only being reachable by decoding wire bytes inside the event
+/// loop. `peer` is for the warn! messages only; every branch here degrades
+/// to an empty/`None` result on a storage error rather than panicking, since
+/// a malformed or out-of-range request from a peer must never take the node
+/// down.
+pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, request: SyncRequest) -> SyncResponse<Block<P>> {
+    match request {
+        SyncRequest::Status => SyncResponse::<Block<P>>::Status { tip_height: local_tip_height(db) },
+        SyncRequest::Blocks { from } => {
+            let tip_height = local_tip_height(db);
+            let blocks = db.get_block_range::<P>(from, tip_height).unwrap_or_else(|err| {
+                warn!("failed to read blocks {from}..={tip_height} for sync response to {peer}: {err}");
+                Vec::new()
+            });
+            SyncResponse::Blocks(blocks)
+        }
+        // Everything a follower would otherwise have to hardcode or guess:
+        // the page size it must match, how far finality has actually got,
+        // and which wire generation we speak.
+        SyncRequest::NodeInfo => {
+            let tip_height = local_tip_height(db);
+            let tip_hash = db
+                .get_block_range::<P>(tip_height, tip_height)
+                .ok()
+                .and_then(|blocks| blocks.first().map(|b| b.hash()));
+            SyncResponse::<Block<P>>::NodeInfo(NodeInfo {
+                wire_version: xc_wire::WIRE_VERSION,
+                tip_height,
+                tip_hash,
+                finalized_height: db.get_finalized_height().unwrap_or_else(|err| {
+                    warn!("failed to read finalized height: {err}");
+                    None
+                }),
+                max_page_size: xc_storage::MAX_PAGE_SIZE as u32,
+            })
+        }
+        // Hashes without bodies, so a follower resolving a fork can
+        // binary-search for the common ancestor instead of downloading one
+        // block per round trip.
+        SyncRequest::Hashes { from, to } => {
+            let to = to.min(local_tip_height(db));
+            let hashes = db
+                .get_block_range::<P>(from, to)
+                .unwrap_or_else(|err| {
+                    warn!("failed to read blocks {from}..={to} for hash response to {peer}: {err}");
+                    Vec::new()
+                })
+                .into_iter()
+                .map(|block| (block.height, block.hash()))
+                .collect();
+            SyncResponse::<Block<P>>::Hashes(hashes)
+        }
+        // Serving this is what lets a diverged peer check our claim instead
+        // of taking it on faith — see `recovery`.
+        SyncRequest::Certificate { height } => {
+            let record = db
+                .get_finality_record(height)
+                .unwrap_or_else(|err| {
+                    warn!("failed to read finality record at {height} for {peer}: {err}");
+                    None
+                })
+                .and_then(|record| {
+                    bincode::serde::encode_to_vec(&record, xc_primitives::wire_config())
+                        .map_err(|err| warn!("failed to encode finality record at {height}: {err}"))
+                        .ok()
+                });
+            SyncResponse::<Block<P>>::Certificate { height, record }
+        }
+    }
 }
 
 /// Advances the "is the tip stuck" tracker after processing one sync page,
@@ -100,6 +176,127 @@ mod tests {
         let (state, rounds) = advance_stuck_tip(None, 5);
         assert_eq!(state, Some((5, 0)));
         assert_eq!(rounds, 0);
+    }
+
+    fn temp_db() -> ArxiumDb {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "arxium-test-sync-{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        ArxiumDb::open(&path).unwrap()
+    }
+
+    fn block(height: u64) -> Block<()> {
+        Block {
+            height,
+            parent_hash: "0xparent".into(),
+            timestamp: height,
+            actions: vec![],
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        }
+    }
+
+    // Adversarial coverage for `build_sync_response`, extracted from the
+    // sync event loop precisely so a peer sending an out-of-range,
+    // already-rejected, or otherwise malformed request can be exercised
+    // directly instead of only through a live swarm.
+
+    #[test]
+    fn blocks_request_from_past_the_tip_is_an_empty_page_not_an_error() {
+        let db = temp_db();
+        db.write_batch(&block(0)).unwrap();
+        db.write_batch(&block(1)).unwrap();
+        let SyncResponse::Blocks(blocks) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 50 })
+        else {
+            panic!("expected Blocks response");
+        };
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn blocks_request_from_genesis_returns_the_whole_chain() {
+        let db = temp_db();
+        for h in 0..=3 {
+            db.write_batch(&block(h)).unwrap();
+        }
+        let SyncResponse::Blocks(blocks) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 0 })
+        else {
+            panic!("expected Blocks response");
+        };
+        assert_eq!(blocks.iter().map(|b| b.height).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn hashes_request_past_the_tip_is_clamped_not_rejected() {
+        let db = temp_db();
+        db.write_batch(&block(0)).unwrap();
+        db.write_batch(&block(1)).unwrap();
+        let SyncResponse::Hashes(hashes) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Hashes { from: 0, to: 999 })
+        else {
+            panic!("expected Hashes response");
+        };
+        // Clamped to the real tip (1), not the peer's claimed upper bound.
+        assert_eq!(hashes.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    fn certificate_request_for_an_unfinalized_height_returns_none_not_a_panic() {
+        let db = temp_db();
+        db.write_batch(&block(0)).unwrap();
+        let SyncResponse::Certificate { height, record } =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Certificate { height: 0 })
+        else {
+            panic!("expected Certificate response");
+        };
+        assert_eq!(height, 0);
+        assert_eq!(record, None);
+    }
+
+    #[test]
+    fn certificate_request_for_a_height_never_reached_returns_none_not_a_panic() {
+        let db = temp_db();
+        let SyncResponse::Certificate { record, .. } =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Certificate { height: 12345 })
+        else {
+            panic!("expected Certificate response");
+        };
+        assert_eq!(record, None);
+    }
+
+    #[test]
+    fn node_info_on_an_empty_chain_reports_tip_zero_with_no_hash() {
+        let db = temp_db();
+        let SyncResponse::NodeInfo(info) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::NodeInfo) else {
+            panic!("expected NodeInfo response");
+        };
+        assert_eq!(info.tip_height, 0);
+        // No block has ever been written, so genesis itself can't be
+        // resolved to a hash — must degrade to `None`, not panic or fabricate one.
+        assert_eq!(info.tip_hash, None);
+    }
+
+    #[test]
+    fn status_request_reports_the_real_local_tip() {
+        let db = temp_db();
+        db.write_batch(&block(0)).unwrap();
+        db.write_batch(&block(1)).unwrap();
+        db.write_batch(&block(2)).unwrap();
+        let SyncResponse::Status { tip_height } = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Status)
+        else {
+            panic!("expected Status response");
+        };
+        assert_eq!(tip_height, 2);
     }
 }
 

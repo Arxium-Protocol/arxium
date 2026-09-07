@@ -124,6 +124,24 @@ pub enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Deletes block bodies (and superseded validator-set snapshots) older
+    /// than `retain_blocks` behind the tip, clamped to the contiguous
+    /// finalized watermark so nothing unfinalized or still needed by
+    /// `revert_to` is ever touched. State (account/validator balances) and
+    /// the Merkle trie are untouched — this only shrinks how far back a
+    /// fresh node could replay from genesis. Use `snapshot` beforehand if
+    /// you want a new node to be able to bootstrap past the pruned range.
+    Prune {
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
+        base_path: PathBuf,
+        /// Same meaning as `arxd --chain`.
+        #[arg(long, env = "ARXD_CHAIN", default_value = "devnet")]
+        chain: String,
+        /// How many blocks behind the tip to keep. Everything older is
+        /// eligible for deletion.
+        #[arg(long, default_value_t = 100_000)]
+        retain_blocks: u64,
+    },
     /// Prints a summary of a chain spec — name, genesis hash, validator and
     /// account counts, boot nodes — without starting a node. `--list` prints
     /// the available built-in preset names instead and ignores `--chain`.

@@ -1116,6 +1116,35 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         return Ok(());
     }
 
+    if let Some(Command::Prune {
+        base_path,
+        chain,
+        retain_blocks,
+    }) = &cli.command
+    {
+        let config = xc_primitives::NodeConfig {
+            base_path: base_path.clone(),
+            chain: chain.clone(),
+            port: 0,
+            p2p_port: 0,
+            bootnodes: Vec::new(),
+            is_bootnode: false,
+            is_validator: false,
+            rpc_token: None,
+            rpc_bind: "127.0.0.1".to_string(),
+            limits: xc_primitives::Limits::default(),
+        };
+        let components = new_partial::<R>(&config)?;
+        let tip = components.db.get_tip_height()?.unwrap_or(0);
+        let requested_cutoff = tip.saturating_sub(*retain_blocks);
+        let actual_cutoff = requested_cutoff.min(components.db.get_final_watermark()?);
+        components.db.prune::<R::Payload>(requested_cutoff)?;
+        println!(
+            "pruned blocks and superseded validator-set snapshots below height {actual_cutoff} (tip {tip}, retain_blocks {retain_blocks})"
+        );
+        return Ok(());
+    }
+
     if let Some(Command::ChainInfo { chain, list }) = &cli.command {
         if *list {
             for name in R::presets().names() {
