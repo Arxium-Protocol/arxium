@@ -36,6 +36,7 @@ members = [
     #
     "examples/toy-chain",
 ]
+exclude = ["fuzz"]
 resolver = "2"
 default-members = ["arxd"]
 

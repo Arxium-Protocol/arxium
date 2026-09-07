@@ -66,6 +66,7 @@ pub(crate) struct Behaviour {
 pub(crate) fn build_swarm(
     keypair: libp2p::identity::Keypair,
     chain_id: &str,
+    max_peers_incoming: u32,
 ) -> Result<libp2p::Swarm<Behaviour>> {
     let local_peer_id = PeerId::from(keypair.public());
     let sync_protocol = StreamProtocol::try_from_owned(sync_protocol(chain_id))
@@ -93,15 +94,18 @@ pub(crate) fn build_swarm(
                 [(sync_protocol, ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
-            // ponytail: fixed caps sized for a devnet's handful of peers;
-            // revisit if a real deployment needs more concurrent peers than
-            // this. per-peer allows a few (mdns reports one entry per
-            // transport, so a single peer legitimately holds >1 connection).
+            // Inbound capacity is operator-set (`--max-peers-incoming`,
+            // default 200) since it is the one an exposed bootnode actually
+            // runs into. Pending inbound is half of it: a handshake backlog
+            // larger than the connections that could survive it is only a
+            // bigger foothold for a connection flood. Per-peer stays fixed at
+            // a few — mdns reports one entry per transport, so a single peer
+            // legitimately holds >1 connection, but never many.
             let limits = connection_limits::Behaviour::new(
                 ConnectionLimits::default()
                     .with_max_established_per_peer(Some(4))
-                    .with_max_established_incoming(Some(200))
-                    .with_max_pending_incoming(Some(100)),
+                    .with_max_established_incoming(Some(max_peers_incoming))
+                    .with_max_pending_incoming(Some(max_peers_incoming.div_ceil(2))),
             );
             let identify = identify::Behaviour::new(
                 identify::Config::new(identify_protocol_version, keypair.public())

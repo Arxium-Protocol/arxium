@@ -103,7 +103,7 @@ mod tests {
     #[tokio::test]
     async fn crossing_threshold_bans_peer_permanently() {
         let mut swarm =
-            build_swarm(libp2p::identity::Keypair::generate_ed25519(), "test-chain").unwrap();
+            build_swarm(libp2p::identity::Keypair::generate_ed25519(), "test-chain", 200).unwrap();
         let mut bad_gossip = HashMap::new();
         let peer = PeerId::random();
 

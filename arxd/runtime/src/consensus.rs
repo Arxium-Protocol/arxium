@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{EvidenceMarkerKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
@@ -86,15 +86,19 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
 /// rejected here — that kind goes through `SubmitEquivocationEvidence` with
 /// the real blocks, not a JSON artifact.
 ///
-/// ponytail: `artifact.genesis_hash` isn't checked against this chain's
-/// real genesis — same open design question already deferred at
-/// `arxd/node/src/lib.rs:1057`; wire both together when that's resolved.
-/// Concrete shape of the hole while it's open: a validator running the same
-/// keys on two Arxium chains (e.g. mainnet + a testnet) can be slashed here
-/// for a fault actually committed on the *other* chain — nothing currently
-/// stops an artifact genuinely produced against chain B's genesis from being
-/// replayed and adjudicated against chain A's live state, since `dispatch`
-/// only depends on the action bytes and proofs, never on `genesis_hash`.
+/// `artifact.genesis_hash` is checked against this chain's own genesis hash
+/// (`GenesisHashKey`) first: adjudication depends only on the artifact's
+/// action bytes and proofs, so without this a validator running the same
+/// keys on two Arxium chains could be slashed here for a fault committed on
+/// the other one.
+/// Genesis hashes are written both ways in this codebase — `0x`-prefixed in
+/// artifacts (`core/evidence`), bare hex in some specs — so compare on the
+/// hex itself, case-insensitively.
+fn genesis_hash_matches(a: &str, b: &str) -> bool {
+    let strip = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_ascii_lowercase();
+    strip(a) == strip(b)
+}
+
 pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     view: &V,
     artifact_json: &str,
@@ -103,6 +107,18 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
 ) -> anyhow::Result<BlockUpdates> {
     let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json)
         .map_err(|err| anyhow::anyhow!("malformed evidence artifact JSON: {err}"))?;
+
+    // Fail closed: a chain with no seeded genesis hash cannot tell its own
+    // faults from another chain's, and slashing is not the place to guess.
+    let chain_genesis = view
+        .get(&GenesisHashKey)?
+        .ok_or_else(|| anyhow::anyhow!("this chain has no seeded genesis hash to check the artifact against"))?;
+    if !genesis_hash_matches(&chain_genesis, &artifact.genesis_hash) {
+        anyhow::bail!(
+            "evidence artifact was produced against genesis {}, this chain's genesis is {chain_genesis}",
+            artifact.genesis_hash,
+        );
+    }
 
     let (outcome, height, proposer_pubkey, voter_pubkey) = match &artifact.fault {
         xc_artifact::Fault::ActionDivergence { proposer_pubkey, voter_pubkey, height, .. } => {
@@ -446,5 +462,67 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid BLS public key"));
+    }
+
+    /// The artifact is only parsed, never adjudicated, before the genesis
+    /// check runs — so an `equivocation` artifact (which
+    /// `submit_execution_fault` rejects on its own grounds) is enough to see
+    /// which rejection comes first, and that the check exists at all.
+    fn attestation() -> serde_json::Value {
+        serde_json::json!({
+            "header": {
+                "height": 1,
+                "parent_hash": "",
+                "timestamp": 0,
+                "tx_root": "0x00",
+                "proposer": "",
+                "state_root": "",
+                "round": 0,
+            },
+            "signature": "0x00",
+        })
+    }
+
+    fn foreign_artifact_json(genesis_hash: &str) -> String {
+        serde_json::json!({
+            "artifact_version": xc_artifact::ARTIFACT_VERSION,
+            "genesis_hash": genesis_hash,
+            "fault": "equivocation",
+            "proposer_pubkey": "0x00",
+            "height": 1,
+            "blocks": [attestation(), attestation()],
+            "human_readable": serde_json::Value::Null,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn execution_fault_from_another_chain_is_rejected() {
+        let db = temp_db();
+        let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
+        view.put(&GenesisHashKey, &"0xaaaa".to_string()).unwrap();
+        let no_bls_owner = |_: &BlsPublicKey| -> Result<Option<Address>, StorageError> { Ok(None) };
+
+        let err = submit_execution_fault(&view, &foreign_artifact_json("0xbbbb"), 1, &no_bls_owner)
+            .unwrap_err();
+        assert!(err.to_string().contains("0xbbbb"), "{err}");
+
+        // Same artifact, this chain's genesis (and the `0x`/case spelling
+        // artifacts actually use): the genesis check is out of the way and
+        // the fault kind itself is what rejects it.
+        let err = submit_execution_fault(&view, &foreign_artifact_json("0xAAAA"), 1, &no_bls_owner)
+            .unwrap_err();
+        assert!(err.to_string().contains("SubmitEquivocationEvidence"), "{err}");
+    }
+
+    #[test]
+    fn execution_fault_is_rejected_on_a_chain_with_no_seeded_genesis_hash() {
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
+        let no_bls_owner = |_: &BlsPublicKey| -> Result<Option<Address>, StorageError> { Ok(None) };
+
+        let err = submit_execution_fault(&view, &foreign_artifact_json("0xaaaa"), 1, &no_bls_owner)
+            .unwrap_err();
+        assert!(err.to_string().contains("no seeded genesis hash"), "{err}");
     }
 }

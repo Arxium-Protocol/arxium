@@ -19,6 +19,7 @@ use libp2p::{Multiaddr, gossipsub, identify, mdns};
 use metrics::counter;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -43,18 +44,63 @@ use sync::{
 };
 use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
-/// Decodes an untrusted, peer-supplied byte slice (gossip message or sync
-/// payload, always read before any signature check) — bounded by
-/// `xc_primitives::MAX_WIRE_MESSAGE_SIZE` so a peer can't force a huge
-/// allocation via a declared length, and rejecting trailing bytes so a
-/// padded message can't silently round-trip to something other than what
-/// arrived on the wire.
-fn decode_wire<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, bincode::error::DecodeError> {
-    let (value, consumed) = bincode::serde::decode_from_slice(bytes, xc_primitives::wire_config())?;
-    if consumed != bytes.len() {
-        return Err(bincode::error::DecodeError::Other("trailing bytes after decoded value"));
+/// Exit code for a node that halted because it proved its own chain wrong
+/// (see `Recovery::HaltBelowWatermark`). Distinct from 1 so a supervisor can
+/// tell "this node must not be restarted onto the same state" apart from an
+/// ordinary crash, and pairs with `arxium_divergence_below_watermark_total`.
+pub const HALT_EXIT_CODE: u8 = 17;
+
+/// Exit code for an operator-requested (ctrl-c) stop — success, but still
+/// non-zero in the latch so `shutdown_code() != 0` means "stop".
+pub const GRACEFUL_SHUTDOWN: u8 = 1;
+
+/// The whole shutdown channel: `0` = keep running, anything else = stop, and
+/// the value is the process exit code (`GRACEFUL_SHUTDOWN` meaning exit 0).
+/// A process-global rather than an `Arc` threaded through every subsystem
+/// signature, because it *is* process-global state — there is one node per
+/// process and this latch is one-way.
+static SHUTDOWN: AtomicU8 = AtomicU8::new(0);
+
+/// Latches a shutdown. First writer wins, so a halt can't be downgraded to a
+/// graceful stop by a ctrl-c arriving afterwards.
+pub fn request_shutdown(code: u8) {
+    let _ = SHUTDOWN.compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+}
+
+/// `0` while the node should keep producing and voting; otherwise the exit
+/// code it must stop with. Polled by `arxd/node`'s produce loop and vote
+/// bridges.
+pub fn shutdown_code() -> u8 {
+    SHUTDOWN.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    /// The one thing that must not go wrong: a HALT being downgraded to a
+    /// graceful exit 0 by a ctrl-c arriving after it, which would hide the
+    /// very condition the exit code exists to alert on.
+    #[test]
+    fn a_halt_is_not_downgraded_by_a_later_graceful_shutdown() {
+        assert_eq!(shutdown_code(), 0);
+        request_shutdown(HALT_EXIT_CODE);
+        request_shutdown(GRACEFUL_SHUTDOWN);
+        assert_eq!(shutdown_code(), HALT_EXIT_CODE);
+        SHUTDOWN.store(0, Ordering::Relaxed);
     }
-    Ok(value)
+}
+
+/// Decodes an untrusted, peer-supplied byte slice (gossip message or sync
+/// payload, always read before any signature check). Bounded by
+/// `xc_primitives::MAX_WIRE_MESSAGE_SIZE` so a peer can't force a huge
+/// allocation via a declared length; rejects trailing bytes and
+/// non-canonical encodings — see `decode_wire_canonical`, which every
+/// untrusted decode in this crate routes through.
+fn decode_wire<T: serde::de::DeserializeOwned + serde::Serialize>(
+    bytes: &[u8],
+) -> Result<T, bincode::error::DecodeError> {
+    xc_primitives::decode_wire_canonical(bytes)
 }
 
 /// A gossip publish can fail because nobody local is subscribed to the
@@ -116,6 +162,8 @@ pub fn spawn_p2p_node<P: Payload>(
     // `xc_mempool::PayloadPrecheck` doc comment. `None` for chains with no
     // such rules.
     payload_precheck: Option<PayloadPrecheck<P>>,
+    // Operator-set resource limits; this crate reads `max_peers_incoming`.
+    limits: xc_primitives::Limits,
 ) -> Result<PeerId> {
     let keypair = if is_bootnode {
         identity::load_or_generate_devnet_bootnode_keypair(base_path)?
@@ -152,7 +200,7 @@ pub fn spawn_p2p_node<P: Payload>(
         runtime.block_on(run_swarm(
             keypair, listen_port, bootnodes, &chain_id, mempool, db, gossip_rx, block_rx, precommit_rx,
             dissent_rx, round_timeout_rx, on_block, on_precommit_vote, on_dissent, on_round_timeout_vote,
-            payload_precheck, ready_tx,
+            payload_precheck, limits, ready_tx,
         ));
     });
 
@@ -180,9 +228,10 @@ async fn run_swarm<P: Payload>(
     on_dissent: impl Fn(Dissent) + Send + 'static,
     on_round_timeout_vote: impl Fn(RoundTimeoutVote) + Send + 'static,
     payload_precheck: Option<PayloadPrecheck<P>>,
+    limits: xc_primitives::Limits,
     ready_tx: std_mpsc::Sender<Result<()>>,
 ) {
-    let mut swarm = match build_swarm(keypair, chain_id) {
+    let mut swarm = match build_swarm(keypair, chain_id, limits.max_peers_incoming) {
         Ok(swarm) => swarm,
         Err(err) => {
             let _ = ready_tx.send(Err(err));
@@ -274,6 +323,12 @@ async fn run_swarm<P: Payload>(
 
     loop {
         tokio::select! {
+            // This runtime already exists, so ctrl-c rides it rather than
+            // `arxd/node` spinning up a whole tokio runtime just to await it.
+            _ = tokio::signal::ctrl_c(), if shutdown_code() == 0 => {
+                info!("shutdown signal received, exiting after the current block");
+                request_shutdown(GRACEFUL_SHUTDOWN);
+            }
             _ = status_interval.tick() => {
                 let peers: Vec<PeerId> = swarm.connected_peers().cloned().collect();
                 metrics::gauge!("arxium_connected_peers").set(peers.len() as f64);
@@ -813,7 +868,8 @@ async fn run_swarm<P: Payload>(
                                             // never a reason to pick one.
                                             counter!("arxium_conflicting_certificates_total").increment(1);
                                             halted_below_watermark = true;
-                                            error!("HALT: two verified finality certificates at height {height} name different blocks ({} stored, {} from {peer}). That requires an equivocating quorum; this node will not choose between them. State preserved, automatic recovery disabled for this process.", stored.block_hash, record.block_hash);
+                                            request_shutdown(HALT_EXIT_CODE);
+                                            error!("HALT: two verified finality certificates at height {height} name different blocks ({} stored, {} from {peer}). That requires an equivocating quorum; this node will not choose between them. State preserved, automatic recovery disabled, and this node stops producing and voting and exits {HALT_EXIT_CODE}.", stored.block_hash, record.block_hash);
                                             continue;
                                         }
                                         Ok(Some(_)) => {}
@@ -850,16 +906,16 @@ async fn run_swarm<P: Payload>(
                                 match plan(height, watermark) {
                                     Recovery::HaltBelowWatermark => {
                                         counter!("arxium_divergence_below_watermark_total").increment(1);
-                                        // ponytail: latch + loud log, not a
-                                        // process-level halt — stopping the
-                                        // node needs a shutdown channel into
-                                        // `arxd/node` that doesn't exist yet.
-                                        // The part that matters now is that
-                                        // state is preserved untouched and
-                                        // never self-modified after this.
+                                        // State is preserved untouched and
+                                        // never self-modified after this; the
+                                        // latch stops recovery, the shutdown
+                                        // stops production and voting. A node
+                                        // that kept signing here would be
+                                        // signing a chain it just proved wrong.
                                         halted_below_watermark = true;
+                                        request_shutdown(HALT_EXIT_CODE);
                                         error!(
-                                            "HALT: this node's block at height {height} contradicts a finality certificate it verified itself (local {local_hash:?}, certified {}). The network finalized against this node at or below its own watermark {watermark} — this is a fault in this node, not in {peer}. State is preserved untouched for forensics; automatic recovery is now disabled for this process.",
+                                            "HALT: this node's block at height {height} contradicts a finality certificate it verified itself (local {local_hash:?}, certified {}). The network finalized against this node at or below its own watermark {watermark} — this is a fault in this node, not in {peer}. State is preserved untouched for forensics; automatic recovery is disabled, and this node stops producing and voting and exits {HALT_EXIT_CODE}.",
                                             record.block_hash
                                         );
                                     }
@@ -1029,6 +1085,7 @@ mod tests {
         let peer_id = spawn_p2p_node(
             &base_path, 0, &[], false, "test-chain", mempool, db, gossip_rx, block_rx, precommit_rx,
             dissent_rx, round_timeout_rx, |_, _| false, |_| {}, |_| {}, |_| {}, None,
+            xc_primitives::Limits::default(),
         )
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());

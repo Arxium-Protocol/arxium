@@ -9,14 +9,10 @@ use thiserror::Error;
 use xc_primitives::{Action, Address, SignatureError};
 use xc_storage::{ArxiumDb, StorageError};
 
-// ponytail: fixed cap sized for a devnet; make configurable if throughput ever
-// becomes a real constraint.
-const MAX_PENDING: usize = 10_000;
-
-// A count cap alone lets a mempool of a few huge actions still exhaust
-// memory well under MAX_PENDING entries. 10MB is generous for devnet-sized
-// actions; make configurable alongside MAX_PENDING if that changes.
-const MAX_PENDING_BYTES: usize = 10_000_000;
+// Both caps are per-instance and operator-set (`xc_primitives::Limits`,
+// `Mempool::with_limits`), defaulting to the devnet values they used to be
+// fixed at. They move together on purpose: a count cap alone lets a mempool
+// of a few huge actions exhaust memory well under the entry cap.
 
 #[derive(Debug, Error)]
 pub enum MempoolError {
@@ -96,17 +92,29 @@ pub struct Mempool<P> {
     // spammed action doesn't grow the queue unboundedly — only one action
     // per sender/nonce can ever land in a block anyway.
     seen: HashSet<(Address, u64)>,
+    // Signatures currently queued, so `contains_signature` (called per
+    // `GET /actions/{signature}` status poll) is a hash lookup rather than a
+    // scan of the whole queue. Maintained exactly like `seen`; kept separate
+    // because an action's identity to a *client* is its signature, while its
+    // identity for dedup purposes is (sender, nonce).
+    signatures: HashSet<String>,
     // Running total of every queued action's encoded size, so push/drain/purge
     // stay O(1) instead of re-encoding the whole queue to check the cap.
     total_bytes: usize,
+    max_pending: usize,
+    max_pending_bytes: usize,
 }
 
 impl<P> Default for Mempool<P> {
     fn default() -> Self {
+        let limits = xc_primitives::Limits::default();
         Self {
             pending: VecDeque::new(),
             seen: HashSet::new(),
+            signatures: HashSet::new(),
             total_bytes: 0,
+            max_pending: limits.mempool_max_pending,
+            max_pending_bytes: limits.mempool_max_bytes,
         }
     }
 }
@@ -114,6 +122,15 @@ impl<P> Default for Mempool<P> {
 impl<P: Serialize> Mempool<P> {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Same mempool with operator-set caps instead of the defaults.
+    pub fn with_limits(limits: &xc_primitives::Limits) -> Self {
+        Self {
+            max_pending: limits.mempool_max_pending,
+            max_pending_bytes: limits.mempool_max_bytes,
+            ..Self::default()
+        }
     }
 
     fn encoded_size(action: &Action<P>) -> usize {
@@ -126,14 +143,14 @@ impl<P: Serialize> Mempool<P> {
     }
 
     pub fn push(&mut self, action: Action<P>) -> Result<(), MempoolError> {
-        if self.pending.len() >= MAX_PENDING {
+        if self.pending.len() >= self.max_pending {
             return Err(MempoolError::Full);
         }
         let size = Self::encoded_size(&action);
         if size > xc_primitives::MAX_WIRE_MESSAGE_SIZE {
             return Err(MempoolError::TooLarge { size, max: xc_primitives::MAX_WIRE_MESSAGE_SIZE });
         }
-        if self.total_bytes + size > MAX_PENDING_BYTES {
+        if self.total_bytes + size > self.max_pending_bytes {
             return Err(MempoolError::Full);
         }
 
@@ -145,6 +162,9 @@ impl<P: Serialize> Mempool<P> {
             });
         }
 
+        if let Some(signature) = &action.signature {
+            self.signatures.insert(signature.clone());
+        }
         self.total_bytes += size;
         self.pending.push_back(action);
         Ok(())
@@ -158,11 +178,8 @@ impl<P: Serialize> Mempool<P> {
         self.pending.len()
     }
 
-    // ponytail: linear scan, fine at MAX_PENDING scale; index by signature if this gets hot.
     pub fn contains_signature(&self, signature: &str) -> bool {
-        self.pending
-            .iter()
-            .any(|action| action.signature.as_deref() == Some(signature))
+        self.signatures.contains(signature)
     }
 
     pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
@@ -172,6 +189,9 @@ impl<P: Serialize> Mempool<P> {
             .drain(..n)
             .inspect(|action| {
                 self.seen.remove(&(action.sender.clone(), action.nonce));
+                if let Some(signature) = &action.signature {
+                    self.signatures.remove(signature);
+                }
             })
             .collect();
         for action in &drained {
@@ -189,10 +209,14 @@ impl<P: Serialize> Mempool<P> {
     /// peer re-executing it would reject.
     pub fn purge_stale(&mut self, sender: &Address, current_nonce: u64) {
         let seen = &mut self.seen;
+        let signatures = &mut self.signatures;
         let mut removed_bytes = 0usize;
         self.pending.retain(|action| {
             if &action.sender == sender && action.nonce < current_nonce {
                 seen.remove(&(action.sender.clone(), action.nonce));
+                if let Some(signature) = &action.signature {
+                    signatures.remove(signature);
+                }
                 removed_bytes += Self::encoded_size(action);
                 false
             } else {
@@ -221,14 +245,14 @@ mod tests {
     }
 
     /// A handful of large actions can exhaust the byte budget long before
-    /// MAX_PENDING (10,000) entries would — proves the cap is on bytes, not
+    /// the entry cap (10,000) would — proves the cap is on bytes, not
     /// just count.
     #[test]
     fn push_rejects_once_the_byte_budget_is_exhausted_well_under_the_count_cap() {
         let mut mempool: Mempool<Vec<u8>> = Mempool::new();
         // Leaves headroom for per-action encoding overhead (address, nonce,
         // signature, length prefix) so 10 of these comfortably fit under
-        // MAX_PENDING_BYTES (10MB) but an 11th does not.
+        // the default byte cap (10MB) but an 11th does not.
         let big_payload = vec![0u8; 950_000];
 
         for nonce in 0..10 {
@@ -253,7 +277,7 @@ mod tests {
 
     /// A single over-cap action must be rejected at push, not accepted into
     /// the mempool and left to fail later at gossip-encode time — the
-    /// aggregate `MAX_PENDING_BYTES` budget alone wouldn't catch this (one
+    /// aggregate byte budget alone wouldn't catch this (one
     /// action, well under the aggregate budget, still over the per-message
     /// wire limit).
     #[test]
@@ -298,5 +322,32 @@ mod tests {
         mempool2.push(action(addr(1), 1)).unwrap();
         mempool2.purge_stale(&addr(1), 2);
         assert!(mempool2.push(action(addr(1), 1)).is_ok());
+    }
+
+    /// The signature index must track the queue exactly — a status poll for
+    /// a drained action reporting "still pending" is the same class of bug
+    /// the read/write rate-limit split was fixed for.
+    #[test]
+    fn contains_signature_tracks_push_drain_and_purge() {
+        let mut mempool: Mempool<()> = Mempool::new();
+        mempool.push(action(addr(1), 0)).unwrap();
+        mempool.push(action(addr(1), 1)).unwrap();
+        assert!(mempool.contains_signature("sig-0"));
+
+        mempool.drain_pending(1);
+        assert!(!mempool.contains_signature("sig-0"), "drained action must leave the index");
+        assert!(mempool.contains_signature("sig-1"));
+
+        mempool.purge_stale(&addr(1), 5);
+        assert!(!mempool.contains_signature("sig-1"), "purged action must leave the index");
+    }
+
+    #[test]
+    fn a_configured_entry_cap_replaces_the_default() {
+        let limits = xc_primitives::Limits { mempool_max_pending: 2, ..Default::default() };
+        let mut mempool: Mempool<()> = Mempool::with_limits(&limits);
+        mempool.push(action(addr(1), 0)).unwrap();
+        mempool.push(action(addr(1), 1)).unwrap();
+        assert!(matches!(mempool.push(action(addr(1), 2)), Err(MempoolError::Full)));
     }
 }

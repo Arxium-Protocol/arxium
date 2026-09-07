@@ -168,15 +168,21 @@ impl KeySpec for EvidenceMarkerKey<'_> {
     }
 }
 
-/// This chain's genesis hash, seeded once at genesis — reuses `CF_EVIDENCE`
-/// so it is merkleized and provable, letting `dispatch` check a submitted
-/// fault artifact's `genesis_hash` against the chain it's actually running on.
+/// This chain's genesis hash — block 0's state root — seeded once at genesis
+/// so `dispatch` can check a submitted fault artifact's `genesis_hash`
+/// against the chain it is actually running on.
+///
+/// `CF_META`, *not* a merkleized state key, and that is forced rather than
+/// chosen: the value is the genesis state root itself, so storing it in a
+/// key `is_state_key` covers would change the very root it records. Same
+/// trust shape as `GovernorKey`, which is also genesis-seeded, `CF_META`,
+/// and read through `KvRead` at dispatch time.
 pub struct GenesisHashKey;
 impl KeySpec for GenesisHashKey {
-    const CF: &'static str = CF_EVIDENCE;
+    const CF: &'static str = CF_META;
     type Value = String;
     fn encode(&self) -> Vec<u8> {
-        b"evidence:genesis_hash".to_vec()
+        b"meta:genesis_hash".to_vec()
     }
 }
 

@@ -76,7 +76,7 @@ for tool in jq curl; do
 done
 
 ROOT="$(mktemp -d -t arxium-fault-harness)"
-echo "harness scratch dir: $ROOT (kept on failure, removed on success)"
+echo "harness scratch dir: $ROOT (kept either way)"
 
 declare -a DIRS RPC_PORTS P2P_PORTS PIDS ADDRS
 PID_A=""  # index 0's pid, kept named for cleanup clarity
@@ -354,10 +354,16 @@ if [ "$pass" = true ]; then
     echo "PASS — culprit resolution, self-incrimination, the slash landing, and"
     echo "the diverged node's automatic rollback and reconvergence all held."
     echo "(Recursion guard not exercised by this scenario — see header comment.)"
-    rm -rf "$ROOT"
+    # Kept, not deleted. A passing run's logs are how a pass gets checked
+    # against the run that came before it: deleting them made attempt 9 read
+    # as "no detection" when it had in fact passed, and skewed the
+    # stall-rate numbers a whole session was spent chasing.
+    echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"
+    echo "logs and RPC captures kept in $ROOT"
     exit 0
 else
     echo
+    echo "FAIL $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"
     echo "FAIL — see $ROOT for logs and RPC captures."
     exit 1
 fi

@@ -23,7 +23,7 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address, Block, quorum};
+use xc_primitives::{Action, Address, Block, Limits, quorum};
 use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
@@ -32,26 +32,25 @@ use xc_storage::{ArxiumDb, StorageError};
 pub trait Payload: Serialize + DeserializeOwned + Clone + Send + Sync + 'static {}
 impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload for P {}
 
-// ponytail: fixed cap on a single JSON action body; make configurable if a
-// payload type ever legitimately needs more than this.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+// Every limit below now comes from `xc_primitives::Limits` (operator-set,
+// defaulting to exactly these devnet values):
+//
+// - the cap on a single JSON action body,
+// - the rate-limit window and the per-IP write budget inside it. Writes
+//   (state-mutating: POST /actions, POST /pairing) keep the tight budget —
+//   this is the one that actually bounds spam/DoS risk against the mempool
+//   and chain state,
+// - the per-IP read budget. Reads (GET /accounts/*, /blocks/*, ...) are
+//   cheap lookups against already-committed state, not a mempool/consensus
+//   risk, so they get a much higher ceiling. Load-testing this RPC
+//   (scripts/load-test) surfaced the bug a single shared budget causes: a
+//   client's own status-check polling right after a submission burst would
+//   get starved by its own writes, making confirmed-on-chain actions look
+//   "still pending" indefinitely.
 
-// ponytail: fixed window, single-node in-memory; move to a shared store
-// (redis, etc.) if this ever runs behind more than one RPC instance.
-const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
-// Writes (state-mutating: POST /actions, POST /pairing) keep the original
-// tight budget — this is the one that actually needs to bound spam/DoS
-// risk against the mempool and chain state.
-const RATE_LIMIT_MAX_WRITE_REQUESTS: u32 = 60;
-// Reads (GET /accounts/*, /blocks/*, etc.) are cheap lookups against
-// already-committed state, not a mempool/consensus risk, so they get a much
-// higher ceiling. Load-testing this RPC (scripts/load-test) surfaced the
-// bug a single shared budget causes: a client's own status-check polling
-// right after a submission burst would get starved by its own writes,
-// making confirmed-on-chain actions look "still pending" indefinitely.
-const RATE_LIMIT_MAX_READ_REQUESTS: u32 = 600;
 // Sweep stale per-IP entries once the map crosses this size, bounding worst-
 // case memory instead of growing forever for a public/long-lived instance.
+// Not operator-tunable: it bounds this map's memory, it is not a policy knob.
 const RATE_LIMIT_SWEEP_THRESHOLD: usize = 10_000;
 
 #[derive(Clone)]
@@ -82,17 +81,31 @@ struct AppState<P: Payload> {
     evidence_dir: PathBuf,
 }
 
+/// Fixed window, per-IP, in this process's memory only. Deliberately a
+/// backstop rather than the deployment's rate limit: behind more than one
+/// RPC instance each keeps its own counters, so N instances multiply every
+/// budget by N. The public deployment limits at the edge instead
+/// (`limit_req` in nginx-gateway.conf), which is also the only layer that
+/// can shed load before it reaches this process at all. Keep both: the edge
+/// protects the fleet, this protects a node someone points a client at
+/// directly.
 struct RateLimiter {
     // Keyed by (ip, is_write) so a client's write budget and read budget
     // are tracked — and exhausted — independently. Same map/sweep shape as
     // the single-budget version, just keyed one level deeper.
     hits: Mutex<HashMap<(IpAddr, bool), (Instant, u32)>>,
+    window: Duration,
+    max_writes: u32,
+    max_reads: u32,
 }
 
 impl RateLimiter {
-    fn new() -> Self {
+    fn new(limits: &Limits) -> Self {
         Self {
             hits: Mutex::new(HashMap::new()),
+            window: Duration::from_secs(limits.rpc_rate_limit_window_secs),
+            max_writes: limits.rpc_rate_limit_writes,
+            max_reads: limits.rpc_rate_limit_reads,
         }
     }
 
@@ -103,12 +116,12 @@ impl RateLimiter {
         // Sweep stale entries once the map gets large rather than every call —
         // bounds worst-case memory without paying a scan on every request.
         if hits.len() > RATE_LIMIT_SWEEP_THRESHOLD {
-            hits.retain(|_, (seen, _)| now.duration_since(*seen) <= RATE_LIMIT_WINDOW);
+            hits.retain(|_, (seen, _)| now.duration_since(*seen) <= self.window);
         }
 
-        let max = if is_write { RATE_LIMIT_MAX_WRITE_REQUESTS } else { RATE_LIMIT_MAX_READ_REQUESTS };
+        let max = if is_write { self.max_writes } else { self.max_reads };
         let entry = hits.entry((ip, is_write)).or_insert((now, 0));
-        if now.duration_since(entry.0) > RATE_LIMIT_WINDOW {
+        if now.duration_since(entry.0) > self.window {
             *entry = (now, 0);
         }
         entry.1 += 1;
@@ -346,13 +359,14 @@ pub fn spawn_http_ingest<P: Payload>(
     min_stake: Option<u128>,
     action_fee: Option<u128>,
     evidence_dir: PathBuf,
+    limits: Limits,
 ) -> Result<()> {
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
         mempool,
         db,
         rpc_token: rpc_token.map(Arc::new),
-        rate_limiter: Arc::new(RateLimiter::new()),
+        rate_limiter: Arc::new(RateLimiter::new(&limits)),
         gossip_tx,
         metrics_handle,
         payload_precheck,
@@ -382,7 +396,7 @@ pub fn spawn_http_ingest<P: Payload>(
             // on the same docker network.
             let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))
-                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(limits.rpc_max_body_bytes))
                 .route("/accounts/{address}", get(get_account::<P>))
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
                 .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
@@ -1338,14 +1352,15 @@ async fn search<P: Payload>(
 
 #[cfg(test)]
 mod rate_limiter_tests {
-    use super::{IpAddr, RATE_LIMIT_MAX_READ_REQUESTS, RATE_LIMIT_MAX_WRITE_REQUESTS, RateLimiter};
+    use super::{IpAddr, Limits, RateLimiter};
 
     #[test]
     fn write_budget_exhausting_does_not_affect_reads() {
-        let limiter = RateLimiter::new();
+        let limits = Limits::default();
+        let limiter = RateLimiter::new(&limits);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-        for _ in 0..RATE_LIMIT_MAX_WRITE_REQUESTS {
+        for _ in 0..limits.rpc_rate_limit_writes {
             assert!(limiter.allow(ip, true));
         }
         assert!(!limiter.allow(ip, true), "write budget should be exhausted");
@@ -1358,14 +1373,28 @@ mod rate_limiter_tests {
 
     #[test]
     fn read_budget_is_higher_than_write_budget() {
-        let limiter = RateLimiter::new();
+        let limits = Limits::default();
+        let limiter = RateLimiter::new(&limits);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
-        for _ in 0..RATE_LIMIT_MAX_READ_REQUESTS {
+        for _ in 0..limits.rpc_rate_limit_reads {
             assert!(limiter.allow(ip, false));
         }
         assert!(!limiter.allow(ip, false));
-        assert!(RATE_LIMIT_MAX_READ_REQUESTS > RATE_LIMIT_MAX_WRITE_REQUESTS);
+        assert!(limits.rpc_rate_limit_reads > limits.rpc_rate_limit_writes);
+    }
+
+    /// An operator lowering a budget must actually lower it — the flag is
+    /// pointless if the limiter still reads the compiled-in default.
+    #[test]
+    fn a_configured_budget_replaces_the_default() {
+        let limits = Limits { rpc_rate_limit_writes: 2, ..Limits::default() };
+        let limiter = RateLimiter::new(&limits);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+
+        assert!(limiter.allow(ip, true));
+        assert!(limiter.allow(ip, true));
+        assert!(!limiter.allow(ip, true));
     }
 }
 
@@ -1397,7 +1426,7 @@ mod tests {
             mempool: Arc::new(Mutex::new(Mempool::new())),
             db: ArxiumDb::open(&dir).unwrap(),
             rpc_token: None,
-            rate_limiter: Arc::new(RateLimiter::new()),
+            rate_limiter: Arc::new(RateLimiter::new(&Limits::default())),
             gossip_tx: None,
             // Not installed as the global recorder — tests don't assert on
             // rendered metric values, just that requests still succeed.

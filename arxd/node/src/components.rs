@@ -178,6 +178,7 @@ mod tests {
             is_validator: false,
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
+            limits: xc_primitives::Limits::default(),
         }
     }
 
@@ -262,6 +263,7 @@ mod tests {
             is_validator: true,
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
+            limits: xc_primitives::Limits::default(),
         };
 
         assert!(new_partial::<CoreChainRuntime>(&config).is_err(), "an invalid genesis spec must be rejected");

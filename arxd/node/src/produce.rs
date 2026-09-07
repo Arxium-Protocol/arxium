@@ -7,12 +7,11 @@ use ed25519_dalek::SigningKey;
 use arxd_finality::FinalityEvent;
 use metrics::{counter, gauge, histogram};
 use xc_runtime_api::ChainRuntime;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use xc_runtime_api::DispatchCtx;
 use xc_executor::{execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
@@ -260,8 +259,10 @@ pub fn produce_block<R: ChainRuntime>(
 /// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
 /// the validator whose turn it is. A non-validator node (`identity: None`)
 /// never produces — it only accepts blocks gossiped/synced from peers (see
-/// `accept_block`). Runs until `shutdown` is set, e.g. by the ctrl_c handler
-/// spawned in `run`.
+/// `accept_block`). Runs until `arxd_network::shutdown_code()` is non-zero —
+/// ctrl-c (graceful return) or a HALT this node proved against itself, which
+/// exits the process with `HALT_EXIT_CODE` so a supervisor can alert on it
+/// instead of reading a silent exit as an ordinary crash.
 pub fn produce_loop<R: ChainRuntime>(
     db: &ArxiumDb,
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
@@ -269,7 +270,6 @@ pub fn produce_loop<R: ChainRuntime>(
     chain_lock: &Arc<Mutex<()>>,
     finality_event_tx: &std_mpsc::Sender<FinalityEvent<R::Payload>>,
     block_tx: &tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
-    shutdown: &Arc<AtomicBool>,
 ) -> Result<()> {
     // Rate-limit state for the skip log below. Local because `produce_loop`
     // owns its thread — no lock needed, and no risk of two producers sharing
@@ -286,9 +286,20 @@ pub fn produce_loop<R: ChainRuntime>(
     loop {
         thread::sleep(next_sleep(&mut next_tick, Instant::now(), BLOCK_INTERVAL));
 
-        if shutdown.load(Ordering::Relaxed) {
-            info!("shutting down");
-            return Ok(());
+        match arxd_network::shutdown_code() {
+            0 => {}
+            arxd_network::HALT_EXIT_CODE => {
+                error!(
+                    "halted: this node proved its own chain wrong, has stopped producing and \
+                     voting, and is exiting {}",
+                    arxd_network::HALT_EXIT_CODE
+                );
+                std::process::exit(arxd_network::HALT_EXIT_CODE.into());
+            }
+            _ => {
+                info!("shutting down");
+                return Ok(());
+            }
         }
 
         // Held for the whole read-tip / decide / write cycle, so a block

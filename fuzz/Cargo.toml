@@ -1,0 +1,50 @@
+# Not a workspace member (see the root Cargo.toml's `exclude`): cargo-fuzz
+# builds this with its own nightly toolchain and sanitizer flags, which must
+# not leak into an ordinary `cargo build` of the node.
+[package]
+name = "arxium-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+serde_json = "1"
+xc-primitives = { path = "../core/primitives" }
+xc-wire = { path = "../core/wire" }
+xc-artifact = { path = "../core/artifact" }
+arxd-runtime = { path = "../arxd/runtime" }
+
+[[bin]]
+name = "block_decode"
+path = "fuzz_targets/block_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "raw_block_decode"
+path = "fuzz_targets/raw_block_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "sync_wire_decode"
+path = "fuzz_targets/sync_wire_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "artifact_decode"
+path = "fuzz_targets/artifact_decode.rs"
+test = false
+doc = false
+
+# cargo-fuzz's own release-with-debug profile; keeps a crash's backtrace
+# useful without giving up the throughput that makes fuzzing worth running.
+[profile.release]
+debug = 1

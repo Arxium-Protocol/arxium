@@ -106,6 +106,7 @@ pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
         .get_block::<()>(0)?
         .expect("just verified/written above")
         .state_root;
+    seed_genesis_hash(db, &root)?;
     Ok(root)
 }
 
@@ -154,7 +155,22 @@ pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
             );
         }
     }
-    db.get_block::<()>(0)?.context("raw chain spec installed but block 0 is missing from its entries")?;
+    let block_zero = db
+        .get_block::<()>(0)?
+        .context("raw chain spec installed but block 0 is missing from its entries")?;
+    seed_genesis_hash(db, &block_zero.state_root)?;
+    Ok(())
+}
+
+/// Records the chain's own genesis hash (block 0's state root) where
+/// `dispatch` can read it, so a fault artifact produced against a *different*
+/// Arxium chain can be rejected instead of adjudicated here — see
+/// `GenesisHashKey`. Idempotent, and written after the root is known rather
+/// than as part of the genesis batch, because the value is that batch's root.
+fn seed_genesis_hash(db: &ArxiumDb, root: &str) -> Result<()> {
+    if db.genesis_hash()?.is_none() {
+        db.write_batch(&xc_storage::GenesisHash(root.to_string()))?;
+    }
     Ok(())
 }
 

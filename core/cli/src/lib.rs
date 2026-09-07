@@ -3,7 +3,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
-use xc_primitives::NodeConfig;
+use xc_primitives::{Limits, NodeConfig};
 
 /// Flags accepted with no subcommand — runs the node, same as always
 /// (`arxd --validator ...`). `arxd node-key` is the only other subcommand.
@@ -195,6 +195,12 @@ pub struct RunArgs {
     #[arg(long, env = "ARXD_RPC_BIND", default_value = "127.0.0.1")]
     pub rpc_bind: String,
 
+    /// Resource limits. Defaults are the devnet-sized values these used to
+    /// be hardcoded at (see `xc_primitives::Limits`); a node exposed to
+    /// strangers can raise or lower them without a rebuild.
+    #[command(flatten)]
+    pub limits: LimitArgs,
+
     /// Harness-only, and only compiled in at all with `--features
     /// fault-injection` (never present in a normal build): corrupt this
     /// node's own computed state_root by one bit the next time it produces
@@ -208,6 +214,56 @@ pub struct RunArgs {
     #[cfg(feature = "fault-injection")]
     #[arg(long, env = "ARXD_INJECT_FAULT_AT_HEIGHT")]
     pub inject_fault_at_height: Option<u64>,
+}
+
+/// Flattened into `RunArgs`, so `xc_primitives::Limits` stays the single
+/// definition of what each limit means and what it defaults to — clap only
+/// names the flags.
+#[derive(Args, Clone, Debug)]
+pub struct LimitArgs {
+    /// Largest single JSON action body the RPC will accept, in bytes.
+    #[arg(long, env = "ARXD_RPC_MAX_BODY_BYTES", default_value_t = Limits::default().rpc_max_body_bytes)]
+    pub rpc_max_body_bytes: usize,
+
+    /// Rate-limit window in seconds. Per RPC instance, in memory — behind
+    /// more than one instance, rate limit at the reverse proxy instead
+    /// (see nginx-gateway.conf).
+    #[arg(long, env = "ARXD_RPC_RATE_LIMIT_WINDOW_SECS", default_value_t = Limits::default().rpc_rate_limit_window_secs)]
+    pub rpc_rate_limit_window_secs: u64,
+
+    /// Per-IP write requests (POST /actions, POST /pairing) per window.
+    #[arg(long, env = "ARXD_RPC_RATE_LIMIT_WRITES", default_value_t = Limits::default().rpc_rate_limit_writes)]
+    pub rpc_rate_limit_writes: u32,
+
+    /// Per-IP read requests per window.
+    #[arg(long, env = "ARXD_RPC_RATE_LIMIT_READS", default_value_t = Limits::default().rpc_rate_limit_reads)]
+    pub rpc_rate_limit_reads: u32,
+
+    /// Mempool cap in pending actions. Raise `--mempool-max-bytes` with it.
+    #[arg(long, env = "ARXD_MEMPOOL_MAX_PENDING", default_value_t = Limits::default().mempool_max_pending)]
+    pub mempool_max_pending: usize,
+
+    /// Mempool cap in total encoded bytes of pending actions.
+    #[arg(long, env = "ARXD_MEMPOOL_MAX_BYTES", default_value_t = Limits::default().mempool_max_bytes)]
+    pub mempool_max_bytes: usize,
+
+    /// Concurrent inbound P2P connections.
+    #[arg(long, env = "ARXD_MAX_PEERS_INCOMING", default_value_t = Limits::default().max_peers_incoming)]
+    pub max_peers_incoming: u32,
+}
+
+impl From<LimitArgs> for Limits {
+    fn from(args: LimitArgs) -> Self {
+        Self {
+            rpc_max_body_bytes: args.rpc_max_body_bytes,
+            rpc_rate_limit_window_secs: args.rpc_rate_limit_window_secs,
+            rpc_rate_limit_writes: args.rpc_rate_limit_writes,
+            rpc_rate_limit_reads: args.rpc_rate_limit_reads,
+            mempool_max_pending: args.mempool_max_pending,
+            mempool_max_bytes: args.mempool_max_bytes,
+            max_peers_incoming: args.max_peers_incoming,
+        }
+    }
 }
 
 fn default_base_path() -> PathBuf {
@@ -241,6 +297,7 @@ impl RunArgs {
             is_validator: self.validator,
             rpc_token: self.rpc_token,
             rpc_bind: self.rpc_bind,
+            limits: self.limits.into(),
         }
     }
 }

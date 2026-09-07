@@ -12,7 +12,7 @@ use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey,
-    AttestorRecordKey, BlsKeyKey, EvidenceMarkerKey, GovernorKey, KeySpec, KvRead,
+    AttestorRecordKey, BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec, KvRead,
     StakeByValidatorKey, StakeKey,
 };
 use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_META, CF_VALIDATORS};
@@ -22,8 +22,21 @@ use xc_primitives::{
 #[cfg(test)]
 use xc_primitives::Action;
 
-// ponytail: cap shared by range/history reads so an explorer client can't
-// force a full-chain scan in one request; bump if a real UI needs more.
+/// Cap shared by range/history reads, so an explorer client can't force a
+/// full-chain scan in one request.
+///
+/// Re-checked (Track 2.4) against what Retracer actually asks for now that
+/// it indexes unknown action kinds too: Retracer does not use these RPC
+/// range reads at all — it ingests over P2P (`SyncRequest::Blocks`) and its
+/// own gRPC page cap is a separate constant that happens to mirror this one.
+/// What that re-check did surface is that this constant is *not* only an
+/// explorer guard: `get_blocks_in_range` serves `SyncRequest::Blocks`, so
+/// this is also the sync page size — the node's own catch-up rate, Retracer's
+/// ingestion rate, and `NodeInfo.max_page_size` all follow it.
+///
+/// Left at 100 deliberately: raising it is a throughput lever, and Part Two's
+/// sync throughput / time-to-tip measurement is what should set it, not a
+/// guess made before the numbers exist.
 pub const MAX_PAGE_SIZE: usize = 100;
 
 #[derive(Error, Debug)]
@@ -325,13 +338,27 @@ impl ArxiumDb {
     /// dir at a copy of this output instead of replaying every block from
     /// genesis.
     ///
-    /// ponytail: this is a trust-the-source bootstrap shortcut, not a
-    /// consensus-verified state sync — `Block` carries no state root a new
-    /// node could check a snapshot against, so nothing here proves the
-    /// snapshot matches what the network actually finalized. Upgrade path:
-    /// add a state root to the block header, then a downloading node can
-    /// verify a snapshot against a finalized block instead of trusting
-    /// whoever handed it the directory.
+    /// Decision (Track 2.6), acceptable for testnet: this is a
+    /// trust-the-source bootstrap shortcut, not a consensus-verified state
+    /// sync. The old reason given here — that `Block` carries no state root
+    /// to check against — is no longer true; blocks carry `state_root`, so a
+    /// node *could* recompute the imported state's root and compare it
+    /// against the root in the checkpoint's own tip block, and against a
+    /// finality certificate for that height.
+    ///
+    /// It stays a shortcut anyway because of who can reach it: nothing in the
+    /// network serves checkpoints. There is no snapshot-sync wire request; a
+    /// checkpoint only ever arrives because an operator copied a directory
+    /// they chose to trust. That makes it an operator-trust decision, not an
+    /// attacker-reachable path, which is why it is not on the hostile-input
+    /// list with the rest of Track 2.
+    ///
+    /// It stops being acceptable the moment a node can *fetch* a snapshot
+    /// from a peer. Whoever adds that must add the verification with it:
+    /// recompute the root of the imported state, check it against the tip
+    /// block's `state_root`, and check that block against a finality
+    /// certificate — otherwise snapshot sync is a way to hand a joining node
+    /// any state at all.
     pub fn export_checkpoint(&self, path: &Path) -> Result<(), StorageError> {
         rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
         Ok(())
@@ -1508,6 +1535,30 @@ impl ArxiumDb {
             }
         }
         Ok(results)
+    }
+}
+
+impl ArxiumDb {
+    /// This chain's genesis hash (block 0's state root) as seeded by
+    /// `arxd/genesis`. `None` on a chain initialized before this was seeded.
+    pub fn genesis_hash(&self) -> Result<Option<String>, StorageError> {
+        KvRead::get(self, &GenesisHashKey)
+    }
+}
+
+/// Seeds `GenesisHashKey` with this chain's genesis hash (block 0's state
+/// root). Written once by `arxd/genesis` after the root is known — it cannot
+/// be part of the genesis snapshot batch itself, since the root is computed
+/// from that batch.
+pub struct GenesisHash(pub String);
+
+impl BatchWritable for GenesisHash {
+    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+        let config = bincode::config::standard();
+        Ok(vec![(
+            GenesisHashKey.encode(),
+            bincode::serde::encode_to_vec(&self.0, config)?,
+        )])
     }
 }
 

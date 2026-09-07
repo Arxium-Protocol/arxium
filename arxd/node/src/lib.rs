@@ -13,7 +13,6 @@ use ed25519_dalek::Signer;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -334,7 +333,6 @@ struct SubsystemHandles<R: ChainRuntime> {
     on_dissent: Box<dyn Fn(Dissent) + Send>,
     on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
     payload_precheck: xc_mempool::PayloadPrecheck<R::Payload>,
-    shutdown: Arc<AtomicBool>,
 }
 
 /// Turns a `DissentRecord` `arxd/finality` just persisted (whether signed
@@ -567,6 +565,13 @@ fn spawn_subsystems<R: ChainRuntime>(
         "precommit_bridge",
         thread::spawn(move || {
             for vote in finality_vote_rx {
+                // A halted node must not keep signing the chain it just
+                // proved wrong; dropping the vote here is what "stops
+                // voting" means in practice, and it takes effect at once
+                // rather than at the produce loop's next tick.
+                if arxd_network::shutdown_code() != 0 {
+                    break;
+                }
                 if precommit_tx.send(vote).is_err() {
                     break;
                 }
@@ -582,6 +587,9 @@ fn spawn_subsystems<R: ChainRuntime>(
         "round_timeout_bridge",
         thread::spawn(move || {
             for vote in finality_round_timeout_rx {
+                if arxd_network::shutdown_code() != 0 {
+                    break;
+                }
                 if round_timeout_tx.send(vote).is_err() {
                     break;
                 }
@@ -631,6 +639,7 @@ fn spawn_subsystems<R: ChainRuntime>(
         R::min_validator_stake(),
         Some(R::action_fee()),
         config.base_path.join(chain_name).join("evidence"),
+        config.limits.clone(),
     )?;
 
     // Guards the read-tip / decide / write critical section shared by this
@@ -898,24 +907,8 @@ fn spawn_subsystems<R: ChainRuntime>(
         config.bootnodes.clone()
     };
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let shutdown = shutdown.clone();
-        spawn_supervised(
-            "ctrl_c_watcher",
-            thread::spawn(move || {
-                // ponytail: dedicated runtime just to await ctrl_c; the block-production
-                // loop stays plain sync.
-                if let Ok(runtime) = tokio::runtime::Runtime::new() {
-                    runtime.block_on(async {
-                        let _ = tokio::signal::ctrl_c().await;
-                    });
-                    info!("shutdown signal received, exiting after current block");
-                    shutdown.store(true, Ordering::Relaxed);
-                }
-            }),
-        );
-    }
+    // ctrl-c is handled by the p2p runtime (`arxd_network::shutdown_code`);
+    // nothing to spawn here.
 
     Ok(SubsystemHandles {
         bootnodes,
@@ -932,7 +925,6 @@ fn spawn_subsystems<R: ChainRuntime>(
         on_dissent,
         on_round_timeout_vote,
         payload_precheck,
-        shutdown,
     })
 }
 
@@ -1107,6 +1099,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             is_validator: false,
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
+            limits: xc_primitives::Limits::default(),
         };
         let components = new_partial::<R>(&config)?;
         components.db.export_checkpoint(output).with_context(|| {
@@ -1139,10 +1132,13 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
                     .context("chain spec failed validation")?;
                 println!("format:         plain");
                 println!("chain name:     {}", snapshot.chain_name);
-                // ponytail: genesis hash needs the state actually reached at
-                // genesis, which means opening a DB — skipped for a plain
-                // spec so `chain-info` stays a zero-RocksDB preview; use
-                // `arx-spec-builder inspect` for the real hash.
+                // A chain's genesis hash is block 0's state root — the state
+                // actually reached at genesis, which means opening a DB.
+                // Skipped here so `chain-info` stays a zero-RocksDB preview;
+                // use `arx-spec-builder inspect` for the real hash. The node
+                // seeds that same value into `GenesisHashKey` at genesis, so
+                // `submit_execution_fault` can reject another chain's
+                // artifacts.
                 println!(
                     "genesis hash:   <derive with `arx-spec-builder inspect`, or boot the node>"
                 );
@@ -1233,7 +1229,6 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         on_dissent,
         on_round_timeout_vote,
         payload_precheck,
-        shutdown,
     } = spawn_subsystems::<R>(
         &config,
         &chain_name,
@@ -1266,6 +1261,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         on_dissent,
         on_round_timeout_vote,
         Some(payload_precheck.clone()),
+        config.limits.clone(),
     )?;
 
     produce::produce_loop::<R>(
@@ -1275,6 +1271,5 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         &chain_lock,
         &finality_event_tx,
         &block_tx,
-        &shutdown,
     )
 }

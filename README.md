@@ -73,6 +73,22 @@ systemd (`EnvironmentFile=`) and `arxd` read directly.
 | `--bootnodes` | `ARXD_BOOTNODES` | chain spec | Comma-separated peer multiaddrs |
 | `--bootnode` | `ARXD_BOOTNODE` | `false` | Use the well-known seeded network identity |
 
+Resource limits. Defaults are the devnet-sized values these were fixed at
+before; raise them for a node facing real traffic. The RPC rate limiter is
+per process and in memory — behind more than one RPC instance, limit at the
+reverse proxy (`limit_req`, see `nginx-gateway.conf`) and treat these as the
+per-node backstop.
+
+| Flag | Environment | Default | Purpose |
+| --- | --- | --- | --- |
+| `--rpc-max-body-bytes` | `ARXD_RPC_MAX_BODY_BYTES` | `65536` | Largest single JSON action body |
+| `--rpc-rate-limit-window-secs` | `ARXD_RPC_RATE_LIMIT_WINDOW_SECS` | `60` | Rate-limit window |
+| `--rpc-rate-limit-writes` | `ARXD_RPC_RATE_LIMIT_WRITES` | `60` | Per-IP writes per window (POST) |
+| `--rpc-rate-limit-reads` | `ARXD_RPC_RATE_LIMIT_READS` | `600` | Per-IP reads per window |
+| `--mempool-max-pending` | `ARXD_MEMPOOL_MAX_PENDING` | `10000` | Queued actions |
+| `--mempool-max-bytes` | `ARXD_MEMPOOL_MAX_BYTES` | `10000000` | Queued action bytes — raise with the entry cap |
+| `--max-peers-incoming` | `ARXD_MAX_PEERS_INCOMING` | `200` | Concurrent inbound P2P connections |
+
 `arxd` runs in the foreground and logs to stdout. It does not daemonize, write
 a PID file, or restart itself — process lifecycle belongs to systemd, and logs
 to journald.
