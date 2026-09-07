@@ -39,6 +39,19 @@ use xc_primitives::Action;
 /// guess made before the numbers exist.
 pub const MAX_PAGE_SIZE: usize = 100;
 
+/// One prefix scan's cost, so Part Two decides which of these need an index
+/// from measurements rather than intuition. Every scan below is correct and
+/// cheap at today's scale; what is unknown is where "today's scale" ends.
+/// `rows` is what actually gets walked — the number that grows — and
+/// `seconds` is what it costs. An index is justified when a scan's rows
+/// climb *and* its seconds show up next to real work, not before.
+fn record_scan(scan: &'static str, rows: u64, started: std::time::Instant) {
+    metrics::counter!("arxium_storage_scan_total", "scan" => scan).increment(1);
+    metrics::histogram!("arxium_storage_scan_rows", "scan" => scan).record(rows as f64);
+    metrics::histogram!("arxium_storage_scan_seconds", "scan" => scan)
+        .record(started.elapsed().as_secs_f64());
+}
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("RocksDB underlying error: {0}")]
@@ -447,27 +460,35 @@ impl ArxiumDb {
         Ok(None)
     }
 
-    // ponytail: linear scan over the `meta:blskey:` prefix, fine at
-    // devnet validator-set scale — add a pubkey->address reverse index if
-    // the validator set ever grows enough to make this a bottleneck.
+    /// Linear scan over the `meta:blskey:` prefix, one row per validator.
+    /// Fine at devnet validator-set scale; instrumented as
+    /// `arxium_storage_scan_*{scan="bls_pubkey_owner"}` rather than indexed,
+    /// since the upgrade (a pubkey->address reverse index) is only worth its
+    /// second source of truth if the numbers say so.
+    ///
     /// Address already holding `pubkey`, if any — used to reject a second
     /// validator registering the same BLS key.
     pub fn bls_pubkey_owner(&self, pubkey: &BlsPublicKey) -> Result<Option<Address>, StorageError> {
         let prefix = b"meta:blskey:";
+        let started = std::time::Instant::now();
+        let mut rows = 0u64;
         let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix, Direction::Forward));
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
                 break;
             }
+            rows += 1;
             let config = bincode::config::standard();
             let (existing, _len): (BlsPublicKey, usize) = bincode::serde::decode_from_slice(&value, config)?;
             if &existing == pubkey {
                 let address_str = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
                 let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
+                record_scan("bls_pubkey_owner", rows, started);
                 return Ok(Some(address));
             }
         }
+        record_scan("bls_pubkey_owner", rows, started);
         Ok(None)
     }
 
@@ -626,13 +647,15 @@ impl ArxiumDb {
     /// exists yet. See `RoundCertificate`'s doc comment for why this — not a
     /// block-claimed value — is the source of truth for round.
     ///
-    /// ponytail: a linear scan over this height's certificates, not a
+    /// A linear scan over this height's certificates, not a
     /// denormalized "current round" counter kept in sync on every write —
     /// round certificates are rare (only formed on an actual timeout) and
     /// small in number per height, so the scan is cheap and there is no
     /// second value that can drift from the certificates themselves.
     pub fn current_round(&self, height: u64) -> Result<u32, StorageError> {
         let prefix = format!("meta:roundcert:{height:020}:");
+        let started = std::time::Instant::now();
+        let mut rows = 0u64;
         let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
         let mut highest_certified: Option<u32> = None;
         for item in iter {
@@ -640,11 +663,13 @@ impl ArxiumDb {
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
+            rows += 1;
             let round_str =
                 std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
             let round: u32 = round_str.parse().map_err(|_| StorageError::CorruptedMeta)?;
             highest_certified = Some(highest_certified.map_or(round, |m| m.max(round)));
         }
+        record_scan("current_round", rows, started);
         Ok(highest_certified.map_or(0, |m| m + 1))
     }
 
@@ -1508,14 +1533,20 @@ impl ArxiumDb {
     }
 
     /// Every allocation with an `Unbonding` batch matured as of `height`.
-    // ponytail: full `stake:` prefix scan — fine at current scale (matches
-    // the doc's "walking skeleton" allowance); add an unlock-height
-    // secondary index if allocation count ever makes this a bottleneck.
+    /// Full `stake:` prefix scan — every allocation on the chain, once per
+    /// block. Fine at the current scale (matches the doc's "walking skeleton"
+    /// allowance), and the likeliest of these three to stop being fine: it is
+    /// the only one on the per-block path, and the only one whose row count
+    /// grows with users rather than with the validator set. Measured as
+    /// `arxium_storage_scan_*{scan="unbonding_due"}`; the upgrade is an
+    /// unlock-height secondary index.
     pub fn get_allocations_with_unbonding_due(
         &self,
         height: u64,
     ) -> Result<Vec<StakeAllocation>, StorageError> {
         let prefix = b"stake:";
+        let started = std::time::Instant::now();
+        let mut rows = 0u64;
         let mut results = Vec::new();
         let iter = self
             .db
@@ -1525,6 +1556,7 @@ impl ArxiumDb {
             if !key.starts_with(prefix) {
                 break;
             }
+            rows += 1;
             let config = bincode::config::standard();
             let (allocation, _len): (StakeAllocation, usize) =
                 bincode::serde::decode_from_slice(&value, config)?;
@@ -1534,6 +1566,7 @@ impl ArxiumDb {
                 }
             }
         }
+        record_scan("unbonding_due", rows, started);
         Ok(results)
     }
 }

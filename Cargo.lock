@@ -5284,6 +5284,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "hex",
+ "metrics",
  "rocksdb",
  "serde",
  "thiserror 2.0.19",

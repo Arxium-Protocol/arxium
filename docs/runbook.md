@@ -202,6 +202,50 @@ is a fatal error, not a silent divergence.
   validator-identity gotcha above before assuming it's a deeper bug —
   that's the single most likely cause on a freshly (re)provisioned box.
 
+### Sync throughput and scan cost (measurement, not alerting)
+
+These exist to turn two open decisions into numbers rather than intuitions:
+whether `CF_MERKLE` pruning and snapshot sync belong in this phase, and which
+of the storage prefix scans need an index. Nothing here is worth an alert
+yet — read them during the acceptance runs and the soak.
+
+Sync (`arxd/network/src/lib.rs`, recorded per applied page):
+
+- `arxium_sync_blocks_applied_total` (counter) and `arxium_sync_page_seconds`
+  (histogram) — throughput, either as a ratio or as `rate()` over wall clock.
+- `arxium_sync_blocks_per_second` (histogram) — the same number recorded
+  directly per page, so a single page's throughput is readable without
+  combining two series.
+- `arxium_sync_time_to_tip_seconds` (gauge) — from the moment this node
+  noticed it was behind to reaching the highest tip any peer advertised.
+  Re-armed afterwards, so a node that falls behind again measures that too.
+- `arxium_sync_blocks_behind` (gauge) — the live gap. This is the one that
+  becomes an alert once a target for it exists.
+
+```promql
+# blocks/sec while catching up
+rate(arxium_sync_blocks_applied_total[1m])
+# time-to-tip at a few chain lengths — the pruning decision
+arxium_sync_time_to_tip_seconds
+```
+
+Storage scans (`core/storage/src/lib.rs`), labelled `scan=` with
+`bls_pubkey_owner`, `current_round`, or `unbonding_due`:
+
+- `arxium_storage_scan_total`, `arxium_storage_scan_rows`,
+  `arxium_storage_scan_seconds`.
+
+Rows is the number that grows; seconds is what it costs. An index is
+justified when both move, not when either looks large on its own.
+`unbonding_due` is the one to watch first — it is the only one on the
+per-block path, and the only one whose rows grow with users rather than with
+the validator set.
+
+```promql
+histogram_quantile(0.99, rate(arxium_storage_scan_rows_bucket[5m]))
+histogram_quantile(0.99, rate(arxium_storage_scan_seconds_bucket[5m]))
+```
+
 ### Detecting a stall
 
 **Alert on `arxium_tip_timestamp_seconds`, not on `arxium_tip_height`.**

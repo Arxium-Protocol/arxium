@@ -16,7 +16,7 @@ use libp2p::futures::StreamExt;
 use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, gossipsub, identify, mdns};
-use metrics::counter;
+use metrics::{counter, gauge, histogram};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -320,6 +320,9 @@ async fn run_swarm<P: Payload>(
     // own watermark. Recovery never runs again after that: the state is
     // preserved as-is for forensics rather than reshaped.
     let mut halted_below_watermark = false;
+    // When this node last noticed it was behind a peer — see the
+    // time-to-tip metric where a sync page lands. `None` means caught up.
+    let mut catching_up_since: Option<Instant> = None;
 
     loop {
         tokio::select! {
@@ -959,6 +962,7 @@ async fn run_swarm<P: Payload>(
                                     info!(
                                         "peer {peer} is ahead (tip {tip_height} vs local {local_tip}), requesting sync"
                                     );
+                                    catching_up_since.get_or_insert_with(Instant::now);
                                     send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
                                         from: local_tip + 1,
                                     });
@@ -981,6 +985,7 @@ async fn run_swarm<P: Payload>(
                                 // just means re-fetching this page from a peer.
                                 let tip_before = local_tip_height(&db);
                                 let page_len = blocks.len();
+                                let page_started = Instant::now();
                                 for block in blocks {
                                     if on_block(block, true) {
                                         record_bad_gossip(
@@ -998,7 +1003,37 @@ async fn run_swarm<P: Payload>(
                                     warn!("failed to flush WAL after sync page: {err}");
                                 }
                                 let local_tip = local_tip_height(&db);
+                                // B2 is unmeasured, and the pruning /
+                                // snapshot-sync decision should fall out of a
+                                // number rather than an intuition: `CF_MERKLE`
+                                // is never pruned and there is no snapshot
+                                // sync, so a node joining in week ten replays
+                                // ten weeks. These are what that replay costs.
+                                let applied = local_tip.saturating_sub(tip_before);
+                                let page_seconds = page_started.elapsed().as_secs_f64();
+                                counter!("arxium_sync_blocks_applied_total").increment(applied);
+                                histogram!("arxium_sync_page_seconds").record(page_seconds);
+                                if page_seconds > 0.0 {
+                                    histogram!("arxium_sync_blocks_per_second")
+                                        .record(applied as f64 / page_seconds);
+                                }
                                 info!("synced page of {page_len} block(s) from {peer}: tip {tip_before} -> {local_tip}");
+                                // Time-to-tip: measured from the moment this
+                                // node first noticed it was behind until it
+                                // reaches the highest tip any peer has
+                                // advertised. Recorded once per catch-up and
+                                // then re-armed, so a node that falls behind
+                                // again measures that too.
+                                let best_peer_tip = peer_tips.values().copied().max().unwrap_or(0);
+                                if let Some(started) = catching_up_since
+                                    && local_tip >= best_peer_tip
+                                {
+                                    gauge!("arxium_sync_time_to_tip_seconds")
+                                        .set(started.elapsed().as_secs_f64());
+                                    catching_up_since = None;
+                                }
+                                gauge!("arxium_sync_blocks_behind")
+                                    .set(best_peer_tip.saturating_sub(local_tip) as f64);
                                 let (next_stuck_tip, stuck_rounds) = advance_stuck_tip(stuck_tip, local_tip);
                                 stuck_tip = next_stuck_tip;
                                 // Past the cap this peer keeps re-serving a
@@ -1045,6 +1080,7 @@ async fn run_swarm<P: Payload>(
                                     }
                                     sync_failures.insert(peer, MAX_CONSECUTIVE_SYNC_FAILURES);
                                 } else if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip) {
+                                    catching_up_since.get_or_insert_with(Instant::now);
                                     send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks {
                                         from: local_tip + 1,
                                     });
