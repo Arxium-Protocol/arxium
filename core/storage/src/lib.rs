@@ -221,14 +221,13 @@ fn note_write(
     };
     // Decoded here rather than re-read after the write, because the watermark
     // has to be decided inside the same batch that adds the certificate.
-    if let Some(value) = value {
-        if let Ok((record, _len)) = bincode::serde::decode_from_slice::<FinalityRecord, _>(
+    if let Some(value) = value
+        && let Ok((record, _len)) = bincode::serde::decode_from_slice::<FinalityRecord, _>(
             value,
             bincode::config::standard(),
         ) {
             certified.insert(height, record.block_hash);
         }
-    }
 }
 
 /// Prior on-disk values for every key one block's write batch touched —
@@ -313,13 +312,13 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
 pub struct ArxiumDb {
     db: Arc<DB>,
 }
+
 /// One batch's worth of raw key-value pairs, exactly as they go to RocksDB.
 type BatchEntries = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// Every entry in the database as `(column family, key, value)` — the shape
 /// `export_all_entries` hands to snapshot/artifact writers.
 type ExportedEntries = Vec<(String, Vec<u8>, Vec<u8>)>;
-
 
 /// Anything that can be turned into a set of key-value pairs for storage.
 pub trait BatchWritable {
@@ -1181,6 +1180,10 @@ impl ArxiumDb {
         let defaults = default_hashes();
         let mut siblings = [[0u8; 32]; 256];
         let mut node = root;
+        // `level` is the trie depth, not just an index: it drives `depth` and
+        // `bit_at` as well as the `siblings` slot, so an iterator would have to
+        // carry it anyway.
+        #[allow(clippy::needless_range_loop)]
         for level in 0..256 {
             let depth = 256 - level;
             if node == defaults[depth] {
@@ -1275,11 +1278,10 @@ impl ArxiumDb {
             root = current;
         }
 
-        if let Some(batch) = batch.as_deref_mut() {
-            if !changes.is_empty() {
+        if let Some(batch) = batch
+            && !changes.is_empty() {
                 batch.put_cf(self.cf(CF_META), MERKLE_ROOT_KEY, root);
             }
-        }
         Ok(root)
     }
 
@@ -1623,11 +1625,10 @@ impl ArxiumDb {
             let config = bincode::config::standard();
             let (allocation, _len): (StakeAllocation, usize) =
                 bincode::serde::decode_from_slice(&value, config)?;
-            if let Some(unbonding) = &allocation.unbonding {
-                if unbonding.unlock_at_height <= height {
+            if let Some(unbonding) = &allocation.unbonding
+                && unbonding.unlock_at_height <= height {
                     results.push(allocation);
                 }
-            }
         }
         record_scan("unbonding_due", rows, started);
         Ok(results)
@@ -1697,7 +1698,7 @@ impl BatchWritable for Snapshot {
             ));
             entries.push((
                 StakeByValidatorKey(address).encode(),
-                bincode::serde::encode_to_vec(&vec![address.clone()], config)?,
+                bincode::serde::encode_to_vec(vec![address.clone()], config)?,
             ));
 
             // The other half of the same fix: `apply_stake` always moves the
@@ -1848,7 +1849,7 @@ pub struct BlsKeyRegistration {
 impl BatchWritable for BlsKeyRegistration {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
-        let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
+        let value = bincode::serde::encode_to_vec(self.pubkey, config)?;
         let current_key = BlsKeyKey(&self.address).encode();
         let history_key =
             format!("meta:blskey_hist:{}:{:020}", self.address, self.effective_height).into_bytes();
@@ -2254,11 +2255,10 @@ impl<'a> BlockView<'a> {
     }
 
     fn record_touched(&self, raw_key: &[u8]) {
-        if let Some(touched) = &self.touched {
-            if is_state_key(raw_key) {
+        if let Some(touched) = &self.touched
+            && is_state_key(raw_key) {
                 touched.borrow_mut().insert(raw_key.to_vec());
             }
-        }
     }
 
     pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
@@ -2376,15 +2376,6 @@ mod explorer_index_tests {
 
     fn addr(byte: u8) -> Address {
         Address::from_pubkey_bytes(&[byte; 32]).unwrap()
-    }
-
-    fn action(sender: Address, nonce: u64) -> Action<()> {
-        Action {
-            sender,
-            nonce,
-            signature: Some(format!("sig-{}", nonce)),
-            payload: (),
-        }
     }
 
     fn block(height: u64, actions: Vec<Action<()>>) -> Block<()> {
@@ -2615,7 +2606,7 @@ mod asset_index_tests {
         let gold = asset("gold", &issuer, true);
 
         let updates = balances(&[("gold", &holder, 1_000)]);
-        let index = db.asset_index_updates(&[gold.clone()], &updates).unwrap();
+        let index = db.asset_index_updates(std::slice::from_ref(&gold), &updates).unwrap();
         db.write_batches(&[&gold, &updates, &index]).unwrap();
 
         assert_eq!(db.list_asset_ids().unwrap(), vec!["gold".to_string()]);
@@ -2645,12 +2636,12 @@ mod asset_index_tests {
 
         let gold = asset("gold", &issuer, true);
         let first = balances(&[("gold", &holder, 1_000)]);
-        let index = db.asset_index_updates(&[gold.clone()], &first).unwrap();
+        let index = db.asset_index_updates(std::slice::from_ref(&gold), &first).unwrap();
         db.write_batches(&[&gold, &first, &index]).unwrap();
 
         let silver = asset("silver", &issuer, false);
         let second = balances(&[("silver", &holder, 50)]);
-        let index = db.asset_index_updates(&[silver.clone()], &second).unwrap();
+        let index = db.asset_index_updates(std::slice::from_ref(&silver), &second).unwrap();
         db.write_batches(&[&silver, &second, &index]).unwrap();
 
         assert_eq!(
@@ -2708,7 +2699,7 @@ mod asset_index_tests {
         let gold = asset("gold", &issuer, true);
 
         let updates = balances(&[("gold", &issuer, 900), ("gold", &recipient, 100)]);
-        let index = db.asset_index_updates(&[gold.clone()], &updates).unwrap();
+        let index = db.asset_index_updates(std::slice::from_ref(&gold), &updates).unwrap();
         db.write_batches(&[&gold, &updates, &index]).unwrap();
 
         assert_eq!(
@@ -2929,16 +2920,16 @@ mod bls_key_history_tests {
             let db = ArxiumDb::open(&path).unwrap();
             db.write_batches(&[&BlsKeyRegistration {
                 address: validator.clone(),
-                pubkey: key_a.clone(),
+                pubkey: key_a,
                 effective_height: 0,
                 previous_pubkey: None,
             }])
             .unwrap();
             db.write_batches(&[&BlsKeyRegistration {
                 address: validator.clone(),
-                pubkey: key_b.clone(),
+                pubkey: key_b,
                 effective_height: 11,
-                previous_pubkey: Some(key_a.clone()),
+                previous_pubkey: Some(key_a),
             }])
             .unwrap();
         }
@@ -2947,10 +2938,10 @@ mod bls_key_history_tests {
         // that wrote the rotation.
         let db = ArxiumDb::open(&path).unwrap();
 
-        assert_eq!(db.get_bls_pubkey_at(&validator, 5).unwrap(), Some(key_a.clone()));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 5).unwrap(), Some(key_a));
         assert_eq!(db.get_bls_pubkey_at(&validator, 10).unwrap(), Some(key_a));
-        assert_eq!(db.get_bls_pubkey_at(&validator, 11).unwrap(), Some(key_b.clone()));
-        assert_eq!(db.get_bls_pubkey_at(&validator, 100).unwrap(), Some(key_b.clone()));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 11).unwrap(), Some(key_b));
+        assert_eq!(db.get_bls_pubkey_at(&validator, 100).unwrap(), Some(key_b));
 
         // The current-key lookup reflects only the latest rotation — using
         // it for a historical height would silently return the wrong key.

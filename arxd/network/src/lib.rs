@@ -590,12 +590,12 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                         continue;
                     }
 
-                    if let Some(precheck) = &payload_precheck {
-                        if let Err(err) = precheck(&action, &db) {
-                            counter!("arxium_gossip_rejected_total", "topic" => "actions", "reason" => "stale").increment(1);
-                            warn!("rejected gossiped action from {propagation_source}: {err}");
-                            continue;
-                        }
+                    if let Some(precheck) = &payload_precheck
+                        && let Err(err) = precheck(&action, &db)
+                    {
+                        counter!("arxium_gossip_rejected_total", "topic" => "actions", "reason" => "stale").increment(1);
+                        warn!("rejected gossiped action from {propagation_source}: {err}");
+                        continue;
                     }
 
                     let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
@@ -729,18 +729,23 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                         // until the counter ramps up on its own.
                         *failures = MAX_CONSECUTIVE_SYNC_FAILURES;
                         info!("peer {peer} does not support the sync protocol, will not retry until it reconnects");
-                    } else if { *failures += 1; *failures >= MAX_CONSECUTIVE_SYNC_FAILURES } {
-                        warn!(
-                            "sync request to {peer} failed: {error} ({failures} consecutive failures, giving up until it reconnects)"
-                        );
-                    } else if swarm.is_connected(&peer) {
-                        warn!(
-                            "sync request to {peer} failed: {error} (will retry on next status interval)"
-                        );
                     } else {
-                        warn!(
-                            "sync request to {peer} failed: {error} (not connected, will retry on reconnect)"
-                        );
+                        // Only transient faults count towards the give-up
+                        // threshold; the capability case above sets it outright.
+                        *failures += 1;
+                        if *failures >= MAX_CONSECUTIVE_SYNC_FAILURES {
+                            warn!(
+                                "sync request to {peer} failed: {error} ({failures} consecutive failures, giving up until it reconnects)"
+                            );
+                        } else if swarm.is_connected(&peer) {
+                            warn!(
+                                "sync request to {peer} failed: {error} (will retry on next status interval)"
+                            );
+                        } else {
+                            warn!(
+                                "sync request to {peer} failed: {error} (not connected, will retry on reconnect)"
+                            );
+                        }
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Sync(request_response::Event::InboundFailure {

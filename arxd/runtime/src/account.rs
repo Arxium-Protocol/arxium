@@ -28,13 +28,12 @@ pub(crate) fn authorize_operator(
 ) -> anyhow::Result<BlockUpdates> {
     let validator = action.sender.clone();
     let mut operator_index = std::collections::BTreeMap::new();
-    if let Some(previous) = operator_lookup(&validator)? {
-        if &previous != operator {
+    if let Some(previous) = operator_lookup(&validator)?
+        && &previous != operator {
             let mut previous_list = operator_validators_lookup(&previous)?;
             previous_list.retain(|v| v != &validator);
             operator_index.insert(previous, previous_list);
         }
-    }
     let mut new_list = operator_validators_lookup(operator)?;
     if !new_list.contains(&validator) {
         new_list.push(validator.clone());

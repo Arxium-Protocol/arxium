@@ -157,11 +157,10 @@ pub fn apply_stake<V: KvRead<Error = StorageError>>(
     }
 
     let existing = view.get(&StakeKey { master, validator })?;
-    if let Some(existing) = &existing {
-        if existing.unbonding.is_some() {
+    if let Some(existing) = &existing
+        && existing.unbonding.is_some() {
             return Err(StakingError::AlreadyUnbonding { master: master.clone(), validator: validator.clone() });
         }
-    }
 
     let current_total = existing.as_ref().map(|e| e.active_amount).unwrap_or(0);
     let new_total = current_total + amount;
@@ -279,14 +278,13 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
     let from_active = slash_amount.min(existing.active_amount);
     existing.active_amount -= from_active;
     let remaining = slash_amount - from_active;
-    if remaining > 0 {
-        if let Some(unbonding) = &mut existing.unbonding {
+    if remaining > 0
+        && let Some(unbonding) = &mut existing.unbonding {
             unbonding.amount -= remaining;
             if unbonding.amount == 0 {
                 existing.unbonding = None;
             }
         }
-    }
     existing.updated_at = now_height;
 
     let sub_account = stake_subaccount(validator);

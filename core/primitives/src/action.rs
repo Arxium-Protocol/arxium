@@ -167,7 +167,7 @@ mod tests {
     fn trailing_bytes_inside_payload_blob_are_rejected() {
         let action = test_action();
         let mut payload_bytes =
-            bincode::serde::encode_to_vec(&action.payload, crate::wire_config()).unwrap();
+            bincode::serde::encode_to_vec(action.payload, crate::wire_config()).unwrap();
         payload_bytes.push(0xff);
         let wire = ActionWire {
             sender: action.sender,
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn oversized_declared_length_is_rejected_before_allocating() {
         let huge_len_prefix =
-            bincode::serde::encode_to_vec(&(u64::MAX / 2), bincode::config::standard()).unwrap();
+            bincode::serde::encode_to_vec(u64::MAX / 2, bincode::config::standard()).unwrap();
         let result: Result<(Vec<u8>, usize), _> =
             bincode::serde::decode_from_slice(&huge_len_prefix, crate::wire_config());
         assert!(result.is_err());

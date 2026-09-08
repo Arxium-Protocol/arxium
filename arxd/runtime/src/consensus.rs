@@ -216,11 +216,10 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
         anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
     }
     let bytes = validated_bls_pubkey(pubkey)?;
-    if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))? {
-        if &owner != validator {
+    if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
+        && &owner != validator {
             anyhow::bail!("BLS pubkey already registered to {owner}");
         }
-    }
     let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
         // Effective one block later, same delay as `ValidatorSetSnapshot` —

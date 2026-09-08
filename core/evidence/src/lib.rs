@@ -107,7 +107,7 @@ pub enum EvidenceEvent<P> {
 /// Builds a self-describing evidence artifact (see `xc_artifact`) from a
 /// verified equivocation and writes it to
 /// `<evidence_dir>/<height>-<proposer>.json`. Commits to a `CanonicalHeader`
-/// + `signature` for each block — `verify()` recomputes the signing bytes
+/// and `signature` for each block — `verify()` recomputes the signing bytes
 /// from the header rather than trusting anything this artifact merely
 /// asserts, so `arx-verify` can check it without knowing `P` and without
 /// trusting the artifact's author. The decoded blocks (including their
@@ -907,7 +907,7 @@ mod tests {
         let reported = mempool.lock().unwrap().drain_pending(1);
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].sender, addr);
-        assert!(db.evidence_processed(5, &addr).unwrap_or(false) == false, "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
+        assert!(!db.evidence_processed(5, &addr).unwrap_or(false), "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
 
         let artifact_path = evidence_dir.join(format!("5-{addr}.json"));
         let artifact: xc_artifact::EvidenceArtifact =

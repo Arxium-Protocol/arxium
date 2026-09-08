@@ -366,8 +366,8 @@ where
                             return;
                         }
                     }
-                    if let Some((address, secret_key)) = &bls_identity {
-                        if last_progress.1.elapsed() >= ROUND_TIMEOUT {
+                    if let Some((address, secret_key)) = &bls_identity
+                        && last_progress.1.elapsed() >= ROUND_TIMEOUT {
                             let next_height = last_progress.0 + 1;
                             match db.current_round(next_height) {
                                 Ok(round) => {
@@ -430,7 +430,6 @@ where
                                 }
                             }
                         }
-                    }
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -442,11 +441,10 @@ where
                 FinalityEvent::DissentObserved(dissent) => dissent.height,
                 FinalityEvent::RoundTimeoutObserved(vote) => vote.height,
             });
-            if let FinalityEvent::BlockObserved(block) = &event {
-                if block.height > last_progress.0 {
+            if let FinalityEvent::BlockObserved(block) = &event
+                && block.height > last_progress.0 {
                     last_progress = (block.height, Instant::now());
                 }
-            }
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);

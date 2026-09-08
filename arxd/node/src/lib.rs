@@ -887,11 +887,9 @@ fn spawn_subsystems<R: ChainRuntime>(
                             block_height,
                             tip_height,
                         } = &err
-                        {
-                            if block_height == tip_height {
+                            && block_height == tip_height {
                                 let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
                             }
-                        }
                     }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }

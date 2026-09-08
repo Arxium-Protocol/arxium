@@ -311,6 +311,10 @@ pub mod state_trie {
             let defaults = default_hashes();
             let mut siblings = [[0u8; 32]; 256];
             let mut node = self.root;
+            // `level` is the trie depth, not just an index: it drives `depth` and
+            // `bit_at` as well as the `siblings` slot, so an iterator would have to
+            // carry it anyway.
+            #[allow(clippy::needless_range_loop)]
             for level in 0..256 {
                 let depth = 256 - level;
                 if node == defaults[depth] {
@@ -585,7 +589,7 @@ mod tests {
     fn tx_root_of_pair_differs_from_a_leaf_hash_of_their_combined_root() {
         let pair = vec![action(1), action(2)];
         let root = tx_root(&pair).unwrap();
-        let single = vec![action(99)];
+        let single = [action(99)];
         assert_ne!(root, action_hash(&single[0]).unwrap());
         // The old (buggy) scheme hashed nodes identically to leaves, i.e.
         // node_hash(h1, h2) == Sha256(h1 ++ h2) with no domain prefix. Make

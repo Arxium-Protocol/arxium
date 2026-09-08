@@ -154,9 +154,6 @@ mod tests {
         // A flipped byte either fails to deserialize into a well-formed
         // proof at all, or deserializes into one that fails verification —
         // either outcome means the tamper was caught.
-        match Proof::<Bls12_381>::deserialize_compressed(&bytes[..]) {
-            Ok(tampered) => assert!(!verify(&hash, &tampered, &vk)),
-            Err(_) => {}
-        }
+        if let Ok(tampered) = Proof::<Bls12_381>::deserialize_compressed(&bytes[..]) { assert!(!verify(&hash, &tampered, &vk)) }
     }
 }

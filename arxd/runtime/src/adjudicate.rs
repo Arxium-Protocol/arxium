@@ -526,16 +526,15 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         entries.push((AttestorRecordKey(&deregistration.0).encode(), None));
     }
     if let Some(registration) = &updates.bls_key {
-        let value = bincode::serde::encode_to_vec(&registration.pubkey, config).expect("BlsPublicKey always encodes");
+        let value = bincode::serde::encode_to_vec(registration.pubkey, config).expect("BlsPublicKey always encodes");
         entries.push((BlsKeyKey(&registration.address).encode(), Some(value)));
         let owner_value =
             bincode::serde::encode_to_vec(&registration.address, config).expect("Address always encodes");
         entries.push((BlsPubkeyOwnerKey(&registration.pubkey).encode(), Some(owner_value)));
-        if let Some(previous) = &registration.previous_pubkey {
-            if previous != &registration.pubkey {
+        if let Some(previous) = &registration.previous_pubkey
+            && previous != &registration.pubkey {
                 entries.push((BlsPubkeyOwnerKey(previous).encode(), None));
             }
-        }
     }
     entries
 }
