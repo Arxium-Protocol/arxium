@@ -38,3 +38,6 @@ ark-serialize = { workspace = true }
 ark-std = { workspace = true }
 arxd-genesis = { workspace = true }
 sha2 = { workspace = true }
+
+[lints]
+workspace = true

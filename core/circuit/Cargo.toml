@@ -9,3 +9,6 @@ serde = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
 xc-primitives = { path = "../primitives" }
 xc-bls = { path = "../bls" }
+
+[lints]
+workspace = true

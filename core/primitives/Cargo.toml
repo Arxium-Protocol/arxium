@@ -28,3 +28,6 @@ xc-bls = { workspace = true }
 
 [dev-dependencies]
 xc-artifact = { workspace = true }
+
+[lints]
+workspace = true

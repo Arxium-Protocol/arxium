@@ -47,6 +47,22 @@ license = "Apache-2.0"
 repository = "https://github.com/Arxium-Protocol/Arxium"
 
 
+# Lint levels for every member, inherited via `lints.workspace = true` in each
+# member manifest. Centralised here so a new crate cannot quietly opt out of
+# the rules the rest of the workspace is held to; thresholds live in
+# `clippy.toml` alongside.
+[workspace.lints.rust]
+# Nothing in this workspace needs raw pointers or FFI. The one exception is
+# `std::env::set_var` in tests, which carries a local `#[allow]`.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# A consensus node has no business shipping a placeholder that panics at
+# runtime; these are all currently clean, so denying them keeps it that way.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+
 [workspace.dependencies]
 # internal packages
 xc-primitives = { path = "core/primitives" }

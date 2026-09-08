@@ -15,3 +15,6 @@ metrics = { workspace = true }
 xc-bls = { path = "../bls" }
 xc-circuit = { path = "../circuit" }
 xc-poe = { path = "../poe" }
+
+[lints]
+workspace = true

@@ -46,3 +46,6 @@ arxd-runtime = { workspace = true }
 
 [features]
 fault-injection = ["xc-cli/fault-injection"]
+
+[lints]
+workspace = true

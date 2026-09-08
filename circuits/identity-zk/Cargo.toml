@@ -17,3 +17,6 @@ ark-serialize = { workspace = true }
 
 [[example]]
 name = "generate_keys"
+
+[lints]
+workspace = true

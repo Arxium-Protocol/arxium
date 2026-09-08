@@ -20,3 +20,6 @@ hex = { workspace = true }
 circuit-account = { workspace = true }
 ed25519-dalek = { workspace = true }
 xc-circuit = { workspace = true }
+
+[lints]
+workspace = true

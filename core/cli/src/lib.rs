@@ -351,6 +351,11 @@ mod tests {
         assert_eq!(cfg.bootnodes.len(), 2, "a stray comma must not add an empty entry");
     }
 
+    // `set_var`/`remove_var` are `unsafe` since 2024: they mutate process-wide
+    // state that another thread could be reading. Safe here because every env
+    // assertion is confined to this one test (see the comment below) and no
+    // other thread in the test binary touches `ARXD_*`.
+    #[allow(unsafe_code)]
     #[test]
     fn bool_env_vars_need_an_explicit_value() {
         // Bare flag still works, and is still the documented CLI form.
