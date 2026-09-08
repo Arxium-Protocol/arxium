@@ -23,7 +23,7 @@ use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
-use arxd_network::{identity, spawn_p2p_node};
+use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault};
 use xc_cli::{Cli, Command};
 use xc_executor::{AcceptBlockError, accept_block};
@@ -1273,26 +1273,26 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
     // Every node joins the network, not just validators — the libp2p
     // identity is separate from the validator signing key above.
-    spawn_p2p_node(
-        &config.base_path,
-        config.p2p_port,
-        &bootnodes,
-        config.is_bootnode,
-        &chain_id,
-        mempool.clone(),
-        db.clone(),
+    spawn_p2p_node(P2pConfig {
+        base_path: &config.base_path,
+        listen_port: config.p2p_port,
+        bootnodes: &bootnodes,
+        is_bootnode: config.is_bootnode,
+        chain_id: &chain_id,
+        mempool: mempool.clone(),
+        db: db.clone(),
         gossip_rx,
         block_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
-        on_block,
-        on_precommit_vote,
-        on_dissent,
-        on_round_timeout_vote,
-        Some(payload_precheck.clone()),
-        config.limits.clone(),
-    )?;
+        on_block: Box::new(on_block),
+        on_precommit_vote: Box::new(on_precommit_vote),
+        on_dissent: Box::new(on_dissent),
+        on_round_timeout_vote: Box::new(on_round_timeout_vote),
+        payload_precheck: Some(payload_precheck.clone()),
+        limits: config.limits.clone(),
+    })?;
 
     produce::produce_loop::<R>(
         &db,
