@@ -10,11 +10,11 @@ rocksdb = { workspace = true }
 bincode = { workspace = true, features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
-xc-primitives = { path = "../primitives" }
+xc-primitives = { workspace = true }
 metrics = { workspace = true }
-xc-bls = { path = "../bls" }
-xc-circuit = { path = "../circuit" }
-xc-poe = { path = "../poe" }
+xc-bls = { workspace = true }
+xc-circuit = { workspace = true }
+xc-poe = { workspace = true }
 
 [lints]
 workspace = true

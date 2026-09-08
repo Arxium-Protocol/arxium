@@ -7,8 +7,8 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
-xc-primitives = { path = "../primitives" }
-xc-bls = { path = "../bls" }
+xc-primitives = { workspace = true }
+xc-bls = { workspace = true }
 
 [lints]
 workspace = true
