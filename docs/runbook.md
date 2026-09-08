@@ -737,6 +737,62 @@ pay for their own fault reports and the dedup guard matches the chain's own
 notion of "the same fault." `scripts/two-node-fault-harness.sh` is the
 acceptance signal Stage 3 was waiting on, and it now passes reliably.
 
+## Divergence recovery — live-proven 2026-09-08
+
+The `68d2b26` divergence-recovery block added four assertions to
+`scripts/two-node-fault-harness.sh` on top of the culprit/evidence/slash
+checks documented above: the diverged node actually reverts
+(`"reverted from height"` in its log), it converges on the same
+`state_root` as the honest majority, no action from the honest chain is
+lost (every action signature resolves on the recovered node as confirmed or
+pending, never 404), and no node reverts below its finalized watermark
+(a `HALT:` anywhere is a failure). All prior runs recorded above — the
+10-attempt 240s timeout tuning included — predate this block and only
+exercised the fault/evidence/slash loop, not rollback.
+
+**First run against the new assertions (2026-09-08) failed, but not on
+recovery.** It exposed a pre-existing gap the runbook had already
+flagged in passing above ("roughly 1-in-4 to 1-in-8 runs, depending on
+validator address ordering") but never fixed: `FAULT_HEIGHT` is only ever
+corrupted by whoever *proposes* that height, and the proposer is
+`sorted(validator_addresses)[height % n]` — sorted by each validator's
+freshly-random generated address. The harness always armed node 0 for a
+fixed height without checking node 0 actually held that proposer slot. This
+run it didn't; the fault never fired, so the four new assertions passed
+(3 of them) or correctly failed (the revert check) on a scenario that never
+happened — a clean-looking run with nothing exercised.
+
+**Fixed the same day.** `scripts/two-node-fault-harness.sh` now computes
+`FAULT_HEIGHT` *after* generating validator keys: it sorts the real
+addresses and slides `FAULT_HEIGHT` forward to the next height where node 0
+is guaranteed to be the round-0 proposer, instead of gambling on the
+caller's chosen height. (Also had to replace a `mapfile -t` with a plain
+word-split array assignment — macOS's default bash is 3.2 and doesn't have
+`mapfile`, even under `#!/usr/bin/env bash`.)
+
+**Re-run, same day, full pass — the first live proof this feature works:**
+
+```
+reverted from height 5 to 4 in favour of <peer>'s certified chain
+(divergence at 5); 0 action(s) returned to the mempool
+node 0 agrees with the majority at height 11
+  (state_root 0x07b90fd6f7609168d649d84fa16bed7afc1fd44e907bdc599d9fa1b7b3869c95)
+no action from the honest chain went missing on node 0
+no node reverted below its finalized watermark
+```
+
+along with the pre-existing checks: node 0's stake fully slashed, honest
+nodes' stakes untouched, an honest node wrote fault evidence, and node 0
+never self-incriminated another validator.
+
+**Caveat for future readers:** any run of this script from before the
+2026-09-08 fix should be treated as inconclusive on divergence recovery
+specifically (not necessarily on the fault/evidence/slash loop, which the
+proposer-slot bug doesn't affect the same way, since that loop's checks
+tolerate — and log — a non-firing fault as a clear FAIL rather than a
+silent pass). If you're citing an old "green run" as evidence rollback
+works, check it postdates this fix.
+
 ## Known limitations worth an operator's awareness
 
 From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,

@@ -49,7 +49,6 @@ cd "$REPO_ROOT"
 
 NUM_VALIDATORS="${NUM_VALIDATORS:-4}"
 FAULT_HEIGHT="${FAULT_HEIGHT:-5}"
-CONFIRM_HEIGHT=$((FAULT_HEIGHT + 6))
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
 STARTUP_TIMEOUT=30
@@ -129,6 +128,27 @@ for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
         '. + {($addr): {balance: $balance, nonce: 0, identity_hash: null}}' <(echo "$ACCOUNTS"))"
 done
 PEER_0="$("$BIN" node-key --base-path "${DIRS[0]}")"
+
+# ponytail: the proposer for a height is sorted(validator_addresses)[height %
+# n] (core/primitives/src/consensus.rs's eligible_proposer), and validator
+# addresses are freshly random every run — so a fixed FAULT_HEIGHT has only a
+# 1/n chance of ever landing on node 0's turn at round 0. Slide FAULT_HEIGHT
+# forward (keeping it >= the requested value) to the next height where node
+# 0 is actually the round-0 proposer, so the corruption branch in
+# arxd/node/src/produce.rs is guaranteed to fire instead of silently never
+# triggering (see Implementation_log's write-up of the run this fixes).
+SORTED_ADDRS=($(printf '%s\n' "${ADDRS[@]}" | LC_ALL=C sort))
+NODE0_SLOT=-1
+for idx in "${!SORTED_ADDRS[@]}"; do
+    if [ "${SORTED_ADDRS[$idx]}" = "${ADDRS[0]}" ]; then
+        NODE0_SLOT=$idx
+        break
+    fi
+done
+while (( FAULT_HEIGHT % NUM_VALIDATORS != NODE0_SLOT )); do
+    FAULT_HEIGHT=$((FAULT_HEIGHT + 1))
+done
+CONFIRM_HEIGHT=$((FAULT_HEIGHT + 6))
 
 jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
     genesis_format: "plain",
