@@ -472,17 +472,19 @@ impl ArxiumDb {
     pub fn get_bls_pubkey_at(&self, address: &Address, height: u64) -> Result<Option<BlsPublicKey>, StorageError> {
         let prefix = format!("meta:blskey_hist:{address}:").into_bytes();
         let seek_key = format!("meta:blskey_hist:{address}:{height:020}").into_bytes();
-        let iter = self
+        let mut iter = self
             .db
             .iterator_cf(self.cf(CF_META), IteratorMode::From(&seek_key, Direction::Reverse));
-        for item in iter {
+        // Only the first item can match: the reverse seek lands on the newest
+        // entry at or below `height`, and anything past it belongs to another
+        // address.
+        if let Some(item) = iter.next() {
             let (key, value) = item?;
-            if !key.starts_with(&prefix) {
-                break;
+            if key.starts_with(&prefix) {
+                let config = bincode::config::standard();
+                let (pubkey, _len) = bincode::serde::decode_from_slice(&value, config)?;
+                return Ok(Some(pubkey));
             }
-            let config = bincode::config::standard();
-            let (pubkey, _len) = bincode::serde::decode_from_slice(&value, config)?;
-            return Ok(Some(pubkey));
         }
         Ok(None)
     }
@@ -1333,17 +1335,18 @@ impl ArxiumDb {
     pub fn get_validator_set_at(&self, height: u64) -> Result<Vec<Address>, StorageError> {
         let prefix = b"validator_set:";
         let seek_key = format!("validator_set:{height:020}");
-        let iter = self
+        let mut iter = self
             .db
             .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
-        for item in iter {
+        // Only the first item can match: the reverse seek lands on the newest
+        // snapshot at or below `height`, so later items are strictly older.
+        if let Some(item) = iter.next() {
             let (key, value) = item?;
-            if !key.starts_with(prefix) {
-                break;
+            if key.starts_with(prefix) {
+                let config = bincode::config::standard();
+                let (validators, _len) = bincode::serde::decode_from_slice(&value, config)?;
+                return Ok(validators);
             }
-            let config = bincode::config::standard();
-            let (validators, _len) = bincode::serde::decode_from_slice(&value, config)?;
-            return Ok(validators);
         }
         Ok(Vec::new())
     }
@@ -1390,21 +1393,22 @@ impl ArxiumDb {
         // u64::MAX zero-padded: seeks past every real key, so Reverse starts at
         // the highest one that exists.
         let seek_key = format!("meta:finality:{:020}", u64::MAX);
-        let iter = self.db.iterator_cf(
+        let mut iter = self.db.iterator_cf(
             self.cf(CF_META),
             IteratorMode::From(seek_key.as_bytes(), Direction::Reverse),
         );
-        for item in iter {
+        // Only the first item can match: the seek starts past every real key,
+        // so the first reverse step is already the highest certificate.
+        if let Some(item) = iter.next() {
             let (key, _value) = item?;
-            if !key.starts_with(prefix) {
-                break;
+            if key.starts_with(prefix) {
+                let digits = &key[prefix.len()..];
+                let height = std::str::from_utf8(digits)
+                    .ok()
+                    .and_then(|d| d.parse::<u64>().ok())
+                    .ok_or(StorageError::CorruptedMeta)?;
+                return Ok(Some(height));
             }
-            let digits = &key[prefix.len()..];
-            let height = std::str::from_utf8(digits)
-                .ok()
-                .and_then(|d| d.parse::<u64>().ok())
-                .ok_or(StorageError::CorruptedMeta)?;
-            return Ok(Some(height));
         }
         Ok(None)
     }
