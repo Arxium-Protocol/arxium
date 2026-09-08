@@ -266,7 +266,9 @@ fn decode_root(root: &str) -> Result<[u8; 32], StorageError> {
 // comment). Both directions of a proof round-trip (`prove` below builds one,
 // `xc_poe::state_trie::verify_proof` checks it) must use the exact same
 // hashing, which a shared definition guarantees.
-use xc_poe::state_trie::{InclusionProof, bit_at, default_hashes, hash_key, internal_hash, leaf_hash};
+use xc_poe::state_trie::{
+    InclusionProof, bit_at, default_hashes, descend, hash_key, internal_hash, leaf_hash,
+};
 
 /// Which column family a key belongs in, derived from its prefix rather than
 /// tracked separately at each call site — one place to keep in sync with the
@@ -1183,26 +1185,7 @@ impl ArxiumDb {
         key_hash: &[u8; 32],
         overrides: &HashMap<[u8; 32], Vec<u8>>,
     ) -> Result<([[u8; 32]; 256], [u8; 32]), StorageError> {
-        let defaults = default_hashes();
-        let mut siblings = [[0u8; 32]; 256];
-        let mut node = root;
-        // `level` is the trie depth, not just an index: it drives `depth` and
-        // `bit_at` as well as the `siblings` slot, so an iterator would have to
-        // carry it anyway.
-        #[allow(clippy::needless_range_loop)]
-        for level in 0..256 {
-            let depth = 256 - level;
-            if node == defaults[depth] {
-                siblings[level] = defaults[depth - 1];
-                node = defaults[depth - 1];
-            } else {
-                let (left, right) = self.node_children(&node, overrides)?;
-                let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
-                siblings[level] = sibling;
-                node = child;
-            }
-        }
-        Ok((siblings, node))
+        descend(root, key_hash, |hash| self.node_children(hash, overrides))
     }
 
     /// Builds an inclusion (or non-inclusion) proof for `key` against `root`
