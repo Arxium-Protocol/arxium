@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{AccountKey, BlsKeyKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, ValidatorChange, ValidatorEntry};
 use xc_storage::{BlsKeyRegistration, StorageError};
@@ -80,6 +80,7 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
         validator.clone(),
         ValidatorEntry { stake, bls_pubkey: Some(hex::encode(bytes)) },
     );
+    let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
         accounts,
         stakes,
@@ -91,6 +92,7 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
             // produces — the validator isn't eligible to vote until
             // `current_height + 1` either, so the key becomes valid then too.
             effective_height: current_height + 1,
+            previous_pubkey,
         }),
         ..Default::default()
     })

@@ -218,6 +218,7 @@ mod dissent_evidence_bridge_tests {
             address: voter.clone(),
             pubkey: pk,
             effective_height: 0,
+            previous_pubkey: None,
         }])
         .unwrap();
 

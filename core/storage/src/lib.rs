@@ -12,10 +12,12 @@ use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey,
-    AttestorRecordKey, BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec, KvRead,
-    StakeByValidatorKey, StakeKey,
+    AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec,
+    KvRead, OperatorKey, StakeByValidatorKey, StakeKey,
 };
-use xc_circuit::{CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_META, CF_VALIDATORS};
+use xc_circuit::{
+    CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
+};
 use xc_primitives::{
     stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation,
 };
@@ -115,8 +117,10 @@ pub enum StorageError {
 /// gated by `SCHEMA_VERSION` below rather than a runtime probe.
 const CF_MERKLE: &str = "merkle";
 
-const COLUMN_FAMILIES: [&str; 8] =
-    [CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS, CF_EVIDENCE];
+const COLUMN_FAMILIES: [&str; 9] = [
+    CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS, CF_EVIDENCE,
+    CF_GOVERNANCE,
+];
 
 /// On-disk layout version this binary understands — covers column-family
 /// layout and key encoding (`cf_for_key`, `Block`'s bincode shape, etc; NOT
@@ -166,7 +170,21 @@ const COLUMN_FAMILIES: [&str; 8] =
 /// A version-5 DB has neither, so it's refused rather than being left in a
 /// state where the one operation that needs the undo log silently can't run —
 /// same "wipe and resync" policy as the prior bumps.
-pub const SCHEMA_VERSION: u32 = 6;
+///
+/// Bumped 6 -> 7: three more `CF_META` rows joined the state trie, in a new
+/// `CF_GOVERNANCE` column family — the governor address (`meta:governor` ->
+/// `governor`, `GovernorKey`), the forward operator-authorization record
+/// (`meta:operator:{validator}` -> `operator:{validator}`, `OperatorKey`;
+/// the reverse `meta:operator_index:` stays in `CF_META`, unprovable, same
+/// as `AssetIndexKey`), and the current BLS key row plus its new reverse
+/// owner index (`meta:blskey:{addr}` -> `blskey:{addr}`, `BlsKeyKey`, plus
+/// `blskey_owner:{pubkey}`, `BlsPubkeyOwnerKey`; the rotation history
+/// `meta:blskey_hist:*` stays in `CF_META`, unprovable — range scans have no
+/// proof shape). Together these let `RegisterAttestor`/`DeregisterAttestor`
+/// and the delegated paths of `JoinValidator`/`LeaveValidator`/
+/// `RegisterBlsKey` resolve to `Culpable` under adjudication instead of
+/// always `Disagreement`. Same "wipe and resync" policy as the prior bumps.
+pub const SCHEMA_VERSION: u32 = 7;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -227,7 +245,10 @@ type UndoRecord = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 /// tracked in the first place, since a raw key outside these four CFs was
 /// never inserted into `CF_MERKLE` to begin with.
 pub fn is_state_key(key: &[u8]) -> bool {
-    matches!(cf_for_key(key), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS | CF_EVIDENCE)
+    matches!(
+        cf_for_key(key),
+        CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS | CF_ATTESTORS | CF_EVIDENCE | CF_GOVERNANCE
+    )
 }
 
 /// Parses a `Block.state_root`-shaped string (`"0x"` + 64 hex chars, as
@@ -275,6 +296,12 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_ATTESTORS
     } else if key.starts_with(b"evidence:") {
         CF_EVIDENCE
+    } else if key.starts_with(b"governor")
+        || key.starts_with(b"operator:")
+        || key.starts_with(b"blskey:")
+        || key.starts_with(b"blskey_owner:")
+    {
+        CF_GOVERNANCE
     } else if key.len() == 32 {
         CF_MERKLE
     } else {
@@ -460,36 +487,13 @@ impl ArxiumDb {
         Ok(None)
     }
 
-    /// Linear scan over the `meta:blskey:` prefix, one row per validator.
-    /// Fine at devnet validator-set scale; instrumented as
-    /// `arxium_storage_scan_*{scan="bls_pubkey_owner"}` rather than indexed,
-    /// since the upgrade (a pubkey->address reverse index) is only worth its
-    /// second source of truth if the numbers say so.
-    ///
     /// Address already holding `pubkey`, if any — used to reject a second
-    /// validator registering the same BLS key.
+    /// validator registering the same BLS key. A single `BlsPubkeyOwnerKey`
+    /// read (schema v7+) rather than the linear scan over `meta:blskey:` this
+    /// used to be — see `BlsKeyRegistration::batch_entries` for how the
+    /// reverse index is kept in sync, including deletion on rotation.
     pub fn bls_pubkey_owner(&self, pubkey: &BlsPublicKey) -> Result<Option<Address>, StorageError> {
-        let prefix = b"meta:blskey:";
-        let started = std::time::Instant::now();
-        let mut rows = 0u64;
-        let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix, Direction::Forward));
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            rows += 1;
-            let config = bincode::config::standard();
-            let (existing, _len): (BlsPublicKey, usize) = bincode::serde::decode_from_slice(&value, config)?;
-            if &existing == pubkey {
-                let address_str = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
-                let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
-                record_scan("bls_pubkey_owner", rows, started);
-                return Ok(Some(address));
-            }
-        }
-        record_scan("bls_pubkey_owner", rows, started);
-        Ok(None)
+        KvRead::get(self, &BlsPubkeyOwnerKey(pubkey))
     }
 
     /// The address currently authorized to submit `JoinValidator`/
@@ -499,15 +503,7 @@ impl ArxiumDb {
     /// validator at a time, mirroring `circuit_staking::apply_stake`'s
     /// single-master invariant.
     pub fn get_operator(&self, validator: &Address) -> Result<Option<Address>, StorageError> {
-        let key = format!("meta:operator:{validator}");
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (operator, _) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(Some(operator))
-            }
-            None => Ok(None),
-        }
+        KvRead::get(self, &OperatorKey(validator))
     }
 
     /// One attestor's registry record, if `attestor` is currently registered.
@@ -1057,7 +1053,7 @@ impl ArxiumDb {
         let mut batch = WriteBatch::default();
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for (cf_name, key, value) in entries {
-            if matches!(cf_name.as_str(), CF_ACCOUNTS | CF_VALIDATORS | CF_ASSETS) {
+            if is_state_key(key) {
                 state_changes.insert(hash_key(key), Some(value.clone()));
             }
             batch.put_cf(self.cf(cf_name), key, value);
@@ -1824,11 +1820,18 @@ impl BatchWritable for EvidenceMarker {
 /// a key change caused by its own actions. Genesis registrations use `0`.
 /// Written alongside the plain current-key record so `get_bls_pubkey_at` can
 /// recover which key was valid at any past height even after a rotation.
+///
+/// `previous_pubkey` is the address's prior current key, if any (`None` at
+/// genesis or first registration) — carried here so the reverse
+/// `BlsPubkeyOwnerKey` index can be deleted for the old pubkey at the same
+/// time the new one is written, freeing it for reuse exactly like the linear
+/// scan `bls_pubkey_owner` used to do implicitly.
 #[derive(Debug)]
 pub struct BlsKeyRegistration {
     pub address: Address,
     pub pubkey: BlsPublicKey,
     pub effective_height: u64,
+    pub previous_pubkey: Option<BlsPublicKey>,
 }
 
 impl BatchWritable for BlsKeyRegistration {
@@ -1838,7 +1841,16 @@ impl BatchWritable for BlsKeyRegistration {
         let current_key = BlsKeyKey(&self.address).encode();
         let history_key =
             format!("meta:blskey_hist:{}:{:020}", self.address, self.effective_height).into_bytes();
-        Ok(vec![(current_key, value.clone()), (history_key, value)])
+        let owner_key = BlsPubkeyOwnerKey(&self.pubkey).encode();
+        let owner_value = bincode::serde::encode_to_vec(&self.address, config)?;
+        Ok(vec![(current_key, value.clone()), (history_key, value), (owner_key, owner_value)])
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        match &self.previous_pubkey {
+            Some(previous) if previous != &self.pubkey => Ok(vec![BlsPubkeyOwnerKey(previous).encode()]),
+            _ => Ok(Vec::new()),
+        }
     }
 }
 
@@ -1863,7 +1875,7 @@ impl BatchWritable for OperatorUpdates {
         let mut entries = Vec::new();
         for (validator, operator) in &self.authorization {
             if let Some(operator) = operator {
-                let key = format!("meta:operator:{validator}").into_bytes();
+                let key = OperatorKey(validator).encode();
                 let value = bincode::serde::encode_to_vec(operator, config)?;
                 entries.push((key, value));
             }
@@ -1882,7 +1894,7 @@ impl BatchWritable for OperatorUpdates {
         let mut deletes = Vec::new();
         for (validator, operator) in &self.authorization {
             if operator.is_none() {
-                deletes.push(format!("meta:operator:{validator}").into_bytes());
+                deletes.push(OperatorKey(validator).encode());
             }
         }
         for (operator, validators) in &self.operator_index {
@@ -2904,12 +2916,18 @@ mod bls_key_history_tests {
 
         {
             let db = ArxiumDb::open(&path).unwrap();
-            db.write_batches(&[&BlsKeyRegistration { address: validator.clone(), pubkey: key_a.clone(), effective_height: 0 }])
-                .unwrap();
+            db.write_batches(&[&BlsKeyRegistration {
+                address: validator.clone(),
+                pubkey: key_a.clone(),
+                effective_height: 0,
+                previous_pubkey: None,
+            }])
+            .unwrap();
             db.write_batches(&[&BlsKeyRegistration {
                 address: validator.clone(),
                 pubkey: key_b.clone(),
                 effective_height: 11,
+                previous_pubkey: Some(key_a.clone()),
             }])
             .unwrap();
         }

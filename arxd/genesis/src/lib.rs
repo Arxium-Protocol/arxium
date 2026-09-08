@@ -28,7 +28,7 @@ use xc_storage::{AccountUpdates, ArxiumDb, cf_for_key};
 
 pub use chain_spec::{ChainSpec, RAW_FORMAT_VERSION};
 
-const BLS_KEY_PREFIX: &[u8] = b"meta:blskey:";
+const BLS_KEY_PREFIX: &[u8] = b"blskey:";
 
 /// Genesis validators that never run `JoinValidator` need their BLS key
 /// registered here, or they enter the validator set unable to vote — the
@@ -64,6 +64,7 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
             address: address.clone(),
             pubkey: BlsPublicKey(bytes),
             effective_height: 0,
+            previous_pubkey: None,
         })?;
     }
     Ok(())
@@ -118,7 +119,7 @@ pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
 ///   the file's version and what this binary supports, rather than writing
 ///   entries it might misread.
 /// - **internal consistency**: every entry's `cf` must match what
-///   `cf_for_key` derives from its own key, and every `meta:blskey:*` entry
+///   `cf_for_key` derives from its own key, and every `blskey:*` entry
 ///   must hold a well-formed, non-reused BLS pubkey.
 /// - **state_root**: on a fresh install, the state actually reached must
 ///   equal `raw.state_root` — a mismatch means the entries do not encode what
@@ -224,7 +225,7 @@ pub fn derive_raw(spec_json: &str) -> Result<RawGenesis> {
 
 /// Decodes and validates every entry: hex must decode, each entry's `cf`
 /// must match what `cf_for_key` derives from its own key (catching a
-/// hand-edited or corrupted raw spec), and every `meta:blskey:*` entry must
+/// hand-edited or corrupted raw spec), and every `blskey:*` entry must
 /// hold a well-formed BLS pubkey not reused by another validator.
 fn verify_raw_entries(entries: &[GenesisEntry]) -> Result<()> {
     let mut seen_pubkeys = HashSet::new();
@@ -440,7 +441,7 @@ mod tests {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.cf == "meta" && hex::decode(&e.key_hex).unwrap().starts_with(BLS_KEY_PREFIX))
+            .filter(|(_, e)| e.cf == "governance" && hex::decode(&e.key_hex).unwrap().starts_with(BLS_KEY_PREFIX))
             .map(|(i, _)| i)
             .collect();
         assert_eq!(bls_indices.len(), 2, "spec must register 2 validator BLS keys");

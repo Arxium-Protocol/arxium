@@ -28,35 +28,48 @@
 //! real `dispatch`, not a reimplementation. That reuse is also what limits
 //! coverage: `dispatch` reads several things outside the Merkle state trie
 //! entirely (`compute_state_root` only ever covers
-//! `CF_ACCOUNTS`/`CF_VALIDATORS`(-balances)/`CF_ASSETS`/`CF_ATTESTORS`
-//! balances — see `xc_storage::is_state_key`), and those reads have no
-//! proof to check them against:
+//! `CF_ACCOUNTS`/`CF_VALIDATORS`(-balances)/`CF_ASSETS`/`CF_ATTESTORS`/
+//! `CF_EVIDENCE`/`CF_GOVERNANCE` — see `xc_storage::is_state_key`), and a
+//! handful of reads still have no proof to check them against even after the
+//! schema-v7 `CF_GOVERNANCE` bump:
 //!
-//! - Operator authorization (`AuthorizeOperator`/`RevokeOperator`, and the
-//!   delegated-management path of `JoinValidator`/`LeaveValidator`/
-//!   `RegisterBlsKey`) lives in `CF_META`.
-//! - BLS-key ownership (`JoinValidator`/`RegisterBlsKey`) lives in `CF_META`.
-//! - The equivocation-processed marker (`SubmitEquivocationEvidence`) lives
-//!   in `CF_EVIDENCE`.
-//! - The governor key (`RegisterAttestor`/`DeregisterAttestor`) lives in
-//!   `CF_META` — only asset *balances* (`AssetBalanceKey`) and the asset
-//!   registry (`AssetKey`) are Merkleized.
+//! - The reverse operator index (`meta:operator_index:{operator}`), needed
+//!   by `AuthorizeOperator`/`RevokeOperator` to maintain the full
+//!   per-operator validator list, stays in `CF_META` by design (same split
+//!   `AssetIndexKey` uses against `AssetKey`) — those two variants still
+//!   always resolve to `Disagreement`. The forward record
+//!   (`OperatorKey`) *is* Merkleized now, so the delegated-management path of
+//!   `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` no longer hits this.
+//! - BLS-key rotation history (`meta:blskey_hist:{addr}:{height}`, read via
+//!   range scan in `get_bls_pubkey_at`) stays in `CF_META` — range scans have
+//!   no proof shape. The current key (`BlsKeyKey`) and its reverse ownership
+//!   index (`BlsPubkeyOwnerKey`) are both Merkleized, so `JoinValidator` and
+//!   `RegisterBlsKey` are no longer blocked by these.
+//! - The equivocation-processed marker (`SubmitEquivocationEvidence`) and the
+//!   governor key (`RegisterAttestor`/`DeregisterAttestor`) are both already
+//!   Merkleized (`CF_EVIDENCE`, `CF_GOVERNANCE`) and reached fine — `dispatch`
+//!   never fails closed on either.
 //! - `LeaveValidator` additionally needs the current validator set, passed
 //!   into `dispatch` as a plain slice rather than read through `KvRead` —
 //!   there's no proof shape for "this is the answer to a parameter", only
-//!   for a key read, so this is out of reach the same way.
+//!   for a key read, so this is out of reach a different way and stays
+//!   deferred.
+//! - `GenesisHashKey` stores the genesis state root itself, so it can never
+//!   join `is_state_key` — Merkleizing it would change the root it records.
+//!   Structural, not an oversight.
 //!
-//! That leaves `Transfer`, `Stake`, `Unstake`, `VerifyIdentityCredential`,
-//! `GrantAttestation`, and `RevokeAttestation` as the variants this can
-//! actually resolve to `Culpable`. Everything else — reached at all, or
-//! hitting one of the reads above — resolves to `Disagreement`, same as
-//! `xc_artifact::verify()` alone would say. This is a real, load-bearing
-//! decision (not a stopgap TODO): extending it means Merkleizing more state
-//! (a schema change, like the `CF_ASSETS`/`CF_ATTESTORS`/`CF_EVIDENCE` bumps
-//! already in this codebase's history), not writing more code here.
+//! That leaves `AuthorizeOperator`, `RevokeOperator`, `LeaveValidator`, and
+//! the fault-submission variants (unreplayable by construction, see
+//! `is_unreplayable_fault_submission`) as the ones that still can't resolve
+//! to `Culpable`. Everything else does. Extending coverage further means
+//! Merkleizing more state (a schema change) or giving `LeaveValidator`'s
+//! validator-set parameter a proof shape, not writing more code here.
 
 use xc_artifact::{ActionClaim, EvidenceArtifact, Fault, StateProof};
-use xc_circuit::{AccountKey, AssetBalanceKey, AttestorRecordKey, KeySpec, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{
+    AccountKey, AssetBalanceKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, KeySpec, KvRead, OperatorKey,
+    StakeByValidatorKey, StakeKey,
+};
 use xc_executor::BlockUpdates;
 use xc_poe::state_trie::{InclusionProof, ProofBackedTrie};
 use xc_primitives::Address;
@@ -250,10 +263,9 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         Err(_) => return Ok(AdjudicationOutcome::Disagreement { reason: "a supplied proof does not verify".to_string() }),
     };
 
-    let fail_closed = |_: &Address| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    // operator_index (reverse operator lookup) has no proof shape — same split as
+    // AssetIndexKey vs. AssetKey — so it always fails closed.
     let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
-    let fail_closed_bls =
-        |_: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
 
     for action in &decoded_actions {
         if matches!(action.payload, crate::ActionPayload::LeaveValidator { .. }) {
@@ -271,14 +283,17 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         }
 
         let view = ProofBackedView { trie };
+        let operator_lookup = |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
+        let bls_pubkey_owner_lookup =
+            |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { view.get(&BlsPubkeyOwnerKey(pk)) };
         let updates = crate::dispatch(
             action,
             &view,
-            &fail_closed,
+            &operator_lookup,
             &fail_closed_list,
             &[],
             *height,
-            &fail_closed_bls,
+            &bls_pubkey_owner_lookup,
         );
         trie = view.trie;
 
@@ -408,19 +423,21 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
     };
     let view = ProofBackedView { trie };
 
-    let fail_closed = |_: &Address| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    // operator_index (reverse operator lookup) has no proof shape — same split as
+    // AssetIndexKey vs. AssetKey — so it always fails closed.
     let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
-    let fail_closed_bls =
-        |_: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    let operator_lookup = |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
+    let bls_pubkey_owner_lookup =
+        |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { view.get(&BlsPubkeyOwnerKey(pk)) };
 
     let updates = crate::dispatch(
         action,
         &view,
-        &fail_closed,
+        &operator_lookup,
         &fail_closed_list,
         &[],
         height,
-        &fail_closed_bls,
+        &bls_pubkey_owner_lookup,
     );
 
     let updates = match updates {
@@ -456,11 +473,17 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
 /// Flattens the parts of `BlockUpdates` that land in the Merkle state trie
 /// (see `xc_storage::is_state_key`) into raw-key/new-value pairs, mirroring
 /// `execute_actions`'s own `inter_action_roots` overlay construction
-/// (`core/executor/src/lib.rs`) — everything else in `BlockUpdates`
-/// (`validator_change`, `evidence`, `bls_key`, `operator`) never touches the
-/// root, so there's nothing to `apply` for it here. `asset_registration` and
-/// `attestor_registration`/`attestor_deregistration` *are* Merkleized, so
-/// both are flattened below.
+/// (`core/executor/src/lib.rs`). `validator_change` and `evidence` never
+/// touch the root, so there's nothing to `apply` for them here.
+/// `asset_registration`, `attestor_registration`/`attestor_deregistration`,
+/// and now `bls_key` (`CF_GOVERNANCE`, since the schema-v7 reverse-index
+/// migration) are all Merkleized and flattened below. `operator` is
+/// deliberately left out even though `OperatorKey` is Merkleized too: the
+/// only paths that produce an `operator` update are `AuthorizeOperator`/
+/// `RevokeOperator`, and those always fail closed in `dispatch` on the
+/// unprovable `operator_index` reverse lookup before a `BlockUpdates` is
+/// ever returned — so this branch is unreachable during replay, not merely
+/// unimplemented.
 fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     let config = bincode::config::standard();
     let mut entries = Vec::new();
@@ -501,6 +524,18 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     }
     if let Some(deregistration) = &updates.attestor_deregistration {
         entries.push((AttestorRecordKey(&deregistration.0).encode(), None));
+    }
+    if let Some(registration) = &updates.bls_key {
+        let value = bincode::serde::encode_to_vec(&registration.pubkey, config).expect("BlsPublicKey always encodes");
+        entries.push((BlsKeyKey(&registration.address).encode(), Some(value)));
+        let owner_value =
+            bincode::serde::encode_to_vec(&registration.address, config).expect("Address always encodes");
+        entries.push((BlsPubkeyOwnerKey(&registration.pubkey).encode(), Some(owner_value)));
+        if let Some(previous) = &registration.previous_pubkey {
+            if previous != &registration.pubkey {
+                entries.push((BlsPubkeyOwnerKey(previous).encode(), None));
+            }
+        }
     }
     entries
 }
@@ -765,9 +800,11 @@ mod tests {
         assert!(matches!(err, AdjudicateError::InvalidArtifact(_)));
     }
 
-    /// `JoinValidator`'s dispatch always needs `bls_pubkey_owner_lookup` —
-    /// unprovable by construction (see module doc) — so this must resolve
-    /// to `Disagreement`, never a guessed `Culpable`.
+    /// `JoinValidator`'s dispatch needs `BlsPubkeyOwnerKey` — Merkleized and
+    /// provable in principle now, but this artifact only supplies a proof for
+    /// alice's account key, not that one. A dissenter who omits a proof a
+    /// replay actually needs must get `Disagreement`, never a guessed
+    /// `Culpable`.
     #[test]
     fn an_unprovable_action_type_resolves_to_disagreement_not_a_guess() {
         let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
@@ -837,6 +874,148 @@ mod tests {
 
         let outcome = adjudicate_action_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
+    }
+
+    /// Seeds `GovernorKey` directly, the same way `arxd/genesis` would via
+    /// `Snapshot.governor` — mirrors `xc_storage::GenesisHash`'s pattern for
+    /// a single-key write outside a full genesis batch.
+    struct GovernorSeed(Address);
+    impl xc_storage::BatchWritable for GovernorSeed {
+        fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+            Ok(vec![(
+                xc_circuit::GovernorKey.encode(),
+                bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?,
+            )])
+        }
+    }
+
+    /// `RegisterAttestor` under `AuthorizeOperator`/`RevokeOperator`'s old
+    /// company: `GovernorKey` moved into `CF_GOVERNANCE` in the schema-v7
+    /// migration specifically so governance actions like this one stop
+    /// being fail-closed-by-construction and become real `Culpable`
+    /// candidates, same as `Transfer`. A dissenter who claims the wrong
+    /// registered name is named culpable.
+    #[test]
+    fn a_dissenter_with_a_wrong_registered_attestor_name_is_named_culpable() {
+        let db = temp_db();
+        let governor = xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let carol = xc_primitives::Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        db.write_batch(&GovernorSeed(governor.clone())).unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(governor.clone(), entry(1_000_000_000))])))
+            .unwrap();
+        let pre_root = db.compute_state_root(&[]).unwrap();
+
+        let action: crate::ChainAction = xc_primitives::Action {
+            sender: governor.clone(),
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::RegisterAttestor { attestor: carol.clone(), name: "kyc-provider".to_string() },
+        };
+        let action_bytes = bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
+        // Must match the height `replay` below actually dispatches at (the
+        // artifact's `height`), not a stand-in 0 — unlike `Transfer`,
+        // `RegisterAttestor` bakes `current_height` into the record it
+        // writes (`registered_at`), so a mismatched height here would make
+        // this test's own "real" root disagree with what replay computes.
+        let height = 5u64;
+
+        // The real result, for the honest (proposer's) side.
+        let view = xc_storage::BlockView::new(&db);
+        let real_updates = crate::dispatch(
+            &action,
+            &view,
+            &no_operator,
+            &no_operator_validators,
+            &[],
+            height,
+            &no_bls_owner,
+        )
+        .unwrap();
+        db.write_batch(&real_updates.accounts).unwrap();
+        db.write_batch(real_updates.attestor_registration.as_ref().unwrap()).unwrap();
+        let real_post_root = db.compute_state_root(&[]).unwrap();
+
+        // The dissenter's claimed result: a different registered name for
+        // the same attestor, computed against a separate copy of the
+        // pre-state so it doesn't disturb `db`'s already-committed real one.
+        let dissent_db = temp_db();
+        dissent_db.write_batch(&GovernorSeed(governor.clone())).unwrap();
+        dissent_db
+            .write_batch(&AccountUpdates(std::collections::BTreeMap::from([(governor.clone(), entry(1_000_000_000))])))
+            .unwrap();
+        let dissent_action: crate::ChainAction = xc_primitives::Action {
+            sender: governor.clone(),
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::RegisterAttestor { attestor: carol.clone(), name: "wrong-name".to_string() },
+        };
+        let dissent_view = xc_storage::BlockView::new(&dissent_db);
+        let dissent_updates = crate::dispatch(
+            &dissent_action,
+            &dissent_view,
+            &no_operator,
+            &no_operator_validators,
+            &[],
+            height,
+            &no_bls_owner,
+        )
+        .unwrap();
+        dissent_db.write_batch(&dissent_updates.accounts).unwrap();
+        dissent_db.write_batch(dissent_updates.attestor_registration.as_ref().unwrap()).unwrap();
+        let dissent_post_root = dissent_db.compute_state_root(&[]).unwrap();
+
+        let governor_key = xc_circuit::GovernorKey.encode();
+        let governor_account_key = AccountKey(&governor).encode();
+        let attestor_key = AttestorRecordKey(&carol).encode();
+        let proofs = vec![
+            hex_proof(db.prove(&governor_key, &pre_root).unwrap()),
+            hex_proof(db.prove(&governor_account_key, &pre_root).unwrap()),
+            hex_proof(db.prove(&attestor_key, &pre_root).unwrap()),
+        ];
+
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let action_bytes_hash: [u8; 32] = sha2::Sha256::digest(&action_bytes).into();
+        let action_index = 0u64;
+
+        let proposed_msg = xc_artifact::action_claim_signing_bytes(
+            height, action_index, &action_bytes_hash, &pre_root, &real_post_root,
+        );
+        let proposed_claim = ActionClaim {
+            pre_state_root: pre_root.clone(),
+            post_state_root: real_post_root,
+            proofs: proofs.clone(),
+            signature: format!("0x{}", hex::encode(proposer_key.sign(&proposed_msg).to_bytes())),
+        };
+
+        let dissent_msg = xc_artifact::action_claim_signing_bytes(
+            height, action_index, &action_bytes_hash, &pre_root, &dissent_post_root,
+        );
+        let dissent_claim = ActionClaim {
+            pre_state_root: pre_root,
+            post_state_root: dissent_post_root,
+            proofs,
+            signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+        };
+
+        let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
+        let artifact = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::ActionDivergence {
+                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                voter_pubkey: voter_pubkey.clone(),
+                height,
+                action_index,
+                action_bytes: format!("0x{}", hex::encode(&action_bytes)),
+                proposed_claim,
+                dissent_claim,
+            },
+            human_readable: serde_json::json!({}),
+        };
+
+        let outcome = adjudicate_action_divergence(&artifact).unwrap();
+        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey });
     }
 
     /// Builds a real single-action `BlockDivergence` block: alice sends bob

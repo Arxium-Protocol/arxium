@@ -1942,6 +1942,7 @@ mod tests {
                     address: validator.clone(),
                     pubkey: xc_bls::BlsPublicKey([7u8; 48]),
                     effective_height: 0,
+                    previous_pubkey: None,
                 })
                 .unwrap();
 

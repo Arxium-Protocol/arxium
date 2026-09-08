@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey};
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
@@ -203,8 +203,9 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
 /// precommit voting (`arxd/finality`). Any address may be registered —
 /// the key is only meaningful once/if that address is also in the
 /// validator set at some height; no membership check happens here.
-pub(crate) fn register_bls_key(
+pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
+    view: &V,
     validator: &Address,
     pubkey: &[u8],
     current_height: u64,
@@ -220,6 +221,7 @@ pub(crate) fn register_bls_key(
             anyhow::bail!("BLS pubkey already registered to {owner}");
         }
     }
+    let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
         // Effective one block later, same delay as `ValidatorSetSnapshot` —
         // see `BlsKeyRegistration`'s doc comment.
@@ -227,6 +229,7 @@ pub(crate) fn register_bls_key(
             address: validator.clone(),
             pubkey: xc_bls::BlsPublicKey(bytes),
             effective_height: current_height + 1,
+            previous_pubkey,
         }),
         ..Default::default()
     })

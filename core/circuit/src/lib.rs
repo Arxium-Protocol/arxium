@@ -23,6 +23,7 @@ pub const CF_VALIDATORS: &str = "validators";
 pub const CF_ASSETS: &str = "assets";
 pub const CF_ATTESTORS: &str = "attestors";
 pub const CF_EVIDENCE: &str = "evidence";
+pub const CF_GOVERNANCE: &str = "governance";
 
 /// A typed storage key: which column family it lives in, what value it
 /// decodes to, and how to encode itself to the raw bytes RocksDB stores.
@@ -63,13 +64,49 @@ impl KeySpec for StakeByValidatorKey<'_> {
 }
 
 /// Shared between staking/validator-join logic and `arxd/finality` — not
-/// exclusively "owned" by one circuit.
+/// exclusively "owned" by one circuit. Lives in `CF_GOVERNANCE` (included in
+/// `is_state_key`) so `JoinValidator`/`RegisterBlsKey` are provable to the
+/// proof-only adjudicator instead of sitting in `CF_META`. The rotation
+/// history (`meta:blskey_hist:{addr}:{height}`, read via range scan in
+/// `get_bls_pubkey_at`) stays in `CF_META` — range scans have no proof shape.
 pub struct BlsKeyKey<'a>(pub &'a Address);
 impl KeySpec for BlsKeyKey<'_> {
-    const CF: &'static str = CF_META;
+    const CF: &'static str = CF_GOVERNANCE;
     type Value = BlsPublicKey;
     fn encode(&self) -> Vec<u8> {
-        format!("meta:blskey:{}", self.0).into_bytes()
+        format!("blskey:{}", self.0).into_bytes()
+    }
+}
+
+/// Reverse of `BlsKeyKey`: which address currently owns a given BLS pubkey,
+/// so the duplicate-registration check in `JoinValidator`/`RegisterBlsKey`
+/// (previously a `CF_META` linear scan, see `ArxiumDb::bls_pubkey_owner`) is a
+/// single provable key read instead. Written and deleted alongside
+/// `BlsKeyKey` (see `BlsKeyRegistration::batch_entries`/`batch_deletes`) so a
+/// rotated-away-from pubkey is freed for reuse, mirroring the old scan's
+/// self-healing behavior.
+pub struct BlsPubkeyOwnerKey<'a>(pub &'a BlsPublicKey);
+impl KeySpec for BlsPubkeyOwnerKey<'_> {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = Address;
+    fn encode(&self) -> Vec<u8> {
+        format!("blskey_owner:{}", hex::encode(self.0.0)).into_bytes()
+    }
+}
+
+/// The address currently authorized to submit `JoinValidator`/
+/// `LeaveValidator`/`RegisterBlsKey` on `validator`'s behalf, if any. Lives in
+/// `CF_GOVERNANCE` (included in `is_state_key`) so the delegated paths of
+/// those three actions are provable to the adjudicator. The reverse index
+/// (`meta:operator_index:{operator}`, used only by `AuthorizeOperator`/
+/// `RevokeOperator` to maintain the full per-operator validator list) stays
+/// in `CF_META` — same split `AssetIndexKey` already uses against `AssetKey`.
+pub struct OperatorKey<'a>(pub &'a Address);
+impl KeySpec for OperatorKey<'_> {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = Address;
+    fn encode(&self) -> Vec<u8> {
+        format!("operator:{}", self.0).into_bytes()
     }
 }
 
@@ -174,9 +211,11 @@ impl KeySpec for EvidenceMarkerKey<'_> {
 ///
 /// `CF_META`, *not* a merkleized state key, and that is forced rather than
 /// chosen: the value is the genesis state root itself, so storing it in a
-/// key `is_state_key` covers would change the very root it records. Same
-/// trust shape as `GovernorKey`, which is also genesis-seeded, `CF_META`,
-/// and read through `KvRead` at dispatch time.
+/// key `is_state_key` covers would change the very root it records. This is
+/// the one CF_META row of its kind left that structurally can never move —
+/// unlike `GovernorKey`, which was in the same "genesis-seeded, CF_META,
+/// read through `KvRead` at dispatch time" shape but had no such obstacle and
+/// has since moved to `CF_GOVERNANCE`.
 pub struct GenesisHashKey;
 impl KeySpec for GenesisHashKey {
     const CF: &'static str = CF_META;
@@ -187,13 +226,15 @@ impl KeySpec for GenesisHashKey {
 }
 
 /// Address allowed to `RegisterAttestor`/`DeregisterAttestor` — see
-/// `Snapshot::governor`.
+/// `Snapshot::governor`. Lives in `CF_GOVERNANCE` (included in
+/// `is_state_key`) so both actions are provable to the proof-only
+/// adjudicator instead of failing closed.
 pub struct GovernorKey;
 impl KeySpec for GovernorKey {
-    const CF: &'static str = CF_META;
+    const CF: &'static str = CF_GOVERNANCE;
     type Value = Address;
     fn encode(&self) -> Vec<u8> {
-        b"meta:governor".to_vec()
+        b"governor".to_vec()
     }
 }
 

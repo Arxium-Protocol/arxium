@@ -855,7 +855,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -910,7 +910,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -984,7 +984,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -1044,7 +1044,7 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -1064,7 +1064,7 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -1087,7 +1087,7 @@ mod tests {
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
         let (other_sk, _) = xc_bls::keygen_from_seed(&[51u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
 
@@ -1112,7 +1112,7 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }])
+        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }])
             .unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
             .unwrap();
@@ -1194,6 +1194,7 @@ mod tests {
                 address: addr.clone(),
                 pubkey: pk,
                 effective_height: 0,
+                previous_pubkey: None,
             },
             &xc_storage::ValidatorSetSnapshot {
                 effective_height: 0,
@@ -1335,7 +1336,7 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0 }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
                 (addr, sk)
             })
             .collect();
@@ -1530,6 +1531,7 @@ mod tests {
                 address: addr.clone(),
                 pubkey: pk,
                 effective_height: 0,
+                previous_pubkey: None,
             },
             &xc_storage::ValidatorSetSnapshot {
                 effective_height: 0,
