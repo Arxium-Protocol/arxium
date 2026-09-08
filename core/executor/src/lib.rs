@@ -17,6 +17,35 @@ use xc_storage::{
     StorageError, ValidatorSetSnapshot,
 };
 
+/// Everything one block's worth of execution produced, as returned by
+/// `execute_actions`. The per-action `BlockUpdates` below is the same shape
+/// with singleton `Option`s where this has accumulated `Vec`s — this is what
+/// you get after folding all of them together.
+///
+/// A struct rather than the twelve-element tuple this used to be: every
+/// caller destructured it positionally, and several of the fields share a
+/// type, so a transposed pair would have compiled and silently written the
+/// wrong column family.
+pub struct ExecutionOutcome<P> {
+    /// The actions that actually applied — a subset of the input, since
+    /// deterministic rejections (bad nonce, insufficient balance) are dropped
+    /// rather than failing the block.
+    pub applied: Vec<Action<P>>,
+    pub accounts: AccountUpdates,
+    pub validator_changes: Vec<ValidatorChange>,
+    pub stakes: StakeUpdates,
+    pub evidence_markers: Vec<EvidenceMarker>,
+    pub bls_keys: Vec<BlsKeyRegistration>,
+    pub operator: OperatorUpdates,
+    pub assets: AssetBalanceUpdates,
+    pub asset_registrations: Vec<Asset>,
+    pub attestor_registrations: Vec<AttestorRegistration>,
+    pub attestor_deregistrations: Vec<AttestorDeregistration>,
+    /// Every Merkleized key read or written, but only when the caller asked
+    /// for it via `record_touched_keys`; otherwise empty.
+    pub touched_keys: Vec<Vec<u8>>,
+}
+
 /// What a single dispatched action hands back: account changes, an optional
 /// validator-membership change, and any stake-allocation changes. Named
 /// struct instead of a growing positional tuple — every payload variant
@@ -459,20 +488,20 @@ where
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
     let seed = resolve_matured_unbonding(db, block.height)?;
-    let (
+    let ExecutionOutcome {
         applied,
-        mut account_updates,
+        accounts: mut account_updates,
         validator_changes,
-        mut stake_updates,
+        stakes: mut stake_updates,
         evidence_markers,
         bls_keys,
-        operator_updates,
-        mut asset_updates,
+        operator: operator_updates,
+        assets: mut asset_updates,
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
         touched_keys,
-    ) = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
+    } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
@@ -637,23 +666,7 @@ pub fn execute_actions<P>(
     // proofs for, against the *parent* state root. `false` builds a plain,
     // non-recording `BlockView` at no extra cost.
     record_touched_keys: bool,
-) -> Result<
-    (
-        Vec<Action<P>>,
-        AccountUpdates,
-        Vec<ValidatorChange>,
-        StakeUpdates,
-        Vec<EvidenceMarker>,
-        Vec<BlsKeyRegistration>,
-        OperatorUpdates,
-        AssetBalanceUpdates,
-        Vec<Asset>,
-        Vec<AttestorRegistration>,
-        Vec<AttestorDeregistration>,
-        Vec<Vec<u8>>,
-    ),
-    ExecutorError,
->
+) -> Result<ExecutionOutcome<P>, ExecutorError>
 where
     P: serde::Serialize,
 {
@@ -752,26 +765,26 @@ where
         }
     }
 
-    Ok((
+    Ok(ExecutionOutcome {
         applied,
-        AccountUpdates(overlay),
+        accounts: AccountUpdates(overlay),
         validator_changes,
-        StakeUpdates {
+        stakes: StakeUpdates {
             allocations: stake_overlay,
             validator_index: validator_index_overlay,
         },
         evidence_markers,
         bls_keys,
-        OperatorUpdates {
+        operator: OperatorUpdates {
             authorization: operator_overlay,
             operator_index: operator_index_overlay,
         },
-        AssetBalanceUpdates(asset_overlay),
+        assets: AssetBalanceUpdates(asset_overlay),
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-        view.touched_keys(),
-    ))
+        touched_keys: view.touched_keys(),
+    })
 }
 
 #[cfg(test)]
@@ -1021,20 +1034,8 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let (
-            applied,
-            updates,
-            validator_changes,
-            _stake_updates,
-            _evidence_markers,
-            _bls_keys,
-            _operator_updates,
-            _asset_updates,
-            _asset_registrations,
-            _attestor_registrations,
-            _attestor_deregistrations,
-            _touched_keys,
-        ) = execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+        let ExecutionOutcome { applied, accounts: updates, validator_changes, .. } =
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
         assert!(validator_changes.is_empty());
         assert_eq!(
             applied.len(),
@@ -1078,7 +1079,7 @@ mod tests {
             signed_action(&alice_key, &alice, 1, TestPayload::IssueAsset { id: "gold".into() }),
         ];
 
-        let (applied, ..) =
+        let ExecutionOutcome { applied, .. } =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
         assert_eq!(applied.len(), 2, "IssueAsset must see the same-block registration");
     }
@@ -1102,7 +1103,7 @@ mod tests {
             signed_action(&mallory_key, &mallory, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
         ];
 
-        let (applied, .., asset_registrations, _attestor_registrations, _attestor_deregistrations, _touched_keys) =
+        let ExecutionOutcome { applied, asset_registrations, .. } =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
         assert_eq!(applied.len(), 1, "the duplicate registration must be dropped");
         assert_eq!(asset_registrations.len(), 1);
@@ -1138,7 +1139,7 @@ mod tests {
         ];
 
         let mut roots = Vec::new();
-        let (applied, updates, ..) =
+        let ExecutionOutcome { applied, accounts: updates, .. } =
             execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, Some(&mut roots), false).unwrap();
         assert_eq!(applied.len(), 3);
         assert_eq!(roots.len(), 3, "one root per input action, in order");
@@ -1156,7 +1157,7 @@ mod tests {
             )])))
             .unwrap();
         for (i, action) in actions.into_iter().enumerate() {
-            let (_, prefix_updates, ..) =
+            let ExecutionOutcome { accounts: prefix_updates, .. } =
                 execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, None, false).unwrap();
             reference_db.write_batch(&prefix_updates).unwrap();
             assert_eq!(
