@@ -29,7 +29,7 @@ use xc_cli::{Cli, Command};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
-use xc_rpc::spawn_http_ingest;
+use xc_rpc::{IngestConfig, spawn_http_ingest};
 use xc_storage::{ArxiumDb, DissentRecord};
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
@@ -628,20 +628,20 @@ fn spawn_subsystems<R: ChainRuntime>(
     let payload_precheck: xc_mempool::PayloadPrecheck<R::Payload> = Arc::new(R::admission_precheck);
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_http_ingest(
-        mempool.clone(),
-        db.clone(),
-        config.rpc_bind.clone(),
-        config.port,
-        config.rpc_token.clone(),
-        Some(gossip_tx),
+    spawn_http_ingest(IngestConfig {
+        mempool: mempool.clone(),
+        db: db.clone(),
+        bind_addr: config.rpc_bind.clone(),
+        port: config.port,
+        rpc_token: config.rpc_token.clone(),
+        gossip_tx: Some(gossip_tx),
         metrics_handle,
-        Some(payload_precheck.clone()),
-        R::min_validator_stake(),
-        Some(R::action_fee()),
-        config.base_path.join(chain_name).join("evidence"),
-        config.limits.clone(),
-    )?;
+        payload_precheck: Some(payload_precheck.clone()),
+        min_stake: R::min_validator_stake(),
+        action_fee: Some(R::action_fee()),
+        evidence_dir: config.base_path.join(chain_name).join("evidence"),
+        limits: config.limits.clone(),
+    })?;
 
     // Guards the read-tip / decide / write critical section shared by this
     // node's own production loop below and the gossip block-accept path, so
