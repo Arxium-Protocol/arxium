@@ -493,6 +493,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The `G` a test picks when it isn't exercising the on-chain
+    /// fault-reporting hook — spelled out once so `spawn_evidence_watcher`'s
+    /// generic can still be inferred at each call site.
+    type NoFaultHook = Option<fn(EvidenceArtifact) -> Option<Action<()>>>;
+
     use super::*;
     use ed25519_dalek::SigningKey;
 
@@ -587,7 +592,7 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
+        let build_execution_fault_action: NoFaultHook = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
@@ -875,7 +880,7 @@ mod tests {
             signature: None,
             payload: (),
         });
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
+        let build_execution_fault_action: NoFaultHook = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),

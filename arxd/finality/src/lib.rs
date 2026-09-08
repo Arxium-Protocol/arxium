@@ -16,6 +16,12 @@ use xc_storage::{
     RoundTimeoutVoteRecord,
 };
 
+/// Precommit signatures being accumulated, keyed height -> (voter set id,
+/// block hash) -> voter -> signature. Nested rather than flattened because
+/// quorum is counted per (height, block) and pruning is per height, so both
+/// of the hot operations are a single map lookup.
+type VoteTallies = HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>>;
+
 // Domain tags, mixed into what gets signed, so a signature over a precommit
 // can never be replayed as a dissent (or a round-timeout vote, or vice versa)
 // even though they can share fields (height).
@@ -263,7 +269,7 @@ where
         // only ever have one canonical (hash, ep) pair in practice, but keyed
         // this way a stray vote for a competing hash or a diverging ep can't
         // corrupt the real tally.
-        let mut tallies: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> = HashMap::new();
+        let mut tallies: VoteTallies = HashMap::new();
 
         // This node's own not-yet-finalized votes, kept so they can be
         // re-sent on VOTE_REBROADCAST_INTERVAL — see the constant's doc.
@@ -538,7 +544,7 @@ where
 
 fn tally_vote(
     db: &ArxiumDb,
-    tallies: &mut HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>>,
+    tallies: &mut VoteTallies,
     my_votes: &mut HashMap<u64, PrecommitVote>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
@@ -937,7 +943,7 @@ mod tests {
         }
         drop(tallies);
 
-        let mut reloaded: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> = HashMap::new();
+        let mut reloaded: VoteTallies = HashMap::new();
         for record in db.get_precommit_votes_from(0).unwrap() {
             reloaded
                 .entry(record.height)
@@ -1290,7 +1296,7 @@ mod tests {
     /// retention window — and requires the map to stay bounded.
     #[test]
     fn unfinalized_tallies_do_not_grow_without_bound() {
-        let mut tallies: HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>> =
+        let mut tallies: VoteTallies =
             HashMap::new();
 
         // Stand in for the loop's pruning step, which is what the retention

@@ -313,10 +313,17 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
 pub struct ArxiumDb {
     db: Arc<DB>,
 }
+/// One batch's worth of raw key-value pairs, exactly as they go to RocksDB.
+type BatchEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Every entry in the database as `(column family, key, value)` — the shape
+/// `export_all_entries` hands to snapshot/artifact writers.
+type ExportedEntries = Vec<(String, Vec<u8>, Vec<u8>)>;
+
 
 /// Anything that can be turned into a set of key-value pairs for storage.
 pub trait BatchWritable {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError>;
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError>;
 
     /// Keys to remove as part of the same atomic batch. Default empty —
     /// most `BatchWritable`s (accounts, blocks, ...) only ever upsert.
@@ -1035,7 +1042,7 @@ impl ArxiumDb {
     /// scratch DB into a raw artifact, rather than re-deriving keys/values
     /// from `Snapshot` a second time and risking the two encodings drifting
     /// apart.
-    pub fn export_all_entries(&self) -> Result<Vec<(String, Vec<u8>, Vec<u8>)>, StorageError> {
+    pub fn export_all_entries(&self) -> Result<ExportedEntries, StorageError> {
         let mut entries = Vec::new();
         for cf_name in COLUMN_FAMILIES {
             for item in self.db.iterator_cf(self.cf(cf_name), IteratorMode::Start) {
@@ -1642,7 +1649,7 @@ impl ArxiumDb {
 pub struct GenesisHash(pub String);
 
 impl BatchWritable for GenesisHash {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         Ok(vec![(
             GenesisHashKey.encode(),
@@ -1652,7 +1659,7 @@ impl BatchWritable for GenesisHash {
 }
 
 impl BatchWritable for Snapshot {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = vec![
             (b"meta:height".to_vec(), self.height.to_be_bytes().to_vec()),
@@ -1752,7 +1759,7 @@ pub struct ValidatorSetSnapshot {
 }
 
 impl BatchWritable for ValidatorSetSnapshot {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut sorted = self.validators.clone();
         sorted.sort();
@@ -1764,7 +1771,7 @@ impl BatchWritable for ValidatorSetSnapshot {
 }
 
 impl<P: Serialize> BatchWritable for Block<P> {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
 
         let block_key = format!("block:{:020}", self.height).into_bytes();
@@ -1806,7 +1813,7 @@ pub struct EvidenceMarker {
 }
 
 impl BatchWritable for EvidenceMarker {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = EvidenceMarkerKey { height: self.height, proposer: &self.proposer }.encode();
         Ok(vec![(key, vec![1u8])])
     }
@@ -1839,7 +1846,7 @@ pub struct BlsKeyRegistration {
 }
 
 impl BatchWritable for BlsKeyRegistration {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(&self.pubkey, config)?;
         let current_key = BlsKeyKey(&self.address).encode();
@@ -1874,7 +1881,7 @@ pub struct OperatorUpdates {
 }
 
 impl BatchWritable for OperatorUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         for (validator, operator) in &self.authorization {
@@ -1946,7 +1953,7 @@ pub struct PrecommitVoteRecord {
 }
 
 impl BatchWritable for PrecommitVoteRecord {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = format!("meta:precommit:{:020}:{}:{}", self.height, self.block_hash, self.voter).into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
@@ -1974,7 +1981,7 @@ pub struct DissentRecord {
 }
 
 impl BatchWritable for DissentRecord {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = format!("meta:dissent:{:020}:{}", self.height, self.voter).into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
@@ -1983,7 +1990,7 @@ impl BatchWritable for DissentRecord {
 }
 
 impl BatchWritable for FinalityRecord {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = format!("meta:finality:{:020}", self.height).into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
@@ -1998,7 +2005,7 @@ impl BatchWritable for FinalityRecord {
 pub use xc_primitives::RoundCertificate;
 
 impl BatchWritable for RoundCertificate {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = format!("meta:roundcert:{:020}:{}", self.height, self.round).into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
@@ -2019,7 +2026,7 @@ pub struct RoundTimeoutVoteRecord {
 }
 
 impl BatchWritable for RoundTimeoutVoteRecord {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key =
             format!("meta:roundtimeout:{:020}:{}:{}", self.height, self.round, self.voter).into_bytes();
         let config = bincode::config::standard();
@@ -2035,7 +2042,7 @@ impl BatchWritable for RoundTimeoutVoteRecord {
 pub struct AccountUpdates(pub BTreeMap<Address, AccountEntry>);
 
 impl BatchWritable for AccountUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         for (address, entry) in &self.0 {
@@ -2060,7 +2067,7 @@ pub struct StakeUpdates {
 }
 
 impl BatchWritable for StakeUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         for ((master, validator), allocation) in &self.allocations {
@@ -2105,7 +2112,7 @@ impl BatchWritable for StakeUpdates {
 pub struct AssetBalanceUpdates(pub BTreeMap<(String, Address), u128>);
 
 impl BatchWritable for AssetBalanceUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         for ((asset_id, owner), balance) in &self.0 {
@@ -2147,7 +2154,7 @@ impl AssetIndexUpdates {
 }
 
 impl BatchWritable for AssetIndexUpdates {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
         if let Some(ids) = &self.registry {
@@ -2163,7 +2170,7 @@ impl BatchWritable for AssetIndexUpdates {
 }
 
 impl BatchWritable for Asset {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let key = AssetKey(&self.asset_id).encode();
         let value = bincode::serde::encode_to_vec(self, config)?;
@@ -2180,7 +2187,7 @@ pub struct AttestorRegistration {
 }
 
 impl BatchWritable for AttestorRegistration {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let key = AttestorRecordKey(&self.attestor).encode();
         let value = bincode::serde::encode_to_vec(&self.record, config)?;
@@ -2196,7 +2203,7 @@ impl BatchWritable for AttestorRegistration {
 pub struct AttestorDeregistration(pub Address);
 
 impl BatchWritable for AttestorDeregistration {
-    fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         Ok(Vec::new())
     }
 
