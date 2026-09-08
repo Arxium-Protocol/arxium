@@ -55,11 +55,10 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
         // `RegisterBlsKey`/`JoinValidator` both reject a pubkey already
         // owned by another validator — genesis must enforce the same rule,
         // or two validators could unknowingly share a BLS identity.
-        if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))? {
-            if owner != *address {
+        if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
+            && owner != *address {
                 bail!("genesis validator {address} BLS pubkey is already owned by {owner}");
             }
-        }
         db.write_batch(&xc_storage::BlsKeyRegistration {
             address: address.clone(),
             pubkey: BlsPublicKey(bytes),

@@ -19,3 +19,6 @@ xc-artifact = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+
+[lints]
+workspace = true

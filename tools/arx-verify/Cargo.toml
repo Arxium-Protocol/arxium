@@ -45,3 +45,6 @@ thiserror = { workspace = true, optional = true }
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
 sha2 = { workspace = true }
+
+[lints]
+workspace = true

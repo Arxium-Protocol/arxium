@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use xc_runtime_api::DispatchCtx;
-use xc_executor::{execute_actions, resolve_matured_unbonding};
+use xc_executor::{ExecutionOutcome, execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, eligible_proposer, quorum};
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
@@ -63,20 +63,20 @@ pub fn produce_block<R: ChainRuntime>(
     // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
     let validators = db.get_validator_set_at(next_height)?;
     let seed = resolve_matured_unbonding(db, next_height)?;
-    let (
+    let ExecutionOutcome {
         applied,
-        mut account_updates,
+        accounts: mut account_updates,
         validator_changes,
-        mut stake_updates,
+        stakes: mut stake_updates,
         evidence_markers,
         bls_keys,
-        operator_updates,
-        mut asset_updates,
+        operator: operator_updates,
+        assets: mut asset_updates,
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-        _touched_keys,
-    ) = execute_actions(
+        touched_keys: _,
+    } = execute_actions(
         db,
         actions,
         &validators,
@@ -529,7 +529,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let (_, genesis_updates, _, _, _, _, _, _, _, _, _, _) = execute_actions(
+        let ExecutionOutcome { accounts: genesis_updates, .. } = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],

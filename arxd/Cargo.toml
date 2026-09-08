@@ -14,3 +14,6 @@ arxd-runtime = { workspace = true }
 
 [features]
 fault-injection = ["arxd-node/fault-injection"]
+
+[lints]
+workspace = true

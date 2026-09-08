@@ -365,11 +365,10 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
             let bytes = consensus::validated_bls_pubkey(bls_pubkey)?;
-            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))? {
-                if &owner != validator {
+            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
+                && &owner != validator {
                     anyhow::bail!("BLS pubkey already registered to {owner}");
                 }
-            }
             let existing_active = db
                 .get_stake_allocation(&action.sender, validator)?
                 .map(|a| a.active_amount)
@@ -398,11 +397,10 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
             let bytes = consensus::validated_bls_pubkey(pubkey)?;
-            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))? {
-                if &owner != validator {
+            if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
+                && &owner != validator {
                     anyhow::bail!("BLS pubkey already registered to {owner}");
                 }
-            }
         }
         _ => {}
     }
@@ -713,7 +711,7 @@ mod tests {
     #[test]
     fn admission_precheck_rejects_leaving_the_last_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let db = precheck_test_db(&[alice.clone()]);
+        let db = precheck_test_db(std::slice::from_ref(&alice));
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
             .unwrap();
         let action = Action {

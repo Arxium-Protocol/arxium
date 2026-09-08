@@ -13,3 +13,6 @@ xc-primitives = { workspace = true }
 # Never enabled by default and never part of a production build — see
 # RunArgs::inject_fault_at_height's doc comment.
 fault-injection = []
+
+[lints]
+workspace = true

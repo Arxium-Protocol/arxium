@@ -23,13 +23,13 @@ use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
-use arxd_network::{identity, spawn_p2p_node};
+use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault};
 use xc_cli::{Cli, Command};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
-use xc_rpc::spawn_http_ingest;
+use xc_rpc::{IngestConfig, spawn_http_ingest};
 use xc_storage::{ArxiumDb, DissentRecord};
 
 // ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
@@ -628,20 +628,20 @@ fn spawn_subsystems<R: ChainRuntime>(
     let payload_precheck: xc_mempool::PayloadPrecheck<R::Payload> = Arc::new(R::admission_precheck);
 
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
-    spawn_http_ingest(
-        mempool.clone(),
-        db.clone(),
-        config.rpc_bind.clone(),
-        config.port,
-        config.rpc_token.clone(),
-        Some(gossip_tx),
+    spawn_http_ingest(IngestConfig {
+        mempool: mempool.clone(),
+        db: db.clone(),
+        bind_addr: config.rpc_bind.clone(),
+        port: config.port,
+        rpc_token: config.rpc_token.clone(),
+        gossip_tx: Some(gossip_tx),
         metrics_handle,
-        Some(payload_precheck.clone()),
-        R::min_validator_stake(),
-        Some(R::action_fee()),
-        config.base_path.join(chain_name).join("evidence"),
-        config.limits.clone(),
-    )?;
+        payload_precheck: Some(payload_precheck.clone()),
+        min_stake: R::min_validator_stake(),
+        action_fee: Some(R::action_fee()),
+        evidence_dir: config.base_path.join(chain_name).join("evidence"),
+        limits: config.limits.clone(),
+    })?;
 
     // Guards the read-tip / decide / write critical section shared by this
     // node's own production loop below and the gossip block-accept path, so
@@ -887,11 +887,9 @@ fn spawn_subsystems<R: ChainRuntime>(
                             block_height,
                             tip_height,
                         } = &err
-                        {
-                            if block_height == tip_height {
+                            && block_height == tip_height {
                                 let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
                             }
-                        }
                     }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }
@@ -1273,26 +1271,26 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
     // Every node joins the network, not just validators — the libp2p
     // identity is separate from the validator signing key above.
-    spawn_p2p_node(
-        &config.base_path,
-        config.p2p_port,
-        &bootnodes,
-        config.is_bootnode,
-        &chain_id,
-        mempool.clone(),
-        db.clone(),
+    spawn_p2p_node(P2pConfig {
+        base_path: &config.base_path,
+        listen_port: config.p2p_port,
+        bootnodes: &bootnodes,
+        is_bootnode: config.is_bootnode,
+        chain_id: &chain_id,
+        mempool: mempool.clone(),
+        db: db.clone(),
         gossip_rx,
         block_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
-        on_block,
-        on_precommit_vote,
-        on_dissent,
-        on_round_timeout_vote,
-        Some(payload_precheck.clone()),
-        config.limits.clone(),
-    )?;
+        on_block: Box::new(on_block),
+        on_precommit_vote: Box::new(on_precommit_vote),
+        on_dissent: Box::new(on_dissent),
+        on_round_timeout_vote: Box::new(on_round_timeout_vote),
+        payload_precheck: Some(payload_precheck.clone()),
+        limits: config.limits.clone(),
+    })?;
 
     produce::produce_loop::<R>(
         &db,

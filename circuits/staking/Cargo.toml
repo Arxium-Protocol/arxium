@@ -10,3 +10,6 @@ sha2 = { workspace = true }
 xc-storage = { workspace = true }
 xc-primitives = { workspace = true }
 xc-circuit = { workspace = true }
+
+[lints]
+workspace = true

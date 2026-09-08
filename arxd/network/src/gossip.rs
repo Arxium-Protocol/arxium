@@ -22,7 +22,7 @@ impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload fo
 /// never see each other's messages — instead of connecting at the libp2p
 /// layer (identity has nothing to do with which chain a node runs) and only
 /// then rejecting every gossiped block/action/vote one at a time.
-
+///
 /// One pub/sub topic for actions — gossip is just another untrusted entry
 /// point into the mempool, no more trusted than a stranger hitting RPC.
 pub(crate) fn actions_topic(chain_id: &str) -> String {

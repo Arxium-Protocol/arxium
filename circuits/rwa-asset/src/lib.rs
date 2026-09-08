@@ -101,11 +101,11 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
 ) -> Result<(AccountUpdates, AssetBalanceUpdates), RwaError> {
     if asset.compliance_required {
         let sender_entry = view.get(&AccountKey(sender))?;
-        if !sender_entry.is_some_and(|e| e.identity_hash.is_some()) {
+        if sender_entry.is_none_or(|e| e.identity_hash.is_none()) {
             return Err(RwaError::NotCompliant { address: sender.clone() });
         }
         let to_entry = view.get(&AccountKey(to))?;
-        if !to_entry.is_some_and(|e| e.identity_hash.is_some()) {
+        if to_entry.is_none_or(|e| e.identity_hash.is_none()) {
             return Err(RwaError::NotCompliant { address: to.clone() });
         }
     }

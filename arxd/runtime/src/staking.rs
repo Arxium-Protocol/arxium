@@ -68,11 +68,10 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     // Registered in the same block as the join, so the validator is
     // never in the set without the ability to vote.
     let bytes = validated_bls_pubkey(bls_pubkey)?;
-    if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))? {
-        if &owner != validator {
+    if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
+        && &owner != validator {
             anyhow::bail!("BLS pubkey already registered to {owner}");
         }
-    }
     // `bls_pubkey` here is informational, like `stake`:
     // `ValidatorSetSnapshot` persists neither, and the authoritative
     // registration is the `bls_key` update below.
@@ -345,7 +344,7 @@ mod tests {
             &view,
             &operator_lookup,
             &operator_validators_lookup,
-            &[alice.clone()],
+            std::slice::from_ref(&alice),
             10,
             &no_bls_owner,
         )

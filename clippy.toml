@@ -1,0 +1,10 @@
+# Clippy tool configuration (thresholds only — lint *levels* live in the
+# `[workspace.lints]` table in Cargo.toml).
+
+# The default of 7 flagged four functions whose parameters are all distinctly
+# typed, where the compiler already catches a transposed argument. The two
+# places that genuinely could be transposed silently — `spawn_p2p_node` and
+# `spawn_http_ingest`, each with several same-typed neighbours — now take a
+# named-field config struct instead, which is the fix this lint is really
+# asking for. 9 keeps it useful without re-flagging those four.
+too-many-arguments-threshold = 9

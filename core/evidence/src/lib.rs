@@ -107,7 +107,7 @@ pub enum EvidenceEvent<P> {
 /// Builds a self-describing evidence artifact (see `xc_artifact`) from a
 /// verified equivocation and writes it to
 /// `<evidence_dir>/<height>-<proposer>.json`. Commits to a `CanonicalHeader`
-/// + `signature` for each block — `verify()` recomputes the signing bytes
+/// and `signature` for each block — `verify()` recomputes the signing bytes
 /// from the header rather than trusting anything this artifact merely
 /// asserts, so `arx-verify` can check it without knowing `P` and without
 /// trusting the artifact's author. The decoded blocks (including their
@@ -493,6 +493,11 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The `G` a test picks when it isn't exercising the on-chain
+    /// fault-reporting hook — spelled out once so `spawn_evidence_watcher`'s
+    /// generic can still be inferred at each call site.
+    type NoFaultHook = Option<fn(EvidenceArtifact) -> Option<Action<()>>>;
+
     use super::*;
     use ed25519_dalek::SigningKey;
 
@@ -587,7 +592,7 @@ mod tests {
         let mempool: Arc<Mutex<Mempool<()>>> = Arc::new(Mutex::new(Mempool::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let build_evidence_action: Option<fn(EquivocationEvidence<()>) -> Action<()>> = None;
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
+        let build_execution_fault_action: NoFaultHook = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
@@ -875,7 +880,7 @@ mod tests {
             signature: None,
             payload: (),
         });
-        let build_execution_fault_action: Option<fn(EvidenceArtifact) -> Option<Action<()>>> = None;
+        let build_execution_fault_action: NoFaultHook = None;
         let evidence_dir = dir.join("evidence");
         spawn_evidence_watcher(
             db.clone(),
@@ -902,7 +907,7 @@ mod tests {
         let reported = mempool.lock().unwrap().drain_pending(1);
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].sender, addr);
-        assert!(db.evidence_processed(5, &addr).unwrap_or(false) == false, "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
+        assert!(!db.evidence_processed(5, &addr).unwrap_or(false), "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
 
         let artifact_path = evidence_dir.join(format!("5-{addr}.json"));
         let artifact: xc_artifact::EvidenceArtifact =

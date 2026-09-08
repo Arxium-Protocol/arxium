@@ -347,20 +347,41 @@ async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
 /// `Authorization: Bearer` header. Blocks the caller until the listener is
 /// bound (or fails to bind), same as a sync server would, so startup
 /// failures surface immediately instead of on first request.
-pub fn spawn_http_ingest<P: Payload>(
-    mempool: Arc<Mutex<Mempool<P>>>,
-    db: ArxiumDb,
-    bind_addr: String,
-    port: u16,
-    rpc_token: Option<String>,
-    gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
-    metrics_handle: PrometheusHandle,
-    payload_precheck: Option<PayloadPrecheck<P>>,
-    min_stake: Option<u128>,
-    action_fee: Option<u128>,
-    evidence_dir: PathBuf,
-    limits: Limits,
-) -> Result<()> {
+/// `spawn_http_ingest`'s arguments as named fields — `min_stake` and
+/// `action_fee` are both `Option<u128>` and used to sit next to each other in
+/// a twelve-parameter list, where transposing them would have compiled and
+/// quietly repriced every action.
+pub struct IngestConfig<P: Payload> {
+    pub mempool: Arc<Mutex<Mempool<P>>>,
+    pub db: ArxiumDb,
+    pub bind_addr: String,
+    pub port: u16,
+    pub rpc_token: Option<String>,
+    pub gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
+    pub metrics_handle: PrometheusHandle,
+    pub payload_precheck: Option<PayloadPrecheck<P>>,
+    pub min_stake: Option<u128>,
+    pub action_fee: Option<u128>,
+    pub evidence_dir: PathBuf,
+    pub limits: Limits,
+}
+
+pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
+    let IngestConfig {
+        mempool,
+        db,
+        bind_addr,
+        port,
+        rpc_token,
+        gossip_tx,
+        metrics_handle,
+        payload_precheck,
+        min_stake,
+        action_fee,
+        evidence_dir,
+        limits,
+    } = config;
+
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {
         mempool,
@@ -505,12 +526,11 @@ async fn submit_action<P: Payload>(
         }
     }
 
-    if let Some(precheck) = &state.payload_precheck {
-        if let Err(err) = precheck(&action, &state.db) {
+    if let Some(precheck) = &state.payload_precheck
+        && let Err(err) = precheck(&action, &state.db) {
             warn!("rejected action from {sender}: {err}");
             return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
         }
-    }
 
     let gossip_action = state.gossip_tx.is_some().then(|| action.clone());
     match state
@@ -1326,12 +1346,11 @@ async fn search<P: Payload>(
     State(state): State<AppState<P>>,
     Query(SearchQuery { q }): Query<SearchQuery>,
 ) -> Response {
-    if let Ok(height) = q.parse::<u64>() {
-        if matches!(state.db.get_block::<P>(height), Ok(Some(_))) {
+    if let Ok(height) = q.parse::<u64>()
+        && matches!(state.db.get_block::<P>(height), Ok(Some(_))) {
             return Json(serde_json::json!({ "kind": "block", "height": height }))
                 .into_response();
         }
-    }
 
     if let Ok(address) = Address::parse(&q) {
         return Json(serde_json::json!({ "kind": "account", "address": address }))

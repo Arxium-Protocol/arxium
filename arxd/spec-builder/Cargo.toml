@@ -14,3 +14,6 @@ clap = { workspace = true }
 serde_json = { workspace = true }
 xc-chain-spec = { workspace = true }
 arxd-genesis = { workspace = true }
+
+[lints]
+workspace = true

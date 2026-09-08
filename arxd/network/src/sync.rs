@@ -139,6 +139,27 @@ pub(crate) fn advance_stuck_tip(stuck_tip: Option<(u64, u32)>, local_tip: u64) -
     }
 }
 
+pub(crate) fn send_sync_request(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peer: &PeerId,
+    request: &SyncRequest,
+) {
+    let kind = match request {
+        SyncRequest::Status => "status",
+        SyncRequest::Blocks { .. } => "blocks",
+        SyncRequest::NodeInfo => "node_info",
+        SyncRequest::Hashes { .. } => "hashes",
+        SyncRequest::Certificate { .. } => "certificate",
+    };
+    match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
+        Ok(bytes) => {
+            counter!("arxium_sync_requests_total", "kind" => kind).increment(1);
+            swarm.behaviour_mut().sync.send_request(peer, bytes);
+        }
+        Err(err) => warn!("failed to encode sync request: {err}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,26 +318,5 @@ mod tests {
             panic!("expected Status response");
         };
         assert_eq!(tip_height, 2);
-    }
-}
-
-pub(crate) fn send_sync_request(
-    swarm: &mut libp2p::Swarm<Behaviour>,
-    peer: &PeerId,
-    request: &SyncRequest,
-) {
-    let kind = match request {
-        SyncRequest::Status => "status",
-        SyncRequest::Blocks { .. } => "blocks",
-        SyncRequest::NodeInfo => "node_info",
-        SyncRequest::Hashes { .. } => "hashes",
-        SyncRequest::Certificate { .. } => "certificate",
-    };
-    match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
-        Ok(bytes) => {
-            counter!("arxium_sync_requests_total", "kind" => kind).increment(1);
-            swarm.behaviour_mut().sync.send_request(peer, bytes);
-        }
-        Err(err) => warn!("failed to encode sync request: {err}"),
     }
 }

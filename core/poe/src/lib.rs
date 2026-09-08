@@ -162,6 +162,45 @@ pub mod state_trie {
         })
     }
 
+    /// Walks `key_hash`'s 256-bit path down from `root`, returning the
+    /// sibling at each level (index 0 = nearest the root) and the node found
+    /// at the leaf level — either a leaf hash or `default_hashes()[0]` if the
+    /// key is absent. `children` supplies an internal node's two children by
+    /// its own hash, and is only ever called for a hash already known not to
+    /// be a default/empty-subtree hash.
+    ///
+    /// The single implementation of the descent is deliberate: both
+    /// `xc_storage::ArxiumDb` (children from RocksDB) and [`ProvenState`]
+    /// (children from supplied proofs) walk it, and if the two ever diverged
+    /// by a bit, PoE verification would disagree with what the node itself
+    /// computed.
+    pub fn descend<E>(
+        root: [u8; 32],
+        key_hash: &[u8; 32],
+        mut children: impl FnMut(&[u8; 32]) -> Result<([u8; 32], [u8; 32]), E>,
+    ) -> Result<([[u8; 32]; 256], [u8; 32]), E> {
+        let defaults = default_hashes();
+        let mut siblings = [[0u8; 32]; 256];
+        let mut node = root;
+        // `level` is the trie depth, not just an index: it drives `depth` and
+        // `bit_at` as well as the `siblings` slot, so an iterator would have to
+        // carry it anyway.
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..256 {
+            let depth = 256 - level;
+            if node == defaults[depth] {
+                siblings[level] = defaults[depth - 1];
+                node = defaults[depth - 1];
+            } else {
+                let (left, right) = children(&node)?;
+                let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
+                siblings[level] = sibling;
+                node = child;
+            }
+        }
+        Ok((siblings, node))
+    }
+
     /// A key's membership (`value: Some`) or non-membership (`value: None`)
     /// under a given root: the leaf's value plus the sibling at each of the
     /// 256 levels from the root down to the leaf, in that order. Bisection
@@ -302,28 +341,10 @@ pub mod state_trie {
             self.nodes.get(hash).copied().ok_or(UnprovenKey)
         }
 
-        /// Same shape as `xc_storage::ArxiumDb`'s private `descend` — walks
-        /// `key_hash`'s 256-bit path from `self.root`, returning the sibling
-        /// at each level and the node found at the leaf level. Fails closed
-        /// (`UnprovenKey`) the instant the walk needs a node no supplied
-        /// proof covers, rather than guessing.
+        /// Fails closed (`UnprovenKey`) the instant the walk needs a node no
+        /// supplied proof covers, rather than guessing.
         fn descend(&self, key_hash: &[u8; 32]) -> Result<([[u8; 32]; 256], [u8; 32]), UnprovenKey> {
-            let defaults = default_hashes();
-            let mut siblings = [[0u8; 32]; 256];
-            let mut node = self.root;
-            for level in 0..256 {
-                let depth = 256 - level;
-                if node == defaults[depth] {
-                    siblings[level] = defaults[depth - 1];
-                    node = defaults[depth - 1];
-                } else {
-                    let (left, right) = self.children(&node)?;
-                    let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
-                    siblings[level] = sibling;
-                    node = child;
-                }
-            }
-            Ok((siblings, node))
+            descend(self.root, key_hash, |hash| self.children(hash))
         }
 
         /// The value proven for `key_hash` under the trie's current root —
@@ -585,7 +606,7 @@ mod tests {
     fn tx_root_of_pair_differs_from_a_leaf_hash_of_their_combined_root() {
         let pair = vec![action(1), action(2)];
         let root = tx_root(&pair).unwrap();
-        let single = vec![action(99)];
+        let single = [action(99)];
         assert_ne!(root, action_hash(&single[0]).unwrap());
         // The old (buggy) scheme hashed nodes identically to leaves, i.e.
         // node_hash(h1, h2) == Sha256(h1 ++ h2) with no domain prefix. Make
