@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -260,6 +261,7 @@ pub fn spawn_finality<P>(
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
     dissent_tx: Sender<DissentRecord>,
+    chain_lock: Arc<Mutex<()>>,
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -505,7 +507,7 @@ where
                     // so waiting for VoteObserved would leave every validator
                     // counting only its peers' votes.
                     if let Err(err) =
-                        tally_vote(&db, &mut tallies, &mut my_votes, vote.clone())
+                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote.clone())
                     {
                         warn!("finality: failed to process local precommit vote: {err}");
                     }
@@ -516,7 +518,7 @@ where
                     }
                 }
                 FinalityEvent::VoteObserved(vote) => {
-                    if let Err(err) = tally_vote(&db, &mut tallies, &mut my_votes, vote) {
+                    if let Err(err) = tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote) {
                         warn!("finality: failed to process precommit vote: {err}");
                     }
                 }
@@ -540,8 +542,9 @@ where
     })
 }
 
-fn tally_vote(
+fn tally_vote<P: Serialize + DeserializeOwned>(
     db: &ArxiumDb,
+    chain_lock: &Mutex<()>,
     tallies: &mut VoteTallies,
     my_votes: &mut HashMap<u64, PrecommitVote>,
     vote: PrecommitVote,
@@ -622,6 +625,56 @@ fn tally_vote(
     tallies.remove(&vote.height);
     my_votes.remove(&vote.height);
     info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
+    enforce_certificate::<P>(db, chain_lock, &record)?;
+    Ok(())
+}
+
+/// Makes the certificate just persisted actually govern this node's chain.
+///
+/// Everything up to here only *records* what the network decided; the chain
+/// itself still holds whichever block arrived first. Where those differ,
+/// this node is committed to a block a quorum certified against, and until
+/// it unwinds, `ArxiumDb::stage_watermark_advance` refuses to move the
+/// finalized watermark past this height (it cross-checks the certified hash
+/// against the block actually held) — so the node stalls silently, keeps
+/// serving the wrong chain, and only recovers if some peer happens to open
+/// a divergence conversation with it. Acting on our own verified evidence
+/// closes that: unwind to the parent and let sync refill from the certified
+/// chain, exactly as `arxd_network`'s peer-driven recovery would.
+///
+/// `revert_to`'s watermark floor cannot trip here. The watermark only
+/// advances through heights where the local block matches the certificate,
+/// so a mismatch at `height` means it never passed `height - 1`.
+///
+/// The chain lock is the same one `produce_loop` and the gossip accept path
+/// take: reverting is a read-tip/decide/write cycle like theirs, and must
+/// not interleave with a block landing.
+fn enforce_certificate<P: Serialize + DeserializeOwned>(
+    db: &ArxiumDb,
+    chain_lock: &Mutex<()>,
+    record: &FinalityRecord,
+) -> Result<(), xc_storage::StorageError> {
+    let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Nothing held at this height yet (certificate arrived ahead of the
+    // block) — sync fetches it, and `accept_block`'s finality gate makes
+    // sure only the certified one lands.
+    let Some(local) = db.get_block::<P>(record.height)? else {
+        return Ok(());
+    };
+    let local_hash = local.hash();
+    if local_hash == record.block_hash {
+        return Ok(());
+    }
+
+    warn!(
+        "finality: certificate for height {} names {}, this node committed {} — unwinding to {}",
+        record.height,
+        record.block_hash,
+        local_hash,
+        record.height.saturating_sub(1),
+    );
+    db.revert_to::<P>(record.height.saturating_sub(1))?;
     Ok(())
 }
 
@@ -843,6 +896,81 @@ mod tests {
         );
     }
 
+    fn certificate(height: u64, block_hash: &str) -> FinalityRecord {
+        FinalityRecord {
+            height,
+            block_hash: block_hash.to_string(),
+            signers: vec![],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        }
+    }
+
+    /// Two blocks, each written the way the accept path writes one — with an
+    /// undo record, which is what makes them revertible.
+    fn chain_of_two() -> (ArxiumDb, std::path::PathBuf, Block<()>) {
+        let (db, dir) = open_test_db();
+        let key = SigningKey::from_bytes(&[3u8; 32]);
+        // `revert_to` re-checks the unwound trie against the target block's
+        // own `state_root`, so these headers have to carry the real one —
+        // both blocks are empty, so it is the same root either side.
+        let root = db.compute_state_root(&[]).unwrap();
+        let mut genesis = signed_block(&key, 0, 100);
+        genesis.state_root = root.clone();
+        db.write_block_batches(0, &[&genesis], true).unwrap();
+        let mut one = signed_block(&key, 1, 101);
+        one.state_root = root;
+        db.write_block_batches(1, &[&one], true).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        (db, dir, one)
+    }
+
+    /// The gap this closes: `stage_watermark_advance` already *detects* that
+    /// the certified hash is not the block held locally — it just stops
+    /// moving the watermark and says nothing. The node then keeps serving a
+    /// block a quorum voted against until some peer happens to challenge it.
+    #[test]
+    fn a_certificate_naming_another_block_unwinds_this_node_to_the_parent() {
+        let (db, dir, _) = chain_of_two();
+        let record = certificate(1, "0xwhatthenetworkactuallyfinalized");
+        // Precondition: the watermark is stuck exactly because of the
+        // disagreement, so the revert floor cannot be in the way.
+        db.write_batch(&record).unwrap();
+        assert_eq!(db.get_final_watermark().unwrap(), 0);
+
+        enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
+
+        assert_eq!(db.get_tip_height().unwrap(), Some(0), "height 1 must be unwound");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_certificate_for_the_block_we_hold_changes_nothing() {
+        let (db, dir, one) = chain_of_two();
+        let record = certificate(1, &one.hash());
+        db.write_batch(&record).unwrap();
+
+        enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
+
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        assert_eq!(db.get_final_watermark().unwrap(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A certificate can arrive before the block it names. There is nothing
+    /// to unwind, and `accept_block`'s own gate is what keeps the wrong
+    /// block from landing at that height afterwards.
+    #[test]
+    fn a_certificate_ahead_of_our_tip_is_not_a_disagreement() {
+        let (db, dir, _) = chain_of_two();
+        let record = certificate(7, "0xnotherebutcertified");
+
+        enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
+
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn quorum_is_two_thirds_plus_one() {
         assert_eq!(quorum(1), 1);
@@ -885,7 +1013,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
             assert!(db.get_finality_record(5).unwrap().is_none());
         }
 
@@ -897,7 +1025,7 @@ mod tests {
             signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
             ep,
         };
-        tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
+        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
 
         let record = db.get_finality_record(5).unwrap().expect("expected finality record at quorum");
         assert_eq!(record.signers.len(), 3);
@@ -937,7 +1065,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
         }
         drop(tallies);
 
@@ -967,7 +1095,7 @@ mod tests {
             signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
             ep,
         };
-        tally_vote(&db, &mut reloaded, &mut reloaded_my_votes, vote).unwrap();
+        tally_vote::<()>(&db, &Mutex::new(()), &mut reloaded, &mut reloaded_my_votes, vote).unwrap();
         assert!(db.get_finality_record(5).unwrap().is_some());
         assert!(
             db.get_precommit_votes_from(0).unwrap().is_empty(),
@@ -1014,7 +1142,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote(&db, &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
         }
 
         assert!(db.get_finality_record(5).unwrap().is_none(), "neither ep group alone reached quorum");
@@ -1127,7 +1255,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         // No bls_identity: this test only needs the loop's pruning step to
         // run on every event, not for this node to vote.
-        let handle = spawn_finality::<()>(db.clone(), None, event_rx, vote_tx, round_timeout_tx, dissent_tx);
+        let handle = spawn_finality::<()>(db.clone(), None, event_rx, vote_tx, round_timeout_tx, dissent_tx, Arc::new(Mutex::new(())));
 
         let dissent_height = 5;
         event_tx
@@ -1169,6 +1297,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            Arc::new(Mutex::new(())),
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1218,6 +1347,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            Arc::new(Mutex::new(())),
         );
 
         event_tx
@@ -1265,6 +1395,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            Arc::new(Mutex::new(())),
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1509,6 +1640,7 @@ mod tests {
             _vote_tx,
             round_timeout_tx,
             dissent_tx,
+            Arc::new(Mutex::new(())),
         );
 
         let vote = round_timeout_rx
@@ -1555,6 +1687,7 @@ mod tests {
             _vote_tx,
             round_timeout_tx,
             dissent_tx,
+            Arc::new(Mutex::new(())),
         );
 
         let vote = round_timeout_rx
