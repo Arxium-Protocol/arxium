@@ -20,3 +20,6 @@ libp2p = { version = "0.56.0", features = ["tcp", "quic", "noise", "yamux", "tok
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+xc-bls.workspace = true

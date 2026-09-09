@@ -187,6 +187,14 @@ pub enum AcceptBlockError {
     RoundCertificateInvalid { height: u64, round: u32 },
     #[error("block height {block_height} does not extend local tip {tip_height}")]
     NotNextHeight { block_height: u64, tip_height: u64 },
+    #[error(
+        "block {height} hashes to {offered}, but a verified quorum certificate for that height names {certified} — refusing to commit against finality"
+    )]
+    ContradictsCertificate {
+        height: u64,
+        certified: String,
+        offered: String,
+    },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
     ParentMismatch { local: String, expected: String },
     #[error(
@@ -386,6 +394,27 @@ where
             tip_height,
         });
     }
+    // Finality gate. A quorum certificate at this height is the network's
+    // decision about which block belongs there; committing a different one
+    // would make this node's chain contradict evidence it has already
+    // verified and stored. Without this check, commitment follows arrival:
+    // after `arxd_finality` unwinds a wrong block, the very next sync page
+    // from a peer still serving that block would re-commit it, and the
+    // certificate could not stop it a second time (`tally_vote` fires once
+    // per height). The lookup is a point read on `meta:finality`; the hash
+    // is only computed when a certificate actually exists, which on a
+    // healthy chain is never true for the height being extended.
+    if let Some(record) = db.get_finality_record(block.height)? {
+        let offered = block.hash();
+        if record.block_hash != offered {
+            return Err(AcceptBlockError::ContradictsCertificate {
+                height: block.height,
+                certified: record.block_hash,
+                offered,
+            });
+        }
+    }
+
     let parent: Block<P> = db
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height set");
@@ -1652,6 +1681,65 @@ mod tests {
                 "height {bad_height} against tip 1 should be rejected, got {err:?}",
             );
         }
+    }
+
+    /// The finality gate: once a quorum certificate names a block at a
+    /// height, no other block may ever be committed there. Without it,
+    /// `arxd_finality`'s unwind of a wrong block is undone by the very next
+    /// sync page from a peer still serving that block — the certificate
+    /// cannot stop it a second time, since a tally reaching quorum fires
+    /// only once per height.
+    #[test]
+    fn a_block_contradicting_a_quorum_certificate_can_never_be_committed() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+
+        let mut block2 = Block {
+            height: 2,
+            parent_hash: block1.hash(),
+            timestamp: block1.timestamp + 1,
+            actions: vec![],
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        };
+        block2.sign(addr.clone(), &key);
+
+        // A certificate naming a different block at height 2.
+        db.write_batch(&xc_storage::FinalityRecord {
+            height: 2,
+            block_hash: "0xsomeotherblock".to_string(),
+            signers: vec![addr.clone()],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        })
+        .unwrap();
+
+        let err = accept_block(&db, block2.clone(), false, 0, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::ContradictsCertificate { .. }),
+            "got {err:?}",
+        );
+
+        // The gate names one block; it does not freeze the height. Once the
+        // certificate agrees with what is offered, acceptance moves on to the
+        // ordinary checks — here the state root, which this hand-built block
+        // leaves empty.
+        db.write_batch(&xc_storage::FinalityRecord {
+            height: 2,
+            block_hash: block2.hash(),
+            signers: vec![addr],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        })
+        .unwrap();
+        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::StateRootMismatch { .. }),
+            "the gate must be past, got {err:?}",
+        );
     }
 
     /// A proposer's block hash commits to its full claimed action list. If an

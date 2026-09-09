@@ -448,6 +448,7 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "xc-bls",
  "xc-mempool",
  "xc-primitives",
  "xc-storage",

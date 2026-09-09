@@ -526,6 +526,14 @@ fn spawn_subsystems<R: ChainRuntime>(
     // `on_block` below also needs the BLS key to sign dissents on execution
     // disagreement, so clone before `spawn_finality` consumes the original.
     let bls_identity_for_dissent = bls_identity.clone();
+    // Guards the read-tip / decide / write critical section shared by this
+    // node's own production loop below, the gossip block-accept path, and
+    // the finality thread's unwind when a certificate contradicts what this
+    // node committed — so a self-produced block, a peer's gossiped block for
+    // the same height, and a revert can never interleave. Whichever gets the
+    // lock first wins, and the others observe the moved tip and back off.
+    let chain_lock = Arc::new(Mutex::new(()));
+
     spawn_supervised(
         "finality",
         spawn_finality(
@@ -535,6 +543,7 @@ fn spawn_subsystems<R: ChainRuntime>(
             finality_vote_tx,
             finality_round_timeout_tx,
             dissent_recorded_tx,
+            chain_lock.clone(),
         ),
     );
 
@@ -643,12 +652,6 @@ fn spawn_subsystems<R: ChainRuntime>(
         limits: config.limits.clone(),
     })?;
 
-    // Guards the read-tip / decide / write critical section shared by this
-    // node's own production loop below and the gossip block-accept path, so
-    // a self-produced block and a peer's gossiped block for the same height
-    // can never both land — whichever gets the lock first wins, and the
-    // other observes the advanced tip and backs off.
-    let chain_lock = Arc::new(Mutex::new(()));
     let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Returns `true` only when the block's signature itself didn't verify —
@@ -883,13 +886,21 @@ fn spawn_subsystems<R: ChainRuntime>(
                                 }
                                 }
                             }
-                        } else if let xc_executor::AcceptBlockError::NotNextHeight {
-                            block_height,
-                            tip_height,
-                        } = &err
-                            && block_height == tip_height {
-                                let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
-                            }
+                        } else if matches!(
+                            &err,
+                            xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height }
+                                if block_height == tip_height
+                        ) || matches!(&err, xc_executor::AcceptBlockError::ContradictsCertificate { .. })
+                        {
+                            // Two shapes of the same sighting: a second block
+                            // for a height already committed, and a block for
+                            // a height a quorum has certified another block
+                            // for (which is what reaches here once the
+                            // finality unwind has rolled the height back).
+                            // Both are equivocation-shaped and belong to the
+                            // evidence watcher, not to this path.
+                            let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
+                        }
                     }
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }

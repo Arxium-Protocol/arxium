@@ -53,9 +53,33 @@ pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, reque
     match request {
         SyncRequest::Status => SyncResponse::<Block<P>>::Status { tip_height: local_tip_height(db) },
         SyncRequest::Blocks { from } => {
+            // Bodies are served only up to what a quorum has certified. A
+            // block past that is still provisional here — `arxd_finality`
+            // unwinds it if the certificate names another — and shipping it
+            // makes a catching-up peer commit to the same guess, so a local
+            // reorg becomes one every follower has to repeat. The
+            // unfinalized tip reaches peers over gossip instead, where a
+            // node that acted on it is already tracking the votes that
+            // settle it.
+            //
+            // ponytail: a chain with no certificate at all falls back to the
+            // tip, so a fresh or single-node devnet still syncs before its
+            // first height finalizes. Once anything has finalized, the clamp
+            // is unconditional — a chain that has stopped finalizing stops
+            // handing out history to build on, which is the intent.
             let tip_height = local_tip_height(db);
-            let blocks = db.get_block_range::<P>(from, tip_height).unwrap_or_else(|err| {
-                warn!("failed to read blocks {from}..={tip_height} for sync response to {peer}: {err}");
+            //
+            // The watermark, not the highest certificate: it is contiguous
+            // and already cross-checked against the block this node actually
+            // holds (see `stage_watermark_advance`), so it is the one value
+            // that means "committed here" rather than "certified somewhere".
+            let watermark = db.get_final_watermark().unwrap_or_else(|err| {
+                warn!("failed to read finalized watermark for sync response to {peer}: {err}");
+                0
+            });
+            let to = if watermark == 0 { tip_height } else { watermark };
+            let blocks = db.get_block_range::<P>(from, to).unwrap_or_else(|err| {
+                warn!("failed to read blocks {from}..={to} for sync response to {peer}: {err}");
                 Vec::new()
             });
             SyncResponse::Blocks(blocks)
@@ -231,6 +255,62 @@ mod tests {
     // sync event loop precisely so a peer sending an out-of-range,
     // already-rejected, or otherwise malformed request can be exercised
     // directly instead of only through a live swarm.
+
+    fn certify(db: &ArxiumDb, height: u64) {
+        let block_hash = db.get_block::<()>(height).unwrap().expect("block to certify").hash();
+        db.write_batch(&xc_storage::FinalityRecord {
+            height,
+            block_hash,
+            signers: vec![],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn block_bodies_stop_at_the_finalized_watermark() {
+        let db = temp_db();
+        for h in 0..=5 {
+            db.write_batch(&block(h)).unwrap();
+        }
+        for h in 1..=3 {
+            certify(&db, h);
+        }
+        assert_eq!(db.get_final_watermark().unwrap(), 3);
+
+        let SyncResponse::Blocks(blocks) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 0 })
+        else {
+            panic!("expected Blocks response");
+        };
+        // 4 and 5 are held locally and reported by `Status`, but they are
+        // still provisional — a peer must not build on them.
+        assert_eq!(blocks.iter().map(|b| b.height).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+
+        // Hashes are deliberately not clamped: a diverged peer resolving a
+        // fork has to be able to compare the unfinalized tip too.
+        let SyncResponse::Hashes(hashes) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Hashes { from: 0, to: 99 })
+        else {
+            panic!("expected Hashes response");
+        };
+        assert_eq!(hashes.len(), 6);
+    }
+
+    #[test]
+    fn a_chain_that_has_finalized_nothing_still_serves_its_tip() {
+        let db = temp_db();
+        for h in 0..=2 {
+            db.write_batch(&block(h)).unwrap();
+        }
+        let SyncResponse::Blocks(blocks) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 0 })
+        else {
+            panic!("expected Blocks response");
+        };
+        assert_eq!(blocks.len(), 3);
+    }
 
     #[test]
     fn blocks_request_from_past_the_tip_is_an_empty_page_not_an_error() {
