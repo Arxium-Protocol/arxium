@@ -50,6 +50,13 @@ struct Args {
     #[arg(long)]
     bls_pubkey: Option<String>,
 
+    /// Proof of possession for --bls-pubkey, hex-encoded (from
+    /// `arxd bls-key --pop`). Required alongside it: an unproven key is
+    /// rejected on chain, because it may be a rogue key able to forge
+    /// quorum certificates for the whole validator set.
+    #[arg(long)]
+    bls_pop: Option<String>,
+
     /// Operator address (name from devnet-keys.json, or bech32 address) to authorize.
     /// Required for "authorize-operator".
     #[arg(long)]
@@ -65,6 +72,16 @@ struct Args {
     /// Sent as "Authorization: Bearer <token>" — required once the node runs with --rpc-token.
     #[arg(long)]
     token: Option<String>,
+}
+
+/// Both key-carrying actions need the same decode-and-explain, and the error
+/// is the one an operator is most likely to hit on upgrade (the flag didn't
+/// exist before), so it names where to get the value.
+fn decoded_bls_pop(pop: Option<&str>, action: &str) -> Result<Vec<u8>> {
+    hex::decode(pop.with_context(|| {
+        format!("--bls-pop is required for {action} (get it from `arxd bls-key --pop`)")
+    })?)
+    .context("--bls-pop is not valid hex")
 }
 
 fn keys_file() -> Value {
@@ -189,6 +206,7 @@ fn main() -> Result<()> {
                     .context("--bls-pubkey is required for join-validator (get it from `arxd bls-key`)")?,
             )
             .context("--bls-pubkey is not valid hex")?,
+            bls_pop: decoded_bls_pop(args.bls_pop.as_deref(), "join-validator")?,
         },
         "leave-validator" => ActionPayload::LeaveValidator { validator: target_validator()? },
         "stake" => ActionPayload::Stake {
@@ -211,6 +229,7 @@ fn main() -> Result<()> {
                 args.bls_pubkey.as_deref().context("--bls-pubkey is required for register-bls-key")?,
             )
             .context("--bls-pubkey is not valid hex")?,
+            pop: decoded_bls_pop(args.bls_pop.as_deref(), "register-bls-key")?,
         },
         "authorize-operator" => ActionPayload::AuthorizeOperator {
             operator: resolve_address(

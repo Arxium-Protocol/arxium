@@ -823,6 +823,10 @@ mod tests {
                     let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
                     pk.0.to_vec()
                 },
+                bls_pop: {
+                    let (sk, _pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+                    xc_bls::prove_possession(&sk).0.to_vec()
+                },
             },
         };
         let action_bytes = bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();

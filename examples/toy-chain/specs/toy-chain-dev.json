@@ -22,7 +22,8 @@
   "validators": {
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
       "stake": 1,
-      "bls_pubkey": "ac80a5e08c712d5f08f0306ad743f7d8c215d982489b84a1d6ba805733d94c006e8938f9089a75db3ffa135af33bc69a"
+      "bls_pubkey": "95a254501b7733239ed3cec4d56737977bd09ede881d8a234560e83e5525017add3b1dcc3eabfb85e12a4131b19c253b",
+      "bls_pop": "ac7629f05d3ea83c9579750e3f8a82b0d4a16010f2a9b6546bb3f5f4bfb106e05e31c859b9ec0a0646d8574e44f170e607e5f729b3b8f494c2e6122d45b01d4fa0edda63e10bf6973dd97ea3befdcbd880f4ae4758722653b8c7982e67eb7ad5"
     }
   },
   "boot_nodes": []

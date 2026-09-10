@@ -13,6 +13,13 @@
 //! Boot with `--chain examples/toy-chain/specs/toy-chain-dev.json` — the
 //! fixed genesis accounts (issuer, KYC'd recipient, non-KYC'd recipient) live
 //! there, same shared chain-spec path CoreChain's `devnet`/`local` presets use.
+//!
+//! The spec's lone genesis validator holds the BLS key derived from the
+//! well-known seed `0x01` repeated 32 times — write that hex into
+//! `<base-path>/validator.bls.key` to run it. Its `bls_pop` in the spec is
+//! that key's proof of possession, mandatory since `xc_bls` moved to the
+//! PoP scheme (a key without one can be a rogue key; see
+//! `xc_bls::verify_possession`).
 
 use anyhow::Result;
 use xc_runtime_api::ChainRuntime;

@@ -11,7 +11,21 @@ use serde::{Deserialize, Serialize};
 
 /// Domain separation tag — required by the BLS signature spec so a
 /// signature can't be replayed as valid under a different scheme/curve use.
-const DST: &[u8] = b"ARXIUM_FINALITY_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_";
+///
+/// This is the IRTF *proof-of-possession* scheme's tag (`..._POP_`), not the
+/// basic scheme's. [`verify_aggregate`] aggregates N signatures over one
+/// identical message, which is `FastAggregateVerify` — only sound when every
+/// key has proven possession of its secret (see [`prove_possession`]).
+/// Signing under the PoP tag is what makes the scheme label honest, and keeps
+/// a signature from ever verifying under a basic-scheme implementation that
+/// doesn't require PoP.
+const DST: &[u8] = b"ARXIUM_FINALITY_BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// Separate tag for proofs of possession, per the spec: a PoP must not be
+/// reusable as an ordinary signature (or vice versa), which is exactly what
+/// a shared tag would allow — a validator could be tricked into signing a
+/// message that happens to be another validator's pubkey bytes.
+const POP_DST: &[u8] = b"ARXIUM_FINALITY_BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlsError {
@@ -77,6 +91,33 @@ pub fn sign(sk: &BlsSecretKey, msg: &[u8]) -> BlsSignature {
     BlsSignature(sk.0.sign(msg, DST, &[]).to_bytes())
 }
 
+/// Proof of possession: a signature over the public key's own bytes, under a
+/// tag used for nothing else. Mandatory before a key may be registered
+/// anywhere it will later be aggregated over — see [`verify_possession`].
+pub fn prove_possession(sk: &BlsSecretKey) -> BlsSignature {
+    BlsSignature(sk.0.sign(&sk.0.sk_to_pk().to_bytes(), POP_DST, &[]).to_bytes())
+}
+
+/// Verifies a [`prove_possession`] proof, and that `pubkey` is a valid
+/// non-infinity group element.
+///
+/// **This is a consensus-safety requirement, not a formality.**
+/// [`verify_aggregate`] checks N signatures over one identical message, where
+/// the pairing product collapses to `e(sig, g2) == e(H(m), ∏ pk_i)` — it
+/// verifies the *product* of the keys, not each key. Without a PoP, an
+/// attacker who registers a rogue key `pk_r = g^x · (∏ honest pk_i)^-1`
+/// (a perfectly valid group element, so subgroup checks don't catch it) can
+/// produce `sig = H(m)^x` alone and have it verify against the whole honest
+/// set — forging a quorum certificate for any message, signed by validators
+/// who never voted. Requiring a signature under `pk_r` proves the attacker
+/// knows its discrete log, which it cannot for a key built that way.
+pub fn verify_possession(pubkey: &BlsPublicKey, pop: &BlsSignature) -> Result<(), BlsError> {
+    let pk = PublicKey::from_bytes(&pubkey.0).map_err(|_| BlsError::InvalidPublicKey)?;
+    pk.validate().map_err(|_| BlsError::InvalidPublicKey)?;
+    let signature = Signature::from_bytes(&pop.0).map_err(|_| BlsError::InvalidSignature)?;
+    map_blst_err(signature.verify(true, &pubkey.0, POP_DST, &[], &pk, true))
+}
+
 pub fn verify(msg: &[u8], pubkey: &BlsPublicKey, sig: &BlsSignature) -> Result<(), BlsError> {
     let pk = PublicKey::from_bytes(&pubkey.0).map_err(|_| BlsError::InvalidPublicKey)?;
     let signature = Signature::from_bytes(&sig.0).map_err(|_| BlsError::InvalidSignature)?;
@@ -102,20 +143,37 @@ pub fn aggregate(sigs: &[BlsSignature]) -> Result<BlsSignature, BlsError> {
 /// Verifies one aggregate signature was produced by all of `signers` over
 /// the same `msg` — the finality-certificate check. All signers vouching
 /// for the identical block hash means the same message is used for every
-/// signer's contribution, so this is aggregate signature (not aggregate
-/// message) verification.
+/// signer's contribution, so this is `FastAggregateVerify`.
+///
+/// **Caller contract:** every key in `signers` must have had its
+/// [`verify_possession`] proof checked at registration, and `signers` must
+/// contain no duplicates. This is `FastAggregateVerify`, which is only sound
+/// under those two conditions — see [`verify_possession`] for what an
+/// unproven key buys an attacker. On this chain the registration side is
+/// `arxd/runtime`'s `validated_bls_pubkey` and the genesis BLS-key writer;
+/// the duplicate check is in the certificate verifiers that call this.
+///
+/// (This used to call blst's `aggregate_verify` with the message repeated N
+/// times. That implements `CoreAggregateVerify`, which is documented as
+/// sound only for *distinct* messages; with identical ones it degenerates
+/// into exactly this check while merely looking like the stricter one.)
 pub fn verify_aggregate(msg: &[u8], signers: &[BlsPublicKey], agg: &BlsSignature) -> Result<(), BlsError> {
     if signers.is_empty() {
         return Err(BlsError::EmptyAggregate);
     }
     let pks: Vec<PublicKey> = signers
         .iter()
-        .map(|p| PublicKey::from_bytes(&p.0).map_err(|_| BlsError::InvalidPublicKey))
-        .collect::<Result<_, _>>()?;
+        .map(|p| {
+            let pk = PublicKey::from_bytes(&p.0).map_err(|_| BlsError::InvalidPublicKey)?;
+            // `fast_aggregate_verify` has no `pks_validate` flag of its own,
+            // unlike the `aggregate_verify` this replaced — keep the check.
+            pk.validate().map_err(|_| BlsError::InvalidPublicKey)?;
+            Ok(pk)
+        })
+        .collect::<Result<_, BlsError>>()?;
     let pk_refs: Vec<&PublicKey> = pks.iter().collect();
     let signature = Signature::from_bytes(&agg.0).map_err(|_| BlsError::InvalidSignature)?;
-    let msgs: Vec<&[u8]> = pk_refs.iter().map(|_| msg).collect();
-    map_blst_err(signature.aggregate_verify(true, &msgs, DST, &pk_refs, true))
+    map_blst_err(signature.fast_aggregate_verify(true, msg, DST, &pk_refs))
 }
 
 #[cfg(test)]
@@ -173,5 +231,39 @@ mod tests {
     #[test]
     fn aggregate_rejects_empty_input() {
         assert!(aggregate(&[]).is_err());
+    }
+
+    #[test]
+    fn proof_of_possession_roundtrip() {
+        let (sk, pk) = keygen_from_seed(&[31u8; 32]).unwrap();
+        assert!(verify_possession(&pk, &prove_possession(&sk)).is_ok());
+    }
+
+    /// The registration gate that closes the rogue-key attack. A rogue key
+    /// `pk_r = g^x · (∏ honest pk_i)^-1` is a valid group element — it passes
+    /// `PublicKey::validate()`, which is all registration used to check — but
+    /// its owner cannot produce a signature under it, so it cannot produce a
+    /// PoP either. Stand-in here for the same reason we don't hand-build the
+    /// rogue point: any key whose secret the submitter doesn't hold fails,
+    /// and the rogue key is exactly such a key.
+    #[test]
+    fn proof_of_possession_rejects_a_key_whose_secret_the_prover_lacks() {
+        let (sk_a, _) = keygen_from_seed(&[32u8; 32]).unwrap();
+        let (_, pk_b) = keygen_from_seed(&[33u8; 32]).unwrap();
+        // A PoP over someone else's pubkey bytes, signed with our own key.
+        let forged = BlsSignature(sk_a.0.sign(&pk_b.0, POP_DST, &[]).to_bytes());
+        assert!(verify_possession(&pk_b, &forged).is_err());
+        // And our own honest PoP doesn't transfer to their key either.
+        assert!(verify_possession(&pk_b, &prove_possession(&sk_a)).is_err());
+    }
+
+    /// The two tags must not be interchangeable: if they were, a validator
+    /// signing an attacker-chosen message that happened to be another
+    /// validator's pubkey bytes would hand out a PoP for free.
+    #[test]
+    fn a_precommit_signature_is_not_a_valid_proof_of_possession() {
+        let (sk, pk) = keygen_from_seed(&[34u8; 32]).unwrap();
+        assert!(verify_possession(&pk, &sign(&sk, &pk.0)).is_err());
+        assert!(verify(&pk.0, &pk, &prove_possession(&sk)).is_err());
     }
 }

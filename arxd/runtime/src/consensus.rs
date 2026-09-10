@@ -10,19 +10,38 @@ use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
 use crate::{ChainAction, ChainBlock};
 use crate::staking::is_authorized;
 
-/// Validates BLS public-key bytes and returns them sized.
+/// Validates BLS public-key bytes against their proof of possession and
+/// returns the key sized.
 ///
 /// Four call sites need this now (`RegisterBlsKey` and `JoinValidator`, each
 /// in both the admission precheck and dispatch), and the rule is
 /// consensus-relevant: rejecting malformed or off-curve bytes here rather than
 /// at the first failed precommit verification later.
-pub(crate) fn validated_bls_pubkey(pubkey: &[u8]) -> anyhow::Result<[u8; 48]> {
-    blst::min_pk::PublicKey::from_bytes(pubkey)
-        .and_then(|pk| pk.validate())
-        .map_err(|_| anyhow::anyhow!("invalid BLS public key"))?;
-    pubkey
+///
+/// The PoP check is the load-bearing half. `PublicKey::validate()` alone —
+/// which is all this used to do — accepts a rogue key
+/// `pk_r = g^x · (∏ honest pk_i)^-1`, a perfectly valid group element whose
+/// registrant can then forge a finality quorum certificate for an arbitrary
+/// block at an arbitrary height, signed by validators who never voted (see
+/// `xc_bls::verify_possession`). Every path that writes a key into the
+/// registry must go through here, and genesis (`arxd/genesis`) enforces the
+/// same rule for keys that arrive in the chain spec instead of via an action.
+pub(crate) fn validated_bls_pubkey(pubkey: &[u8], pop: &[u8]) -> anyhow::Result<[u8; 48]> {
+    let bytes: [u8; 48] = pubkey
         .try_into()
-        .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))
+        .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))?;
+    let pop: [u8; 96] = pop
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("BLS proof of possession must be 96 bytes"))?;
+    // Two distinct operator-facing errors: a mistyped/off-curve key is a
+    // different mistake from a PoP that doesn't match a good key.
+    xc_bls::verify_possession(&BlsPublicKey(bytes), &xc_bls::BlsSignature(pop)).map_err(|err| {
+        match err {
+            xc_bls::BlsError::InvalidPublicKey => anyhow::anyhow!("invalid BLS public key"),
+            _ => anyhow::anyhow!("invalid BLS proof of possession"),
+        }
+    })?;
+    Ok(bytes)
 }
 
 /// Proof that a validator signed two different blocks at the same
@@ -208,6 +227,7 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
     view: &V,
     validator: &Address,
     pubkey: &[u8],
+    pop: &[u8],
     current_height: u64,
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
@@ -215,7 +235,7 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
     if !is_authorized(&action.sender, validator, operator_lookup)? {
         anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
     }
-    let bytes = validated_bls_pubkey(pubkey)?;
+    let bytes = validated_bls_pubkey(pubkey, pop)?;
     if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
         && &owner != validator {
             anyhow::bail!("BLS pubkey already registered to {owner}");
@@ -349,7 +369,7 @@ mod tests {
     #[test]
     fn register_bls_key_accepts_a_valid_pubkey() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
         let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
@@ -359,6 +379,7 @@ mod tests {
             payload: ActionPayload::RegisterBlsKey {
                 validator: alice.clone(),
                 pubkey: pubkey.0.to_vec(),
+                pop: xc_bls::prove_possession(&sk).0.to_vec(),
             },
         };
 
@@ -381,7 +402,7 @@ mod tests {
     fn register_bls_key_rejects_a_pubkey_already_held_by_a_different_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
         let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
@@ -391,6 +412,7 @@ mod tests {
             payload: ActionPayload::RegisterBlsKey {
                 validator: alice.clone(),
                 pubkey: pubkey.0.to_vec(),
+                pop: xc_bls::prove_possession(&sk).0.to_vec(),
             },
         };
         let owned_by_bob = |_: &BlsPublicKey| Ok(Some(bob.clone()));
@@ -411,7 +433,7 @@ mod tests {
     #[test]
     fn register_bls_key_allows_re_registering_your_own_already_held_pubkey() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
         let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
         let action = Action {
@@ -421,6 +443,7 @@ mod tests {
             payload: ActionPayload::RegisterBlsKey {
                 validator: alice.clone(),
                 pubkey: pubkey.0.to_vec(),
+                pop: xc_bls::prove_possession(&sk).0.to_vec(),
             },
         };
         let owned_by_self = |_: &BlsPublicKey| Ok(Some(alice.clone()));
@@ -450,6 +473,7 @@ mod tests {
             payload: ActionPayload::RegisterBlsKey {
                 validator: alice.clone(),
                 pubkey: vec![0u8; 48],
+                pop: vec![0u8; 96],
             },
         };
 
@@ -464,6 +488,50 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid BLS public key"));
+    }
+
+    /// The rogue-key gate. A key nobody can produce a signature under is
+    /// still a valid group element, so `PublicKey::validate()` — the whole
+    /// of the old check — waves it through; the holder of
+    /// `pk_r = g^x · (∏ honest pk_i)^-1` can then forge a quorum
+    /// certificate for any block at any height, signed by validators who
+    /// never voted (see `xc_bls::verify_possession`). What such a key can
+    /// never come with is a proof of possession, which is what this
+    /// rejects: a well-formed, on-curve, unowned key whose PoP is another
+    /// key's.
+    #[test]
+    fn register_bls_key_rejects_a_well_formed_key_with_someone_elses_proof_of_possession() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view =
+            seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
+        let (_, unowned) = xc_bls::keygen_from_seed(&[21u8; 32]).unwrap();
+        let (other_sk, _) = xc_bls::keygen_from_seed(&[22u8; 32]).unwrap();
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RegisterBlsKey {
+                validator: alice.clone(),
+                pubkey: unowned.0.to_vec(),
+                pop: xc_bls::prove_possession(&other_sk).0.to_vec(),
+            },
+        };
+
+        let err = crate::dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &no_bls_owner,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("invalid BLS proof of possession"),
+            "expected a PoP rejection, got {err}"
+        );
     }
 
     /// The artifact is only parsed, never adjudicated, before the genesis

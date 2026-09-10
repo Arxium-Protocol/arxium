@@ -1,7 +1,15 @@
 {
-  "_comment": "DEVNET ONLY — well-known test seeds, matching devnet.json's genesis accounts. Never use these on anything but a local devnet.",
+  "_comment": "DEVNET ONLY — well-known test seeds, matching devnet.json's genesis accounts and validator BLS keys. Never use these on anything but a local devnet. A validator's bls_seed_hex is the content of <base-path>/validator.bls.key; `arxd bls-key` prints the pubkey it derives and `arxd bls-key --pop` its proof of possession.",
   "bob": {
     "address": "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5",
     "ed25519_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202"
+  },
+  "validator-1": {
+    "address": "arx1c2xdr2sw4d6j474s4fvwj9thp2ae8p8k7nqjsy8yeczkrw5l3wnqd7ems0",
+    "bls_seed_hex": "1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "validator-2": {
+    "address": "arx1ry7xj359ep80qp04r6mm5n304nc57p5cadx23203432hm9n48vlsprku7z",
+    "bls_seed_hex": "1212121212121212121212121212121212121212121212121212121212121212"
   }
 }

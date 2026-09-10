@@ -49,9 +49,29 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
             .ok()
             .and_then(|b| b.try_into().ok())
             .with_context(|| format!("genesis validator {address} has a malformed bls_pubkey"))?;
-        blst::min_pk::PublicKey::from_bytes(&bytes)
-            .and_then(|pk| pk.validate())
-            .map_err(|_| anyhow::anyhow!("genesis validator {address} has an invalid BLS key"))?;
+        // Proof of possession, same rule `RegisterBlsKey`/`JoinValidator`
+        // enforce via `validated_bls_pubkey`. `PublicKey::validate()` alone
+        // (all this used to do) accepts a rogue key
+        // `pk_r = g^x · (∏ honest pk_i)^-1`, which is a valid group element
+        // and whose holder can forge a quorum certificate for the entire
+        // genesis set — see `xc_bls::verify_possession`.
+        let pop: [u8; 96] = entry
+            .bls_pop
+            .as_deref()
+            .map(hex::decode)
+            .transpose()
+            .ok()
+            .flatten()
+            .and_then(|b| b.try_into().ok())
+            .with_context(|| {
+                format!(
+                    "genesis validator {address} has a missing or malformed bls_pop — run \
+                     `arxd keys` to print the key and its proof of possession together"
+                )
+            })?;
+        xc_bls::verify_possession(&BlsPublicKey(bytes), &xc_bls::BlsSignature(pop)).map_err(
+            |_| anyhow::anyhow!("genesis validator {address} has an invalid BLS proof of possession"),
+        )?;
         // `RegisterBlsKey`/`JoinValidator` both reject a pubkey already
         // owned by another validator — genesis must enforce the same rule,
         // or two validators could unknowingly share a BLS identity.
@@ -404,15 +424,15 @@ mod tests {
     fn register_genesis_bls_keys_rejects_duplicate_pubkey() {
         let (db, dir) = scratch_db();
 
-        let ikm = [7u8; 32];
-        let sk = blst::min_pk::SecretKey::key_gen(&ikm, &[]).unwrap();
-        let pubkey_hex = hex::encode(sk.sk_to_pk().to_bytes());
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let pubkey_hex = hex::encode(pk.0);
+        let pop_hex = hex::encode(xc_bls::prove_possession(&sk).0);
 
         let addr_a = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let addr_b = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let mut validators = BTreeMap::new();
-        validators.insert(addr_a, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex.clone()) });
-        validators.insert(addr_b, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex) });
+        validators.insert(addr_a, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex.clone()), bls_pop: Some(pop_hex.clone()) });
+        validators.insert(addr_b, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex), bls_pop: Some(pop_hex) });
 
         let err = register_genesis_bls_keys(&db, &validators).unwrap_err();
         assert!(err.to_string().contains("already owned by"), "expected an already-owned rejection, got {err:?}");
@@ -422,17 +442,19 @@ mod tests {
 
     #[test]
     fn duplicate_bls_pubkey_is_rejected_in_a_raw_spec() {
-        let sk_a = blst::min_pk::SecretKey::key_gen(&[10u8; 32], &[]).unwrap();
-        let sk_b = blst::min_pk::SecretKey::key_gen(&[11u8; 32], &[]).unwrap();
+        let (sk_a, pk_a) = xc_bls::keygen_from_seed(&[10u8; 32]).unwrap();
+        let (sk_b, pk_b) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let addr_a = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
         let addr_b = Address::from_pubkey_bytes(&[6u8; 32]).unwrap();
         let spec = format!(
             r#"{{"height":0,"chain_name":"t","accounts":{{}},"validators":{{
-                "{addr_a}": {{"stake": 1, "bls_pubkey": "{}"}},
-                "{addr_b}": {{"stake": 1, "bls_pubkey": "{}"}}
+                "{addr_a}": {{"stake": 1, "bls_pubkey": "{}", "bls_pop": "{}"}},
+                "{addr_b}": {{"stake": 1, "bls_pubkey": "{}", "bls_pop": "{}"}}
             }},"boot_nodes":[]}}"#,
-            hex::encode(sk_a.sk_to_pk().to_bytes()),
-            hex::encode(sk_b.sk_to_pk().to_bytes()),
+            hex::encode(pk_a.0),
+            hex::encode(xc_bls::prove_possession(&sk_a).0),
+            hex::encode(pk_b.0),
+            hex::encode(xc_bls::prove_possession(&sk_b).0),
         );
         // Two distinct validators with distinct keys must derive cleanly...
         let mut raw = derive_raw(&spec).unwrap();

@@ -865,7 +865,7 @@ mod tests {
             TestPayload::Join => Ok(BlockUpdates {
                 validator_change: Some(ValidatorChange::Join(
                     action.sender.clone(),
-                    xc_primitives::ValidatorEntry { stake: 0, bls_pubkey: None },
+                    xc_primitives::ValidatorEntry { stake: 0, bls_pubkey: None, bls_pop: None },
                 )),
                 ..Default::default()
             }),

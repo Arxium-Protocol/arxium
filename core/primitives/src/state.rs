@@ -46,6 +46,17 @@ pub struct ValidatorEntry {
     /// as unable to vote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bls_pubkey: Option<String>,
+
+    /// Hex-encoded proof of possession for `bls_pubkey` — the 96-byte
+    /// `xc_bls::prove_possession` signature, printed next to the key by
+    /// `arxd keys`. Required whenever `bls_pubkey` is set: without it a
+    /// spec author (or anyone who can edit a spec before launch) can seed a
+    /// rogue key that forges finality certificates for the whole set, the
+    /// same attack `RegisterBlsKey` is gated against. Enforced in
+    /// `arxd_genesis::register_genesis_bls_keys`, which has the `xc-bls`
+    /// dependency this crate deliberately doesn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bls_pop: Option<String>,
 }
 
 /// An in-flight partial unstake on a `StakeAllocation` — v1 allows at most
@@ -204,6 +215,19 @@ impl Snapshot {
                     hex_pubkey.len()
                 );
             }
+            match (&entry.bls_pubkey, &entry.bls_pop) {
+                (Some(_), None) => anyhow::bail!(
+                    "chain spec validator {address} has a bls_pubkey but no bls_pop — \
+                     run `arxd keys` to print both"
+                ),
+                (Some(_), Some(pop)) if pop.len() != 192 => anyhow::bail!(
+                    "chain spec validator {address} has a malformed bls_pop {:?} — expected \
+                     192 hex chars, got {}",
+                    pop,
+                    pop.len()
+                ),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -227,7 +251,7 @@ mod tests {
 
         let emitted = serde_json::to_string(&BTreeMap::from([(
             address.clone(),
-            ValidatorEntry { stake: 100_000 * 1_000_000_000, bls_pubkey: Some(bls.into()) },
+            ValidatorEntry { stake: 100_000 * 1_000_000_000, bls_pubkey: Some(bls.into()), bls_pop: None },
         )]))
         .unwrap();
 

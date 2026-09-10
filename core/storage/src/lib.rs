@@ -1720,7 +1720,7 @@ mod explorer_index_tests {
     fn genesis_validator_gets_a_real_self_stake_allocation() {
         let db = temp_db();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None });
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
             chain_name: "test".into(),
@@ -1755,8 +1755,8 @@ mod explorer_index_tests {
     fn multiple_genesis_validators_each_get_a_distinct_funded_subaccount() {
         let db = temp_db();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None });
-        validators.insert(addr(2), xc_primitives::ValidatorEntry { stake: 2_000_000, bls_pubkey: None });
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None, bls_pop: None });
+        validators.insert(addr(2), xc_primitives::ValidatorEntry { stake: 2_000_000, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
             chain_name: "test".into(),
@@ -1785,7 +1785,7 @@ mod explorer_index_tests {
         db.write_batch(&block(0, vec![])).unwrap();
         db.write_batch(&block(1, vec![])).unwrap();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 500, bls_pubkey: None });
+        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 500, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
             chain_name: "test".into(),

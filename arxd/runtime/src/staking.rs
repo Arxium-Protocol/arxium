@@ -38,6 +38,7 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     validator: &Address,
     stake: u128,
     bls_pubkey: &[u8],
+    bls_pop: &[u8],
     operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
     current_height: u64,
@@ -67,7 +68,7 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     )?;
     // Registered in the same block as the join, so the validator is
     // never in the set without the ability to vote.
-    let bytes = validated_bls_pubkey(bls_pubkey)?;
+    let bytes = validated_bls_pubkey(bls_pubkey, bls_pop)?;
     if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
         && &owner != validator {
             anyhow::bail!("BLS pubkey already registered to {owner}");
@@ -77,7 +78,11 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     // registration is the `bls_key` update below.
     let change = ValidatorChange::Join(
         validator.clone(),
-        ValidatorEntry { stake, bls_pubkey: Some(hex::encode(bytes)) },
+        ValidatorEntry {
+            stake,
+            bls_pubkey: Some(hex::encode(bytes)),
+            bls_pop: Some(hex::encode(bls_pop)),
+        },
     );
     let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
@@ -280,6 +285,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -336,6 +342,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: 500,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -377,6 +384,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -409,6 +417,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE - 1,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -542,6 +551,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -577,6 +587,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -690,6 +701,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -734,6 +746,7 @@ mod tests {
                     validator: alice.clone(),
                     stake: MIN_VALIDATOR_STAKE,
                     bls_pubkey: pubkey,
+                    bls_pop: test_bls_pop(1),
                 },
             };
             let result = crate::dispatch(
@@ -774,6 +787,7 @@ mod tests {
                 validator: alice.clone(),
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: pubkey.clone(),
+                bls_pop: test_bls_pop(42),
             },
         };
         let updates = crate::dispatch(

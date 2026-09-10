@@ -74,6 +74,10 @@ pub enum ActionPayload {
         /// this is Cosmos's `MsgCreateValidator.pubkey`. `RegisterBlsKey`
         /// remains, for rotating a key on an existing validator.
         bls_pubkey: Vec<u8>,
+        /// Proof of possession for `bls_pubkey` — `xc_bls::prove_possession`,
+        /// printed alongside the key by `arxd keys`. Without it a rogue key
+        /// forges quorum certificates; see `consensus::validated_bls_pubkey`.
+        bls_pop: Vec<u8>,
     },
     /// Removal from the validator set, routed through
     /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
@@ -133,6 +137,8 @@ pub enum ActionPayload {
     RegisterBlsKey {
         validator: Address,
         pubkey: Vec<u8>,
+        /// Proof of possession for `pubkey` — see `JoinValidator::bls_pop`.
+        pop: Vec<u8>,
     },
     /// A Groth16 proof of knowledge of a preimage hashing (via
     /// `circuit_identity_zk`'s Poseidon circuit) to the sender's existing
@@ -360,11 +366,11 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
     }
     let operator_lookup = |validator: &Address| db.get_operator(validator);
     match &action.payload {
-        ActionPayload::JoinValidator { validator, stake, bls_pubkey } => {
+        ActionPayload::JoinValidator { validator, stake, bls_pubkey, bls_pop } => {
             if !staking::is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            let bytes = consensus::validated_bls_pubkey(bls_pubkey)?;
+            let bytes = consensus::validated_bls_pubkey(bls_pubkey, bls_pop)?;
             if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
                 && &owner != validator {
                     anyhow::bail!("BLS pubkey already registered to {owner}");
@@ -392,11 +398,11 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 anyhow::bail!("cannot remove the last validator, chain would stall forever");
             }
         }
-        ActionPayload::RegisterBlsKey { validator, pubkey } => {
+        ActionPayload::RegisterBlsKey { validator, pubkey, pop } => {
             if !staking::is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
-            let bytes = consensus::validated_bls_pubkey(pubkey)?;
+            let bytes = consensus::validated_bls_pubkey(pubkey, pop)?;
             if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
                 && &owner != validator {
                     anyhow::bail!("BLS pubkey already registered to {owner}");
@@ -474,12 +480,13 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
         ActionPayload::Transfer { to, amount } => account::transfer(view, action, to, *amount),
-        ActionPayload::JoinValidator { validator, stake, bls_pubkey } => staking::join_validator(
+        ActionPayload::JoinValidator { validator, stake, bls_pubkey, bls_pop } => staking::join_validator(
             action,
             view,
             validator,
             *stake,
             bls_pubkey,
+            bls_pop,
             operator_lookup,
             bls_pubkey_owner_lookup,
             current_height,
@@ -501,11 +508,12 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::SubmitEquivocationEvidence { block_a, block_b } => {
             consensus::submit_equivocation_evidence(view, block_a, block_b, current_height)
         }
-        ActionPayload::RegisterBlsKey { validator, pubkey } => consensus::register_bls_key(
+        ActionPayload::RegisterBlsKey { validator, pubkey, pop } => consensus::register_bls_key(
             action,
             view,
             validator,
             pubkey,
+            pop,
             current_height,
             operator_lookup,
             bls_pubkey_owner_lookup,
@@ -632,6 +640,14 @@ pub(crate) mod test_support {
         let (_sk, pk) = xc_bls::keygen_from_seed(&[seed; 32]).expect("keygen");
         pk.0.to_vec()
     }
+
+    /// The matching proof of possession — also mandatory now, and also not
+    /// forgeable from arbitrary bytes. Seeds must line up with
+    /// `test_bls_pubkey`'s.
+    pub(crate) fn test_bls_pop(seed: u8) -> Vec<u8> {
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[seed; 32]).expect("keygen");
+        xc_bls::prove_possession(&sk).0.to_vec()
+    }
 }
 
 #[cfg(test)]
@@ -680,6 +696,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -701,6 +718,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE - 1,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -739,6 +757,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 
@@ -750,7 +769,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        let (_, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
+        let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey, effective_height: 0, previous_pubkey: None }])
             .unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
@@ -763,6 +782,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: pubkey.0.to_vec(),
+                bls_pop: xc_bls::prove_possession(&sk).0.to_vec(),
             },
         };
 
@@ -790,6 +810,7 @@ mod tests {
                 validator: alice,
                 stake: MIN_VALIDATOR_STAKE,
                 bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
             },
         };
 

@@ -88,7 +88,8 @@ arxd validator-key --base-path <base_path>/data   # just the address
 
 To add this node to a chain spec, `arxd keys --json` emits the `validators`
 entry directly — including `bls_pubkey`, without which the validator produces
-blocks but can never vote on finality while still counting toward the quorum:
+blocks but can never vote on finality while still counting toward the quorum,
+and its `bls_pop`, without which genesis refuses the key outright:
 
 ```sh
 arxd keys --base-path <base_path> --json
@@ -131,8 +132,12 @@ there, this node will never propose until a `JoinValidator` action adds it.
 6. Register the BLS finality key (separate from the Ed25519 node key) so
    this validator's precommit votes count toward finality quorum:
    `arxd bls-key --base-path <path>` prints the pubkey hex (add `--qr` for
-   a terminal QR code), then submit it on-chain:
-   `send-tx --from <validator-name> --action register-bls-key --bls-pubkey <hex>`.
+   a terminal QR code) and `arxd bls-key --pop --base-path <path>` prints its
+   proof of possession, then submit both on-chain:
+   `send-tx --from <validator-name> --action register-bls-key --bls-pubkey <hex> --bls-pop <hex>`.
+   The proof is mandatory: a key registered without one may be a *rogue key*,
+   constructed to forge a finality quorum certificate on behalf of validators
+   who never voted (`xc_bls::verify_possession` spells out the construction).
 7. To let an operator wallet (e.g. Arx-Plus) submit staking actions on this
    validator's behalf without the validator's signing key ever leaving the
    box: `arxd pair --base-path <path> --node <host:port> --token <rpc-token>`
@@ -305,9 +310,13 @@ curl -s localhost:30333/finality
 
 A validator's BLS key is bound to its registration — `JoinValidator` carries
 it, and genesis validators declare `bls_pubkey` in the chain spec — so a set
-built either way can vote. A chain spec whose validators predate that field
-logs a warning per keyless validator at genesis and needs a `RegisterBlsKey`
-action to recover.
+built either way can vote. Each is accompanied by a proof of possession
+(`bls_pop` in the spec, `--bls-pop` on the actions), verified before the key
+is written; a key with no valid proof is rejected, at genesis and on-chain
+alike. A chain spec whose validators predate the `bls_pubkey` field logs a
+warning per keyless validator at genesis and needs a `RegisterBlsKey` action
+to recover; one that has `bls_pubkey` but no `bls_pop` fails validation and
+must be reissued from `arxd keys --json`.
 
 **`quorum_reachable: false` means no amount of waiting will finalize
 anything** — fewer validators hold a BLS key than quorum requires. Fix it by

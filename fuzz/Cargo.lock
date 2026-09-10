@@ -1962,6 +1962,7 @@ dependencies = [
 name = "xc-circuit"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "serde",
  "xc-bls",
  "xc-primitives",
@@ -2058,6 +2059,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "hex",
+ "metrics",
  "rocksdb",
  "serde",
  "thiserror",

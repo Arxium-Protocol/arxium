@@ -1066,8 +1066,9 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
         let validator_key = validator::load_or_generate_key(base_path)?;
         let address = Address::from_pubkey_bytes(validator_key.verifying_key().as_bytes())?;
-        let (_bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
+        let (bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
         let bls_hex = hex::encode(bls_pubkey.0);
+        let bls_pop_hex = hex::encode(xc_bls::prove_possession(&bls_secret).0);
         let peer_id =
             arxd_network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
 
@@ -1080,6 +1081,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             xc_primitives::ValidatorEntry {
                 stake: *stake,
                 bls_pubkey: Some(bls_hex.clone()),
+                bls_pop: Some(bls_pop_hex.clone()),
             },
         )]);
         let entry_json = serde_json::to_string_pretty(&entry)
@@ -1093,6 +1095,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         println!();
         println!("  Validator address   {address}");
         println!("  BLS finality key    {bls_hex}");
+        println!("  BLS possession proof {bls_pop_hex}");
         println!("  libp2p peer ID      {peer_id}");
         println!();
         println!("  Chain-spec entry — merge into \"validators\" in the genesis spec:");
@@ -1119,9 +1122,13 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(Command::BlsKey { base_path, qr }) = &cli.command {
+    if let Some(Command::BlsKey { base_path, qr, pop }) = &cli.command {
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
-        let (_secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
+        let (secret, pubkey) = validator::load_or_generate_bls_key(base_path)?;
+        if *pop {
+            println!("{}", hex::encode(xc_bls::prove_possession(&secret).0));
+            return Ok(());
+        }
         let hex_pubkey = hex::encode(pubkey.0);
         println!("{hex_pubkey}");
         if *qr {

@@ -72,6 +72,14 @@ pub enum Command {
         /// scans it instead of copying hex by hand.
         #[arg(long)]
         qr: bool,
+        /// Print the key's proof of possession (hex) instead of the pubkey.
+        /// `RegisterBlsKey`/`JoinValidator` both require it — a key with no
+        /// PoP is rejected, because an unproven key can be a rogue key that
+        /// forges quorum certificates for the whole validator set. A
+        /// separate flag rather than a second output line so the plain
+        /// invocation stays pipeable.
+        #[arg(long)]
+        pop: bool,
     },
     /// Authorizes an operator wallet (e.g. the app) to submit
     /// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey`/staking actions on
