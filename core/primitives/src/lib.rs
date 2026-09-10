@@ -90,6 +90,11 @@ pub struct Limits {
     pub rpc_rate_limit_window_secs: u64,
     pub rpc_rate_limit_writes: u32,
     pub rpc_rate_limit_reads: u32,
+    /// How many trusted reverse proxies sit in front of the RPC, each
+    /// appending to `X-Forwarded-For`. 0 (the default) keys rate limiting on
+    /// the socket address and ignores the header entirely — see
+    /// `xc_rpc::client_ip`.
+    pub rpc_trusted_proxy_hops: usize,
     /// Mempool admission caps: entries, and total encoded bytes. Raise both
     /// together — a count cap alone lets a few huge actions exhaust memory.
     pub mempool_max_pending: usize,
@@ -105,6 +110,7 @@ impl Default for Limits {
             rpc_rate_limit_window_secs: 60,
             rpc_rate_limit_writes: 60,
             rpc_rate_limit_reads: 600,
+            rpc_trusted_proxy_hops: 0,
             mempool_max_pending: 10_000,
             mempool_max_bytes: 10_000_000,
             max_peers_incoming: 200,

@@ -264,6 +264,14 @@ pub struct LimitArgs {
     /// Per-IP read requests per window.
     #[arg(long, env = "ARXD_RPC_RATE_LIMIT_READS", default_value_t = Limits::default().rpc_rate_limit_reads)]
     pub rpc_rate_limit_reads: u32,
+    /// Number of trusted reverse proxies in front of the RPC, each appending
+    /// to `X-Forwarded-For`. 0 (default) ignores the header and rate-limits
+    /// on the peer's socket address; set it to the exact hop count of your
+    /// deployment (the shipped compose file is 2) or clients behind the proxy
+    /// share one budget. Never guess high — extra hops read a client-supplied
+    /// value as the client IP.
+    #[arg(long, env = "ARXD_RPC_TRUSTED_PROXY_HOPS", default_value_t = Limits::default().rpc_trusted_proxy_hops)]
+    pub rpc_trusted_proxy_hops: usize,
 
     /// Mempool cap in pending actions. Raise `--mempool-max-bytes` with it.
     #[arg(long, env = "ARXD_MEMPOOL_MAX_PENDING", default_value_t = Limits::default().mempool_max_pending)]
@@ -285,6 +293,7 @@ impl From<LimitArgs> for Limits {
             rpc_rate_limit_window_secs: args.rpc_rate_limit_window_secs,
             rpc_rate_limit_writes: args.rpc_rate_limit_writes,
             rpc_rate_limit_reads: args.rpc_rate_limit_reads,
+            rpc_trusted_proxy_hops: args.rpc_trusted_proxy_hops,
             mempool_max_pending: args.mempool_max_pending,
             mempool_max_bytes: args.mempool_max_bytes,
             max_peers_incoming: args.max_peers_incoming,

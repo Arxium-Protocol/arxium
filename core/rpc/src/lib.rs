@@ -59,6 +59,8 @@ struct AppState<P: Payload> {
     db: ArxiumDb,
     rpc_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
+    // Number of trusted proxies in front of this RPC — see `client_ip`.
+    trusted_proxy_hops: usize,
     // Broadcasts freshly admitted actions out to peers over gossip. `None`
     // in tests / any caller that doesn't wire up `network`.
     gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
@@ -233,43 +235,42 @@ enum PollOutcome {
     NotFound,
 }
 
-/// The client IP to key rate limiting on. `ConnectInfo` alone is wrong once
-/// this sits behind the reverse proxy the README already calls for in
-/// production (TLS termination) — every real client would collapse into the
-/// proxy's one IP and share a single limit. `X-Forwarded-For`'s first entry
-/// wins when present, `X-Real-IP` next — verified empirically against a real
-/// Caddy `reverse_proxy` (the documented deployment, see `Caddyfile.example`)
-/// rather than assumed: Caddy doesn't append to a client-supplied
-/// `X-Forwarded-For`, it overwrites it outright with its own observed remote
-/// address, so there's never more than one entry to pick between when Caddy
-/// is the immediate hop — a forged value from the actual client never
-/// survives the proxy. `.next()` on the split is just reading that one
-/// value; it isn't load-bearing leftmost-vs-rightmost logic. (A different
-/// proxy, or a chain of more than one, could behave differently — recheck if
-/// the deployment ever changes from a single Caddy hop.)
+/// The client IP to key rate limiting on. Behind a reverse proxy the socket
+/// address is the proxy's, so every real client would collapse into one IP
+/// and share a single budget — but a client-supplied `X-Forwarded-For` is
+/// forgeable, so the header is only usable if we know exactly how many
+/// trusted hops appended to it. That is what `trusted_hops`
+/// (`--rpc-trusted-proxy-hops`) states, and it defaults to 0: trust nothing,
+/// key on the socket address.
 ///
-/// Only trusted from a loopback peer, though — the documented deployment is
-/// the proxy running on the same host and forwarding to a loopback-bound RPC
-/// (`rpc_bind` defaults to `127.0.0.1`). Trusting the header from *any* peer
-/// would mean a direct connection (a stray `--rpc-bind 0.0.0.0` before the
-/// proxy's wired up, a misconfigured deploy) could set a fresh
-/// `X-Forwarded-For` on every request and the rate limiter would never
-/// trigger — silently, no log line. A non-loopback peer always gets its own
-/// real `addr`, spoofable header or not.
-fn client_ip(req: &Request, addr: SocketAddr) -> IpAddr {
-    if !addr.ip().is_loopback() {
+/// Entries are counted from the *right*, never the left. Each trusted proxy
+/// appends the address it observed (nginx's `$proxy_add_x_forwarded_for`),
+/// so the last entry was appended by the hop nearest this node and the
+/// client's own address was appended by the outermost trusted proxy —
+/// exactly `trusted_hops` entries from the end. Everything further left was
+/// supplied by the client and is ignored. The shipped deployment
+/// (`docker-compose.prod.yml`) is two appending hops, nginx-proxy →
+/// gateway → arxd, so it runs with `--rpc-trusted-proxy-hops 2`.
+///
+/// A header with fewer entries than the configured hop count means the
+/// request did not arrive through the configured chain, so it falls back to
+/// the socket address rather than picking whatever is there.
+fn client_ip(req: &Request, addr: SocketAddr, trusted_hops: usize) -> IpAddr {
+    if trusted_hops == 0 {
         return addr.ip();
     }
-    let header_ip = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .and_then(|v| v.parse::<IpAddr>().ok())
+    let Some(forwarded) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return addr.ip();
     };
-    header_ip("x-forwarded-for")
-        .or_else(|| header_ip("x-real-ip"))
+    let entries: Vec<&str> = forwarded.split(',').map(str::trim).collect();
+    entries
+        .len()
+        .checked_sub(trusted_hops)
+        .and_then(|i| entries[i].parse::<IpAddr>().ok())
         .unwrap_or(addr.ip())
 }
 
@@ -300,7 +301,10 @@ async fn guard<P: Payload>(
         }
     }
 
-    if !state.rate_limiter.allow(client_ip(&req, addr), is_write) {
+    if !state
+        .rate_limiter
+        .allow(client_ip(&req, addr, state.trusted_proxy_hops), is_write)
+    {
         record_request(&path, StatusCode::TOO_MANY_REQUESTS);
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
@@ -321,8 +325,8 @@ fn record_request(path: &str, status: StatusCode) {
 
 /// Renders the current metrics snapshot in Prometheus text format. Outside
 /// the bearer-token guard (metrics aren't secret and this endpoint isn't
-/// meant to be internet-facing — see `docker-compose.prod.yml` / `Caddyfile.prod`,
-/// which don't route it through the public TLS proxy).
+/// meant to be internet-facing — see `docker-compose.prod.yml`, whose gateway
+/// returns 404 for it rather than proxying it).
 async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -388,6 +392,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         db,
         rpc_token: rpc_token.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new(&limits)),
+        trusted_proxy_hops: limits.rpc_trusted_proxy_hops,
         gossip_tx,
         metrics_handle,
         payload_precheck,
@@ -412,9 +417,10 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         runtime.block_on(async move {
             // /metrics is deliberately outside the guarded router below — a
             // scrape endpoint shouldn't need the RPC bearer token, and it's
-            // never routed through the public TLS proxy in production (see
-            // Caddyfile.prod) since it's only meant for an internal scraper
-            // on the same docker network.
+            // never routed through the public TLS proxy in production (the
+            // gateway in docker-compose.prod.yml returns 404 for it) since
+            // it's only meant for an internal scraper on the same docker
+            // network.
             let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))
                 .layer(DefaultBodyLimit::max(limits.rpc_max_body_bytes))
@@ -1418,6 +1424,53 @@ mod rate_limiter_tests {
 }
 
 #[cfg(test)]
+mod client_ip_tests {
+    use super::{Request, client_ip};
+    use std::net::{IpAddr, SocketAddr};
+
+    fn request(forwarded: Option<&str>) -> Request {
+        let mut builder = axum::http::Request::builder();
+        if let Some(value) = forwarded {
+            builder = builder.header("x-forwarded-for", value);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    /// The gateway's own address. Every client shares it, which is exactly
+    /// why keying on it is not good enough behind a proxy.
+    fn peer() -> SocketAddr {
+        "172.18.0.5:41000".parse().unwrap()
+    }
+
+    /// The shipped topology: two appending hops. The client prepends a forged
+    /// entry; counting from the right must skip it.
+    #[test]
+    fn two_trusted_hops_take_the_client_entry_not_the_forged_leftmost_one() {
+        let req = request(Some("9.9.9.9, 203.0.113.7, 172.18.0.4"));
+        let expected: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(client_ip(&req, peer(), 2), expected);
+    }
+
+    /// The default. An unconfigured node must not believe a header at all,
+    /// including from a peer that reaches it directly.
+    #[test]
+    fn zero_trusted_hops_ignores_the_header() {
+        let req = request(Some("9.9.9.9"));
+        assert_eq!(client_ip(&req, peer(), 0), peer().ip());
+    }
+
+    /// Fewer entries than configured hops means the request did not come
+    /// through the configured chain — fall back rather than trust whatever
+    /// the client put there.
+    #[test]
+    fn a_chain_shorter_than_the_configured_hop_count_falls_back_to_the_socket_address() {
+        let req = request(Some("9.9.9.9"));
+        assert_eq!(client_ip(&req, peer(), 2), peer().ip());
+        assert_eq!(client_ip(&request(None), peer(), 2), peer().ip());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
@@ -1446,6 +1499,7 @@ mod tests {
             db: ArxiumDb::open(&dir).unwrap(),
             rpc_token: None,
             rate_limiter: Arc::new(RateLimiter::new(&Limits::default())),
+            trusted_proxy_hops: 0,
             gossip_tx: None,
             // Not installed as the global recorder — tests don't assert on
             // rendered metric values, just that requests still succeed.
@@ -1596,33 +1650,6 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["active_amount"], 2_500);
         });
-    }
-
-    #[test]
-    fn client_ip_trusts_forwarded_header_only_from_a_loopback_peer() {
-        let real_attacker: SocketAddr = "203.0.113.5:12345".parse().unwrap();
-        let proxy: SocketAddr = "127.0.0.1:9999".parse().unwrap();
-        let spoofed = "198.51.100.7";
-
-        let req = Request::builder()
-            .header("x-forwarded-for", spoofed)
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(
-            client_ip(&req, real_attacker),
-            real_attacker.ip(),
-            "a direct, non-loopback peer must never have its header trusted"
-        );
-
-        let req = Request::builder()
-            .header("x-forwarded-for", spoofed)
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(
-            client_ip(&req, proxy),
-            spoofed.parse::<IpAddr>().unwrap(),
-            "the local reverse proxy's forwarded header must still be honored"
-        );
     }
 
     #[test]

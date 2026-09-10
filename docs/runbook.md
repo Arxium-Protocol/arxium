@@ -12,10 +12,16 @@ One `arxd` process = one node. A node is a **validator** if started with
 otherwise (accepts/relays blocks only). RPC (`30333`, HTTP) and P2P (`30334`,
 TCP+QUIC) are separate listeners — see `core/cli`'s `RunArgs` for every flag.
 
-Production topology (`docker-compose.prod.yml`): Caddy terminates TLS and
-reverse-proxies RPC over the private compose network; `arxd`'s RPC port is
-never published to the host. P2P (`30334`) is published directly — there's no
-TLS-terminating proxy in front of libp2p.
+Production topology (`docker-compose.prod.yml`): `nginx-proxy` terminates TLS
+(with `acme-companion` renewing the certificate) and forwards to the `gateway`
+nginx, which applies the edge rate limit (`nginx-gateway.conf`) and proxies RPC
+over the private compose network; `arxd`'s RPC port is never published to the
+host. That is **two** proxy hops, both appending to `X-Forwarded-For`, which is
+why the `arxd` command line carries `--rpc-trusted-proxy-hops 2` — without it
+the in-process rate limiter keys every internet client on the gateway's compose
+IP and one abusive client 429s everyone. Change the hop count whenever you add
+or remove a proxy in front of RPC. P2P (`30334`) is published directly — there's
+no TLS-terminating proxy in front of libp2p.
 
 ## First-time setup (install script)
 
