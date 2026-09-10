@@ -20,8 +20,8 @@ fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<[u8; 32]> {
     let seed: [u8; 32] = if path.exists() {
         let hex_seed =
             std::fs::read_to_string(path).with_context(|| format!("failed to read {what} file"))?;
-        let seed_bytes =
-            hex::decode(hex_seed.trim()).with_context(|| format!("{what} file is not valid hex"))?;
+        let seed_bytes = hex::decode(hex_seed.trim())
+            .with_context(|| format!("{what} file is not valid hex"))?;
         seed_bytes
             .as_slice()
             .try_into()

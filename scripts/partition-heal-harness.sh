@@ -22,6 +22,11 @@
 # node follows the protocol exactly, one just cannot hear the others — and
 # none of the stake assertions apply. Same scaffolding, different fault.
 #
+# HEAL_WHEN selects which unwind path the run aims at — `finalized` (default)
+# for the peer-driven recovery, `votes` for arxd/finality's
+# enforce_certificate, which is unreachable in the default mode. See the
+# HEAL_WHEN block below.
+#
 # Exit codes:
 #   0  pass
 #   1  fail — the chain did the wrong thing
@@ -51,6 +56,32 @@ STARTUP_TIMEOUT=30
 # attempted (arxd/network/src/lib.rs), then a Hashes round trip and a
 # Certificate round trip on top. Slack, not a tight bound.
 CHAIN_TIMEOUT=300
+
+# Which unwind path the run is aiming at. See the "checking the healed node
+# unwound" block for why these are not interchangeable.
+#
+#   finalized  the majority certifies TARGET_H while the victim is still cut
+#              off, so the victim can only learn about it from a peer later.
+#              Exercises the executor's finality gate and arxd/network's
+#              peer-driven recovery.
+#   votes      the victim rejoins while the majority is *still voting* on
+#              TARGET_H, tallies a quorum for a hash it disagrees with, and
+#              unwinds on its own evidence. The only way arxd/finality's
+#              enforce_certificate is reachable from a live network.
+HEAL_WHEN="${HEAL_WHEN:-finalized}"
+case "$HEAL_WHEN" in
+    finalized|votes) ;;
+    *) echo "HEAL_WHEN must be 'finalized' or 'votes', got '$HEAL_WHEN'" >&2; exit 1 ;;
+esac
+
+# Only used by HEAL_WHEN=votes, where it is what makes the window
+# deterministic rather than a race. The real timeout is 8s
+# (arxd/finality's ROUND_TIMEOUT), and a kill/restart is most of that
+# before the victim can receive anything, so at 8s the run would come back
+# inconclusive far more often than not. Widening it leaves the majority
+# inside round 0 while the restart finishes. Needs a fault-injection build;
+# `ensure_fault_injection_allowed` refuses it on a real chain name.
+ROUND_TIMEOUT_SECS="${ROUND_TIMEOUT_SECS:-45}"
 
 if [ "$NUM_VALIDATORS" -lt 4 ]; then
     echo "NUM_VALIDATORS must be >= 4: at n<4 a 3/1 split has no quorum on the" >&2
@@ -156,7 +187,12 @@ start_node() {
     # rather than trusting the caller's: a harness whose verdict depends on an
     # ambient variable is a harness that reports different results on two
     # machines running the same code.
-    env RUST_LOG="${RUST_LOG:-info}" "$@" "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[$i]}" --validator \
+    # HEAL_WHEN=votes slows every node's round timeout, not just the
+    # victim's: it is the *majority* that has to still be in round 0 when
+    # the victim finishes restarting.
+    local slow_rounds=()
+    [ "$HEAL_WHEN" = votes ] && slow_rounds=("ARXD_ROUND_TIMEOUT_SECS=$ROUND_TIMEOUT_SECS")
+    env RUST_LOG="${RUST_LOG:-info}" ${slow_rounds[@]+"${slow_rounds[@]}"} "$@" "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[$i]}" --validator \
         --port "${RPC_PORTS[$i]}" --p2p-port "${P2P_PORTS[$i]}" --rpc-bind 127.0.0.1 \
         ${bootnode[@]+"${bootnode[@]}"} \
         >>"$ROOT/node-$i.log" 2>&1 &
@@ -194,7 +230,10 @@ status_field() { curl -sf "http://127.0.0.1:$1/status" | jq -r ".$2 // 0"; }
 # serves the block struct, which has no hash field, and comparing state_roots
 # would be wrong here — two empty blocks by different proposers at the same
 # height share a state_root while being different blocks.
-hash_at() { curl -sf "http://127.0.0.1:$1/blocks/$(($2 + 1))" | jq -r '.parent_hash // ""'; }
+# Tolerates a 404: HEAL_WHEN=votes polls for this height before the majority
+# has built it, and a bare `curl -sf` in a pipefail pipeline exits 22 and
+# takes the whole run with it. Empty string means "not there yet".
+hash_at() { { curl -sf "http://127.0.0.1:$1/blocks/$(($2 + 1))" || true; } | jq -r '.parent_hash // ""'; }
 
 # Highest tip seen on each majority node, so "never moved backward" is
 # checked against every sample taken, not just the two endpoints.
@@ -312,37 +351,21 @@ done
 ISOLATED_HASH="$(curl -sf "http://127.0.0.1:$RPC_VICTIM/status" | jq -r '.tip_hash // ""')"
 VICTIM_WATERMARK="$(status_field "$RPC_VICTIM" final_watermark)"
 
-echo "waiting for the majority to finalize past $TARGET_H..."
-deadline=$(($(date +%s) + CHAIN_TIMEOUT))
-majority_watermark=0
-while [ "$(date +%s)" -lt "$deadline" ]; do
-    majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
-    [ "$majority_watermark" -gt "$TARGET_H" ] && break
-    sample_majority || true
-    sleep 2
-done
-MAJORITY_HASH="$(hash_at "$RPC_MAJORITY" "$TARGET_H")"
-
-# --- Step 4: the precondition. Never skipped, never a soft warning. ----------
+# --- Step 4a: the half of the precondition that holds in both modes ----------
 #
 # Everything after this only means something if the two sides actually built
 # different blocks at the same height. A heal that "recovers" a chain which
 # never diverged is indistinguishable from a working one, so each of these
 # exits 3 rather than continuing to the recovery assertions.
-echo "checking the partition actually diverged the chain (precondition)..."
+echo "checking the isolated node built its own block at $TARGET_H (precondition)..."
 [ "$victim_tip" -eq "$TARGET_H" ] \
     || inconclusive "isolated node's tip is $victim_tip, expected exactly $TARGET_H — it never produced alone"
-[ -n "$ISOLATED_HASH" ] && [ -n "$MAJORITY_HASH" ] \
-    || inconclusive "could not read both hashes at $TARGET_H (isolated '$ISOLATED_HASH', majority '$MAJORITY_HASH')"
-[ "$ISOLATED_HASH" != "$MAJORITY_HASH" ] \
-    || inconclusive "both sides hold the same block $ISOLATED_HASH at $TARGET_H — the victim heard the majority before the cut landed, so there is no divergence to heal"
+[ -n "$ISOLATED_HASH" ] \
+    || inconclusive "could not read the isolated node's hash at $TARGET_H"
 [ "$VICTIM_WATERMARK" -lt "$TARGET_H" ] \
     || inconclusive "isolated node's watermark is $VICTIM_WATERMARK, not below $TARGET_H — it finalized alone, which means it was never actually isolated"
-[ "$majority_watermark" -gt "$TARGET_H" ] \
-    || inconclusive "majority watermark is $majority_watermark, never passed $TARGET_H — the majority stalled instead of finalizing without the victim"
-echo "  ok: divergence at $TARGET_H — isolated $ISOLATED_HASH vs majority $MAJORITY_HASH"
+echo "  ok: isolated node committed $ISOLATED_HASH at $TARGET_H"
 echo "  ok: isolated watermark $VICTIM_WATERMARK < $TARGET_H (it committed without finalizing)"
-echo "  ok: majority watermark $majority_watermark > $TARGET_H (it finalized without the victim)"
 
 # ponytail: exactly one diverged block, not several. An isolated validator
 # can only produce on its own round-0 slot and cannot advance a round
@@ -353,46 +376,128 @@ echo "  ok: majority watermark $majority_watermark > $TARGET_H (it finalized wit
 # can reach. Add that only if the unwind ever needs to be proven for depth
 # > 1.
 
+if [ "$HEAL_WHEN" = finalized ]; then
+    # The majority is left alone to certify TARGET_H before the victim comes
+    # back, so by the time it reconnects the precommit votes for that height
+    # are already deleted (see the unwind check below).
+    echo "waiting for the majority to finalize past $TARGET_H..."
+    deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+    majority_watermark=0
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
+        [ "$majority_watermark" -gt "$TARGET_H" ] && break
+        sample_majority || true
+        sleep 2
+    done
+    MAJORITY_HASH="$(hash_at "$RPC_MAJORITY" "$TARGET_H")"
+else
+    # HEAL_WHEN=votes: the whole point is to heal *before* the majority has
+    # built TARGET_H, so it is still gossiping precommits for that height
+    # when the victim rejoins. Assert that it really has not yet, or the run
+    # is the `finalized` variant wearing this label.
+    majority_tip="$(status_field "$RPC_MAJORITY" tip_height)"
+    majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
+    [ "$majority_tip" -lt "$TARGET_H" ] \
+        || inconclusive "majority is already at tip $majority_tip before the heal — round 0's timeout expired while the victim was being cut, so the precommits this variant needs are already in flight or gone. Raise ROUND_TIMEOUT_SECS (currently $ROUND_TIMEOUT_SECS)."
+    [ "$majority_watermark" -lt "$TARGET_H" ] \
+        || inconclusive "majority watermark is already $majority_watermark before the heal — it finalized $TARGET_H without the victim, which is the \`finalized\` variant"
+    echo "  ok: majority still inside round 0 at tip $majority_tip (it has not proposed $TARGET_H yet)"
+fi
+
 # --- Heal --------------------------------------------------------------------
-HEAL_FROM_TIP="$(status_field "$RPC_MAJORITY" tip_height)"
 echo "healing the partition (restarting node $VICTIM without the block list)..."
 kill "${PIDS[$VICTIM]}" 2>/dev/null || true
 wait "${PIDS[$VICTIM]}" 2>/dev/null || true
 start_node "$VICTIM"
 wait_for_rpc "$RPC_VICTIM" || { echo "victim never came back up, see $ROOT/node-$VICTIM.log" >&2; exit 1; }
 
-echo "waiting for the healed node to converge past $HEAL_FROM_TIP (timeout ${CHAIN_TIMEOUT}s)..."
+if [ "$HEAL_WHEN" = votes ]; then
+    # Re-checked *after* the restart, not just before it: the restart is the
+    # slow part (process boot, RPC up, dial, identify, a gossipsub mesh
+    # heartbeat), and gossipsub does not replay. If the majority finalized
+    # TARGET_H during those seconds, the votes are deleted, the victim can
+    # only be rescued by the peer-driven path, and the run tests the same
+    # thing the `finalized` variant already tests. That is a no-op run for
+    # this variant's purpose, so it exits 3 rather than passing on the
+    # recovery path. Strictly below, not "at or below": a watermark equal to
+    # TARGET_H already means TARGET_H is final.
+    majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
+    [ "$majority_watermark" -lt "$TARGET_H" ] \
+        || inconclusive "the majority finalized $TARGET_H (watermark $majority_watermark) while the victim was restarting — its precommits are deleted, so this run is the \`finalized\` variant wearing the \`votes\` label"
+    echo "  ok: majority watermark still $majority_watermark < $TARGET_H at the moment of heal"
+
+    echo "waiting for the majority to propose $TARGET_H at round 1 and finalize it..."
+    deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+    MAJORITY_HASH=""
+    majority_watermark=0
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        sample_majority || true
+        [ -n "$MAJORITY_HASH" ] || MAJORITY_HASH="$(hash_at "$RPC_MAJORITY" "$TARGET_H")"
+        majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
+        [ "$majority_watermark" -gt "$TARGET_H" ] && break
+        sleep 1
+    done
+    [ -n "$MAJORITY_HASH" ] || MAJORITY_HASH="$(hash_at "$RPC_MAJORITY" "$TARGET_H")"
+fi
+
+# --- Step 4b: divergence itself ---------------------------------------------
+echo "checking the partition actually diverged the chain (precondition)..."
+[ -n "$MAJORITY_HASH" ] \
+    || inconclusive "could not read the majority's hash at $TARGET_H"
+[ "$ISOLATED_HASH" != "$MAJORITY_HASH" ] \
+    || inconclusive "both sides hold the same block $ISOLATED_HASH at $TARGET_H — the victim heard the majority before the cut landed, so there is no divergence to heal"
+[ "$majority_watermark" -gt "$TARGET_H" ] \
+    || inconclusive "majority watermark is $majority_watermark, never passed $TARGET_H — the majority stalled instead of finalizing without the victim"
+echo "  ok: divergence at $TARGET_H — isolated $ISOLATED_HASH vs majority $MAJORITY_HASH"
+echo "  ok: majority watermark $majority_watermark > $TARGET_H (it finalized without the victim)"
+
+CONVERGE_FROM="$(status_field "$RPC_MAJORITY" tip_height)"
+echo "waiting for the healed node to converge past $CONVERGE_FROM (timeout ${CHAIN_TIMEOUT}s)..."
 deadline=$(($(date +%s) + CHAIN_TIMEOUT))
 converged=false
 while [ "$(date +%s)" -lt "$deadline" ]; do
     sample_majority || true
     victim_tip="$(status_field "$RPC_VICTIM" tip_height)"
-    if [ "$victim_tip" -gt "$HEAL_FROM_TIP" ]; then converged=true; break; fi
+    if [ "$victim_tip" -gt "$CONVERGE_FROM" ]; then converged=true; break; fi
     sleep 2
 done
 
 pass=true
 
 echo "checking the healed node unwound its own block..."
-# Two paths can do this, and which one fires depends on how far ahead the
-# majority got. `finality:` is arxd/finality's enforce_certificate, reached
-# when a live quorum of precommit votes lands for a height this node holds a
-# different block at. `reverted from height` is arxd/network's peer-driven
-# recovery, reached when the node keeps rejecting a peer's blocks and then
-# verifies that peer's certificate itself.
+# Two different code paths can do this, and they are not interchangeable.
 #
-# In this scenario the second one is what actually fires, and the first is
-# structurally unreachable: the majority finalizes TARGET_H while the victim
-# is still cut off, and precommit votes are deleted once a height finalizes
-# and are never re-gossiped (see recovery.rs's BackfillingCertificate note),
-# so no vote for TARGET_H can reach the victim after it reconnects. Both are
-# accepted anyway — a run that heals fast enough to catch the majority still
-# voting on TARGET_H would legitimately take the finality path, and that is
-# a pass too, not a surprise worth failing on.
-if grep -q "finality: certificate for height $TARGET_H names" "$ROOT/node-$VICTIM.log"; then
-    echo "  ok (finality path): $(grep -o "finality: certificate for height $TARGET_H names.*" "$ROOT/node-$VICTIM.log" | head -n 1)"
-elif grep -q "reverted from height" "$ROOT/node-$VICTIM.log"; then
-    echo "  ok (recovery path): $(grep -o 'reverted from height.*' "$ROOT/node-$VICTIM.log" | head -n 1)"
+#   `finality: certificate for height N names X` is arxd/finality's
+#   enforce_certificate — this node tallied a live quorum of precommit
+#   votes for a height it holds a different block at, and acted on its own
+#   evidence.
+#
+#   `reverted from height` is arxd/network's peer-driven recovery — this
+#   node kept rejecting a peer's blocks, gave up after
+#   MAX_CONSECUTIVE_SYNC_FAILURES, and then verified that peer's
+#   certificate.
+#
+# HEAL_WHEN=finalized can only ever take the second: the majority certifies
+# TARGET_H while the victim is cut off, and precommit votes are deleted once
+# a height finalizes and are never re-gossiped (see recovery.rs's
+# BackfillingCertificate note), so no vote for TARGET_H can reach the victim
+# afterwards. enforce_certificate is structurally unreachable there, which is
+# exactly why HEAL_WHEN=votes exists — and why it insists on the first line
+# rather than accepting either. Accepting either would let the peer-driven
+# path satisfy a check written to cover enforce_certificate.
+finality_line="$(grep -o "finality: certificate for height $TARGET_H names.*" "$ROOT/node-$VICTIM.log" | head -n 1 || true)"
+recovery_line="$(grep -o 'reverted from height.*' "$ROOT/node-$VICTIM.log" | head -n 1 || true)"
+if [ -n "$finality_line" ]; then
+    echo "  ok (finality path): $finality_line"
+elif [ "$HEAL_WHEN" = votes ]; then
+    if [ -n "$recovery_line" ]; then
+        inconclusive "the peer-driven path unwound the victim first ($recovery_line) — enforce_certificate was never reached, so PR #3's code was not exercised. The heal lost the race with MAX_CONSECUTIVE_SYNC_FAILURES; raise ROUND_TIMEOUT_SECS (currently $ROUND_TIMEOUT_SECS)."
+    fi
+    echo "  FAIL: healed node never unwound (tip $victim_tip); last lines:"
+    tail -n 30 "$ROOT/node-$VICTIM.log"
+    pass=false
+elif [ -n "$recovery_line" ]; then
+    echo "  ok (recovery path): $recovery_line"
 else
     echo "  FAIL: healed node never unwound (tip $victim_tip); last lines:"
     tail -n 30 "$ROOT/node-$VICTIM.log"
@@ -400,7 +505,7 @@ else
 fi
 
 if [ "$converged" != true ]; then
-    echo "  FAIL: healed node stalled at tip $victim_tip, majority was at $HEAL_FROM_TIP when the partition healed"
+    echo "  FAIL: healed node stalled at tip $victim_tip, majority was at $CONVERGE_FROM after the heal"
     pass=false
 fi
 
@@ -466,9 +571,16 @@ done
 
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — the partition diverged the chain at $TARGET_H, the majority"
-    echo "finalized without the isolated node, and on healing that node unwound its"
-    echo "own committed block and converged on the certified chain."
+    if [ "$HEAL_WHEN" = votes ]; then
+        echo "PASS — the partition diverged the chain at $TARGET_H, and the isolated"
+        echo "node rejoined while the majority was still voting: it tallied a quorum"
+        echo "for a hash it disagreed with and unwound on its own evidence"
+        echo "(arxd/finality's enforce_certificate), without waiting for a peer."
+    else
+        echo "PASS — the partition diverged the chain at $TARGET_H, the majority"
+        echo "finalized without the isolated node, and on healing that node unwound its"
+        echo "own committed block and converged on the certified chain."
+    fi
     # Kept, not deleted: the fault harness lost a session to comparing a run
     # against logs that had already been cleaned up.
     echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"

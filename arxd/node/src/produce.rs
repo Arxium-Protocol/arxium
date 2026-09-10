@@ -3,19 +3,19 @@
 
 use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, STALL_SUSPECT_AFTER, now_secs};
 use anyhow::{Ok, Result};
-use ed25519_dalek::SigningKey;
 use arxd_finality::FinalityEvent;
+use ed25519_dalek::SigningKey;
 use metrics::{counter, gauge, histogram};
-use xc_runtime_api::ChainRuntime;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
-use xc_runtime_api::DispatchCtx;
 use xc_executor::{ExecutionOutcome, execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, eligible_proposer, quorum};
+use xc_runtime_api::ChainRuntime;
+use xc_runtime_api::DispatchCtx;
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
 /// Height this node is armed to corrupt its own state_root at, set once
@@ -107,10 +107,15 @@ pub fn produce_block<R: ChainRuntime>(
         view.apply_accounts(&account_updates)?;
         view.apply_stakes(&stake_updates)?;
         view.apply_asset_balances(&asset_updates)?;
-        let sealed_updates = R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
+        let sealed_updates =
+            R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
         account_updates.0.extend(sealed_updates.accounts.0);
-        stake_updates.allocations.extend(sealed_updates.stakes.allocations);
-        stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
+        stake_updates
+            .allocations
+            .extend(sealed_updates.stakes.allocations);
+        stake_updates
+            .validator_index
+            .extend(sealed_updates.stakes.validator_index);
         asset_updates.0.extend(sealed_updates.assets.0);
     }
 
@@ -127,7 +132,8 @@ pub fn produce_block<R: ChainRuntime>(
     // recompute from the same overlay before accepting this block — must be
     // known before signing, since the signature covers it.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+        let mut overlay: Vec<&dyn BatchWritable> =
+            vec![&account_updates, &stake_updates, &asset_updates];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
         }
@@ -165,7 +171,10 @@ pub fn produce_block<R: ChainRuntime>(
         let hex_part = state_root.strip_prefix("0x").unwrap_or(&state_root);
         let mut bytes = hex::decode(hex_part).expect("state_root is always valid hex");
         bytes[0] ^= 0x01;
-        warn!(height = next_height, "fault-injection: corrupted this block's state_root for an acceptance test");
+        warn!(
+            height = next_height,
+            "fault-injection: corrupted this block's state_root for an acceptance test"
+        );
         format!("0x{}", hex::encode(bytes))
     } else {
         state_root
@@ -196,8 +205,11 @@ pub fn produce_block<R: ChainRuntime>(
     // check) so this stays correct however `produce_block` is called,
     // including directly from tests. See `xc_primitives::Block::round`.
     let round = db.current_round(next_height)?;
-    let round_certificate =
-        if round == 0 { None } else { db.get_round_certificate(next_height, round - 1)? };
+    let round_certificate = if round == 0 {
+        None
+    } else {
+        db.get_round_certificate(next_height, round - 1)?
+    };
 
     let mut new_block = Block {
         height: next_height,
@@ -225,7 +237,8 @@ pub fn produce_block<R: ChainRuntime>(
     // signed above is unaffected.
     let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
 
-    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+    let mut writables: Vec<&dyn BatchWritable> =
+        vec![&account_updates, &stake_updates, &asset_updates];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -486,8 +499,8 @@ fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Dura
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
     use arxd_runtime::{ACTION_FEE, ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
+    use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
     use xc_executor::BlockUpdates;
     use xc_primitives::{AccountEntry, Snapshot, expected_proposer};
@@ -529,7 +542,10 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let ExecutionOutcome { accounts: genesis_updates, .. } = execute_actions(
+        let ExecutionOutcome {
+            accounts: genesis_updates,
+            ..
+        } = execute_actions(
             &db,
             genesis.actions.clone(),
             &[],
@@ -563,7 +579,7 @@ mod tests {
                 nonce: 0,
                 identity_hash: None,
                 zk_identity_verified: false,
-            attested_by: None,
+                attested_by: None,
             },
         );
         db.write_batch(&Snapshot {
@@ -573,7 +589,7 @@ mod tests {
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
             attestor: None,
-        governor: None,
+            governor: None,
         })
         .unwrap();
 
@@ -648,16 +664,25 @@ mod tests {
             // which is a different rule and correctly enforced elsewhere.
             let primary_1 = expected_proposer(&validators, 1).unwrap();
             let key_1 = if primary_1 == addr_a { &key_a } else { &key_b };
-            let block1 =
-                produce_block::<CoreChainRuntime>(&db, vec![], now_secs() - elapsed, Some((&primary_1, key_1)))
-                    .unwrap();
+            let block1 = produce_block::<CoreChainRuntime>(
+                &db,
+                vec![],
+                now_secs() - elapsed,
+                Some((&primary_1, key_1)),
+            )
+            .unwrap();
 
             // Exactly the decision `produce_loop` makes before producing.
             let eligible = eligible_proposer(&validators, 2, db.current_round(2).unwrap()).unwrap();
             covered.insert(eligible.clone());
             let key_2 = if eligible == addr_a { &key_a } else { &key_b };
-            let block2 =
-                produce_block::<CoreChainRuntime>(&db, vec![], now_secs(), Some((&eligible, key_2))).unwrap();
+            let block2 = produce_block::<CoreChainRuntime>(
+                &db,
+                vec![],
+                now_secs(),
+                Some((&eligible, key_2)),
+            )
+            .unwrap();
 
             // Re-validate on a fresh chain holding the same history, the way a
             // peer receiving these over gossip would.
@@ -677,8 +702,12 @@ mod tests {
                     ACTION_FEE,
                     |action, view, operator_lookup, operator_validators_lookup, vals| {
                         dispatch(
-                            action, view, operator_lookup,
-                            operator_validators_lookup, vals, height,
+                            action,
+                            view,
+                            operator_lookup,
+                            operator_validators_lookup,
+                            vals,
+                            height,
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                         )
                     },
@@ -697,7 +726,11 @@ mod tests {
         // No RoundCertificate was ever persisted, so current_round stays 0
         // for every iteration — only the primary is ever eligible for
         // height 2.
-        assert_eq!(covered.len(), 1, "eligible_proposer should be pinned to a single validator");
+        assert_eq!(
+            covered.len(),
+            1,
+            "eligible_proposer should be pinned to a single validator"
+        );
     }
 
     /// A produced block always advances past its parent's timestamp, even when
@@ -725,10 +758,12 @@ mod tests {
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
 
-        let block1 = produce_block::<CoreChainRuntime>(&db, vec![], 1_000_000, Some((&addr, &key))).unwrap();
+        let block1 =
+            produce_block::<CoreChainRuntime>(&db, vec![], 1_000_000, Some((&addr, &key))).unwrap();
 
         // Clock jumps backwards, and then stands still.
-        let block2 = produce_block::<CoreChainRuntime>(&db, vec![], 500_000, Some((&addr, &key))).unwrap();
+        let block2 =
+            produce_block::<CoreChainRuntime>(&db, vec![], 500_000, Some((&addr, &key))).unwrap();
         assert!(
             block2.timestamp > block1.timestamp,
             "backwards clock produced a non-monotonic block: {} after {}",
@@ -736,8 +771,13 @@ mod tests {
             block1.timestamp,
         );
 
-        let block3 = produce_block::<CoreChainRuntime>(&db, vec![], block2.timestamp, Some((&addr, &key))).unwrap();
-        assert!(block3.timestamp > block2.timestamp, "a stalled clock must still advance");
+        let block3 =
+            produce_block::<CoreChainRuntime>(&db, vec![], block2.timestamp, Some((&addr, &key)))
+                .unwrap();
+        assert!(
+            block3.timestamp > block2.timestamp,
+            "a stalled clock must still advance"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

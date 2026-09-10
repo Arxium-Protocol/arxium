@@ -6,7 +6,6 @@ mod produce;
 mod validator;
 
 use crate::components::new_partial;
-use xc_runtime_api::ChainRuntime;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ed25519_dalek::Signer;
@@ -18,14 +17,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+use xc_runtime_api::ChainRuntime;
 
-use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use arxd_finality::{
-    Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
+    Dissent, DissentReason, FinalityEvent, PrecommitVote, RoundTimeoutVote, dissent_signing_bytes,
+    spawn_finality,
 };
 use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault};
 use xc_cli::{Cli, Command};
+use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
@@ -186,7 +187,10 @@ mod dissent_evidence_bridge_tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-node-dissent-evidence-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         (ArxiumDb::open(&dir).expect("open test db"), dir)
@@ -223,8 +227,9 @@ mod dissent_evidence_bridge_tests {
         .unwrap();
 
         let record = sample_record(5, block.hash(), voter.clone());
-        let event = dissent_record_to_evidence_event::<()>(&db, record)
-            .expect("a locally-held block with a registered voter key must yield an artifact event");
+        let event = dissent_record_to_evidence_event::<()>(&db, record).expect(
+            "a locally-held block with a registered voter key must yield an artifact event",
+        );
 
         match event {
             EvidenceEvent::ExecutionDisagreement { proposed, dissent } => {
@@ -358,7 +363,10 @@ fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
             return None;
         }
         Err(err) => {
-            warn!("failed to read block at height {} for dissent evidence: {err}", record.height);
+            warn!(
+                "failed to read block at height {} for dissent evidence: {err}",
+                record.height
+            );
             return None;
         }
     };
@@ -372,7 +380,10 @@ fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
             return None;
         }
         Err(err) => {
-            warn!("failed to read BLS key for dissenter {}: {err}", record.voter);
+            warn!(
+                "failed to read BLS key for dissenter {}: {err}",
+                record.voter
+            );
             return None;
         }
     };
@@ -387,7 +398,10 @@ fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
         voter_pubkey: format!("0x{}", hex::encode(voter_pubkey.0)),
         signature: format!("0x{}", hex::encode(record.signature.0)),
     };
-    Some(EvidenceEvent::ExecutionDisagreement { proposed, dissent: attestation })
+    Some(EvidenceEvent::ExecutionDisagreement {
+        proposed,
+        dissent: attestation,
+    })
 }
 
 /// Spawns every subsystem thread (evidence watcher, finality, the
@@ -430,7 +444,10 @@ fn spawn_subsystems<R: ChainRuntime>(
             round_certificate: None,
         };
         R::build_evidence_action(
-            EquivocationEvidence { block_a: dummy_block(), block_b: dummy_block() },
+            EquivocationEvidence {
+                block_a: dummy_block(),
+                block_b: dummy_block(),
+            },
             address,
             0,
         )?;
@@ -438,19 +455,21 @@ fn spawn_subsystems<R: ChainRuntime>(
         let address = address.clone();
         let key = key.clone();
         let db = db.clone();
-        Some(move |evidence: EquivocationEvidence<R::Payload>| -> Action<R::Payload> {
-            let nonce = db
-                .get_account(&address)
-                .ok()
-                .flatten()
-                .map(|entry| entry.nonce)
-                .unwrap_or(0);
-            let mut action = R::build_evidence_action(evidence, &address, nonce)
-                .expect("probed Some for this runtime at startup");
-            let signature = key.sign(&action.signing_bytes());
-            action.signature = Some(hex::encode(signature.to_bytes()));
-            action
-        })
+        Some(
+            move |evidence: EquivocationEvidence<R::Payload>| -> Action<R::Payload> {
+                let nonce = db
+                    .get_account(&address)
+                    .ok()
+                    .flatten()
+                    .map(|entry| entry.nonce)
+                    .unwrap_or(0);
+                let mut action = R::build_evidence_action(evidence, &address, nonce)
+                    .expect("probed Some for this runtime at startup");
+                let signature = key.sign(&action.signing_bytes());
+                action.signature = Some(hex::encode(signature.to_bytes()));
+                action
+            },
+        )
     });
     // Same probe-once-at-startup pattern as `build_evidence_action` above,
     // for `BlockDivergence` faults (see `ChainRuntime::build_execution_fault_action`).
@@ -512,8 +531,7 @@ fn spawn_subsystems<R: ChainRuntime>(
     // blocks and peer precommit votes both funnel in as `FinalityEvent`s;
     // freshly-signed votes come back out on `finality_vote_rx` to be
     // gossiped over the network layer's precommit topic.
-    let (finality_event_tx, finality_event_rx) =
-        std_mpsc::channel::<FinalityEvent<R::Payload>>();
+    let (finality_event_tx, finality_event_rx) = std_mpsc::channel::<FinalityEvent<R::Payload>>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
     let (finality_round_timeout_tx, finality_round_timeout_rx) =
         std_mpsc::channel::<RoundTimeoutVote>();
@@ -748,12 +766,24 @@ fn spawn_subsystems<R: ChainRuntime>(
                                 // without a matching arm here must not panic the
                                 // block-handling path: skip the dissent instead.
                                 let dissent_fields = match &err {
-                                    AcceptBlockError::StateRootMismatch { expected, touched_keys, .. } => {
-                                        Some((expected.clone(), DissentReason::StateRootMismatch, touched_keys.clone()))
-                                    }
-                                    AcceptBlockError::ActionMismatch { local_state_root, touched_keys, .. } => {
-                                        Some((local_state_root.clone(), DissentReason::ActionMismatch, touched_keys.clone()))
-                                    }
+                                    AcceptBlockError::StateRootMismatch {
+                                        expected,
+                                        touched_keys,
+                                        ..
+                                    } => Some((
+                                        expected.clone(),
+                                        DissentReason::StateRootMismatch,
+                                        touched_keys.clone(),
+                                    )),
+                                    AcceptBlockError::ActionMismatch {
+                                        local_state_root,
+                                        touched_keys,
+                                        ..
+                                    } => Some((
+                                        local_state_root.clone(),
+                                        DissentReason::ActionMismatch,
+                                        touched_keys.clone(),
+                                    )),
                                     _ => {
                                         warn!(
                                             "is_execution_disagreement() true for a variant this match doesn't \
@@ -763,14 +793,15 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     }
                                 };
                                 if let Some((state_root, reason, touched_keys)) = dissent_fields {
-                                // A node that can't read its own parent stays quiet
-                                // instead of signing a dissent built on an EP it
-                                // never actually read — same principle that excludes
-                                // `Storage` errors from `is_execution_disagreement`
-                                // in the first place. Ok(None) (genesis, no parent)
-                                // is a legitimate empty EP, not a read failure.
-                                let parent_state_root =
-                                    match db.get_block::<R::Payload>(height.saturating_sub(1)) {
+                                    // A node that can't read its own parent stays quiet
+                                    // instead of signing a dissent built on an EP it
+                                    // never actually read — same principle that excludes
+                                    // `Storage` errors from `is_execution_disagreement`
+                                    // in the first place. Ok(None) (genesis, no parent)
+                                    // is a legitimate empty EP, not a read failure.
+                                    let parent_state_root = match db
+                                        .get_block::<R::Payload>(height.saturating_sub(1))
+                                    {
                                         Ok(Some(parent)) => parent.state_root,
                                         Ok(None) => String::new(),
                                         Err(err) => {
@@ -782,116 +813,155 @@ fn spawn_subsystems<R: ChainRuntime>(
                                             return false;
                                         }
                                     };
-                                let block_hash = candidate.hash();
-                                let ep = xc_poe::block_ep(&parent_state_root, &candidate.tx_root, &state_root);
-                                let proposer = candidate
-                                    .proposer
-                                    .as_ref()
-                                    .expect("signature already verified, proposer present");
-                                let header_commitment: [u8; 32] =
-                                    Sha256::digest(candidate.signing_bytes(proposer)).into();
-                                let msg = dissent_signing_bytes(
-                                    height,
-                                    &block_hash,
-                                    &state_root,
-                                    &header_commitment,
-                                    &ep,
-                                    reason.as_str(),
-                                );
-                                let signature = xc_bls::sign(bls_key, &msg);
-                                let dissent = Dissent {
-                                    height,
-                                    block_hash,
-                                    state_root: state_root.clone(),
-                                    header_commitment,
-                                    ep,
-                                    reason,
-                                    voter: address.clone(),
-                                    signature,
-                                };
-                                let _ = finality_event_tx.send(FinalityEvent::DissentObserved(dissent.clone()));
-                                let _ = dissent_tx.send(dissent.clone());
-                                if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
-                                    let attestation = DissentAttestation {
-                                        height: dissent.height,
-                                        block_hash: dissent.block_hash.clone(),
-                                        state_root: dissent.state_root.clone(),
-                                        header_commitment: format!("0x{}", hex::encode(dissent.header_commitment)),
-                                        ep: format!("0x{}", hex::encode(dissent.ep)),
-                                        reason: reason.as_str().to_string(),
-                                        voter: address.to_string(),
-                                        voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
-                                        signature: format!("0x{}", hex::encode(dissent.signature.0)),
+                                    let block_hash = candidate.hash();
+                                    let ep = xc_poe::block_ep(
+                                        &parent_state_root,
+                                        &candidate.tx_root,
+                                        &state_root,
+                                    );
+                                    let proposer = candidate
+                                        .proposer
+                                        .as_ref()
+                                        .expect("signature already verified, proposer present");
+                                    let header_commitment: [u8; 32] =
+                                        Sha256::digest(candidate.signing_bytes(proposer)).into();
+                                    let msg = dissent_signing_bytes(
+                                        height,
+                                        &block_hash,
+                                        &state_root,
+                                        &header_commitment,
+                                        &ep,
+                                        reason.as_str(),
+                                    );
+                                    let signature = xc_bls::sign(bls_key, &msg);
+                                    let dissent = Dissent {
+                                        height,
+                                        block_hash,
+                                        state_root: state_root.clone(),
+                                        header_commitment,
+                                        ep,
+                                        reason,
+                                        voter: address.clone(),
+                                        signature,
                                     };
-                                    let _ = evidence_tx.send(EvidenceEvent::ExecutionDisagreement {
-                                        proposed: candidate.clone(),
-                                        dissent: attestation,
-                                    });
+                                    let _ = finality_event_tx
+                                        .send(FinalityEvent::DissentObserved(dissent.clone()));
+                                    let _ = dissent_tx.send(dissent.clone());
+                                    if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
+                                        let attestation = DissentAttestation {
+                                            height: dissent.height,
+                                            block_hash: dissent.block_hash.clone(),
+                                            state_root: dissent.state_root.clone(),
+                                            header_commitment: format!(
+                                                "0x{}",
+                                                hex::encode(dissent.header_commitment)
+                                            ),
+                                            ep: format!("0x{}", hex::encode(dissent.ep)),
+                                            reason: reason.as_str().to_string(),
+                                            voter: address.to_string(),
+                                            voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                                            signature: format!(
+                                                "0x{}",
+                                                hex::encode(dissent.signature.0)
+                                            ),
+                                        };
+                                        let _ = evidence_tx.send(
+                                            EvidenceEvent::ExecutionDisagreement {
+                                                proposed: candidate.clone(),
+                                                dissent: attestation,
+                                            },
+                                        );
 
-                                    // Alongside the plain dissent, try to build the
-                                    // stronger BlockDivergence fraud proof: a proof
-                                    // per touched key against parent_state_root lets
-                                    // arx-verify replay the block and name a culpable
-                                    // party instead of just recording disagreement.
-                                    // Proving can fail (key pruned, db error) — that
-                                    // just means no fraud proof this time, not a
-                                    // reason to skip the dissent already sent above.
-                                    let proofs: Result<Vec<xc_artifact::StateProof>, xc_storage::StorageError> =
-                                        touched_keys
+                                        // Alongside the plain dissent, try to build the
+                                        // stronger BlockDivergence fraud proof: a proof
+                                        // per touched key against parent_state_root lets
+                                        // arx-verify replay the block and name a culpable
+                                        // party instead of just recording disagreement.
+                                        // Proving can fail (key pruned, db error) — that
+                                        // just means no fraud proof this time, not a
+                                        // reason to skip the dissent already sent above.
+                                        let proofs: Result<
+                                            Vec<xc_artifact::StateProof>,
+                                            xc_storage::StorageError,
+                                        > = touched_keys
                                             .iter()
                                             .map(|key| {
                                                 db.prove(key, &parent_state_root).map(|proof| {
                                                     let (bitmap, non_default) = proof.compress();
                                                     xc_artifact::StateProof {
-                                                        key_hash: format!("0x{}", hex::encode(proof.key_hash)),
-                                                        value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
-                                                        siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
+                                                        key_hash: format!(
+                                                            "0x{}",
+                                                            hex::encode(proof.key_hash)
+                                                        ),
+                                                        value: proof.value.map(|v| {
+                                                            format!("0x{}", hex::encode(v))
+                                                        }),
+                                                        siblings_bitmap: format!(
+                                                            "0x{}",
+                                                            hex::encode(bitmap)
+                                                        ),
                                                         siblings: non_default
                                                             .iter()
-                                                            .map(|s| format!("0x{}", hex::encode(s)))
+                                                            .map(|s| {
+                                                                format!("0x{}", hex::encode(s))
+                                                            })
                                                             .collect(),
                                                     }
                                                 })
                                             })
                                             .collect();
-                                    match proofs {
-                                        Ok(proofs) => {
-                                            let claim_msg = xc_artifact::block_divergence_signing_bytes(
-                                                height,
-                                                &header_commitment,
-                                                &parent_state_root,
-                                                &state_root,
-                                            );
-                                            let claim_signature = xc_bls::sign(bls_key, &claim_msg);
-                                            let dissent_claim = xc_artifact::BlockDissentClaim {
-                                                computed_state_root: state_root.clone(),
-                                                proofs,
-                                                signature: format!("0x{}", hex::encode(claim_signature.0)),
-                                            };
-                                            let _ = evidence_tx.send(EvidenceEvent::BlockDivergence {
-                                                proposed: candidate.clone(),
-                                                parent_state_root: parent_state_root.clone(),
-                                                voter: address.to_string(),
-                                                voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
-                                                dissent_claim,
-                                            });
-                                        }
-                                        Err(err) => {
-                                            warn!(
-                                                "failed to prove a touched key for block divergence artifact — \
+                                        match proofs {
+                                            Ok(proofs) => {
+                                                let claim_msg =
+                                                    xc_artifact::block_divergence_signing_bytes(
+                                                        height,
+                                                        &header_commitment,
+                                                        &parent_state_root,
+                                                        &state_root,
+                                                    );
+                                                let claim_signature =
+                                                    xc_bls::sign(bls_key, &claim_msg);
+                                                let dissent_claim =
+                                                    xc_artifact::BlockDissentClaim {
+                                                        computed_state_root: state_root.clone(),
+                                                        proofs,
+                                                        signature: format!(
+                                                            "0x{}",
+                                                            hex::encode(claim_signature.0)
+                                                        ),
+                                                    };
+                                                let _ = evidence_tx.send(
+                                                    EvidenceEvent::BlockDivergence {
+                                                        proposed: candidate.clone(),
+                                                        parent_state_root: parent_state_root
+                                                            .clone(),
+                                                        voter: address.to_string(),
+                                                        voter_pubkey: format!(
+                                                            "0x{}",
+                                                            hex::encode(pubkey.0)
+                                                        ),
+                                                        dissent_claim,
+                                                    },
+                                                );
+                                            }
+                                            Err(err) => {
+                                                warn!(
+                                                    "failed to prove a touched key for block divergence artifact — \
                                                  sending plain dissent only: {err}"
-                                            );
+                                                );
+                                            }
                                         }
                                     }
-                                }
                                 }
                             }
                         } else if matches!(
                             &err,
                             xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height }
                                 if block_height == tip_height
-                        ) || matches!(&err, xc_executor::AcceptBlockError::ContradictsCertificate { .. })
-                        {
+                        ) || matches!(
+                            &err,
+                            xc_executor::AcceptBlockError::ContradictsCertificate { .. }
+                        ) {
                             // Two shapes of the same sighting: a second block
                             // for a height already committed, and a block for
                             // a height a quorum has certified another block
@@ -1079,7 +1149,10 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         // so a mismatch against whatever node the app's backend actually
         // talks to (NODE_RPC_URL) is obvious immediately, not after a
         // confusing "expired" report from the app minutes later.
-        println!("Connecting to node at {node}{}", if token.is_some() { " (with token)" } else { "" });
+        println!(
+            "Connecting to node at {node}{}",
+            if token.is_some() { " (with token)" } else { "" }
+        );
         std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
         let key = validator::load_or_generate_key(base_path)?;
         let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
@@ -1244,15 +1317,31 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
     // `partitioned_block_list`); this only decides whether the process is
     // allowed to boot with it set at all.
     #[cfg(feature = "fault-injection")]
-    if let Ok(peers) = std::env::var("ARXD_BLOCK_PEERS") {
-        if !peers.trim().is_empty() {
-            ensure_fault_injection_allowed(&chain_name)?;
-            warn!(
-                %peers,
-                "PARTITION ARMED — this node refuses all connections to these peers. \
-                 Never use outside a devnet acceptance test."
-            );
-        }
+    if let Ok(peers) = std::env::var("ARXD_BLOCK_PEERS")
+        && !peers.trim().is_empty()
+    {
+        ensure_fault_injection_allowed(&chain_name)?;
+        warn!(
+            %peers,
+            "PARTITION ARMED — this node refuses all connections to these peers. \
+             Never use outside a devnet acceptance test."
+        );
+    }
+
+    // Same guard again. Slowing the round timeout down is how the
+    // partition harness makes its heal-during-voting window deterministic
+    // (arxd/finality's `round_timeout`); on a real chain it would just be a
+    // validator that tolerates a stalled round far longer than its peers do.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(secs) = std::env::var("ARXD_ROUND_TIMEOUT_SECS")
+        && !secs.trim().is_empty()
+    {
+        ensure_fault_injection_allowed(&chain_name)?;
+        warn!(
+            %secs,
+            "ROUND TIMEOUT OVERRIDDEN — this node waits this long before voting to \
+             advance a round. Never use outside a devnet acceptance test."
+        );
     }
 
     // Installs the global recorder the `counter!`/`gauge!` calls below write

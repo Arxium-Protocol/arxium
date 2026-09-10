@@ -60,7 +60,10 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
     let validators = match db.get_validator_set_at(record.height) {
         Ok(validators) => validators,
         Err(err) => {
-            warn!("finality: cannot verify certificate at {}: {err}", record.height);
+            warn!(
+                "finality: cannot verify certificate at {}: {err}",
+                record.height
+            );
             return false;
         }
     };
@@ -231,6 +234,48 @@ const ROUND_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg(test)]
 const ROUND_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// `ROUND_TIMEOUT`, except a `fault-injection` build lets a harness widen it
+/// through `ARXD_ROUND_TIMEOUT_SECS`.
+///
+/// `scripts/partition-heal-harness.sh`'s `HEAL_WHEN=votes` run is the only
+/// way `enforce_certificate` is reachable from a live network: the isolated
+/// node has to rejoin while the majority is *still voting* on its own block
+/// at that height, so that it tallies a quorum for a hash it disagrees with
+/// rather than learning about it later from a peer. Once the height
+/// finalizes those precommit votes are deleted and never re-gossiped, so
+/// there is no second chance at it.
+///
+/// At the real 8s that is a race: a kill/restart is process boot, RPC up,
+/// dial, identify and a gossipsub mesh heartbeat, which is most of the
+/// window, and gossipsub does not replay — a vote broadcast while the node
+/// is still dialing is simply lost to it. Widening the timeout for that one
+/// run makes the window deterministic instead of racing a restart against a
+/// timer that is already half spent.
+#[cfg(all(not(test), feature = "fault-injection"))]
+fn round_timeout() -> Duration {
+    static OVERRIDE: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+        let Ok(raw) = std::env::var("ARXD_ROUND_TIMEOUT_SECS") else {
+            return ROUND_TIMEOUT;
+        };
+        // Loud on purpose, like `ARXD_BLOCK_PEERS`: quietly falling back to
+        // 8s would turn the run this knob exists for back into the race it
+        // exists to remove, and it would still report a pass or a plausible
+        // inconclusive either way.
+        match raw.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(err) => {
+                panic!("ARXD_ROUND_TIMEOUT_SECS: {raw:?} is not a whole number of seconds: {err}")
+            }
+        }
+    });
+    *OVERRIDE
+}
+
+#[cfg(any(test, not(feature = "fault-injection")))]
+fn round_timeout() -> Duration {
+    ROUND_TIMEOUT
+}
+
 /// Fed to `spawn_finality`: either a block this node just accepted/produced
 /// (triggers signing a precommit, if this node has a BLS identity, and
 /// resets the round-timeout clock below), a precommit vote received from a
@@ -281,7 +326,8 @@ where
         // keyed by round too, since more than one round of a single height
         // can be mid-tally at once (an earlier round's stragglers arriving
         // after a later round already got certified).
-        let mut round_timeout_tallies: HashMap<(u64, u32), HashMap<Address, BlsSignature>> = HashMap::new();
+        let mut round_timeout_tallies: HashMap<(u64, u32), HashMap<Address, BlsSignature>> =
+            HashMap::new();
         // This node's own not-yet-certified round-timeout votes — mirrors
         // `my_votes`.
         let mut my_round_timeout_votes: HashMap<(u64, u32), RoundTimeoutVote> = HashMap::new();
@@ -330,14 +376,16 @@ where
         // any tallied vote doesn't leave it un-prunable.
         match db.get_dissents_from(0) {
             Ok(records) => {
-                highest_seen = highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
+                highest_seen =
+                    highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
             }
             Err(err) => warn!("finality: failed to reload persisted dissents: {err}"),
         }
 
         match db.get_round_timeout_votes_from(0) {
             Ok(records) => {
-                highest_seen = highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
+                highest_seen =
+                    highest_seen.max(records.iter().map(|r| r.height).max().unwrap_or(0));
                 let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
                 for record in records {
                     if record.height < cutoff {
@@ -369,69 +417,74 @@ where
                         }
                     }
                     if let Some((address, secret_key)) = &bls_identity
-                        && last_progress.1.elapsed() >= ROUND_TIMEOUT {
-                            let next_height = last_progress.0 + 1;
-                            match db.current_round(next_height) {
-                                Ok(round) => {
-                                    let already_certified =
-                                        matches!(db.get_round_certificate(next_height, round), Ok(Some(_)));
-                                    if !already_certified
-                                        && !my_round_timeout_votes.contains_key(&(next_height, round))
-                                    {
-                                        match db.get_block::<P>(next_height.saturating_sub(1)) {
-                                            Ok(Some(parent)) => {
-                                                let msg = round_timeout_signing_bytes(
-                                                    next_height,
-                                                    round,
-                                                    &parent.hash(),
+                        && last_progress.1.elapsed() >= round_timeout()
+                    {
+                        let next_height = last_progress.0 + 1;
+                        match db.current_round(next_height) {
+                            Ok(round) => {
+                                let already_certified = matches!(
+                                    db.get_round_certificate(next_height, round),
+                                    Ok(Some(_))
+                                );
+                                if !already_certified
+                                    && !my_round_timeout_votes.contains_key(&(next_height, round))
+                                {
+                                    match db.get_block::<P>(next_height.saturating_sub(1)) {
+                                        Ok(Some(parent)) => {
+                                            let msg = round_timeout_signing_bytes(
+                                                next_height,
+                                                round,
+                                                &parent.hash(),
+                                            );
+                                            let signature = xc_bls::sign(secret_key, &msg);
+                                            let vote = RoundTimeoutVote {
+                                                height: next_height,
+                                                round,
+                                                voter: address.clone(),
+                                                signature,
+                                            };
+                                            my_round_timeout_votes
+                                                .insert((vote.height, vote.round), vote.clone());
+
+                                            // Same local-loopback rule as
+                                            // precommit votes: tally our own
+                                            // timeout vote before gossip.
+                                            if let Err(err) = tally_round_timeout::<P>(
+                                                &db,
+                                                &mut round_timeout_tallies,
+                                                &mut my_round_timeout_votes,
+                                                vote.clone(),
+                                            ) {
+                                                warn!(
+                                                    "finality: failed to process local round-timeout vote: {err}"
                                                 );
-                                                let signature = xc_bls::sign(secret_key, &msg);
-                                                let vote = RoundTimeoutVote {
-                                                    height: next_height,
-                                                    round,
-                                                    voter: address.clone(),
-                                                    signature,
-                                                };
-                                                my_round_timeout_votes
-                                                    .insert((vote.height, vote.round), vote.clone());
-
-                                                // Same local-loopback rule as
-                                                // precommit votes: tally our own
-                                                // timeout vote before gossip.
-                                                if let Err(err) = tally_round_timeout::<P>(
-                                                    &db,
-                                                    &mut round_timeout_tallies,
-                                                    &mut my_round_timeout_votes,
-                                                    vote.clone(),
-                                                ) {
-                                                    warn!(
-                                                        "finality: failed to process local round-timeout vote: {err}"
-                                                    );
-                                                }
-
-                                                if round_timeout_tx.send(vote).is_err() {
-                                                    warn!(
-                                                        "finality: round-timeout vote channel closed, stopping"
-                                                    );
-                                                    return;
-                                                }
                                             }
-                                            Ok(None) => warn!(
-                                                "finality: no parent block at height {} to sign a round-timeout vote against",
-                                                next_height.saturating_sub(1)
-                                            ),
-                                            Err(err) => warn!(
-                                                "finality: failed to read parent block at height {}: {err}",
-                                                next_height.saturating_sub(1)
-                                            ),
+
+                                            if round_timeout_tx.send(vote).is_err() {
+                                                warn!(
+                                                    "finality: round-timeout vote channel closed, stopping"
+                                                );
+                                                return;
+                                            }
                                         }
+                                        Ok(None) => warn!(
+                                            "finality: no parent block at height {} to sign a round-timeout vote against",
+                                            next_height.saturating_sub(1)
+                                        ),
+                                        Err(err) => warn!(
+                                            "finality: failed to read parent block at height {}: {err}",
+                                            next_height.saturating_sub(1)
+                                        ),
                                     }
                                 }
-                                Err(err) => {
-                                    warn!("finality: failed to read current round for height {next_height}: {err}")
-                                }
+                            }
+                            Err(err) => {
+                                warn!(
+                                    "finality: failed to read current round for height {next_height}: {err}"
+                                )
                             }
                         }
+                    }
                     continue;
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -444,15 +497,23 @@ where
                 FinalityEvent::RoundTimeoutObserved(vote) => vote.height,
             });
             if let FinalityEvent::BlockObserved(block) = &event
-                && block.height > last_progress.0 {
-                    last_progress = (block.height, Instant::now());
-                }
+                && block.height > last_progress.0
+            {
+                last_progress = (block.height, Instant::now());
+            }
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
-            for height in tallies.keys().copied().filter(|h| *h < cutoff).collect::<Vec<_>>() {
+            for height in tallies
+                .keys()
+                .copied()
+                .filter(|h| *h < cutoff)
+                .collect::<Vec<_>>()
+            {
                 if let Err(err) = db.delete_precommit_votes(height) {
-                    warn!("finality: failed to prune persisted precommit votes for height {height}: {err}");
+                    warn!(
+                        "finality: failed to prune persisted precommit votes for height {height}: {err}"
+                    );
                 }
                 // Dissents are deliberately *not* pruned on this schedule — see
                 // `TALLY_RETENTION_HEIGHTS`'s doc: that bound is justified for
@@ -466,7 +527,12 @@ where
             }
             tallies.retain(|height, _| *height >= cutoff);
             my_votes.retain(|height, _| *height >= cutoff);
-            for key in round_timeout_tallies.keys().copied().filter(|(h, _)| *h < cutoff).collect::<Vec<_>>() {
+            for key in round_timeout_tallies
+                .keys()
+                .copied()
+                .filter(|(h, _)| *h < cutoff)
+                .collect::<Vec<_>>()
+            {
                 if let Err(err) = db.delete_round_timeout_votes(key.0, key.1) {
                     warn!(
                         "finality: failed to prune persisted round-timeout votes for height {} round {}: {err}",
@@ -479,7 +545,9 @@ where
 
             match event {
                 FinalityEvent::BlockObserved(block) => {
-                    let Some((address, secret_key)) = &bls_identity else { continue };
+                    let Some((address, secret_key)) = &bls_identity else {
+                        continue;
+                    };
                     let hash = block.hash();
                     // ponytail: parent lookup failure (or genesis) falls back
                     // to an empty parent state root rather than dropping the
@@ -487,19 +555,29 @@ where
                     // (every honest node hits the same fallback), so quorum
                     // still forms; only an actually-diverging EP should ever
                     // block it.
-                    let parent_state_root = match db.get_block::<P>(block.height.saturating_sub(1)) {
+                    let parent_state_root = match db.get_block::<P>(block.height.saturating_sub(1))
+                    {
                         Ok(Some(parent)) => parent.state_root,
                         Ok(None) => String::new(),
                         Err(err) => {
-                            warn!("finality: failed to read parent block for EP at height {}: {err}", block.height);
+                            warn!(
+                                "finality: failed to read parent block for EP at height {}: {err}",
+                                block.height
+                            );
                             String::new()
                         }
                     };
-                    let ep = xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root);
+                    let ep =
+                        xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root);
                     let msg = precommit_signing_bytes(block.height, &hash, &ep);
                     let signature = xc_bls::sign(secret_key, &msg);
-                    let vote =
-                        PrecommitVote { height: block.height, block_hash: hash, voter: address.clone(), signature, ep };
+                    let vote = PrecommitVote {
+                        height: block.height,
+                        block_hash: hash,
+                        voter: address.clone(),
+                        signature,
+                        ep,
+                    };
                     my_votes.insert(vote.height, vote.clone());
 
                     // Count our own signed vote locally before gossiping it.
@@ -518,7 +596,9 @@ where
                     }
                 }
                 FinalityEvent::VoteObserved(vote) => {
-                    if let Err(err) = tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote) {
+                    if let Err(err) =
+                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote)
+                    {
                         warn!("finality: failed to process precommit vote: {err}");
                     }
                 }
@@ -559,18 +639,27 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     // against the key that was valid when the vote was cast, not whatever
     // the voter has rotated to since. See `ArxiumDb::get_bls_pubkey_at`.
     let Some(pubkey) = db.get_bls_pubkey_at(&vote.voter, vote.height)? else {
-        warn!("finality: vote from {} with no registered BLS key, dropping", vote.voter);
+        warn!(
+            "finality: vote from {} with no registered BLS key, dropping",
+            vote.voter
+        );
         return Ok(());
     };
     let msg = precommit_signing_bytes(vote.height, &vote.block_hash, &vote.ep);
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
-        warn!("finality: dropping vote from {} with an invalid signature", vote.voter);
+        warn!(
+            "finality: dropping vote from {} with an invalid signature",
+            vote.voter
+        );
         return Ok(());
     }
 
     let validators = db.get_validator_set_at(vote.height)?;
     if !validators.contains(&vote.voter) {
-        warn!("finality: dropping vote from {}, not a validator at height {}", vote.voter, vote.height);
+        warn!(
+            "finality: dropping vote from {}, not a validator at height {}",
+            vote.voter, vote.height
+        );
         return Ok(());
     }
 
@@ -603,11 +692,17 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         .collect();
     let sigs: Vec<BlsSignature> = signers.values().cloned().collect();
     let Ok(aggregate_signature) = xc_bls::aggregate(&sigs) else {
-        warn!("finality: failed to aggregate signatures for height {}", vote.height);
+        warn!(
+            "finality: failed to aggregate signatures for height {}",
+            vote.height
+        );
         return Ok(());
     };
     if xc_bls::verify_aggregate(&msg, &pubkeys, &aggregate_signature).is_err() {
-        warn!("finality: aggregate signature failed to verify for height {}", vote.height);
+        warn!(
+            "finality: aggregate signature failed to verify for height {}",
+            vote.height
+        );
         return Ok(());
     }
 
@@ -620,11 +715,18 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     };
     db.write_batches(&[&record])?;
     if let Err(err) = db.delete_precommit_votes(vote.height) {
-        warn!("finality: failed to delete persisted precommit votes for finalized height {}: {err}", vote.height);
+        warn!(
+            "finality: failed to delete persisted precommit votes for finalized height {}: {err}",
+            vote.height
+        );
     }
     tallies.remove(&vote.height);
     my_votes.remove(&vote.height);
-    info!("finality: block {} finalized with {} signers", vote.height, record.signers.len());
+    info!(
+        "finality: block {} finalized with {} signers",
+        vote.height,
+        record.signers.len()
+    );
     enforce_certificate::<P>(db, chain_lock, &record)?;
     Ok(())
 }
@@ -703,12 +805,18 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     };
 
     let Some(pubkey) = db.get_bls_pubkey_at(&vote.voter, vote.height)? else {
-        warn!("finality: round-timeout vote from {} with no registered BLS key, dropping", vote.voter);
+        warn!(
+            "finality: round-timeout vote from {} with no registered BLS key, dropping",
+            vote.voter
+        );
         return Ok(());
     };
     let msg = round_timeout_signing_bytes(vote.height, vote.round, &parent.hash());
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
-        warn!("finality: dropping round-timeout vote from {} with an invalid signature", vote.voter);
+        warn!(
+            "finality: dropping round-timeout vote from {} with an invalid signature",
+            vote.voter
+        );
         return Ok(());
     }
 
@@ -746,7 +854,10 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         .collect();
     let sigs: Vec<BlsSignature> = signers.values().cloned().collect();
     let Ok(aggregate_signature) = xc_bls::aggregate(&sigs) else {
-        warn!("finality: failed to aggregate round-timeout signatures for height {} round {}", vote.height, vote.round);
+        warn!(
+            "finality: failed to aggregate round-timeout signatures for height {} round {}",
+            vote.height, vote.round
+        );
         return Ok(());
     };
     if xc_bls::verify_aggregate(&msg, &pubkeys, &aggregate_signature).is_err() {
@@ -772,7 +883,12 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     }
     tallies.remove(&key);
     my_votes.remove(&key);
-    info!("finality: round {} at height {} certified as timed out with {} signers", vote.round, vote.height, record.signers.len());
+    info!(
+        "finality: round {} at height {} certified as timed out with {} signers",
+        vote.round,
+        vote.height,
+        record.signers.len()
+    );
     Ok(())
 }
 
@@ -793,7 +909,10 @@ fn handle_dissent(
     }
 
     let Some(pubkey) = db.get_bls_pubkey_at(&dissent.voter, dissent.height)? else {
-        warn!("finality: dissent from {} with no registered BLS key, dropping", dissent.voter);
+        warn!(
+            "finality: dissent from {} with no registered BLS key, dropping",
+            dissent.voter
+        );
         return Ok(());
     };
     let reason = dissent.reason.as_str();
@@ -806,18 +925,27 @@ fn handle_dissent(
         reason,
     );
     if xc_bls::verify(&msg, &pubkey, &dissent.signature).is_err() {
-        warn!("finality: dropping dissent from {} with an invalid signature", dissent.voter);
+        warn!(
+            "finality: dropping dissent from {} with an invalid signature",
+            dissent.voter
+        );
         return Ok(());
     }
 
     let validators = db.get_validator_set_at(dissent.height)?;
     if !validators.contains(&dissent.voter) {
-        warn!("finality: dropping dissent from {}, not a validator at height {}", dissent.voter, dissent.height);
+        warn!(
+            "finality: dropping dissent from {}, not a validator at height {}",
+            dissent.voter, dissent.height
+        );
         return Ok(());
     }
 
     if db.get_dissent(dissent.height, &dissent.voter)?.is_some() {
-        warn!("finality: dropping duplicate dissent from {} at height {}", dissent.voter, dissent.height);
+        warn!(
+            "finality: dropping duplicate dissent from {} at height {}",
+            dissent.voter, dissent.height
+        );
         return Ok(());
     }
 
@@ -833,7 +961,10 @@ fn handle_dissent(
     };
     db.write_batches(&[&record])?;
     metrics::counter!("arxium_dissent_total", "reason" => reason).increment(1);
-    info!("finality: recorded dissent from {} at height {} ({reason})", record.voter, record.height);
+    info!(
+        "finality: recorded dissent from {} at height {} ({reason})",
+        record.voter, record.height
+    );
     let _ = dissent_tx.send(record);
     Ok(())
 }
@@ -865,7 +996,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-finality-{}-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         (ArxiumDb::open(&dir).expect("open test db"), dir)
@@ -940,7 +1074,11 @@ mod tests {
 
         enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
 
-        assert_eq!(db.get_tip_height().unwrap(), Some(0), "height 1 must be unwound");
+        assert_eq!(
+            db.get_tip_height().unwrap(),
+            Some(0),
+            "height 1 must be unwound"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -987,7 +1125,13 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration {
+                    address: addr.clone(),
+                    pubkey: pk,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                }])
+                .unwrap();
                 (addr, sk)
             })
             .collect();
@@ -1027,7 +1171,10 @@ mod tests {
         };
         tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
 
-        let record = db.get_finality_record(5).unwrap().expect("expected finality record at quorum");
+        let record = db
+            .get_finality_record(5)
+            .unwrap()
+            .expect("expected finality record at quorum");
         assert_eq!(record.signers.len(), 3);
         assert_eq!(record.block_hash, block_hash);
 
@@ -1042,12 +1189,22 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration {
+                    address: addr.clone(),
+                    pubkey: pk,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                }])
+                .unwrap();
                 (addr, sk)
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators,
+        }])
+        .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
 
@@ -1080,7 +1237,12 @@ mod tests {
         }
         let mut reloaded_my_votes = HashMap::new();
         assert_eq!(
-            reloaded.get(&5).unwrap().get(&(block_hash.clone(), ep)).unwrap().len(),
+            reloaded
+                .get(&5)
+                .unwrap()
+                .get(&(block_hash.clone(), ep))
+                .unwrap()
+                .len(),
             2,
             "both pre-crash votes should have survived via persisted records"
         );
@@ -1095,7 +1257,14 @@ mod tests {
             signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
             ep,
         };
-        tally_vote::<()>(&db, &Mutex::new(()), &mut reloaded, &mut reloaded_my_votes, vote).unwrap();
+        tally_vote::<()>(
+            &db,
+            &Mutex::new(()),
+            &mut reloaded,
+            &mut reloaded_my_votes,
+            vote,
+        )
+        .unwrap();
         assert!(db.get_finality_record(5).unwrap().is_some());
         assert!(
             db.get_precommit_votes_from(0).unwrap().is_empty(),
@@ -1116,12 +1285,22 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration {
+                    address: addr.clone(),
+                    pubkey: pk,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                }])
+                .unwrap();
                 (addr, sk)
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators,
+        }])
+        .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
         let ep_a = [1u8; 32];
@@ -1145,19 +1324,50 @@ mod tests {
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
         }
 
-        assert!(db.get_finality_record(5).unwrap().is_none(), "neither ep group alone reached quorum");
-        assert_eq!(tallies.get(&5).unwrap().get(&(block_hash.clone(), ep_a)).unwrap().len(), 2);
-        assert_eq!(tallies.get(&5).unwrap().get(&(block_hash, ep_b)).unwrap().len(), 1);
+        assert!(
+            db.get_finality_record(5).unwrap().is_none(),
+            "neither ep group alone reached quorum"
+        );
+        assert_eq!(
+            tallies
+                .get(&5)
+                .unwrap()
+                .get(&(block_hash.clone(), ep_a))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            tallies
+                .get(&5)
+                .unwrap()
+                .get(&(block_hash, ep_b))
+                .unwrap()
+                .len(),
+            1
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    fn dissent_fixture(voter: Address, sk: &BlsSecretKey, height: u64, block_hash: &str) -> Dissent {
+    fn dissent_fixture(
+        voter: Address,
+        sk: &BlsSecretKey,
+        height: u64,
+        block_hash: &str,
+    ) -> Dissent {
         let state_root = "0xdisputed".to_string();
         let header_commitment = [4u8; 32];
         let ep = [9u8; 32];
         let reason = DissentReason::StateRootMismatch;
-        let msg = dissent_signing_bytes(height, block_hash, &state_root, &header_commitment, &ep, reason.as_str());
+        let msg = dissent_signing_bytes(
+            height,
+            block_hash,
+            &state_root,
+            &header_commitment,
+            &ep,
+            reason.as_str(),
+        );
         Dissent {
             height,
             block_hash: block_hash.to_string(),
@@ -1176,15 +1386,27 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
-            .unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr.clone()],
+        }])
+        .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xblockhash");
         handle_dissent(&db, dissent, &dissent_tx).unwrap();
 
-        let stored = db.get_dissent(5, &addr).unwrap().expect("dissent should be persisted");
+        let stored = db
+            .get_dissent(5, &addr)
+            .unwrap()
+            .expect("dissent should be persisted");
         assert_eq!(stored.reason, "state_root_mismatch");
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1196,18 +1418,40 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
-            .unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr.clone()],
+        }])
+        .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
-        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xblockhash"), &dissent_tx).unwrap();
+        handle_dissent(
+            &db,
+            dissent_fixture(addr.clone(), &sk, 5, "0xblockhash"),
+            &dissent_tx,
+        )
+        .unwrap();
         // A second, differently-shaped dissent from the same voter at the
         // same height must not overwrite the first.
-        handle_dissent(&db, dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash"), &dissent_tx).unwrap();
+        handle_dissent(
+            &db,
+            dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash"),
+            &dissent_tx,
+        )
+        .unwrap();
 
         let stored = db.get_dissent(5, &addr).unwrap().unwrap();
-        assert_eq!(stored.block_hash, "0xblockhash", "the first dissent must win, not be overwritten");
+        assert_eq!(
+            stored.block_hash, "0xblockhash",
+            "the first dissent must win, not be overwritten"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1219,15 +1463,32 @@ mod tests {
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
         let (other_sk, _) = xc_bls::keygen_from_seed(&[51u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
-            .unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr.clone()],
+        }])
+        .unwrap();
 
         // Signed with a key that doesn't match the registered pubkey for `addr`.
         let (dissent_tx, _dissent_rx) = mpsc::channel();
-        handle_dissent(&db, dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash"), &dissent_tx).unwrap();
+        handle_dissent(
+            &db,
+            dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash"),
+            &dissent_tx,
+        )
+        .unwrap();
 
-        assert!(db.get_dissent(5, &addr).unwrap().is_none(), "a forged dissent signature must not be persisted");
+        assert!(
+            db.get_dissent(5, &addr).unwrap().is_none(),
+            "a forged dissent signature must not be persisted"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1244,10 +1505,18 @@ mod tests {
         let ed_key = SigningKey::from_bytes(&[1u8; 32]);
         let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
-        db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }])
-            .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators: vec![addr.clone()] }])
-            .unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators: vec![addr.clone()],
+        }])
+        .unwrap();
 
         let (event_tx, event_rx) = mpsc::channel();
         let (vote_tx, _vote_rx) = mpsc::channel();
@@ -1255,18 +1524,35 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         // No bls_identity: this test only needs the loop's pruning step to
         // run on every event, not for this node to vote.
-        let handle = spawn_finality::<()>(db.clone(), None, event_rx, vote_tx, round_timeout_tx, dissent_tx, Arc::new(Mutex::new(())));
+        let handle = spawn_finality::<()>(
+            db.clone(),
+            None,
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+            dissent_tx,
+            Arc::new(Mutex::new(())),
+        );
 
         let dissent_height = 5;
         event_tx
-            .send(FinalityEvent::DissentObserved(dissent_fixture(addr.clone(), &sk, dissent_height, "0xblockhash")))
+            .send(FinalityEvent::DissentObserved(dissent_fixture(
+                addr.clone(),
+                &sk,
+                dissent_height,
+                "0xblockhash",
+            )))
             .unwrap();
 
         // Push the tip well past `dissent_height + TALLY_RETENTION_HEIGHTS` —
         // this is what drives the pruning cutoff in the real loop.
         for height in 1..=(dissent_height + TALLY_RETENTION_HEIGHTS + 10) {
             event_tx
-                .send(FinalityEvent::BlockObserved(signed_block(&ed_key, height, 100 + height)))
+                .send(FinalityEvent::BlockObserved(signed_block(
+                    &ed_key,
+                    height,
+                    100 + height,
+                )))
                 .unwrap();
         }
         drop(event_tx);
@@ -1425,8 +1711,7 @@ mod tests {
     /// retention window — and requires the map to stay bounded.
     #[test]
     fn unfinalized_tallies_do_not_grow_without_bound() {
-        let mut tallies: VoteTallies =
-            HashMap::new();
+        let mut tallies: VoteTallies = HashMap::new();
 
         // Stand in for the loop's pruning step, which is what the retention
         // constant actually drives.
@@ -1436,7 +1721,11 @@ mod tests {
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
             tallies.retain(|h, _| *h >= cutoff);
             // A vote arrives for this height and never reaches quorum.
-            tallies.entry(height).or_default().entry(("0xdeadbeef".into(), [0u8; 32])).or_default();
+            tallies
+                .entry(height)
+                .or_default()
+                .entry(("0xdeadbeef".into(), [0u8; 32]))
+                .or_default();
         }
 
         assert!(
@@ -1471,12 +1760,22 @@ mod tests {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
                 let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
-                db.write_batches(&[&xc_storage::BlsKeyRegistration { address: addr.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None }]).unwrap();
+                db.write_batches(&[&xc_storage::BlsKeyRegistration {
+                    address: addr.clone(),
+                    pubkey: pk,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                }])
+                .unwrap();
                 (addr, sk)
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators,
+        }])
+        .unwrap();
         addrs_and_keys
     }
 
@@ -1526,7 +1825,10 @@ mod tests {
             )
             .unwrap();
         }
-        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "below quorum (2 of 4) must not certify");
+        assert!(
+            db.get_round_certificate(5, 0).unwrap().is_none(),
+            "below quorum (2 of 4) must not certify"
+        );
 
         let (addr, sk) = &addrs_and_keys[2];
         tally_round_timeout::<()>(
@@ -1537,7 +1839,10 @@ mod tests {
         )
         .unwrap();
 
-        let record = db.get_round_certificate(5, 0).unwrap().expect("expected a certificate at quorum");
+        let record = db
+            .get_round_certificate(5, 0)
+            .unwrap()
+            .expect("expected a certificate at quorum");
         assert_eq!(record.signers.len(), 3);
         assert_eq!(db.current_round(5).unwrap(), 1);
 
@@ -1574,7 +1879,11 @@ mod tests {
 
         assert!(db.get_round_certificate(5, 0).unwrap().is_none());
         assert!(db.get_round_certificate(5, 1).unwrap().is_none());
-        assert_eq!(db.current_round(5).unwrap(), 0, "neither round has reached quorum yet");
+        assert_eq!(
+            db.current_round(5).unwrap(),
+            0,
+            "neither round has reached quorum yet"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

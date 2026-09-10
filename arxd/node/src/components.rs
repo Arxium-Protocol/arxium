@@ -4,11 +4,11 @@
 use crate::validator;
 use anyhow::{Context, Result};
 use arxd_genesis::ChainSpec;
-use xc_runtime_api::ChainRuntime;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex};
 use xc_mempool::Mempool;
 use xc_primitives::{Address, NodeConfig};
+use xc_runtime_api::ChainRuntime;
 use xc_storage::ArxiumDb;
 
 /// Everything a node needs that does *not* require the network: genesis,
@@ -55,7 +55,9 @@ pub(crate) fn chain_data_path(base_path: &std::path::Path, chain_name: &str) -> 
 fn state_root_bytes(state_root: &str) -> Result<[u8; 32]> {
     let hex_part = state_root.strip_prefix("0x").unwrap_or(state_root);
     let bytes = hex::decode(hex_part).context("state root is not valid hex")?;
-    bytes.try_into().map_err(|v: Vec<u8>| anyhow::anyhow!("state root is {} bytes, expected 32", v.len()))
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("state root is {} bytes, expected 32", v.len()))
 }
 
 /// Read-only construction: genesis load, DB open, genesis write on a fresh
@@ -90,11 +92,19 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     let (chain_name, boot_nodes, state_root) = match &chain_spec {
         ChainSpec::Plain(snapshot) => {
             let state_root = arxd_genesis::write_plain(&db, snapshot)?;
-            (snapshot.chain_name.clone(), snapshot.boot_nodes.clone(), state_root)
+            (
+                snapshot.chain_name.clone(),
+                snapshot.boot_nodes.clone(),
+                state_root,
+            )
         }
         ChainSpec::Raw(raw) => {
             arxd_genesis::write_raw(&db, raw)?;
-            (raw.chain_name.clone(), raw.boot_nodes.clone(), raw.state_root.clone())
+            (
+                raw.chain_name.clone(),
+                raw.boot_nodes.clone(),
+                raw.state_root.clone(),
+            )
         }
     };
     let genesis_hash = state_root_bytes(&state_root)?;
@@ -155,8 +165,8 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arxd_runtime::{ChainBlock, CoreChainRuntime};
     use crate::produce::produce_block;
+    use arxd_runtime::{ChainBlock, CoreChainRuntime};
     use ed25519_dalek::SigningKey;
 
     fn test_config() -> NodeConfig {
@@ -243,7 +253,10 @@ mod tests {
     fn new_partial_does_not_generate_keys_when_genesis_is_invalid() {
         let base_path = std::env::temp_dir().join(format!(
             "arxium-test-components-invalid-genesis-{}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let spec_path = base_path.join("bad-spec.json");
         std::fs::create_dir_all(&base_path).unwrap();
@@ -266,8 +279,14 @@ mod tests {
             limits: xc_primitives::Limits::default(),
         };
 
-        assert!(new_partial::<CoreChainRuntime>(&config).is_err(), "an invalid genesis spec must be rejected");
-        assert!(!base_path.join("validator.key").exists(), "must not generate a key on a failed boot");
+        assert!(
+            new_partial::<CoreChainRuntime>(&config).is_err(),
+            "an invalid genesis spec must be rejected"
+        );
+        assert!(
+            !base_path.join("validator.key").exists(),
+            "must not generate a key on a failed boot"
+        );
 
         std::fs::remove_dir_all(&base_path).ok();
     }
@@ -282,7 +301,10 @@ mod tests {
         let config = test_config();
         std::fs::create_dir_all(config.base_path.join("corechain")).unwrap();
         std::fs::write(
-            config.base_path.join("corechain").join("genesis.artifact.json"),
+            config
+                .base_path
+                .join("corechain")
+                .join("genesis.artifact.json"),
             r#"{"not":"a chain spec"}"#,
         )
         .unwrap();
@@ -312,14 +334,21 @@ mod tests {
 
         let raw_dir = std::env::temp_dir().join(format!(
             "arxium-test-components-raw-{}-{:?}",
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             std::thread::current().id(),
         ));
         let spec_path = raw_dir.join("devnet-raw.json");
         std::fs::create_dir_all(&raw_dir).unwrap();
         std::fs::write(&spec_path, &raw_json).unwrap();
 
-        let raw_config = NodeConfig { base_path: raw_dir.clone(), chain: spec_path.to_string_lossy().into_owned(), ..test_config() };
+        let raw_config = NodeConfig {
+            base_path: raw_dir.clone(),
+            chain: spec_path.to_string_lossy().into_owned(),
+            ..test_config()
+        };
         let raw_components = new_partial::<CoreChainRuntime>(&raw_config).unwrap();
 
         assert_eq!(raw_components.genesis_hash, plain.genesis_hash);

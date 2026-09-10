@@ -17,5 +17,10 @@ xc-poe = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 
+[features]
+# Harness-only knob (`ARXD_ROUND_TIMEOUT_SECS`, see `round_timeout`). Empty
+# on purpose: it gates code, pulls in nothing.
+fault-injection = []
+
 [lints]
 workspace = true
