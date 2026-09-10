@@ -181,6 +181,15 @@ pub enum AcceptBlockError {
         quorum: usize,
         needed: usize,
     },
+    #[error(
+        "block {height} round {round} certificate lists {signers} signer(s) but there are only {validators} validator(s) at this height"
+    )]
+    RoundCertificateOversized {
+        height: u64,
+        round: u32,
+        signers: usize,
+        validators: usize,
+    },
     #[error("block {height} round {round} certificate includes signer {signer} who is not a registered BLS validator at this height")]
     RoundCertificateUnknownSigner { height: u64, round: u32, signer: Address },
     #[error("block {height} round {round} certificate's aggregate signature does not verify")]
@@ -295,6 +304,20 @@ fn verify_round_certificate(
             signers: cert.signers.len(),
             quorum: validators.len(),
             needed,
+        });
+    }
+
+    // Upper bound before the quadratic scan below. Signers must be distinct
+    // and all members of `validators`, so a longer list can never be valid —
+    // but without this the loop's only bound is the wire size cap, which
+    // allows ~16k signers and ~10^8 string comparisons on a block any peer
+    // can gossip, while this node holds `chain_lock`.
+    if cert.signers.len() > validators.len() {
+        return Err(AcceptBlockError::RoundCertificateOversized {
+            height,
+            round,
+            signers: cert.signers.len(),
+            validators: validators.len(),
         });
     }
 
@@ -1802,6 +1825,36 @@ mod tests {
         let err = accept_block(&db, block1, false, 0, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
+            "got {err:?}",
+        );
+    }
+
+    /// A gossiped block's round certificate is verified before the proposer
+    /// is even checked, so its signer list is attacker-chosen: without an
+    /// upper bound the quadratic distinctness scan is limited only by the
+    /// wire size cap. Signers must be distinct members of the validator set,
+    /// so anything longer than the set is rejected outright.
+    #[test]
+    fn a_round_certificate_listing_more_signers_than_validators_is_rejected() {
+        let db = temp_db();
+        let validators: Vec<Address> = (1u8..=3)
+            .map(|i| Address::from_pubkey_bytes(&[i; 32]).unwrap())
+            .collect();
+        let mut signers = validators.clone();
+        signers.push(validators[0].clone());
+
+        let cert = RoundCertificate {
+            height: 7,
+            round: 0,
+            signers,
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        };
+        let err = verify_round_certificate(&db, &cert, 7, 1, "parent", &validators).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AcceptBlockError::RoundCertificateOversized { signers: 4, validators: 3, .. }
+            ),
             "got {err:?}",
         );
     }
