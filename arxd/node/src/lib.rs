@@ -1337,6 +1337,16 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         && !secs.trim().is_empty()
     {
         ensure_fault_injection_allowed(&chain_name)?;
+        // Parsed here, on the main thread, so a typo refuses to boot. The
+        // value is read lazily by a thread `spawn_finality` spawns, where
+        // rejecting it is not an option: a panic there unwinds that thread
+        // alone (no panic hook, no `panic = "abort"`), leaving a node that
+        // still produces and gossips but has silently stopped voting and
+        // tallying. Touching it here resolves it while a failure can still
+        // be a clean startup error.
+        if let Some(err) = arxd_finality::round_timeout_override_error() {
+            anyhow::bail!(err);
+        }
         warn!(
             %secs,
             "ROUND TIMEOUT OVERRIDDEN — this node waits this long before voting to \

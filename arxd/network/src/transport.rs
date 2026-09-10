@@ -63,13 +63,20 @@ pub(crate) struct Behaviour {
     pub(crate) identify: identify::Behaviour,
 }
 
+/// What `partitioned_block_list` hands back: the same boxed error the
+/// `with_behaviour` closure already returns, so the call site is a `?`.
+type BlockListResult = std::result::Result<
+    allow_block_list::Behaviour<BlockedPeers>,
+    Box<dyn std::error::Error + Send + Sync>,
+>;
+
 /// The block list a node starts with: empty in every real build.
 ///
 /// `build_swarm` used to inline `allow_block_list::Behaviour::default()`
 /// here; the only reason it is a function is the harness variant below.
 #[cfg(not(feature = "fault-injection"))]
-fn partitioned_block_list() -> allow_block_list::Behaviour<BlockedPeers> {
-    allow_block_list::Behaviour::default()
+fn partitioned_block_list() -> BlockListResult {
+    Ok(allow_block_list::Behaviour::default())
 }
 
 /// Harness-only (`--features fault-injection`, never in a normal build):
@@ -86,23 +93,25 @@ fn partitioned_block_list() -> allow_block_list::Behaviour<BlockedPeers> {
 /// dials and its own outbound dials fail — a clean two-way cut that heals
 /// by restarting without the variable.
 #[cfg(feature = "fault-injection")]
-fn partitioned_block_list() -> allow_block_list::Behaviour<BlockedPeers> {
+fn partitioned_block_list() -> BlockListResult {
     let mut behaviour = allow_block_list::Behaviour::default();
     let Ok(list) = std::env::var("ARXD_BLOCK_PEERS") else {
-        return behaviour;
+        return Ok(behaviour);
     };
     for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-        match entry.parse::<PeerId>() {
-            // Loud on purpose: a typo'd peer id silently not blocked is a
-            // harness run that reports a healthy heal of a partition that
-            // never happened.
-            Err(err) => panic!("ARXD_BLOCK_PEERS: {entry:?} is not a peer id: {err}"),
-            Ok(peer) => {
-                behaviour.block_peer(peer);
-            }
-        }
+        // Fatal, not skipped: a typo'd peer id silently not blocked is a
+        // harness run that reports a healthy heal of a partition that never
+        // happened. Returned rather than panicked — this runs on the thread
+        // `spawn_p2p_node` spawns, and `build_swarm`'s error already travels
+        // back to the caller over the readiness channel, so failing this way
+        // refuses to boot with the actual reason instead of a panic and a
+        // "receiving on a closed channel" cause.
+        let peer = entry
+            .parse::<PeerId>()
+            .map_err(|err| format!("ARXD_BLOCK_PEERS: {entry:?} is not a peer id: {err}"))?;
+        behaviour.block_peer(peer);
     }
-    behaviour
+    Ok(behaviour)
 }
 
 pub(crate) fn build_swarm(
@@ -158,7 +167,7 @@ pub(crate) fn build_swarm(
                 gossipsub,
                 sync,
                 limits,
-                blocked_peers: partitioned_block_list(),
+                blocked_peers: partitioned_block_list()?,
                 identify,
             })
         })?

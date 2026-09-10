@@ -251,24 +251,43 @@ const ROUND_TIMEOUT: Duration = Duration::from_millis(150);
 /// is still dialing is simply lost to it. Widening the timeout for that one
 /// run makes the window deterministic instead of racing a restart against a
 /// timer that is already half spent.
+///
+/// Rejecting a malformed value has to happen at boot, on the main thread —
+/// see `round_timeout_override_error`. This resolves to the default rather
+/// than panicking because it runs inside the thread `spawn_finality` spawns,
+/// where a panic unwinds that thread alone: the node would keep producing
+/// and gossiping while silently no longer voting or tallying.
 #[cfg(all(not(test), feature = "fault-injection"))]
-fn round_timeout() -> Duration {
-    static OVERRIDE: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+static ROUND_TIMEOUT_OVERRIDE: std::sync::LazyLock<Result<Option<Duration>, String>> =
+    std::sync::LazyLock::new(|| {
         let Ok(raw) = std::env::var("ARXD_ROUND_TIMEOUT_SECS") else {
-            return ROUND_TIMEOUT;
+            return Ok(None);
         };
-        // Loud on purpose, like `ARXD_BLOCK_PEERS`: quietly falling back to
-        // 8s would turn the run this knob exists for back into the race it
-        // exists to remove, and it would still report a pass or a plausible
-        // inconclusive either way.
         match raw.trim().parse::<u64>() {
-            Ok(secs) => Duration::from_secs(secs),
-            Err(err) => {
-                panic!("ARXD_ROUND_TIMEOUT_SECS: {raw:?} is not a whole number of seconds: {err}")
-            }
+            Ok(secs) => Ok(Some(Duration::from_secs(secs))),
+            Err(err) => Err(format!(
+                "ARXD_ROUND_TIMEOUT_SECS: {raw:?} is not a whole number of seconds: {err}"
+            )),
         }
     });
-    *OVERRIDE
+
+/// `Some(complaint)` if `ARXD_ROUND_TIMEOUT_SECS` is set but unreadable.
+///
+/// Call it from the node's boot path so a typo refuses to start rather than
+/// quietly leaving the timeout at 8s. Silently defaulting would turn the run
+/// this knob exists for back into the race it exists to remove, and the
+/// harness would still report a pass or a plausible inconclusive either way.
+#[cfg(all(not(test), feature = "fault-injection"))]
+pub fn round_timeout_override_error() -> Option<String> {
+    ROUND_TIMEOUT_OVERRIDE.as_ref().err().cloned()
+}
+
+#[cfg(all(not(test), feature = "fault-injection"))]
+fn round_timeout() -> Duration {
+    match ROUND_TIMEOUT_OVERRIDE.as_ref() {
+        Ok(Some(overridden)) => *overridden,
+        _ => ROUND_TIMEOUT,
+    }
 }
 
 #[cfg(any(test, not(feature = "fault-injection")))]
