@@ -85,13 +85,20 @@ jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
     boot_nodes: []
 }' > "$ROOT/genesis.json"
 
+# RUST_LOG explicitly, not from the caller's environment: arxd's tracing
+# subscriber emits nothing at all with it unset, so the log greps below
+# ("reverted from height", "HALT:") read an empty file and the run's verdict
+# silently depends on whoever's shell started it. Found while building
+# scripts/partition-heal-harness.sh.
 echo "starting node 0 as ${ADDRS[0]} ..."
+RUST_LOG="${RUST_LOG:-info}" \
 "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[0]}" --validator \
     --port "${RPC_PORTS[0]}" --p2p-port "${P2P_PORTS[0]}" --rpc-bind 127.0.0.1 \
     >"$ROOT/node-0.log" 2>&1 &
 PIDS[0]=$!
 
 echo "starting node 1 as ${ADDRS[1]} ..."
+RUST_LOG="${RUST_LOG:-info}" \
 "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[1]}" --validator \
     --port "${RPC_PORTS[1]}" --p2p-port "${P2P_PORTS[1]}" --rpc-bind 127.0.0.1 \
     --bootnodes "/ip4/127.0.0.1/tcp/${P2P_PORTS[0]}/p2p/$PEER_0" \

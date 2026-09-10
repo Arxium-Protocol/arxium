@@ -45,7 +45,7 @@ xc-artifact = { workspace = true }
 arxd-runtime = { workspace = true }
 
 [features]
-fault-injection = ["xc-cli/fault-injection"]
+fault-injection = ["xc-cli/fault-injection", "arxd-network/fault-injection"]
 
 [lints]
 workspace = true

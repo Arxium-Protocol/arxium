@@ -1237,6 +1237,24 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         );
     }
 
+    // Same guard as the fault flag above, for the same reason: this one
+    // makes a validator refuse to talk to named peers, which outside a
+    // harness is just a node silently cutting itself off from the network.
+    // `build_swarm` reads the variable itself (arxd/network's
+    // `partitioned_block_list`); this only decides whether the process is
+    // allowed to boot with it set at all.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(peers) = std::env::var("ARXD_BLOCK_PEERS") {
+        if !peers.trim().is_empty() {
+            ensure_fault_injection_allowed(&chain_name)?;
+            warn!(
+                %peers,
+                "PARTITION ARMED — this node refuses all connections to these peers. \
+                 Never use outside a devnet acceptance test."
+            );
+        }
+    }
+
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the
     // RPC server so `GET /metrics` can render it.

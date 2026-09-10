@@ -66,7 +66,13 @@ pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, reque
             // tip, so a fresh or single-node devnet still syncs before its
             // first height finalizes. Once anything has finalized, the clamp
             // is unconditional — a chain that has stopped finalizing stops
-            // handing out history to build on, which is the intent.
+            // handing out history to build on, which is the intent. `watermark
+            // == 0` cannot instead mean "genesis finalized": the advance loop
+            // in `stage_watermark_advance` begins at `watermark + 1`, so height
+            // 0 is never a certification target and 0 reads unambiguously as
+            // "nothing finalized yet". The fallback is therefore bounded to
+            // pre-first-finality, and monotonicity keeps it there — once
+            // height 1 finalizes the clamp is on permanently.
             let tip_height = local_tip_height(db);
             //
             // The watermark, not the highest certificate: it is contiguous

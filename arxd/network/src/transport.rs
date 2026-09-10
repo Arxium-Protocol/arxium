@@ -63,6 +63,48 @@ pub(crate) struct Behaviour {
     pub(crate) identify: identify::Behaviour,
 }
 
+/// The block list a node starts with: empty in every real build.
+///
+/// `build_swarm` used to inline `allow_block_list::Behaviour::default()`
+/// here; the only reason it is a function is the harness variant below.
+#[cfg(not(feature = "fault-injection"))]
+fn partitioned_block_list() -> allow_block_list::Behaviour<BlockedPeers> {
+    allow_block_list::Behaviour::default()
+}
+
+/// Harness-only (`--features fault-injection`, never in a normal build):
+/// pre-block the comma-separated `PeerId`s in `ARXD_BLOCK_PEERS`, so
+/// `scripts/partition-heal-harness.sh` can isolate one validator on a single
+/// host. `arxd_node` refuses to start with this set unless the chain is the
+/// harness chain, the same guard `--inject-fault-at-height` gets.
+///
+/// This is the only lever that actually partitions a node here: mDNS is
+/// unconditional in `Behaviour`, so a node restarted with no `--bootnodes`
+/// rediscovers every peer on localhost within seconds, and pf/iptables need
+/// root. Blocking at the swarm level is what the ban path already does
+/// (`gossip::record_bad_gossip`), so a partitioned node refuses inbound
+/// dials and its own outbound dials fail — a clean two-way cut that heals
+/// by restarting without the variable.
+#[cfg(feature = "fault-injection")]
+fn partitioned_block_list() -> allow_block_list::Behaviour<BlockedPeers> {
+    let mut behaviour = allow_block_list::Behaviour::default();
+    let Ok(list) = std::env::var("ARXD_BLOCK_PEERS") else {
+        return behaviour;
+    };
+    for entry in list.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        match entry.parse::<PeerId>() {
+            // Loud on purpose: a typo'd peer id silently not blocked is a
+            // harness run that reports a healthy heal of a partition that
+            // never happened.
+            Err(err) => panic!("ARXD_BLOCK_PEERS: {entry:?} is not a peer id: {err}"),
+            Ok(peer) => {
+                behaviour.block_peer(peer);
+            }
+        }
+    }
+    behaviour
+}
+
 pub(crate) fn build_swarm(
     keypair: libp2p::identity::Keypair,
     chain_id: &str,
@@ -116,7 +158,7 @@ pub(crate) fn build_swarm(
                 gossipsub,
                 sync,
                 limits,
-                blocked_peers: allow_block_list::Behaviour::default(),
+                blocked_peers: partitioned_block_list(),
                 identify,
             })
         })?
