@@ -51,28 +51,15 @@ fn load_or_generate_keypair_inner(base_path: &Path, fixed_seed: Option<[u8; 32]>
         let bytes = keypair
             .to_protobuf_encoding()
             .context("failed to encode generated network key")?;
-        std::fs::write(&key_path, bytes).context("failed to persist generated network key")?;
+        xc_primitives::keyfile::write_new_key_file(&key_path, &bytes)
+            .context("failed to persist generated network key")?;
         keypair
     };
 
     // Applied on every load, not just generation, mirroring validator.rs —
     // a key file created before this check existed still gets locked down.
-    restrict_key_file_permissions(&key_path)
+    xc_primitives::keyfile::restrict_key_file_permissions(&key_path)
         .context("failed to restrict network key file permissions")?;
 
     Ok(keypair)
-}
-
-#[cfg(unix)]
-fn restrict_key_file_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_key_file_permissions(_path: &Path) -> Result<()> {
-    // ponytail: no portable equivalent of chmod 0600 on non-Unix; revisit if
-    // this ever needs to run on Windows in production.
-    Ok(())
 }

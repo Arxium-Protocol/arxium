@@ -570,7 +570,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     // Gossip is just another untrusted input source — no more
                     // trusted than a stranger hitting RPC directly, so it runs
                     // through the exact same admission check.
-                    if let Err(err) = validate_action(&db, &action) {
+                    if let Err(err) = validate_action(&db, &action, limits.mempool_max_nonce_gap) {
                         // A bad signature can't be innocent lag — it's forged
                         // or corrupted. Stale-nonce/storage rejects are just
                         // an honest peer relaying something already applied,

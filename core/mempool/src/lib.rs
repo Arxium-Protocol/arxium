@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -28,6 +28,11 @@ pub enum MempoolError {
     // away, when something eventually tries to encode it for the wire.
     #[error("action is {size} bytes, over the {max}-byte wire limit")]
     TooLarge { size: usize, max: usize },
+    // Per-sender cap. The global caps alone let one account hold every slot:
+    // admission is FIFO and there is no fee-priority eviction, so whoever
+    // fills the queue first keeps it.
+    #[error("sender {sender} already holds {max} mempool slot(s), its limit")]
+    SenderQueueFull { sender: Address, max: usize },
 }
 
 /// Everything an action must pass before it's allowed anywhere near the
@@ -44,6 +49,15 @@ pub enum AdmissionError {
         action_nonce: u64,
         current_nonce: u64,
     },
+    #[error(
+        "nonce for {sender} is too far ahead: action has {action_nonce}, current on-chain nonce is {current_nonce}, max gap is {max_gap}"
+    )]
+    NonceTooFarAhead {
+        sender: Address,
+        action_nonce: u64,
+        current_nonce: u64,
+        max_gap: u64,
+    },
     #[error("failed to look up account for nonce check: {0}")]
     Storage(#[from] StorageError),
 }
@@ -57,6 +71,7 @@ pub enum AdmissionError {
 pub fn validate_action<P: Serialize>(
     db: &ArxiumDb,
     action: &Action<P>,
+    max_nonce_gap: u64,
 ) -> Result<(), AdmissionError> {
     action.verify_signature()?;
 
@@ -69,6 +84,19 @@ pub fn validate_action<P: Serialize>(
             sender: action.sender.clone(),
             action_nonce: action.nonce,
             current_nonce,
+        });
+    }
+    // An action more than `max_nonce_gap` ahead cannot execute until every
+    // nonce below it does, so it would sit in the queue indefinitely — and
+    // `purge_stale` only evicts nonces that have gone *stale*, never ones
+    // that were never reachable. Without this bound a sender can queue
+    // actions at arbitrary far-future nonces and never have them reclaimed.
+    if action.nonce - current_nonce > max_nonce_gap {
+        return Err(AdmissionError::NonceTooFarAhead {
+            sender: action.sender.clone(),
+            action_nonce: action.nonce,
+            current_nonce,
+            max_gap: max_nonce_gap,
         });
     }
 
@@ -101,8 +129,12 @@ pub struct Mempool<P> {
     // Running total of every queued action's encoded size, so push/drain/purge
     // stay O(1) instead of re-encoding the whole queue to check the cap.
     total_bytes: usize,
+    // Queued action count per sender, maintained exactly like `signatures`,
+    // so the per-sender cap is an O(1) lookup instead of a scan.
+    per_sender: HashMap<Address, usize>,
     max_pending: usize,
     max_pending_bytes: usize,
+    max_per_sender: usize,
 }
 
 impl<P> Default for Mempool<P> {
@@ -113,8 +145,10 @@ impl<P> Default for Mempool<P> {
             seen: HashSet::new(),
             signatures: HashSet::new(),
             total_bytes: 0,
+            per_sender: HashMap::new(),
             max_pending: limits.mempool_max_pending,
             max_pending_bytes: limits.mempool_max_bytes,
+            max_per_sender: limits.mempool_max_per_sender,
         }
     }
 }
@@ -129,6 +163,7 @@ impl<P: Serialize> Mempool<P> {
         Self {
             max_pending: limits.mempool_max_pending,
             max_pending_bytes: limits.mempool_max_bytes,
+            max_per_sender: limits.mempool_max_per_sender,
             ..Self::default()
         }
     }
@@ -154,6 +189,13 @@ impl<P: Serialize> Mempool<P> {
             return Err(MempoolError::Full);
         }
 
+        if self.per_sender.get(&action.sender).copied().unwrap_or(0) >= self.max_per_sender {
+            return Err(MempoolError::SenderQueueFull {
+                sender: action.sender,
+                max: self.max_per_sender,
+            });
+        }
+
         let key = (action.sender.clone(), action.nonce);
         if !self.seen.insert(key) {
             return Err(MempoolError::Duplicate {
@@ -166,6 +208,7 @@ impl<P: Serialize> Mempool<P> {
             self.signatures.insert(signature.clone());
         }
         self.total_bytes += size;
+        *self.per_sender.entry(action.sender.clone()).or_insert(0) += 1;
         self.pending.push_back(action);
         Ok(())
     }
@@ -192,6 +235,7 @@ impl<P: Serialize> Mempool<P> {
                 if let Some(signature) = &action.signature {
                     self.signatures.remove(signature);
                 }
+                release_slot(&mut self.per_sender, &action.sender);
             })
             .collect();
         for action in &drained {
@@ -210,6 +254,7 @@ impl<P: Serialize> Mempool<P> {
     pub fn purge_stale(&mut self, sender: &Address, current_nonce: u64) {
         let seen = &mut self.seen;
         let signatures = &mut self.signatures;
+        let per_sender = &mut self.per_sender;
         let mut removed_bytes = 0usize;
         self.pending.retain(|action| {
             if &action.sender == sender && action.nonce < current_nonce {
@@ -218,12 +263,24 @@ impl<P: Serialize> Mempool<P> {
                     signatures.remove(signature);
                 }
                 removed_bytes += Self::encoded_size(action);
+                release_slot(per_sender, &action.sender);
                 false
             } else {
                 true
             }
         });
         self.total_bytes -= removed_bytes;
+    }
+}
+
+/// Drops one queued slot for `sender`, removing the entry entirely at zero so
+/// the map doesn't retain one key per address ever seen.
+fn release_slot(per_sender: &mut HashMap<Address, usize>, sender: &Address) {
+    if let Some(count) = per_sender.get_mut(sender) {
+        *count -= 1;
+        if *count == 0 {
+            per_sender.remove(sender);
+        }
     }
 }
 
@@ -273,6 +330,36 @@ mod tests {
         };
         assert!(matches!(mempool.push(overflow), Err(MempoolError::Full)));
         assert_eq!(mempool.len(), 10, "the 11th action must not have been queued");
+    }
+
+    /// One sender must not be able to hold the whole queue. Admission is
+    /// FIFO with no fee-priority eviction, so without a per-sender cap the
+    /// first account to fill the mempool keeps it — for the price of one
+    /// action fee, since the fee is only charged when an action executes.
+    #[test]
+    fn one_sender_cannot_hold_more_than_its_share_of_the_queue() {
+        let limits = xc_primitives::Limits { mempool_max_per_sender: 3, ..Default::default() };
+        let mut mempool: Mempool<()> = Mempool::with_limits(&limits);
+
+        for nonce in 0..3 {
+            mempool.push(action(addr(1), nonce)).unwrap();
+        }
+        assert!(matches!(
+            mempool.push(action(addr(1), 3)),
+            Err(MempoolError::SenderQueueFull { max: 3, .. })
+        ));
+
+        // Another sender is unaffected — the cap is per sender, not a
+        // smaller global cap.
+        mempool.push(action(addr(2), 0)).unwrap();
+        assert_eq!(mempool.len(), 4);
+
+        // Slots come back as actions leave, by either route.
+        mempool.drain_pending(1);
+        mempool.push(action(addr(1), 3)).unwrap();
+        mempool.purge_stale(&addr(1), 2);
+        mempool.push(action(addr(1), 4)).unwrap();
+        assert_eq!(mempool.len(), 4);
     }
 
     /// A single over-cap action must be rejected at push, not accepted into

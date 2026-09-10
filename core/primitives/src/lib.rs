@@ -8,6 +8,7 @@ mod action;
 mod address;
 mod block;
 mod consensus;
+pub mod keyfile;
 mod state;
 
 pub use action::{Action, RawAction, SignatureError};
@@ -99,6 +100,15 @@ pub struct Limits {
     /// together — a count cap alone lets a few huge actions exhaust memory.
     pub mempool_max_pending: usize,
     pub mempool_max_bytes: usize,
+    /// Mempool slots any single sender may hold at once. Without it one
+    /// account can fill the whole queue: admission is FIFO against the global
+    /// caps, with no fee-priority eviction.
+    pub mempool_max_per_sender: usize,
+    /// How far ahead of a sender's on-chain nonce an action may be and still
+    /// be admitted. An action beyond it cannot execute until the gap is
+    /// filled, so without a bound a sender can queue actions that are
+    /// permanently unexecutable and never purged as stale.
+    pub mempool_max_nonce_gap: u64,
     /// Concurrent inbound P2P connections this node will hold.
     pub max_peers_incoming: u32,
 }
@@ -113,6 +123,8 @@ impl Default for Limits {
             rpc_trusted_proxy_hops: 0,
             mempool_max_pending: 10_000,
             mempool_max_bytes: 10_000_000,
+            mempool_max_per_sender: 64,
+            mempool_max_nonce_gap: 64,
             max_peers_incoming: 200,
         }
     }

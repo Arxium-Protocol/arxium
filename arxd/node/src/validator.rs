@@ -29,12 +29,12 @@ fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<[u8; 32]> {
     } else {
         let mut seed = [0u8; 32];
         rand::rng().fill_bytes(&mut seed);
-        std::fs::write(path, hex::encode(seed))
+        xc_primitives::keyfile::write_new_key_file(path, hex::encode(seed).as_bytes())
             .with_context(|| format!("failed to persist generated {what}"))?;
         seed
     };
 
-    restrict_key_file_permissions(path)
+    xc_primitives::keyfile::restrict_key_file_permissions(path)
         .with_context(|| format!("failed to restrict {what} file permissions"))?;
 
     Ok(seed)
@@ -67,16 +67,35 @@ pub fn load_or_generate_bls_key(base_path: &Path) -> Result<(BlsSecretKey, BlsPu
     xc_bls::keygen_from_seed(&seed).map_err(|_| anyhow::anyhow!("invalid BLS key seed"))
 }
 
-#[cfg(unix)]
-fn restrict_key_file_permissions(path: &Path) -> Result<()> {
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
 
-#[cfg(not(unix))]
-fn restrict_key_file_permissions(_path: &Path) -> Result<()> {
-    // ponytail: no portable equivalent of chmod 0600 on non-Unix; revisit if
-    // this ever needs to run on Windows in production.
-    Ok(())
+    /// Generation must produce an owner-only file directly. Asserted here as
+    /// well as in `xc_primitives::keyfile` because this is the path that
+    /// actually mints a validator's signing keys — a regression to
+    /// `std::fs::write` + chmod would leave both of them briefly
+    /// world-readable, and only this test would notice.
+    #[test]
+    fn generated_validator_keys_are_never_world_readable() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-validator-keys-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        load_or_generate_key(&dir).unwrap();
+        load_or_generate_bls_key(&dir).unwrap();
+
+        for file in [KEY_FILE, BLS_KEY_FILE] {
+            let mode = std::fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{file} mode is {mode:o}");
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

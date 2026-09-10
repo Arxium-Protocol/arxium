@@ -280,6 +280,13 @@ pub struct LimitArgs {
     /// Mempool cap in total encoded bytes of pending actions.
     #[arg(long, env = "ARXD_MEMPOOL_MAX_BYTES", default_value_t = Limits::default().mempool_max_bytes)]
     pub mempool_max_bytes: usize,
+    /// Mempool slots a single sender may occupy at once.
+    #[arg(long, env = "ARXD_MEMPOOL_MAX_PER_SENDER", default_value_t = Limits::default().mempool_max_per_sender)]
+    pub mempool_max_per_sender: usize,
+    /// How far ahead of a sender's on-chain nonce an action may be and still
+    /// be admitted to the mempool.
+    #[arg(long, env = "ARXD_MEMPOOL_MAX_NONCE_GAP", default_value_t = Limits::default().mempool_max_nonce_gap)]
+    pub mempool_max_nonce_gap: u64,
 
     /// Concurrent inbound P2P connections.
     #[arg(long, env = "ARXD_MAX_PEERS_INCOMING", default_value_t = Limits::default().max_peers_incoming)]
@@ -296,6 +303,8 @@ impl From<LimitArgs> for Limits {
             rpc_trusted_proxy_hops: args.rpc_trusted_proxy_hops,
             mempool_max_pending: args.mempool_max_pending,
             mempool_max_bytes: args.mempool_max_bytes,
+            mempool_max_per_sender: args.mempool_max_per_sender,
+            mempool_max_nonce_gap: args.mempool_max_nonce_gap,
             max_peers_incoming: args.max_peers_incoming,
         }
     }

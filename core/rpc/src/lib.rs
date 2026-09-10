@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result};
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -53,6 +53,10 @@ impl<P: Serialize + DeserializeOwned + Clone + Send + Sync + 'static> Payload fo
 // Not operator-tunable: it bounds this map's memory, it is not a policy knob.
 const RATE_LIMIT_SWEEP_THRESHOLD: usize = 10_000;
 
+// One bucket for every request that matched no route, so 404 traffic cannot
+// mint labels either.
+const UNMATCHED_PATH: &str = "<unmatched>";
+
 #[derive(Clone)]
 struct AppState<P: Payload> {
     mempool: Arc<Mutex<Mempool<P>>>,
@@ -61,6 +65,9 @@ struct AppState<P: Payload> {
     rate_limiter: Arc<RateLimiter>,
     // Number of trusted proxies in front of this RPC — see `client_ip`.
     trusted_proxy_hops: usize,
+    // How far ahead of a sender's on-chain nonce a submitted action may be —
+    // see `xc_mempool::validate_action`.
+    max_nonce_gap: u64,
     // Broadcasts freshly admitted actions out to peers over gossip. `None`
     // in tests / any caller that doesn't wire up `network`.
     gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
@@ -280,10 +287,18 @@ async fn guard<P: Payload>(
     req: Request,
     next: Next,
 ) -> Response {
-    // Path only (never the query string — addresses/signatures/heights can
-    // appear there and would blow up the metric's cardinality), captured
-    // before `req` moves into `next.run`.
-    let path = req.uri().path().to_string();
+    // The matched *route template* (`/accounts/{address}`), never the request
+    // path: addresses, hashes, signatures and heights all appear in path
+    // segments, and `metrics-exporter-prometheus` never evicts a label set —
+    // so keying on the real path grows the registry without bound on ordinary
+    // explorer traffic, and lets anyone drive that growth deliberately (this
+    // runs on 404s and on rate-limited requests too). Captured before `req`
+    // moves into `next.run`. Requests that matched no route have no template
+    // and share one bucket.
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| UNMATCHED_PATH.to_string(), |matched| matched.as_str().to_string());
     let is_write = req.method() != Method::GET;
 
     if let Some(token) = &state.rpc_token {
@@ -393,6 +408,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         rpc_token: rpc_token.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new(&limits)),
         trusted_proxy_hops: limits.rpc_trusted_proxy_hops,
+        max_nonce_gap: limits.mempool_max_nonce_gap,
         gossip_tx,
         metrics_handle,
         payload_precheck,
@@ -520,7 +536,7 @@ async fn submit_action<P: Payload>(
     };
     let sender = action.sender.clone();
 
-    match validate_action(&state.db, &action) {
+    match validate_action(&state.db, &action, state.max_nonce_gap) {
         Ok(()) => {}
         Err(err @ AdmissionError::Storage(_)) => {
             warn!("failed to validate action from {sender}: {err}");
@@ -552,7 +568,9 @@ async fn submit_action<P: Payload>(
             }
             StatusCode::ACCEPTED.into_response()
         }
-        Err(err @ MempoolError::Full) => {
+        // Both are "come back later": the global queue is full, or this
+        // sender is holding its share of it.
+        Err(err @ (MempoolError::Full | MempoolError::SenderQueueFull { .. })) => {
             warn!("rejected action from {sender}: {err}");
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
@@ -1500,6 +1518,7 @@ mod tests {
             rpc_token: None,
             rate_limiter: Arc::new(RateLimiter::new(&Limits::default())),
             trusted_proxy_hops: 0,
+            max_nonce_gap: Limits::default().mempool_max_nonce_gap,
             gossip_tx: None,
             // Not installed as the global recorder — tests don't assert on
             // rendered metric values, just that requests still succeed.
@@ -1526,6 +1545,52 @@ mod tests {
         let sig = key.sign(&action.signing_bytes());
         action.signature = Some(hex::encode(sig.to_bytes()));
         action
+    }
+
+    /// Two requests for two different addresses must produce *one* label set,
+    /// naming the route template. Keying on the request path instead grows the
+    /// metrics registry once per distinct address anyone asks about, and
+    /// nothing ever evicts it.
+    #[test]
+    fn the_request_metric_is_labelled_with_the_route_template_not_the_path() {
+        use tower::ServiceExt;
+
+        let state = test_state();
+        let app = Router::new()
+            .route("/accounts/{address}", get(|| async { "ok" }))
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(state, guard::<TestPayload>));
+
+        let peer = ConnectInfo("203.0.113.9:5000".parse::<SocketAddr>().unwrap());
+        let request = |uri: &str| {
+            axum::http::Request::builder()
+                .uri(uri)
+                .extension(peer)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // `with_local_recorder` installs the recorder for *this* thread, so
+        // the requests have to run on it — hence a current-thread runtime.
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                for address in ["arx1aaaaaaaa", "arx1bbbbbbbb"] {
+                    app.clone().oneshot(request(&format!("/accounts/{address}"))).await.unwrap();
+                }
+                // A 404 must not mint a label of its own either — the guard
+                // wraps the fallback too.
+                app.clone().oneshot(request("/no/such/route/arx1cccccccc")).await.unwrap();
+            });
+        });
+
+        let rendered = handle.render();
+        assert!(rendered.contains("path=\"/accounts/{address}\""), "{rendered}");
+        assert!(rendered.contains(&format!("path=\"{UNMATCHED_PATH}\"")), "{rendered}");
+        assert!(!rendered.contains("arx1aaaaaaaa"), "{rendered}");
+        assert!(!rendered.contains("arx1cccccccc"), "{rendered}");
     }
 
     #[test]
@@ -1692,11 +1757,24 @@ mod tests {
             let resp = submit_action(State(state.clone()), Ok(Json(stale))).await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+            // Far-future nonce: can never execute until every nonce below it
+            // does, and `purge_stale` never reclaims it — so it must not take
+            // a mempool slot at all.
+            let far_future = signed_action(&key, 5 + state.max_nonce_gap + 1);
+            let resp = submit_action(State(state.clone()), Ok(Json(far_future))).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(state.mempool.lock().unwrap().len(), 0);
+
+            // The edge of the window is still admissible.
+            let edge = signed_action(&key, 5 + state.max_nonce_gap);
+            let resp = submit_action(State(state.clone()), Ok(Json(edge))).await;
+            assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
             // Correctly signed, current nonce: must be accepted into the mempool.
             let valid = signed_action(&key, 5);
             let resp = submit_action(State(state.clone()), Ok(Json(valid))).await;
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
-            assert_eq!(state.mempool.lock().unwrap().len(), 1);
+            assert_eq!(state.mempool.lock().unwrap().len(), 2);
         });
     }
 
