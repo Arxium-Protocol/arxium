@@ -359,8 +359,10 @@ where
         // chain's very first height.
         let mut last_progress: (u64, Instant) = (0, Instant::now());
 
-        // Highest height seen from either event kind, used as the pruning
-        // watermark below.
+        // Pruning watermark. Only ever raised from locally-validated chain
+        // state — accepted blocks, and the records this node itself persisted
+        // after verifying them — never from raw gossip. See the per-event
+        // update in the loop below.
         let mut highest_seen: u64 = 0;
 
         // Reload whatever partial tallies survived a restart — a crash after
@@ -509,12 +511,16 @@ where
                 Err(RecvTimeoutError::Disconnected) => return,
             };
 
-            highest_seen = highest_seen.max(match &event {
-                FinalityEvent::BlockObserved(block) => block.height,
-                FinalityEvent::VoteObserved(vote) => vote.height,
-                FinalityEvent::DissentObserved(dissent) => dissent.height,
-                FinalityEvent::RoundTimeoutObserved(vote) => vote.height,
-            });
+            // Only `BlockObserved` moves the watermark: it's emitted for blocks
+            // this node already validated and persisted, so its height is local
+            // chain state. Vote/dissent/round-timeout heights are raw
+            // gossip — signatures are checked later, in `tally_vote` — so
+            // letting them advance the watermark let one unauthenticated packet
+            // claiming `height: u64::MAX` prune every real tally, this node's
+            // own votes and the persisted votes on disk, permanently.
+            if let FinalityEvent::BlockObserved(block) = &event {
+                highest_seen = highest_seen.max(block.height);
+            }
             if let FinalityEvent::BlockObserved(block) = &event
                 && block.height > last_progress.0
             {
@@ -1716,6 +1722,63 @@ mod tests {
         let resent = vote_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("expected a rebroadcast");
+        assert_eq!(resent.height, first.height);
+        assert_eq!(resent.signature, first.signature);
+
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pruning watermark used to be raised from raw event heights, before
+    /// any signature check, so one unauthenticated gossiped vote claiming
+    /// `height: u64::MAX` pruned every real tally and this node's own votes —
+    /// a permanent chain-wide finality halt from a single packet. The
+    /// watermark now only moves on validated chain state, so the bogus vote
+    /// must not stop the rebroadcast of our own vote at height 5.
+    #[test]
+    fn an_unauthenticated_far_future_vote_does_not_prune_our_own_votes() {
+        let (db, dir) = open_test_db();
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[5u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[6u8; 32]).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, vote_rx) = mpsc::channel();
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr.clone(), sk)),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+            dissent_tx,
+            Arc::new(Mutex::new(())),
+        );
+
+        let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
+        event_tx.send(FinalityEvent::BlockObserved(block)).unwrap();
+        let first = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected initial vote");
+        assert_eq!(first.height, 5);
+
+        // Not a validator, signature over nothing in particular: exactly what
+        // any peer can put on the `precommits` topic.
+        let (attacker_sk, _) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        event_tx
+            .send(FinalityEvent::VoteObserved(PrecommitVote {
+                height: u64::MAX,
+                block_hash: "0".repeat(64),
+                voter: Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
+                signature: xc_bls::sign(&attacker_sk, b"not a precommit"),
+                ep: [0u8; 32],
+            }))
+            .unwrap();
+
+        let resent = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("our own vote must survive the bogus watermark");
         assert_eq!(resent.height, first.height);
         assert_eq!(resent.signature, first.signature);
 
