@@ -19,8 +19,9 @@ pub use consensus::{
     round_timeout_signing_bytes,
 };
 pub use state::{
-    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, AttestorRecord,
-    Snapshot, StakeAllocation, Unbonding, ValidatorChange, ValidatorEntry,
+    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, AssetClass,
+    AssetMetadata, AttestorRecord, ClaimTopic, CountryCode, Snapshot, StakeAllocation, Unbonding, ValidatorChange,
+    ValidatorEntry,
 };
 
 /// Ceiling for any single bincode-decoded value read from untrusted bytes

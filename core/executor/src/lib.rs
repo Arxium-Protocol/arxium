@@ -901,11 +901,11 @@ mod tests {
                     anyhow::bail!("asset {id} already registered");
                 }
                 Ok(BlockUpdates {
-                    asset_registration: Some(Asset {
-                        asset_id: id.clone(),
-                        issuer: action.sender.clone(),
-                        compliance_required: *compliance_required,
-                    }),
+                    asset_registration: Some(Asset::new(
+                        id.clone(),
+                        action.sender.clone(),
+                        *compliance_required,
+                    )),
                     ..Default::default()
                 })
             }
@@ -1069,10 +1069,7 @@ mod tests {
             alice.clone(),
             AccountEntry {
                 balance: 100,
-                nonce: 0,
-                identity_hash: None,
-                zk_identity_verified: false,
-            attested_by: None,
+                ..Default::default()
             },
         )])))
         .unwrap();
@@ -1180,7 +1177,7 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            AccountEntry { balance: 100, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None },
+            AccountEntry { balance: 100, ..Default::default() },
         )])))
         .unwrap();
 
@@ -1205,7 +1202,7 @@ mod tests {
         reference_db
             .write_batch(&AccountUpdates(BTreeMap::from([(
                 alice.clone(),
-                AccountEntry { balance: 100, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None },
+                AccountEntry { balance: 100, ..Default::default() },
             )])))
             .unwrap();
         for (i, action) in actions.into_iter().enumerate() {
@@ -1259,10 +1256,7 @@ mod tests {
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,
-                    nonce: 0,
-                    identity_hash: None,
-                    zk_identity_verified: false,
-                attested_by: None,
+                    ..Default::default()
                 },
             )])),
             &genesis,
@@ -1314,10 +1308,7 @@ mod tests {
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,
-                    nonce: 0,
-                    identity_hash: None,
-                    zk_identity_verified: false,
-                attested_by: None,
+                    ..Default::default()
                 },
             )])),
             &genesis,
@@ -1353,10 +1344,7 @@ mod tests {
             sub_account,
             AccountEntry {
                 balance: 300,
-                nonce: 0,
-                identity_hash: None,
-                zk_identity_verified: false,
-            attested_by: None,
+                ..Default::default()
             },
         )])))
         .unwrap();
@@ -1790,10 +1778,7 @@ mod tests {
                 alice.clone(),
                 AccountEntry {
                     balance: 1000,
-                    nonce: 0,
-                    identity_hash: None,
-                    zk_identity_verified: false,
-                attested_by: None,
+                    ..Default::default()
                 },
             )])),
             &genesis,

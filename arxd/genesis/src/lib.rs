@@ -378,7 +378,7 @@ mod tests {
         let mut updates = AccountUpdates::default();
         updates.0.insert(
             address,
-            xc_primitives::AccountEntry { balance: 1_000, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None },
+            xc_primitives::AccountEntry { balance: 1_000, ..Default::default() },
         );
         db.write_batch(&updates).unwrap();
 

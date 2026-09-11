@@ -3,25 +3,108 @@
 
 use xc_circuit::{AssetKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, Asset};
+use xc_primitives::{Address, Asset, AssetMetadata};
 use xc_storage::StorageError;
 
 use crate::ChainAction;
+
+/// `asset_id` is both the storage key (`asset_record:{id}`) and the primary
+/// key every downstream consumer joins and displays, so it is bounded here,
+/// at the only place an id enters state.
+const MAX_ASSET_ID_LEN: usize = 64;
+
+/// `metadata_uri` lands in a merkleized, permanent record. The 1 MiB
+/// `MAX_WIRE_MESSAGE_SIZE` ceiling stops a peer exhausting memory during
+/// decode, but on its own it would happily let a single registration park
+/// most of a megabyte in the state trie forever.
+const MAX_METADATA_URI_LEN: usize = 2048;
+
+/// Display scale only, and 18 is what every downstream formatter assumes.
+/// `u8` alone would permit 255, which no consumer can render.
+const MAX_DECIMALS: u8 = 18;
+
+/// A `ForcedTransfer`'s `reason` rides in the block forever, so it is capped —
+/// generously, since this is a legal justification a human writes, but capped,
+/// because `MAX_WIRE_MESSAGE_SIZE` alone would permit most of a megabyte of it.
+const MAX_REASON_LEN: usize = 512;
+
+/// Charset is restricted rather than case-folded, for two reasons.
+///
+/// Case: folding would mean the id stored, indexed and shown by every
+/// consumer is not the id the issuer submitted, so `Gold` would silently
+/// surface as `gold` in the explorer. Rejecting rules out the `Gold`/`gold`
+/// collision while keeping stored id == submitted id.
+///
+/// Punctuation: `AssetBalanceKey` encodes as `asset_balance:{asset_id}:{owner}`
+/// and shares `CF_ASSETS` with `asset_record:{asset_id}`, so a `:` in an id
+/// puts issuer-controlled text into key structure. Nothing parses those keys
+/// back apart today, but an allowlisted charset closes the class rather than
+/// relying on that staying true.
+fn validate_asset_id(asset_id: &str) -> anyhow::Result<()> {
+    if asset_id.is_empty() {
+        anyhow::bail!("asset_id must not be empty");
+    }
+    if asset_id.len() > MAX_ASSET_ID_LEN {
+        anyhow::bail!(
+            "asset_id is {} bytes, over the {MAX_ASSET_ID_LEN}-byte limit",
+            asset_id.len()
+        );
+    }
+    if let Some(bad) = asset_id
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '_'))
+    {
+        anyhow::bail!(
+            "asset_id {asset_id:?} contains {bad:?}: only lowercase ascii, digits, '-' and '_' are allowed"
+        );
+    }
+    Ok(())
+}
+
+fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
+    if metadata.decimals > MAX_DECIMALS {
+        anyhow::bail!("decimals is {}, over the maximum of {MAX_DECIMALS}", metadata.decimals);
+    }
+    if let Some(uri) = &metadata.metadata_uri
+        && uri.len() > MAX_METADATA_URI_LEN
+    {
+        anyhow::bail!(
+            "metadata_uri is {} bytes, over the {MAX_METADATA_URI_LEN}-byte limit",
+            uri.len()
+        );
+    }
+    // `Some(vec![])` is left valid on purpose: it means no jurisdiction may
+    // hold the asset, which is useless but unambiguous, and is distinct from
+    // `None` (unrestricted). Rejecting it would make `None` and empty behave
+    // the same, which is exactly the confusion the two-state field avoids.
+    for code in metadata.allowed_jurisdictions.iter().flatten() {
+        if code.len() != 2 || !code.chars().all(|c| c.is_ascii_uppercase()) {
+            anyhow::bail!("jurisdiction {code:?} is not a 2-letter uppercase ISO-3166-1 alpha-2 code");
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn register_asset<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     asset_id: &str,
     compliance_required: bool,
+    metadata: &AssetMetadata,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
+    validate_asset_id(asset_id)?;
+    validate_metadata(metadata)?;
     if view.get(&AssetKey(asset_id))?.is_some() {
         anyhow::bail!("asset {asset_id} is already registered");
     }
-    let asset = Asset {
-        asset_id: asset_id.to_string(),
-        issuer: action.sender.clone(),
+    let asset = Asset::register(
+        asset_id,
+        action.sender.clone(),
         compliance_required,
-    };
+        metadata.clone(),
+        current_height,
+    );
     Ok(BlockUpdates {
         asset_registration: Some(asset),
         ..Default::default()
@@ -39,10 +122,16 @@ pub(crate) fn issue_asset<V: KvRead<Error = StorageError>>(
     asset_id: &str,
     amount: u128,
 ) -> anyhow::Result<BlockUpdates> {
-    let asset = resolve_asset(view, asset_id)?;
+    let mut asset = resolve_asset(view, asset_id)?;
     let (accounts, assets) =
-        circuit_rwa_asset::apply_issue(view, &asset, &action.sender, action.nonce, amount)?;
-    Ok(BlockUpdates { accounts, assets, ..Default::default() })
+        circuit_rwa_asset::apply_issue(view, &mut asset, &action.sender, action.nonce, amount)?;
+    // `apply_issue` advanced `total_supply`, so the record has to go back.
+    // `asset_registration` is the channel for that despite the name: it is a
+    // plain `put` on `AssetKey` (`BlockView::apply_asset_registration`), an
+    // upsert rather than an insert, and `asset_index_updates` dedupes the
+    // registry list by id, so re-emitting an already-registered asset is
+    // harmless.
+    Ok(BlockUpdates { accounts, assets, asset_registration: Some(asset), ..Default::default() })
 }
 
 pub(crate) fn transfer_asset<V: KvRead<Error = StorageError>>(
@@ -62,6 +151,63 @@ pub(crate) fn transfer_asset<V: KvRead<Error = StorageError>>(
         amount,
     )?;
     Ok(BlockUpdates { accounts, assets, ..Default::default() })
+}
+
+/// Sets or clears `Asset.frozen` (`FreezeAsset`/`UnfreezeAsset`). Authorized
+/// for the asset's own issuer or the chain governor: the issuer is the party
+/// that answers for the instrument, and the governor is the regulatory
+/// backstop for when the issuer is the problem.
+///
+/// Idempotent in both directions — freezing an already-frozen asset is a
+/// successful no-op write, so a caller never needs to read the current flag
+/// first. It costs the action fee like anything else; it does not consume the
+/// sender's nonce, same as the other non-balance handlers (`register_asset`,
+/// the `identity::*` ones) — only the circuits that move value do that.
+pub(crate) fn set_frozen<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    frozen: bool,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = resolve_asset(view, asset_id)?;
+    if action.sender != asset.issuer {
+        crate::identity::require_governor(view, action)
+            .map_err(|_| anyhow::anyhow!("{} is neither the issuer of {asset_id} nor the chain governor", action.sender))?;
+    }
+    asset.frozen = frozen;
+    Ok(BlockUpdates { asset_registration: Some(asset), ..Default::default() })
+}
+
+/// Moves an asset balance on the governor's authority alone
+/// (`ForcedTransfer`) — no signature from `from`, and none of the compliance,
+/// claim, jurisdiction or freeze gates, which is the entire point: the cases
+/// this exists for (court order, sanctions, a lost key) are ones ordinary
+/// compliance refuses. It cannot mint — `circuit_rwa_asset::apply_forced_transfer`
+/// still requires `from` to hold the balance.
+///
+/// `reason` is required and length-capped. It isn't written to state; the
+/// block carrying the action is the audit record.
+pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    reason: &str,
+) -> anyhow::Result<BlockUpdates> {
+    if reason.trim().is_empty() {
+        anyhow::bail!("a forced transfer needs a non-empty reason");
+    }
+    if reason.len() > MAX_REASON_LEN {
+        anyhow::bail!("reason is {} bytes, over the {MAX_REASON_LEN}-byte limit", reason.len());
+    }
+    crate::identity::require_governor(view, action)
+        .map_err(|_| anyhow::anyhow!("only the chain governor may force a transfer"))?;
+
+    let asset = resolve_asset(view, asset_id)?;
+    let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
+    Ok(BlockUpdates { assets, ..Default::default() })
 }
 
 #[cfg(test)]
@@ -103,7 +249,11 @@ mod tests {
             sender: issuer.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::RegisterAsset { asset_id: "gold".into(), compliance_required: true },
+            payload: ActionPayload::RegisterAsset {
+                asset_id: "gold".into(),
+                compliance_required: true,
+                metadata: AssetMetadata::default(),
+            },
         };
         let updates = dispatch(&register, &view).unwrap();
         let asset = updates.asset_registration.clone().expect("asset registered");
@@ -121,6 +271,10 @@ mod tests {
         let updates = dispatch(&issue, &view).unwrap();
         view.apply_accounts(&updates.accounts).unwrap();
         view.apply_asset_balances(&updates.assets).unwrap();
+        // Issuance now rewrites the asset record too, to carry `total_supply`.
+        let issued = updates.asset_registration.clone().expect("issue rewrites the record");
+        assert_eq!(issued.total_supply, 1000);
+        view.put(&AssetKey("gold"), &issued).unwrap();
 
         // Recipient has no attestation yet — transfer must fail. The
         // compliance check runs before the nonce check, so the rejected
@@ -149,6 +303,234 @@ mod tests {
             payload: ActionPayload::TransferAsset { asset_id: "gold".into(), to: recipient.clone(), amount: 100 },
         };
         let updates = dispatch(&transfer, &view).unwrap();
-        assert_eq!(updates.assets.0[&("gold".to_string(), recipient)], 100);
+        assert_eq!(updates.assets.0[&("gold".to_string(), recipient.clone())], 100);
+        view.apply_accounts(&updates.accounts).unwrap();
+        view.apply_asset_balances(&updates.assets).unwrap();
+
+        // Freezing blocks the same transfer that just succeeded, and
+        // unfreezing restores it — the one path that proves the flag is read
+        // from state rather than only written to it.
+        let freeze = Action {
+            sender: issuer.clone(),
+            nonce: 2,
+            signature: None,
+            payload: ActionPayload::FreezeAsset { asset_id: "gold".into() },
+        };
+        let updates = dispatch(&freeze, &view).unwrap();
+        let frozen = updates.asset_registration.clone().expect("freeze rewrites the record");
+        assert!(frozen.frozen);
+        assert_eq!(frozen.total_supply, 1000, "freezing must not disturb the supply counter");
+        view.put(&AssetKey("gold"), &frozen).unwrap();
+
+        let transfer = Action {
+            sender: issuer.clone(),
+            nonce: 2,
+            signature: None,
+            payload: ActionPayload::TransferAsset { asset_id: "gold".into(), to: recipient.clone(), amount: 10 },
+        };
+        let err = dispatch(&transfer, &view).unwrap_err();
+        assert!(err.to_string().contains("is frozen"), "got: {err}");
+
+        let unfreeze = Action {
+            sender: issuer.clone(),
+            nonce: 2,
+            signature: None,
+            payload: ActionPayload::UnfreezeAsset { asset_id: "gold".into() },
+        };
+        let updates = dispatch(&unfreeze, &view).unwrap();
+        let thawed = updates.asset_registration.clone().expect("unfreeze rewrites the record");
+        assert!(!thawed.frozen);
+        view.put(&AssetKey("gold"), &thawed).unwrap();
+        dispatch(&transfer, &view).expect("transfer works again once unfrozen");
+    }
+
+    fn register(asset_id: &str, metadata: AssetMetadata) -> anyhow::Result<BlockUpdates> {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
+        let action = ChainAction {
+            sender: issuer,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RegisterAsset {
+                asset_id: asset_id.into(),
+                compliance_required: false,
+                metadata: metadata.clone(),
+            },
+        };
+        register_asset(&view, &action, asset_id, false, &metadata, 42)
+    }
+
+    #[test]
+    fn register_stores_issuer_metadata_and_stamps_the_height() {
+        let updates = register(
+            "gold-a_1",
+            AssetMetadata {
+                asset_class: xc_primitives::AssetClass::Commodity,
+                decimals: 8,
+                required_claims: vec![xc_primitives::ClaimTopic::Kyc],
+                allowed_jurisdictions: Some(vec!["CH".into(), "DE".into()]),
+                max_supply: Some(1_000),
+                metadata_uri: Some("https://example.test/prospectus.pdf".into()),
+            },
+        )
+        .unwrap();
+        let asset = updates.asset_registration.expect("registered");
+        assert_eq!(asset.decimals, 8);
+        assert_eq!(asset.max_supply, Some(1_000));
+        assert_eq!(asset.allowed_jurisdictions.as_deref(), Some(&["CH".to_string(), "DE".to_string()][..]));
+        assert_eq!(asset.registered_at, 42, "height comes from the block, not the issuer");
+        // Never issuer-settable, whatever the payload says.
+        assert_eq!(asset.total_supply, 0);
+        assert!(!asset.frozen);
+    }
+
+    #[test]
+    fn register_rejects_ids_that_are_empty_mixed_case_overlong_or_punctuated() {
+        for bad in ["", "Gold", "GOLD", "gold:bar", "gold bar", "gold.bar", "goldé"] {
+            let err = register(bad, AssetMetadata::default()).unwrap_err();
+            assert!(
+                err.to_string().contains("asset_id"),
+                "id {bad:?} should have been rejected on asset_id grounds, got: {err}"
+            );
+        }
+        let overlong = "g".repeat(MAX_ASSET_ID_LEN + 1);
+        assert!(register(&overlong, AssetMetadata::default()).unwrap_err().to_string().contains("over the"));
+        // The boundary itself is fine.
+        assert!(register(&"g".repeat(MAX_ASSET_ID_LEN), AssetMetadata::default()).is_ok());
+    }
+
+    #[test]
+    fn register_rejects_unrenderable_decimals_oversized_uris_and_bad_jurisdictions() {
+        let err = register("gold", AssetMetadata { decimals: MAX_DECIMALS + 1, ..Default::default() })
+            .unwrap_err();
+        assert!(err.to_string().contains("decimals"), "got: {err}");
+        assert!(register("gold", AssetMetadata { decimals: MAX_DECIMALS, ..Default::default() }).is_ok());
+
+        let err = register(
+            "gold",
+            AssetMetadata { metadata_uri: Some("u".repeat(MAX_METADATA_URI_LEN + 1)), ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("metadata_uri"), "got: {err}");
+
+        for bad in ["ch", "CHE", "C", "C1"] {
+            let err = register(
+                "gold",
+                AssetMetadata { allowed_jurisdictions: Some(vec![bad.into()]), ..Default::default() },
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("jurisdiction"), "code {bad:?}, got: {err}");
+        }
+        // `None` is unrestricted; `Some(vec![])` is "nobody", and both are legal.
+        assert!(register("gold", AssetMetadata { allowed_jurisdictions: None, ..Default::default() }).is_ok());
+        assert!(register("gold", AssetMetadata { allowed_jurisdictions: Some(vec![]), ..Default::default() }).is_ok());
+    }
+
+    /// Freeze is issuer-or-governor. This chain has no governor configured,
+    /// so a third party has no route to it at all.
+    #[test]
+    fn freeze_rejects_a_sender_who_is_neither_issuer_nor_governor() {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let stranger = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(stranger.clone(), funded(ACTION_FEE * 2))]),
+            HashMap::new(),
+        );
+        view.put(&AssetKey("gold"), &Asset::new("gold", issuer.clone(), true)).unwrap();
+
+        let action = ChainAction {
+            sender: stranger.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::FreezeAsset { asset_id: "gold".into() },
+        };
+        let err = set_frozen(&view, &action, "gold", true).unwrap_err();
+        assert!(err.to_string().contains("neither the issuer"), "got: {err}");
+    }
+
+    /// A forced transfer is governor-only and must carry a reason. The issuer
+    /// is deliberately *not* enough here, unlike freeze: moving someone
+    /// else's holding without their signature is a regulatory power, not an
+    /// issuer's housekeeping.
+    #[test]
+    fn forced_transfer_requires_the_governor_and_a_non_empty_reason() {
+        let governor = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let receiver = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (governor.clone(), funded(ACTION_FEE * 4)),
+                (issuer.clone(), funded(ACTION_FEE * 4)),
+            ]),
+            HashMap::new(),
+        );
+        view.put(&xc_circuit::GovernorKey, &governor).unwrap();
+        view.put(&AssetKey("gold"), &Asset::new("gold", issuer.clone(), true)).unwrap();
+        view.put(
+            &xc_circuit::AssetBalanceKey { asset_id: "gold", owner: &holder },
+            &100u128,
+        )
+        .unwrap();
+
+        let action = |sender: &Address, reason: &str| ChainAction {
+            sender: sender.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::ForcedTransfer {
+                asset_id: "gold".into(),
+                from: holder.clone(),
+                to: receiver.clone(),
+                amount: 40,
+                reason: reason.to_string(),
+            },
+        };
+
+        let err = forced_transfer(
+            &view,
+            &action(&issuer, "court order 2026-114"),
+            "gold",
+            &holder,
+            &receiver,
+            40,
+            "court order 2026-114",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only the chain governor"), "got: {err}");
+
+        // Whitespace is not a reason — the check is on content, not length.
+        let err = forced_transfer(&view, &action(&governor, "  "), "gold", &holder, &receiver, 40, "  ")
+            .unwrap_err();
+        assert!(err.to_string().contains("non-empty reason"), "got: {err}");
+
+        let err = forced_transfer(
+            &view,
+            &action(&governor, &"x".repeat(513)),
+            "gold",
+            &holder,
+            &receiver,
+            40,
+            &"x".repeat(513),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("over the 512-byte limit"), "got: {err}");
+
+        let updates = forced_transfer(
+            &view,
+            &action(&governor, "court order 2026-114"),
+            "gold",
+            &holder,
+            &receiver,
+            40,
+            "court order 2026-114",
+        )
+        .unwrap();
+        assert_eq!(updates.assets.0[&("gold".to_string(), holder.clone())], 60);
+        assert_eq!(updates.assets.0[&("gold".to_string(), receiver.clone())], 40);
     }
 }

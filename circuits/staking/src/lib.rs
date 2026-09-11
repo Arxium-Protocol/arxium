@@ -82,7 +82,7 @@ pub enum StakingError {
 }
 
 fn default_account() -> AccountEntry {
-    AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
+    AccountEntry { balance: 0, ..Default::default() }
 }
 
 /// Once per block: pays the proposer the flat block reward (capped at
@@ -425,7 +425,7 @@ mod tests {
 
     fn write_balance(db: &ArxiumDb, address: &Address, balance: u128) {
         let mut updates = BTreeMap::new();
-        updates.insert(address.clone(), AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None });
+        updates.insert(address.clone(), AccountEntry { balance, ..Default::default() });
         db.write_batch(&AccountUpdates(updates)).unwrap();
     }
 

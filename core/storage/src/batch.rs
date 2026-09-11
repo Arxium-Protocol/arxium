@@ -83,7 +83,7 @@ impl BatchWritable for Snapshot {
                 .accounts
                 .get(&sub_account)
                 .cloned()
-                .unwrap_or(AccountEntry { balance: 0, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None });
+                .unwrap_or(AccountEntry { balance: 0, ..Default::default() });
             sub_entry.balance += validator.stake;
             entries.push((
                 AccountKey(&sub_account).encode(),

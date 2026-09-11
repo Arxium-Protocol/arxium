@@ -44,10 +44,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
 ) -> Result<AccountUpdates, AccountError> {
     let mut sender_entry = view.get(&AccountKey(sender))?.unwrap_or(AccountEntry {
         balance: 0,
-        nonce: 0,
-        identity_hash: None,
-        zk_identity_verified: false,
-    attested_by: None,
+        ..Default::default()
     });
 
     if nonce != sender_entry.nonce {
@@ -77,10 +74,7 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
 
     let mut receiver_entry = view.get(&AccountKey(to))?.unwrap_or(AccountEntry {
         balance: 0,
-        nonce: 0,
-        identity_hash: None,
-        zk_identity_verified: false,
-    attested_by: None,
+        ..Default::default()
     });
 
     sender_entry.balance -= amount;
@@ -129,10 +123,7 @@ mod tests {
             sender.clone(),
             AccountEntry {
                 balance: 100,
-                nonce: 0,
-                identity_hash: None,
-                zk_identity_verified: false,
-            attested_by: None,
+                ..Default::default()
             },
         )])))
         .unwrap();
