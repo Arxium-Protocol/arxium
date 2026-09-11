@@ -27,7 +27,7 @@ use xc_bls::BlsPublicKey;
 use xc_chain_spec::presets::PresetRegistry;
 use xc_circuit::{AccountKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address};
+use xc_primitives::{Action, Address, AssetMetadata, ClaimTopic, CountryCode};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
 /// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
@@ -176,6 +176,15 @@ pub enum ActionPayload {
     GrantAttestation {
         subject: Address,
         hash: String,
+        /// Which claim topics this attestation confers. Empty grants an
+        /// `identity_hash` and nothing topic-level, which is what every
+        /// attestation did before topics existed and is still enough for
+        /// assets that gate on `compliance_required`.
+        topics: Vec<ClaimTopic>,
+        /// Subject's jurisdiction, for assets restricting
+        /// `allowed_jurisdictions`. `None` leaves it unknown, and an asset
+        /// with a restriction rejects unknown rather than permitting it.
+        jurisdiction: Option<CountryCode>,
     },
     /// Reverses `GrantAttestation` — clears `identity_hash` and, since a
     /// revoked KYC status shouldn't leave a stale ZK-verified flag around,
@@ -186,10 +195,21 @@ pub enum ActionPayload {
         subject: Address,
     },
     /// Registers a new regulated asset, `sender` becoming its issuer.
-    /// Rejected if `asset_id` is already registered.
+    /// Rejected if `asset_id` is already registered, or if `asset_id` /
+    /// `metadata` fail `asset::register_asset`'s validation.
+    ///
+    /// `metadata` was added to this variant in place rather than as a new
+    /// variant: bincode encodes struct-variant fields positionally, so this
+    /// changes the encoding and old blocks carrying the two-field form no
+    /// longer decode. That is acceptable only because devnet genesis is being
+    /// reset alongside it — on a live chain this would need a new variant
+    /// appended instead. Retracer's hand-mirrored copy of this enum
+    /// (`crates/ingestion/src/corechain_payload.rs`) must gain the same
+    /// field, in this position, in the same release.
     RegisterAsset {
         asset_id: String,
         compliance_required: bool,
+        metadata: AssetMetadata,
     },
     /// Mints `amount` of `asset_id` into the issuer's own asset balance —
     /// only the registered issuer may call this. Native balance untouched.
@@ -231,6 +251,46 @@ pub enum ActionPayload {
     /// submitted it.
     SubmitExecutionFault {
         artifact_json: String,
+    },
+    /// Halts all transfers of `asset_id` until an `UnfreezeAsset` lands.
+    /// Issuance is deliberately unaffected — a freeze is about circulation,
+    /// not about sealing the supply.
+    ///
+    /// Appended here, not inserted: see `AuthorizeOperator` above for why
+    /// variant order is part of the wire format. Retracer keeps a
+    /// hand-mirrored copy of this enum
+    /// (`crates/ingestion/src/corechain_payload.rs`) that has to gain the
+    /// same variants in the same order, or it will misdecode blocks rather
+    /// than fail on them.
+    FreezeAsset {
+        asset_id: String,
+    },
+    /// Lifts a `FreezeAsset`. Idempotent — unfreezing an asset that isn't
+    /// frozen succeeds rather than erroring, so a governor never has to know
+    /// the current flag to reach the state they want.
+    UnfreezeAsset {
+        asset_id: String,
+    },
+    /// Moves `amount` of `asset_id` from `from` to `to` without `from`'s
+    /// signature and without any compliance, claim, jurisdiction or freeze
+    /// check — the chain governor only. This is the recovery and enforcement
+    /// path for what compliance cannot express: a court-ordered
+    /// reassignment, a sanctioned holder, a holder who has lost their key.
+    /// It still cannot mint: `from` must actually hold the balance.
+    ///
+    /// `reason` is mandatory and non-empty. It is not stored in state — it
+    /// lives in the block that carried the action, which is the durable,
+    /// replicated audit record a regulator would be shown, and keeping it out
+    /// of state avoids growing the trie with free-text an issuer controls.
+    ///
+    /// Appended, like `FreezeAsset`/`UnfreezeAsset` above; the same note
+    /// about Retracer's mirrored enum applies.
+    ForcedTransfer {
+        asset_id: String,
+        from: Address,
+        to: Address,
+        amount: u128,
+        reason: String,
     },
 }
 
@@ -527,14 +587,14 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::RevokeOperator => {
             account::revoke_operator(action, operator_lookup, operator_validators_lookup)
         }
-        ActionPayload::GrantAttestation { subject, hash } => {
-            identity::grant_attestation(view, action, subject, hash)
+        ActionPayload::GrantAttestation { subject, hash, topics, jurisdiction } => {
+            identity::grant_attestation(view, action, subject, hash, topics, jurisdiction.as_deref())
         }
         ActionPayload::RevokeAttestation { subject } => {
             identity::revoke_attestation(view, action, subject)
         }
-        ActionPayload::RegisterAsset { asset_id, compliance_required } => {
-            asset::register_asset(view, action, asset_id, *compliance_required)
+        ActionPayload::RegisterAsset { asset_id, compliance_required, metadata } => {
+            asset::register_asset(view, action, asset_id, *compliance_required, metadata, current_height)
         }
         ActionPayload::IssueAsset { asset_id, amount } => {
             asset::issue_asset(view, action, asset_id, *amount)
@@ -544,6 +604,11 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         }
         ActionPayload::DeregisterAttestor { attestor } => {
             identity::deregister_attestor(view, action, attestor)
+        }
+        ActionPayload::FreezeAsset { asset_id } => asset::set_frozen(view, action, asset_id, true),
+        ActionPayload::UnfreezeAsset { asset_id } => asset::set_frozen(view, action, asset_id, false),
+        ActionPayload::ForcedTransfer { asset_id, from, to, amount, reason } => {
+            asset::forced_transfer(view, action, asset_id, from, to, *amount, reason)
         }
         ActionPayload::TransferAsset { asset_id, to, amount } => {
             asset::transfer_asset(view, action, asset_id, to, *amount)
@@ -614,13 +679,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn funded(balance: u128) -> AccountEntry {
-        AccountEntry {
-            balance,
-            nonce: 0,
-            identity_hash: None,
-            zk_identity_verified: false,
-        attested_by: None,
-        }
+        AccountEntry { balance, ..Default::default() }
     }
 
     pub(crate) fn self_allocation(addr: &Address, active_amount: u128) -> StakeAllocation {

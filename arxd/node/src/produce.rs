@@ -576,10 +576,7 @@ mod tests {
             alice.clone(),
             AccountEntry {
                 balance: 2_000_000,
-                nonce: 0,
-                identity_hash: None,
-                zk_identity_verified: false,
-                attested_by: None,
+                ..Default::default()
             },
         );
         db.write_batch(&Snapshot {

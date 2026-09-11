@@ -6,7 +6,7 @@ use ark_serialize::CanonicalDeserialize;
 use std::sync::OnceLock;
 use xc_circuit::{AccountKey, AttestorRecordKey, GovernorKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{AccountEntry, Address, AttestorRecord};
+use xc_primitives::{AccountEntry, Address, AttestorRecord, ClaimTopic};
 use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
 
 use crate::ChainAction;
@@ -31,7 +31,7 @@ fn require_attestor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAct
 /// Deliberately a single fixed address for now, same walking-skeleton
 /// stage `require_attestor` used to be: a Compliance Committee
 /// (multi-sig/voting) is the deferred upgrade for this role.
-fn require_governor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
+pub(crate) fn require_governor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
     let governor = view
         .get(&GovernorKey)?
         .ok_or_else(|| anyhow::anyhow!("chain has no governor configured"))?;
@@ -86,31 +86,52 @@ pub(crate) fn deregister_attestor<V: KvRead<Error = StorageError>>(
 /// accountability trail needed once more than one attestor can grant
 /// attestations (no slashing or dispute path on top of it yet).
 /// Creates a fresh account entry if `subject` has none yet.
+///
+/// `topics` and `jurisdiction` replace the account's existing ones outright
+/// rather than merging into them. An attestation is a statement of what an
+/// attestor currently vouches for, so re-granting with a narrower topic list
+/// has to be able to take a claim away — merging would make claims
+/// append-only and leave `RevokeAttestation` as the only way to drop one,
+/// which also clears the subject's `identity_hash` as collateral damage.
 pub(crate) fn grant_attestation<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     subject: &Address,
     hash: &str,
+    topics: &[ClaimTopic],
+    jurisdiction: Option<&str>,
 ) -> anyhow::Result<BlockUpdates> {
     require_attestor(view, action)?;
+    if let Some(code) = jurisdiction
+        && (code.len() != 2 || !code.chars().all(|c| c.is_ascii_uppercase()))
+    {
+        anyhow::bail!("jurisdiction {code:?} is not a 2-letter uppercase ISO-3166-1 alpha-2 code");
+    }
     let mut entry = view.get(&AccountKey(subject))?.unwrap_or(AccountEntry {
         balance: 0,
-        nonce: 0,
-        identity_hash: None,
-        zk_identity_verified: false,
-        attested_by: None,
+        ..Default::default()
     });
     entry.identity_hash = Some(hash.to_string());
     entry.attested_by = Some(action.sender.clone());
+    // Deduped so repeated topics can't grow the list without bound across
+    // re-grants; order is not meaningful to any reader.
+    entry.claims = {
+        let mut topics = topics.to_vec();
+        topics.dedup();
+        topics
+    };
+    entry.jurisdiction = jurisdiction.map(str::to_string);
     Ok(BlockUpdates {
         accounts: AccountUpdates(std::collections::BTreeMap::from([(subject.clone(), entry)])),
         ..Default::default()
     })
 }
 
-/// Reverses `grant_attestation` — clears `identity_hash` and
-/// `zk_identity_verified` (a revoked KYC status shouldn't leave a stale
-/// ZK-verified flag standing).
+/// Reverses `grant_attestation` — clears `identity_hash`,
+/// `zk_identity_verified`, `claims` and `jurisdiction`. A revoked attestation
+/// must not leave any of them standing: a stale ZK-verified flag or a
+/// surviving `Accredited` claim would keep gating decisions passing on an
+/// attestation that no longer exists.
 pub(crate) fn revoke_attestation<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -122,6 +143,8 @@ pub(crate) fn revoke_attestation<V: KvRead<Error = StorageError>>(
         .ok_or_else(|| anyhow::anyhow!("account {subject} not found"))?;
     entry.identity_hash = None;
     entry.zk_identity_verified = false;
+    entry.claims.clear();
+    entry.jurisdiction = None;
     Ok(BlockUpdates {
         accounts: AccountUpdates(std::collections::BTreeMap::from([(subject.clone(), entry)])),
         ..Default::default()
@@ -183,6 +206,96 @@ mod tests {
     use std::collections::HashMap;
     use xc_primitives::{Action, Address};
 
+    /// Re-granting replaces the topic set rather than merging into it, and
+    /// revoking clears every attestation-derived field. Both matter for
+    /// gating: a merge would make claims append-only, and a partial revoke
+    /// would leave a stale claim satisfying an asset's `required_claims`.
+    #[test]
+    fn granting_replaces_topics_and_revoking_clears_them() {
+        use xc_primitives::ClaimTopic;
+
+        let attestor = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(attestor.clone(), funded(ACTION_FEE * 4))]),
+            HashMap::new(),
+        );
+        view.put(
+            &AttestorRecordKey(&attestor),
+            &AttestorRecord { name: "test".to_string(), registered_at: 0 },
+        )
+        .unwrap();
+
+        let action = ChainAction {
+            sender: attestor.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RevokeAttestation { subject: alice.clone() },
+        };
+
+        let updates = grant_attestation(
+            &view,
+            &action,
+            &alice,
+            "kyc-alice",
+            &[ClaimTopic::Kyc, ClaimTopic::Accredited],
+            Some("CH"),
+        )
+        .unwrap();
+        let entry = &updates.accounts.0[&alice];
+        assert_eq!(entry.claims, vec![ClaimTopic::Kyc, ClaimTopic::Accredited]);
+        assert_eq!(entry.jurisdiction.as_deref(), Some("CH"));
+        assert_eq!(entry.attested_by.as_ref(), Some(&attestor));
+        view.apply_accounts(&updates.accounts).unwrap();
+
+        // Narrower re-grant: Accredited is dropped, not kept.
+        let updates =
+            grant_attestation(&view, &action, &alice, "kyc-alice", &[ClaimTopic::Kyc], Some("DE"))
+                .unwrap();
+        let entry = &updates.accounts.0[&alice];
+        assert_eq!(entry.claims, vec![ClaimTopic::Kyc], "re-grant replaces, never merges");
+        assert_eq!(entry.jurisdiction.as_deref(), Some("DE"));
+        view.apply_accounts(&updates.accounts).unwrap();
+
+        let updates = revoke_attestation(&view, &action, &alice).unwrap();
+        let entry = &updates.accounts.0[&alice];
+        assert!(entry.identity_hash.is_none());
+        assert!(entry.claims.is_empty(), "a revoked attestation must leave no claims standing");
+        assert!(entry.jurisdiction.is_none());
+    }
+
+    #[test]
+    fn grant_rejects_a_malformed_jurisdiction_code() {
+        let attestor = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(attestor.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
+        view.put(
+            &AttestorRecordKey(&attestor),
+            &AttestorRecord { name: "test".to_string(), registered_at: 0 },
+        )
+        .unwrap();
+        let action = ChainAction {
+            sender: attestor,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::RevokeAttestation { subject: alice.clone() },
+        };
+
+        for bad in ["ch", "CHE", "C", "C1"] {
+            let err = grant_attestation(&view, &action, &alice, "h", &[], Some(bad)).unwrap_err();
+            assert!(err.to_string().contains("jurisdiction"), "code {bad:?}, got: {err}");
+        }
+        assert!(grant_attestation(&view, &action, &alice, "h", &[], Some("CH")).is_ok());
+        assert!(grant_attestation(&view, &action, &alice, "h", &[], None).is_ok());
+    }
+
     #[test]
     fn grant_attestation_then_verify_identity_credential_succeeds_end_to_end() {
         use ark_std::rand::{rngs::StdRng, SeedableRng};
@@ -211,7 +324,12 @@ mod tests {
             sender: attestor.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::GrantAttestation { subject: alice.clone(), hash: hash_hex },
+            payload: ActionPayload::GrantAttestation {
+                subject: alice.clone(),
+                hash: hash_hex,
+                topics: Vec::new(),
+                jurisdiction: None,
+            },
         };
         let grant_updates = crate::dispatch(
             &grant,
