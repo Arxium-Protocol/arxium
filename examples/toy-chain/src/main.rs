@@ -34,7 +34,7 @@ use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
 /// exactly this reason: CoreChain backs it with a real `asset_record:{id}`
 /// registry, toy-chain doesn't need one.
 fn toy_asset(issuer: &Address) -> Asset {
-    Asset { asset_id: "toy".into(), issuer: issuer.clone(), compliance_required: true }
+    Asset::new("toy", issuer.clone(), true)
 }
 
 /// The RWA chain's own action set — distinct from CoreChain's `ActionPayload`
@@ -57,10 +57,10 @@ fn dispatch(
     view: &BlockView<'_>,
     issuer: &Address,
 ) -> anyhow::Result<(AccountUpdates, AssetBalanceUpdates, Option<ValidatorChange>)> {
-    let asset = toy_asset(issuer);
+    let mut asset = toy_asset(issuer);
     let (accounts, assets) = match &action.payload {
         RwaPayload::Issue { amount } => {
-            circuit_rwa_asset::apply_issue(view, &asset, &action.sender, action.nonce, *amount)?
+            circuit_rwa_asset::apply_issue(view, &mut asset, &action.sender, action.nonce, *amount)?
         }
         RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
             view,

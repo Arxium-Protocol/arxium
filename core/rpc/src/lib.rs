@@ -825,11 +825,20 @@ async fn get_account_bls_key<P: Payload>(
 /// a wallet has to know whether an asset is compliance-gated before it can
 /// tell the holder why a transfer would be refused, and making that a second
 /// request per asset would put an N+1 on the one screen that lists them all.
+///
+/// `frozen` and `decimals` are here for the same reason as
+/// `compliance_required`: a frozen asset refuses every transfer, so a wallet
+/// that can't see the flag can only report the failure after the fact, and
+/// `balance` is a raw integer that cannot be rendered at all without the
+/// scale. The rest of the record (claims, jurisdictions, supply) is only
+/// needed on an asset's own screen, which can fetch `GET /assets`.
 #[derive(serde::Serialize)]
 struct AccountAssetBalance {
     asset_id: String,
     issuer: String,
     compliance_required: bool,
+    frozen: bool,
+    decimals: u8,
     balance: u128,
 }
 
@@ -872,6 +881,8 @@ async fn get_account_assets<P: Payload>(
             asset_id,
             issuer: asset.issuer.to_string(),
             compliance_required: asset.compliance_required,
+            frozen: asset.frozen,
+            decimals: asset.decimals,
             balance,
         });
     }
@@ -902,6 +913,8 @@ async fn get_account_asset_balance<P: Payload>(
             asset_id,
             issuer: asset.issuer.to_string(),
             compliance_required: asset.compliance_required,
+            frozen: asset.frozen,
+            decimals: asset.decimals,
             balance,
         })
         .into_response(),
@@ -1742,9 +1755,7 @@ mod tests {
                         AccountEntry {
                             balance: 1000,
                             nonce: 5,
-                            identity_hash: None,
-                            zk_identity_verified: false,
-                        attested_by: None,
+                            ..Default::default()
                         },
                     )]),
                     validators: BTreeMap::new(),

@@ -11,13 +11,20 @@ use sha2::{Digest, Sha256};
 // IUM — 1 ARX = 1_000_000_000 IUM, an app-level convention (see `ArxAmount`
 // on the Swift side), not a field the chain itself defines.
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountEntry {
     pub balance: u128,
     pub nonce: u64,
     pub identity_hash: Option<String>,
-    // `#[serde(default)]` so existing RocksDB entries deserialize as `false`
-    // without a migration.
+    // NOTE: `#[serde(default)]` does *not* make old RocksDB entries readable,
+    // contrary to what this comment used to claim. Entries are bincode-encoded
+    // (`BatchWritable for AccountEntry`), which is positional and emits no
+    // field names, so a decoder expecting five fields hits `UnexpectedEnd` on
+    // a three-field record — there is no absent-field signal for `default` to
+    // fire on. The attribute is load-bearing only for a self-describing format
+    // (JSON specs/fixtures), and this field arrived with a devnet genesis
+    // reset, which is what actually made it safe. Appending a field here is a
+    // state-breaking change.
     #[serde(default)]
     pub zk_identity_verified: bool,
     /// Which registered attestor most recently granted `identity_hash` —
@@ -27,6 +34,23 @@ pub struct AccountEntry {
     /// path would need, recorded now so it isn't missing retroactively.
     #[serde(default)]
     pub attested_by: Option<Address>,
+    /// Which claim topics this account currently holds, granted together with
+    /// `identity_hash` by `GrantAttestation`. Empty means no topic-level
+    /// claims, which is not the same as "not attested" — an account attested
+    /// before topics existed has an `identity_hash` and no claims, and is
+    /// still accepted by assets that gate on `compliance_required`.
+    ///
+    /// A flat `Vec` rather than a per-topic record with its own attestor and
+    /// timestamp: every topic on an account is granted by one attestor in one
+    /// action today, so the extra structure would carry no information that
+    /// `attested_by` doesn't already.
+    #[serde(default)]
+    pub claims: Vec<ClaimTopic>,
+    /// Holder's jurisdiction, for assets that restrict `allowed_jurisdictions`.
+    /// `None` means unknown, and an asset with a jurisdiction restriction
+    /// rejects unknown rather than treating it as permitted.
+    #[serde(default)]
+    pub jurisdiction: Option<CountryCode>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,18 +150,162 @@ pub enum ValidatorChange {
     Leave(Address),
 }
 
+/// Broad regulatory category, recorded so downstream consumers (Retracer's
+/// listings, Console's filters) don't have to infer it from the asset id.
+/// Purely descriptive — nothing in the runtime gates on it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AssetClass {
+    #[default]
+    Other,
+    RealEstate,
+    Equity,
+    Bond,
+    Stablecoin,
+    Commodity,
+}
+
+/// A single attestable property of a holder. `Asset.required_claims` lists
+/// which of these a holder must carry before they may send or receive.
+///
+/// Nothing enforces these yet: `AccountEntry` records one `identity_hash`
+/// with no topic attached, so a holder is either attested or not — there's
+/// no way to say "KYC'd but not Accredited". Enforcement lands with the
+/// `AccountEntry`/`GrantAttestation` extension that gives attestations a
+/// topic; until then `apply_compliant_transfer` falls back to
+/// `compliance_required`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ClaimTopic {
+    Kyc,
+    Aml,
+    Accredited,
+    Jurisdiction,
+}
+
+/// ISO-3166-1 alpha-2, uppercase — validated at registration rather than
+/// made a distinct type.
+///
+// ponytail: a plain alias, no ISO crate. The workspace has no country
+// dependency today and this is a two-character string; revisit if something
+// ever needs to *reason* about jurisdictions (subdivisions, EU membership,
+// sanctions lists) rather than just compare and display them.
+pub type CountryCode = String;
+
 /// A registered regulated asset (`ActionPayload::RegisterAsset`) — the
 /// record lives in `CF_ASSETS` (`asset_record:{asset_id}`), separate from its
 /// balances (also `CF_ASSETS`, one entry per `(asset_id, owner)`), which is
 /// what makes asset issuance/transfer a compliance-gated overlay on top of the
 /// native token rather than a replacement for it. Merkleized like balances,
-/// since `compliance_required` gates every transfer and must be provable in
+/// since the compliance fields gate every transfer and must be provable in
 /// the state root, not just agreed on by full nodes reading local state.
+///
+/// Field order is load-bearing: records are bincode-encoded
+/// (`BatchWritable for Asset`), which is positional and carries no field
+/// names, so reordering or removing a field silently reinterprets every
+/// stored record. Append only, and deprecate in place rather than deleting.
+/// Note that appending is itself a state-breaking change — see
+/// `AccountEntry` for why `#[serde(default)]` does *not* make old records
+/// readable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Asset {
     pub asset_id: String,
     pub issuer: Address,
+    /// Superseded by `required_claims`, kept because removing a field
+    /// rewrites the encoding of every stored record. Authoritative only
+    /// while `required_claims` is empty.
     pub compliance_required: bool,
+    pub asset_class: AssetClass,
+    /// Display scale only — balances are integer base units everywhere in
+    /// the runtime, exactly as with the native token.
+    pub decimals: u8,
+    /// Empty means "fall back to `compliance_required`", not "no checks".
+    pub required_claims: Vec<ClaimTopic>,
+    /// `None` means unrestricted. An empty `Vec` means no jurisdiction may
+    /// hold it, which is a valid (if useless) configuration rather than a
+    /// synonym for `None`.
+    pub allowed_jurisdictions: Option<Vec<CountryCode>>,
+    /// `None` means uncapped. Enforced in `circuit_rwa_asset::apply_issue`.
+    pub max_supply: Option<u128>,
+    /// Cumulative issued supply, maintained by `apply_issue`. Never
+    /// decreases — there's no burn action.
+    pub total_supply: u128,
+    /// Blocks every transfer of this asset while set. Issuance is
+    /// deliberately still allowed; freezing is about circulation.
+    pub frozen: bool,
+    /// Off-chain pointer (prospectus, terms). Stored verbatim and never
+    /// dereferenced by the node.
+    pub metadata_uri: Option<String>,
+    /// Height of the block that registered this asset.
+    pub registered_at: u64,
+}
+
+/// The issuer-supplied half of an `Asset`: everything `RegisterAsset` carries
+/// that isn't derived from the action itself. `issuer` comes from the sender,
+/// `registered_at` from the block height, and `total_supply`/`frozen` always
+/// start at their zero values, so none of those are settable at registration.
+///
+/// Grouped into a struct rather than spread across the enum variant so
+/// `asset::register_asset` stays under a sane argument count, and so the
+/// out-of-process codecs that mirror `ActionPayload` by hand have one shape to
+/// copy instead of six loose fields.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AssetMetadata {
+    pub asset_class: AssetClass,
+    pub decimals: u8,
+    pub required_claims: Vec<ClaimTopic>,
+    pub allowed_jurisdictions: Option<Vec<CountryCode>>,
+    pub max_supply: Option<u128>,
+    pub metadata_uri: Option<String>,
+}
+
+impl Asset {
+    /// The pre-metadata three-field shape, with everything added since left
+    /// at its zero value: unclassified, uncapped, unfrozen, no claims, no
+    /// jurisdiction restriction. Exists so the many call sites that only
+    /// care about id/issuer/gating don't each have to spell out nine
+    /// defaults.
+    pub fn new(asset_id: impl Into<String>, issuer: Address, compliance_required: bool) -> Self {
+        Self {
+            asset_id: asset_id.into(),
+            issuer,
+            compliance_required,
+            asset_class: AssetClass::Other,
+            decimals: 0,
+            required_claims: Vec::new(),
+            allowed_jurisdictions: None,
+            max_supply: None,
+            total_supply: 0,
+            frozen: false,
+            metadata_uri: None,
+            registered_at: 0,
+        }
+    }
+
+    /// The registration constructor: issuer-supplied `metadata` plus the
+    /// three fields only the chain can supply. `total_supply` and `frozen`
+    /// are deliberately not settable by the issuer — a newly registered asset
+    /// always starts with nothing issued and circulation open.
+    pub fn register(
+        asset_id: impl Into<String>,
+        issuer: Address,
+        compliance_required: bool,
+        metadata: AssetMetadata,
+        registered_at: u64,
+    ) -> Self {
+        Self {
+            asset_id: asset_id.into(),
+            issuer,
+            compliance_required,
+            asset_class: metadata.asset_class,
+            decimals: metadata.decimals,
+            required_claims: metadata.required_claims,
+            allowed_jurisdictions: metadata.allowed_jurisdictions,
+            max_supply: metadata.max_supply,
+            total_supply: 0,
+            frozen: false,
+            metadata_uri: metadata.metadata_uri,
+            registered_at,
+        }
+    }
 }
 
 /// A registered KYC provider (`ActionPayload::RegisterAttestor`) — the

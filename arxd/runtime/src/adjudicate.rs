@@ -594,7 +594,7 @@ mod tests {
     }
 
     fn entry(balance: u128) -> xc_primitives::AccountEntry {
-        xc_primitives::AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
+        xc_primitives::AccountEntry { balance, ..Default::default() }
     }
 
     fn hex_proof(proof: xc_poe::state_trie::InclusionProof) -> StateProof {

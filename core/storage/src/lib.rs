@@ -1859,11 +1859,7 @@ mod asset_index_tests {
     }
 
     fn asset(id: &str, issuer: &Address, gated: bool) -> Asset {
-        Asset {
-            asset_id: id.to_string(),
-            issuer: issuer.clone(),
-            compliance_required: gated,
-        }
+        Asset::new(id, issuer.clone(), gated)
     }
 
     fn balances(rows: &[(&str, &Address, u128)]) -> AssetBalanceUpdates {
@@ -2250,7 +2246,7 @@ mod merkle_state_root_tests {
     }
 
     fn entry(balance: u128) -> AccountEntry {
-        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
+        AccountEntry { balance, ..Default::default() }
     }
 
     fn accounts(pairs: &[(u8, u128)]) -> AccountUpdates {
@@ -2459,7 +2455,7 @@ mod merkle_state_root_tests {
     }
 
     fn asset(id: &str, issuer: Address, compliance_required: bool) -> Asset {
-        Asset { asset_id: id.to_string(), issuer, compliance_required }
+        Asset::new(id, issuer, compliance_required)
     }
 
     /// Stage 1A: registering an asset moves the state root (it's in
@@ -2533,7 +2529,7 @@ mod divergence_recovery_tests {
     }
 
     fn entry(balance: u128) -> AccountEntry {
-        AccountEntry { balance, nonce: 0, identity_hash: None, zk_identity_verified: false, attested_by: None }
+        AccountEntry { balance, ..Default::default() }
     }
 
     /// Commits one block that sets `holder`'s balance, the same way the
@@ -2707,11 +2703,7 @@ mod divergence_recovery_tests {
         let db = ArxiumDb::open(&temp_path()).unwrap();
         commit(&db, 0, 1, 100);
 
-        let gold = Asset {
-            asset_id: "gold".to_string(),
-            issuer: addr(1),
-            compliance_required: false,
-        };
+        let gold = Asset::new("gold", addr(1), false);
         let balances = AssetBalanceUpdates(BTreeMap::from([(("gold".to_string(), addr(1)), 5u128)]));
         let index = db.asset_index_updates(std::slice::from_ref(&gold), &balances).unwrap();
         let state_root = db.compute_state_root(&[&gold, &balances]).unwrap();
