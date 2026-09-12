@@ -320,7 +320,10 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         admission_precheck(action, db)
     }
 
-    fn dispatch(action: &ChainAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
+    fn dispatch(
+        action: &ChainAction,
+        ctx: &xc_runtime_api::DispatchCtx<'_>,
+    ) -> anyhow::Result<BlockUpdates> {
         dispatch(
             action,
             ctx.view,
@@ -353,8 +356,14 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             let (downtime_accounts, downtime_stakes) =
                 circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
             updates.accounts.0.extend(downtime_accounts.0);
-            updates.stakes.allocations.extend(downtime_stakes.allocations);
-            updates.stakes.validator_index.extend(downtime_stakes.validator_index);
+            updates
+                .stakes
+                .allocations
+                .extend(downtime_stakes.allocations);
+            updates
+                .stakes
+                .validator_index
+                .extend(downtime_stakes.validator_index);
         }
         Ok(updates)
     }
@@ -391,9 +400,18 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
     fn locally_adjudicate_execution_fault(artifact_json: &str) -> Option<String> {
         let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json).ok()?;
         let outcome = match &artifact.fault {
-            xc_artifact::Fault::ActionDivergence { .. } => adjudicate::adjudicate_action_divergence(&artifact).ok()?,
-            xc_artifact::Fault::BlockDivergence { .. } => adjudicate::adjudicate_block_divergence(&artifact).ok()?,
-            xc_artifact::Fault::Equivocation { .. } | xc_artifact::Fault::ExecutionDisagreement { .. } => return None,
+            xc_artifact::Fault::ActionDivergence { .. } => {
+                adjudicate::adjudicate_action_divergence(&artifact).ok()?
+            }
+            xc_artifact::Fault::BlockDivergence { .. } => {
+                adjudicate::adjudicate_block_divergence(&artifact).ok()?
+            }
+            // Neither is an execution fault: both are settled by signature
+            // checks alone (`xc_artifact::verify`), with nothing for the
+            // adjudicator to replay.
+            xc_artifact::Fault::Equivocation { .. }
+            | xc_artifact::Fault::PrecommitEquivocation { .. }
+            | xc_artifact::Fault::ExecutionDisagreement { .. } => return None,
         };
         match outcome {
             adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey } => Some(culpable_pubkey),
@@ -401,7 +419,13 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         }
     }
 
-    fn pair(seed: &[u8; 32], sender: &Address, node: &str, token: Option<&str>, revoke: bool) -> anyhow::Result<()> {
+    fn pair(
+        seed: &[u8; 32],
+        sender: &Address,
+        node: &str,
+        token: Option<&str>,
+        revoke: bool,
+    ) -> anyhow::Result<()> {
         pair::run(seed, sender, node, token, revoke)
     }
 }
@@ -420,21 +444,30 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
 /// same-block race between two actions) is still caught, just later, by
 /// `dispatch` itself, which remains the authoritative check.
 pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result<()> {
-    let balance = db.get_account(&action.sender)?.map(|e| e.balance).unwrap_or(0);
+    let balance = db
+        .get_account(&action.sender)?
+        .map(|e| e.balance)
+        .unwrap_or(0);
     if balance < ACTION_FEE {
         anyhow::bail!("insufficient balance for the action fee ({ACTION_FEE} IUM)");
     }
     let operator_lookup = |validator: &Address| db.get_operator(validator);
     match &action.payload {
-        ActionPayload::JoinValidator { validator, stake, bls_pubkey, bls_pop } => {
+        ActionPayload::JoinValidator {
+            validator,
+            stake,
+            bls_pubkey,
+            bls_pop,
+        } => {
             if !staking::is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
             let bytes = consensus::validated_bls_pubkey(bls_pubkey, bls_pop)?;
             if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
-                && &owner != validator {
-                    anyhow::bail!("BLS pubkey already registered to {owner}");
-                }
+                && &owner != validator
+            {
+                anyhow::bail!("BLS pubkey already registered to {owner}");
+            }
             let existing_active = db
                 .get_stake_allocation(&action.sender, validator)?
                 .map(|a| a.active_amount)
@@ -458,15 +491,20 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 anyhow::bail!("cannot remove the last validator, chain would stall forever");
             }
         }
-        ActionPayload::RegisterBlsKey { validator, pubkey, pop } => {
+        ActionPayload::RegisterBlsKey {
+            validator,
+            pubkey,
+            pop,
+        } => {
             if !staking::is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
             let bytes = consensus::validated_bls_pubkey(pubkey, pop)?;
             if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
-                && &owner != validator {
-                    anyhow::bail!("BLS pubkey already registered to {owner}");
-                }
+                && &owner != validator
+            {
+                anyhow::bail!("BLS pubkey already registered to {owner}");
+            }
         }
         _ => {}
     }
@@ -540,7 +578,12 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
         ActionPayload::Transfer { to, amount } => account::transfer(view, action, to, *amount),
-        ActionPayload::JoinValidator { validator, stake, bls_pubkey, bls_pop } => staking::join_validator(
+        ActionPayload::JoinValidator {
+            validator,
+            stake,
+            bls_pubkey,
+            bls_pop,
+        } => staking::join_validator(
             action,
             view,
             validator,
@@ -568,7 +611,11 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::SubmitEquivocationEvidence { block_a, block_b } => {
             consensus::submit_equivocation_evidence(view, block_a, block_b, current_height)
         }
-        ActionPayload::RegisterBlsKey { validator, pubkey, pop } => consensus::register_bls_key(
+        ActionPayload::RegisterBlsKey {
+            validator,
+            pubkey,
+            pop,
+        } => consensus::register_bls_key(
             action,
             view,
             validator,
@@ -581,21 +628,43 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::VerifyIdentityCredential { proof } => {
             identity::verify_identity_credential(view, action, proof)
         }
-        ActionPayload::AuthorizeOperator { operator } => {
-            account::authorize_operator(action, operator, operator_lookup, operator_validators_lookup)
-        }
+        ActionPayload::AuthorizeOperator { operator } => account::authorize_operator(
+            action,
+            operator,
+            operator_lookup,
+            operator_validators_lookup,
+        ),
         ActionPayload::RevokeOperator => {
             account::revoke_operator(action, operator_lookup, operator_validators_lookup)
         }
-        ActionPayload::GrantAttestation { subject, hash, topics, jurisdiction } => {
-            identity::grant_attestation(view, action, subject, hash, topics, jurisdiction.as_deref())
-        }
+        ActionPayload::GrantAttestation {
+            subject,
+            hash,
+            topics,
+            jurisdiction,
+        } => identity::grant_attestation(
+            view,
+            action,
+            subject,
+            hash,
+            topics,
+            jurisdiction.as_deref(),
+        ),
         ActionPayload::RevokeAttestation { subject } => {
             identity::revoke_attestation(view, action, subject)
         }
-        ActionPayload::RegisterAsset { asset_id, compliance_required, metadata } => {
-            asset::register_asset(view, action, asset_id, *compliance_required, metadata, current_height)
-        }
+        ActionPayload::RegisterAsset {
+            asset_id,
+            compliance_required,
+            metadata,
+        } => asset::register_asset(
+            view,
+            action,
+            asset_id,
+            *compliance_required,
+            metadata,
+            current_height,
+        ),
         ActionPayload::IssueAsset { asset_id, amount } => {
             asset::issue_asset(view, action, asset_id, *amount)
         }
@@ -606,16 +675,27 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             identity::deregister_attestor(view, action, attestor)
         }
         ActionPayload::FreezeAsset { asset_id } => asset::set_frozen(view, action, asset_id, true),
-        ActionPayload::UnfreezeAsset { asset_id } => asset::set_frozen(view, action, asset_id, false),
-        ActionPayload::ForcedTransfer { asset_id, from, to, amount, reason } => {
-            asset::forced_transfer(view, action, asset_id, from, to, *amount, reason)
+        ActionPayload::UnfreezeAsset { asset_id } => {
+            asset::set_frozen(view, action, asset_id, false)
         }
-        ActionPayload::TransferAsset { asset_id, to, amount } => {
-            asset::transfer_asset(view, action, asset_id, to, *amount)
-        }
-        ActionPayload::SubmitExecutionFault { artifact_json } => {
-            consensus::submit_execution_fault(view, artifact_json, current_height, bls_pubkey_owner_lookup)
-        }
+        ActionPayload::ForcedTransfer {
+            asset_id,
+            from,
+            to,
+            amount,
+            reason,
+        } => asset::forced_transfer(view, action, asset_id, from, to, *amount, reason),
+        ActionPayload::TransferAsset {
+            asset_id,
+            to,
+            amount,
+        } => asset::transfer_asset(view, action, asset_id, to, *amount),
+        ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
+            view,
+            artifact_json,
+            current_height,
+            bls_pubkey_owner_lookup,
+        ),
     }
 }
 
@@ -624,11 +704,11 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
 /// doesn't duplicate the same closures and builders.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::collections::HashMap;
     use xc_bls::BlsPublicKey;
     use xc_circuit::{AccountKey, StakeKey};
-    use xc_primitives::{Address, AccountEntry, StakeAllocation};
+    use xc_primitives::{AccountEntry, Address, StakeAllocation};
     use xc_storage::{ArxiumDb, BlockView, StorageError};
-    use std::collections::HashMap;
 
     pub(crate) fn temp_db() -> ArxiumDb {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -654,8 +734,14 @@ pub(crate) mod test_support {
             view.put(&AccountKey(&addr), &entry).unwrap();
         }
         for ((master, validator), allocation) in stakes {
-            view.put(&StakeKey { master: &master, validator: &validator }, &allocation)
-                .unwrap();
+            view.put(
+                &StakeKey {
+                    master: &master,
+                    validator: &validator,
+                },
+                &allocation,
+            )
+            .unwrap();
         }
         view
     }
@@ -664,7 +750,9 @@ pub(crate) mod test_support {
         Ok(None)
     }
 
-    pub(crate) fn operator_validators_lookup(_operator: &Address) -> Result<Vec<Address>, StorageError> {
+    pub(crate) fn operator_validators_lookup(
+        _operator: &Address,
+    ) -> Result<Vec<Address>, StorageError> {
         Ok(Vec::new())
     }
 
@@ -679,7 +767,10 @@ pub(crate) mod test_support {
     }
 
     pub(crate) fn funded(balance: u128) -> AccountEntry {
-        AccountEntry { balance, ..Default::default() }
+        AccountEntry {
+            balance,
+            ..Default::default()
+        }
     }
 
     pub(crate) fn self_allocation(addr: &Address, active_amount: u128) -> StakeAllocation {
@@ -712,8 +803,8 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use test_support::*;
     use std::collections::BTreeMap;
+    use test_support::*;
     use xc_runtime_api::ChainRuntime;
     use xc_storage::{AccountUpdates, BlsKeyRegistration, OperatorUpdates, ValidatorSetSnapshot};
 
@@ -745,8 +836,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(bob.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            bob.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: bob,
             nonce: 0,
@@ -767,8 +861,11 @@ mod tests {
     fn admission_precheck_rejects_below_minimum_stake() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -782,15 +879,21 @@ mod tests {
         };
 
         let err = admission_precheck(&action, &db).unwrap_err();
-        assert!(err.to_string().contains("below the minimum validator stake"));
+        assert!(
+            err.to_string()
+                .contains("below the minimum validator stake")
+        );
     }
 
     #[test]
     fn admission_precheck_rejects_leaving_the_last_validator() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(std::slice::from_ref(&alice));
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -806,8 +909,11 @@ mod tests {
     fn admission_precheck_accepts_authorized_sufficient_join() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -829,10 +935,18 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = precheck_test_db(&[]);
         let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        db.write_batches(&[&BlsKeyRegistration { address: bob, pubkey, effective_height: 0, previous_pubkey: None }])
-            .unwrap();
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(alice.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&BlsKeyRegistration {
+            address: bob,
+            pubkey,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -859,8 +973,11 @@ mod tests {
             operator_index: std::collections::BTreeMap::from([(bob.clone(), vec![alice.clone()])]),
         }])
         .unwrap();
-        db.write_batches(&[&AccountUpdates(BTreeMap::from([(bob.clone(), funded(ACTION_FEE))]))])
-            .unwrap();
+        db.write_batches(&[&AccountUpdates(BTreeMap::from([(
+            bob.clone(),
+            funded(ACTION_FEE),
+        )]))])
+        .unwrap();
         let action = Action {
             sender: bob,
             nonce: 0,
@@ -879,7 +996,10 @@ mod tests {
 
     #[test]
     fn locally_adjudicate_execution_fault_rejects_malformed_json() {
-        assert_eq!(CoreChainRuntime::locally_adjudicate_execution_fault("not json"), None);
+        assert_eq!(
+            CoreChainRuntime::locally_adjudicate_execution_fault("not json"),
+            None
+        );
     }
 
     #[test]
@@ -923,7 +1043,10 @@ mod tests {
             human_readable: serde_json::json!({}),
         };
         let artifact_json = serde_json::to_string(&artifact).unwrap();
-        assert_eq!(CoreChainRuntime::locally_adjudicate_execution_fault(&artifact_json), None);
+        assert_eq!(
+            CoreChainRuntime::locally_adjudicate_execution_fault(&artifact_json),
+            None
+        );
     }
 }
 
@@ -978,4 +1101,76 @@ mod client_signing_vectors {
 
     /// Kept as a constant so the value is greppable from the app repos.
     const TRANSFER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a030e04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fc40420f00";
+
+    /// `RegisterAsset` is variant 12. This vector takes every branch of
+    /// `AssetMetadata` that a hand-written encoder can get wrong: a non-empty
+    /// `required_claims`, `Some` jurisdictions, a `max_supply` past the
+    /// single-byte varint range (so the `0xfc` u32 marker appears) and a
+    /// `Some` URI. The payload bytes match the fixture pinned in
+    /// Arx-Plus-Api's `TestCanonicalPayloadMatchesNodeEncoding`.
+    #[test]
+    fn register_asset_vector_matches_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(
+                0,
+                ActionPayload::RegisterAsset {
+                    asset_id: "gold".to_string(),
+                    compliance_required: true,
+                    metadata: AssetMetadata {
+                        asset_class: xc_primitives::AssetClass::Bond,
+                        decimals: 6,
+                        required_claims: vec![ClaimTopic::Kyc, ClaimTopic::Accredited],
+                        allowed_jurisdictions: Some(vec!["CH".to_string(), "DE".to_string()]),
+                        max_supply: Some(1_000_000),
+                        metadata_uri: Some("ipfs://a".to_string()),
+                    },
+                },
+            ),
+            REGISTER_ASSET_VECTOR,
+            "RegisterAsset signing bytes changed — the Console and Arx-Plus-Api \
+             codecs pin this exact string"
+        );
+    }
+
+    /// Every optional absent: `None` is one zero byte, not an empty
+    /// collection — the difference between "unrestricted" and "nobody may
+    /// hold it" — and `required_claims: []` is a zero-length vec.
+    #[test]
+    fn register_asset_default_vector_matches_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(
+                0,
+                ActionPayload::RegisterAsset {
+                    asset_id: "gold".to_string(),
+                    compliance_required: false,
+                    metadata: AssetMetadata::default(),
+                },
+            ),
+            REGISTER_ASSET_DEFAULT_VECTOR,
+            "RegisterAsset (default metadata) signing bytes changed — the Console \
+             and Arx-Plus-Api codecs pin this exact string"
+        );
+    }
+
+    /// `IssueAsset` is variant 13; nonce 1 because the client issues right
+    /// after registering at nonce 0. `1000` lands in the `0xfb` u16 range.
+    #[test]
+    fn issue_asset_vector_matches_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(
+                1,
+                ActionPayload::IssueAsset {
+                    asset_id: "gold".to_string(),
+                    amount: 1000
+                },
+            ),
+            ISSUE_ASSET_VECTOR,
+            "IssueAsset signing bytes changed — the Console and Arx-Plus-Api \
+             codecs pin this exact string"
+        );
+    }
+
+    const REGISTER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c64010306020002010202434802444501fc40420f000108697066733a2f2f61";
+    const REGISTER_ASSET_DEFAULT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c6400000000000000";
+    const ISSUE_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a010d04676f6c64fbe803";
 }
