@@ -23,7 +23,7 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address, Block, Limits, quorum};
+use xc_primitives::{Action, Address, Asset, Block, Limits, quorum};
 use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
@@ -962,21 +962,42 @@ async fn get_account_asset_balance<P: Payload>(
 }
 
 /// Every asset registered on this chain, in registration order.
+/// The registry record plus `holders`, the cap-table size — one index read
+/// per asset, so a listing page does not need a request per row.
+#[derive(Serialize)]
+struct AssetWithHolders {
+    #[serde(flatten)]
+    asset: Asset,
+    holders: usize,
+}
+
+fn with_holders(db: &ArxiumDb, asset: Asset) -> Result<AssetWithHolders, StorageError> {
+    let holders = db.get_asset_holders(&asset.asset_id)?.len();
+    Ok(AssetWithHolders { asset, holders })
+}
+
 async fn get_assets<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    match state.db.list_assets() {
-        Ok(assets) => Json(assets).into_response(),
+    let assets = match state.db.list_assets() {
+        Ok(assets) => assets,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match assets.into_iter().map(|asset| with_holders(&state.db, asset)).collect::<Result<Vec<_>, _>>() {
+        Ok(rows) => Json(rows).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-/// One asset's registry record — issuer and whether transfers of it are
-/// compliance-gated.
+/// One asset's registry record — issuer, compliance flag, metadata and
+/// `holders` (cap-table size).
 async fn get_asset<P: Payload>(
     State(state): State<AppState<P>>,
     Path(asset_id): Path<String>,
 ) -> Response {
     match state.db.get_asset(&asset_id) {
-        Ok(Some(asset)) => Json(asset).into_response(),
+        Ok(Some(asset)) => match with_holders(&state.db, asset) {
+            Ok(row) => Json(row).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
