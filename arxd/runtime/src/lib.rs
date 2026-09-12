@@ -594,7 +594,7 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
 /// contains such blocks, and re-executing them under the strict rule would
 /// reject them. ponytail: a constant, not a chain-spec field — devnet is the
 /// only chain and this is its one activation.
-pub const NONCE_DISCIPLINE_HEIGHT: u64 = 64_000;
+pub const NONCE_DISCIPLINE_HEIGHT: u64 = 80_000;
 
 /// Ensures the action consumed exactly one nonce. Circuits that already
 /// checked and bumped it leave the sender's entry at `current + 1` and are
