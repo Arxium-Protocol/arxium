@@ -588,8 +588,39 @@ impl ArxiumDb {
         Ok(KvRead::get(self, &AccountAssetsKey(owner))?.unwrap_or_default())
     }
 
+    /// The cap table. Falls back to a scan of the asset's balance rows when the
+    /// index has no entry: the index only exists from the release that added
+    /// holder controls, so assets issued before it have balances but no
+    /// index row until their next balance change. Bounded to one asset's
+    /// `asset_balance:{id}:` prefix, and metered like every other scan.
     pub fn get_asset_holders(&self, asset_id: &str) -> Result<Vec<Address>, StorageError> {
-        Ok(KvRead::get(self, &AssetHoldersKey(asset_id))?.unwrap_or_default())
+        if let Some(holders) = KvRead::get(self, &AssetHoldersKey(asset_id))? {
+            return Ok(holders);
+        }
+        let prefix = format!("asset_balance:{asset_id}:");
+        let started = std::time::Instant::now();
+        let mut rows = 0u64;
+        let mut holders = Vec::new();
+        let iter = self.db.iterator_cf(self.cf(CF_ASSETS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            rows += 1;
+            let balance: u128 = bincode::serde::decode_from_slice(&value, bincode::config::standard())
+                .map(|(v, _)| v)
+                .map_err(|_| StorageError::CorruptedMeta)?;
+            if balance == 0 {
+                continue;
+            }
+            let owner = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
+            if let Ok(address) = Address::parse(owner) {
+                holders.push(address);
+            }
+        }
+        record_scan("asset_holders_backfill", rows, started);
+        Ok(holders)
     }
 
     pub fn get_holder_state(&self, asset_id: &str, holder: &Address) -> Result<HolderState, StorageError> {
@@ -1926,6 +1957,36 @@ mod asset_index_tests {
         // An account that has never held anything gets an empty list, not an
         // error and not someone else's.
         assert!(db.get_account_assets(&addr(9)).unwrap().is_empty());
+    }
+
+    /// The cap table: maintained by the index once a balance changes, and
+    /// backfilled from the balance rows for assets issued before the index
+    /// existed. Zero balances are not holders either way.
+    #[test]
+    fn asset_holders_come_from_the_index_or_a_bounded_balance_scan() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let alice = addr(2);
+        let bob = addr(3);
+        let gold = asset("gold", &issuer, false);
+        let silver = asset("silver", &issuer, false);
+
+        // Pre-index world: balances written with no holders row at all.
+        let legacy = balances(&[("gold", &alice, 10), ("gold", &bob, 0), ("silver", &bob, 5)]);
+        db.write_batches(&[&gold, &silver, &legacy]).unwrap();
+        assert_eq!(db.get_asset_holders("gold").unwrap(), vec![alice.clone()], "scan skips zero balances and other assets");
+        assert_eq!(db.get_asset_holders("silver").unwrap(), vec![bob.clone()]);
+
+        // From now on the index rules: bob buys in, alice sells out.
+        let updates = balances(&[("gold", &bob, 4)]);
+        let index = db.asset_index_updates(&[], &updates).unwrap();
+        assert_eq!(index.holders["gold"], vec![alice.clone(), bob.clone()], "seeded from the scan, then bob appended");
+        db.write_batches(&[&updates, &index]).unwrap();
+        let updates = balances(&[("gold", &alice, 0)]);
+        let index = db.asset_index_updates(&[], &updates).unwrap();
+        assert_eq!(index.holders["gold"], vec![bob.clone()]);
+        db.write_batches(&[&updates, &index]).unwrap();
+        assert_eq!(db.get_asset_holders("gold").unwrap(), vec![bob]);
     }
 
     /// A second block must extend both lists rather than replace them —
