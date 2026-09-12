@@ -18,7 +18,10 @@ pub(crate) fn dial_bootnodes(swarm: &mut libp2p::Swarm<Behaviour>, bootnodes: Ve
 /// discovered peer gets dialed twice and briefly shows two connections.
 /// Harmless while nothing beyond gossip messages is exchanged over them;
 /// collapse to one dial per peer if that changes.
-pub(crate) fn dial_discovered(swarm: &mut libp2p::Swarm<Behaviour>, peers: Vec<(PeerId, Multiaddr)>) {
+pub(crate) fn dial_discovered(
+    swarm: &mut libp2p::Swarm<Behaviour>,
+    peers: Vec<(PeerId, Multiaddr)>,
+) {
     for (peer_id, addr) in peers {
         info!("mdns discovered peer {peer_id} at {addr}");
         if let Err(err) = swarm.dial(addr.clone()) {

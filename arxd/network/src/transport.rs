@@ -181,11 +181,17 @@ mod tests {
 
     #[test]
     fn different_chains_get_different_identify_protocol_versions() {
-        assert_ne!(identify_protocol_version("chain-a"), identify_protocol_version("chain-b"));
+        assert_ne!(
+            identify_protocol_version("chain-a"),
+            identify_protocol_version("chain-b")
+        );
     }
 
     #[test]
     fn the_same_chain_id_is_stable() {
-        assert_eq!(identify_protocol_version("devnet"), identify_protocol_version("devnet"));
+        assert_eq!(
+            identify_protocol_version("devnet"),
+            identify_protocol_version("devnet")
+        );
     }
 }

@@ -102,17 +102,33 @@ mod tests {
     /// peer that stays under the cap does not.
     #[tokio::test]
     async fn crossing_threshold_bans_peer_permanently() {
-        let mut swarm =
-            build_swarm(libp2p::identity::Keypair::generate_ed25519(), "test-chain", 200).unwrap();
+        let mut swarm = build_swarm(
+            libp2p::identity::Keypair::generate_ed25519(),
+            "test-chain",
+            200,
+        )
+        .unwrap();
         let mut bad_gossip = HashMap::new();
         let peer = PeerId::random();
 
         for _ in 0..MAX_BAD_GOSSIP - 1 {
             record_bad_gossip(&mut swarm, &mut bad_gossip, peer, "test", "test");
         }
-        assert!(!swarm.behaviour().blocked_peers.blocked_peers().contains(&peer));
+        assert!(
+            !swarm
+                .behaviour()
+                .blocked_peers
+                .blocked_peers()
+                .contains(&peer)
+        );
 
         record_bad_gossip(&mut swarm, &mut bad_gossip, peer, "test", "test");
-        assert!(swarm.behaviour().blocked_peers.blocked_peers().contains(&peer));
+        assert!(
+            swarm
+                .behaviour()
+                .blocked_peers
+                .blocked_peers()
+                .contains(&peer)
+        );
     }
 }

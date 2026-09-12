@@ -117,7 +117,10 @@ mod tests {
     #[test]
     fn agreement_everywhere_is_not_a_divergence() {
         let remote = page(&[(10, "a"), (11, "b"), (12, "c")]);
-        assert_eq!(first_divergent_height(&remote, |h| Some(["a", "b", "c"][h as usize - 10].into())), None);
+        assert_eq!(
+            first_divergent_height(&remote, |h| Some(["a", "b", "c"][h as usize - 10].into())),
+            None
+        );
     }
 
     #[test]
@@ -130,7 +133,10 @@ mod tests {
     #[test]
     fn heights_we_dont_have_are_the_peer_being_ahead_not_a_fork() {
         let remote = page(&[(10, "a"), (11, "b")]);
-        assert_eq!(first_divergent_height(&remote, |h| (h == 10).then(|| "a".to_string())), None);
+        assert_eq!(
+            first_divergent_height(&remote, |h| (h == 10).then(|| "a".to_string())),
+            None
+        );
     }
 
     #[test]

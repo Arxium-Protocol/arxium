@@ -34,7 +34,10 @@ pub fn load_or_generate_devnet_bootnode_keypair(base_path: &Path) -> Result<Keyp
     load_or_generate_keypair_inner(base_path, Some(DEVNET_BOOTNODE_SEED))
 }
 
-fn load_or_generate_keypair_inner(base_path: &Path, fixed_seed: Option<[u8; 32]>) -> Result<Keypair> {
+fn load_or_generate_keypair_inner(
+    base_path: &Path,
+    fixed_seed: Option<[u8; 32]>,
+) -> Result<Keypair> {
     let key_path = base_path.join(KEY_FILE);
 
     let keypair = if key_path.exists() {
