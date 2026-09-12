@@ -450,6 +450,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 )
                 .route("/assets", get(get_assets::<P>))
                 .route("/assets/{asset_id}", get(get_asset::<P>))
+                .route("/assets/{asset_id}/holders", get(get_asset_holders::<P>))
                 .route("/attestors", get(get_attestors::<P>))
                 .route("/attestors/{address}", get(get_attestor::<P>))
                 .route("/validators", get(get_validators::<P>))
@@ -849,6 +850,44 @@ struct AccountAssetBalance {
 /// held this". Answered from the `meta:account_assets:` index; the balance
 /// keys themselves are ordered `{asset_id}:{owner}` and cannot be scanned by
 /// owner.
+/// One row of an asset's cap table: balance plus the issuer's freeze state.
+#[derive(Serialize)]
+struct AssetHolderRow {
+    address: Address,
+    balance: u128,
+    frozen: bool,
+    frozen_amount: u128,
+}
+
+/// The cap table — every address with a non-zero balance (from the
+/// `meta:asset_holders` index) with its balance and holder state.
+async fn get_asset_holders<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(asset_id): Path<String>,
+) -> Response {
+    match state.db.get_asset(&asset_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+    let holders = match state.db.get_asset_holders(&asset_id) {
+        Ok(holders) => holders,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let mut rows = Vec::with_capacity(holders.len());
+    for address in holders {
+        let (balance, holder_state) = match (
+            state.db.get_asset_balance(&asset_id, &address),
+            state.db.get_holder_state(&asset_id, &address),
+        ) {
+            (Ok(balance), Ok(holder_state)) => (balance, holder_state),
+            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        };
+        rows.push(AssetHolderRow { address, balance, frozen: holder_state.frozen, frozen_amount: holder_state.frozen_amount });
+    }
+    Json(rows).into_response()
+}
+
 async fn get_account_assets<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,

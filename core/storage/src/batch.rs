@@ -510,13 +510,15 @@ pub struct AssetIndexUpdates {
     pub registry: Option<Vec<String>>,
     /// `owner -> full new list of asset ids held`.
     pub owners: BTreeMap<Address, Vec<String>>,
+    /// `asset_id -> full new list of holders with a non-zero balance`.
+    pub holders: BTreeMap<String, Vec<Address>>,
 }
 
 impl AssetIndexUpdates {
     /// Whether anything would be written. Lets a caller skip pushing this
     /// into the batch at all on the common no-asset-activity block.
     pub fn is_empty(&self) -> bool {
-        self.registry.is_none() && self.owners.is_empty()
+        self.registry.is_none() && self.owners.is_empty() && self.holders.is_empty()
     }
 }
 
@@ -531,6 +533,28 @@ impl BatchWritable for AssetIndexUpdates {
         for (owner, asset_ids) in &self.owners {
             let value = bincode::serde::encode_to_vec(asset_ids, config)?;
             entries.push((AccountAssetsKey(owner).encode(), value));
+        }
+        for (asset_id, holders) in &self.holders {
+            let value = bincode::serde::encode_to_vec(holders, config)?;
+            entries.push((AssetHoldersKey(asset_id).encode(), value));
+        }
+        Ok(entries)
+    }
+}
+
+/// `(asset_id, holder) -> new HolderState`, the issuer's per-holder freeze
+/// controls. `CF_ASSETS`, so part of the state root like the balances.
+#[derive(Debug, Default, Clone)]
+pub struct HolderStateUpdates(pub BTreeMap<(String, Address), HolderState>);
+
+impl BatchWritable for HolderStateUpdates {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        let config = bincode::config::standard();
+        let mut entries = Vec::new();
+        for ((asset_id, holder), state) in &self.0 {
+            let key = AssetHolderStateKey { asset_id, holder }.encode();
+            let value = bincode::serde::encode_to_vec(state, config)?;
+            entries.push((key, value));
         }
         Ok(entries)
     }

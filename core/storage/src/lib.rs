@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
-    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetIndexKey, AssetKey,
+    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, AssetIndexKey, AssetKey,
     AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec,
     KvRead, OperatorKey, StakeByValidatorKey, StakeKey,
 };
@@ -19,7 +19,7 @@ use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
 };
 use xc_primitives::{
-    stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation,
+    stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation, HolderState,
 };
 #[cfg(test)]
 use xc_primitives::Action;
@@ -291,7 +291,7 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_BLOCKS
     } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
         CF_VALIDATORS
-    } else if key.starts_with(b"asset_balance:") || key.starts_with(b"asset_record:") {
+    } else if key.starts_with(b"asset_balance:") || key.starts_with(b"asset_record:") || key.starts_with(b"asset_holder:") {
         CF_ASSETS
     } else if key.starts_with(b"attestor_record:") {
         CF_ATTESTORS
@@ -588,6 +588,14 @@ impl ArxiumDb {
         Ok(KvRead::get(self, &AccountAssetsKey(owner))?.unwrap_or_default())
     }
 
+    pub fn get_asset_holders(&self, asset_id: &str) -> Result<Vec<Address>, StorageError> {
+        Ok(KvRead::get(self, &AssetHoldersKey(asset_id))?.unwrap_or_default())
+    }
+
+    pub fn get_holder_state(&self, asset_id: &str, holder: &Address) -> Result<HolderState, StorageError> {
+        Ok(KvRead::get(self, &AssetHolderStateKey { asset_id, holder })?.unwrap_or_default())
+    }
+
     /// The index rows implied by one block's asset effects: the registry list
     /// grows by any newly registered ids, and each owner touched by a balance
     /// change gains the ids it was touched for.
@@ -632,6 +640,27 @@ impl ArxiumDb {
             }
             if held.len() != before {
                 updates.owners.insert(owner.clone(), held);
+            }
+        }
+
+        // The cap table: a holder is listed while its balance is non-zero.
+        let mut by_asset: BTreeMap<&String, Vec<(&Address, u128)>> = BTreeMap::new();
+        for ((asset_id, owner), balance) in &balances.0 {
+            by_asset.entry(asset_id).or_default().push((owner, *balance));
+        }
+        for (asset_id, rows) in by_asset {
+            let mut holders = self.get_asset_holders(asset_id)?;
+            let before = holders.clone();
+            for (owner, balance) in rows {
+                let listed = holders.iter().position(|h| h == owner);
+                match (listed, balance > 0) {
+                    (None, true) => holders.push(owner.clone()),
+                    (Some(i), false) => { holders.remove(i); }
+                    _ => {}
+                }
+            }
+            if holders != before {
+                updates.holders.insert(asset_id.clone(), holders);
             }
         }
 
@@ -1994,7 +2023,8 @@ mod asset_index_tests {
         let holder = addr(2);
         let index = AssetIndexUpdates {
             registry: Some(vec!["gold".to_string()]),
-            owners: [(holder, vec!["gold".to_string()])].into_iter().collect(),
+            owners: [(holder.clone(), vec!["gold".to_string()])].into_iter().collect(),
+            holders: [("gold".to_string(), vec![holder])].into_iter().collect(),
         };
         for (key, _) in index.batch_entries().unwrap() {
             assert!(

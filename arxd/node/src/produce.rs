@@ -72,6 +72,7 @@ pub fn produce_block<R: ChainRuntime>(
         bls_keys,
         operator: operator_updates,
         assets: mut asset_updates,
+        holder_states,
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
@@ -107,6 +108,7 @@ pub fn produce_block<R: ChainRuntime>(
         view.apply_accounts(&account_updates)?;
         view.apply_stakes(&stake_updates)?;
         view.apply_asset_balances(&asset_updates)?;
+        view.apply_holder_states(&holder_states)?;
         let sealed_updates =
             R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
         account_updates.0.extend(sealed_updates.accounts.0);
@@ -133,7 +135,7 @@ pub fn produce_block<R: ChainRuntime>(
     // known before signing, since the signature covers it.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
         let mut overlay: Vec<&dyn BatchWritable> =
-            vec![&account_updates, &stake_updates, &asset_updates];
+            vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
         }

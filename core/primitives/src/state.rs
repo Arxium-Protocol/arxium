@@ -313,6 +313,20 @@ impl Asset {
 /// merkleized: whether an address belongs to the trusted-attestor set gates
 /// every `GrantAttestation`/`RevokeAttestation`, so membership must be
 /// provable in the state root the same way balances are.
+/// Per-(asset, holder) compliance state an issuer controls after issuance —
+/// the T-REX `setAddressFrozen` / `freezePartialTokens` pair. A new key
+/// (`AssetHolderStateKey`) rather than fields on the balance row, so adding
+/// it changes no existing bincode layout. Absent means the default: not
+/// frozen, nothing locked.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HolderState {
+    /// The holder may neither send nor receive this asset.
+    pub frozen: bool,
+    /// Units of the balance that cannot be spent by a compliant transfer.
+    /// Forced transfers and recovery ignore it.
+    pub frozen_amount: u128,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestorRecord {
     pub name: String,

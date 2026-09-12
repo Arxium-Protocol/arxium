@@ -14,7 +14,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use xc_bls::BlsPublicKey;
-use xc_primitives::{AccountEntry, Address, Asset, AttestorRecord, StakeAllocation};
+use xc_primitives::{AccountEntry, Address, Asset, AttestorRecord, HolderState, StakeAllocation};
 
 pub const CF_META: &str = "meta";
 pub const CF_BLOCKS: &str = "blocks";
@@ -135,6 +135,33 @@ impl KeySpec for AssetBalanceKey<'_> {
     type Value = u128;
     fn encode(&self) -> Vec<u8> {
         format!("asset_balance:{}:{}", self.asset_id, self.owner).into_bytes()
+    }
+}
+
+/// Issuer-controlled per-holder compliance state for one asset (see
+/// `HolderState`). `CF_ASSETS`, merkleized: whether a holder is frozen is a
+/// fact a light client may need to prove.
+pub struct AssetHolderStateKey<'a> {
+    pub asset_id: &'a str,
+    pub holder: &'a Address,
+}
+impl KeySpec for AssetHolderStateKey<'_> {
+    const CF: &'static str = CF_ASSETS;
+    type Value = HolderState;
+    fn encode(&self) -> Vec<u8> {
+        format!("asset_holder:{}:{}", self.asset_id, self.holder).into_bytes()
+    }
+}
+
+/// Every address holding a non-zero balance of one asset — the cap table.
+/// Same reasoning as `AccountAssetsKey`: a maintained `CF_META` index, not a
+/// scan and not part of the state root.
+pub struct AssetHoldersKey<'a>(pub &'a str);
+impl KeySpec for AssetHoldersKey<'_> {
+    const CF: &'static str = CF_META;
+    type Value = Vec<Address>;
+    fn encode(&self) -> Vec<u8> {
+        format!("meta:asset_holders:{}", self.0).into_bytes()
     }
 }
 

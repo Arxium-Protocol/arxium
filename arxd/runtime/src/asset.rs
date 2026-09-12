@@ -240,6 +240,110 @@ pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
     })
 }
 
+fn require_issuer<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction, asset_id: &str) -> anyhow::Result<Asset> {
+    let asset = resolve_asset(view, asset_id)?;
+    if action.sender != asset.issuer {
+        anyhow::bail!("only the issuer ({}) of {asset_id} may do this, got {}", asset.issuer, action.sender);
+    }
+    Ok(asset)
+}
+
+pub(crate) fn burn_asset<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    amount: u128,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset_id)?;
+    if amount == 0 {
+        anyhow::bail!("burn amount must be positive");
+    }
+    let assets = circuit_rwa_asset::apply_burn(view, &mut asset, &action.sender, amount)?;
+    Ok(BlockUpdates {
+        assets,
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn set_holder_frozen<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    holder: &Address,
+    frozen: bool,
+) -> anyhow::Result<BlockUpdates> {
+    let asset = require_issuer(view, action, asset_id)?;
+    let holder_states = circuit_rwa_asset::apply_set_holder_frozen(view, &asset, holder, frozen)?;
+    Ok(BlockUpdates {
+        holder_states,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn lock_holder_amount<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    holder: &Address,
+    amount: u128,
+    lock: bool,
+) -> anyhow::Result<BlockUpdates> {
+    let asset = require_issuer(view, action, asset_id)?;
+    if amount == 0 {
+        anyhow::bail!("lock amount must be positive");
+    }
+    let holder_states = circuit_rwa_asset::apply_lock_amount(view, &asset, holder, amount, lock)?;
+    Ok(BlockUpdates {
+        holder_states,
+        ..Default::default()
+    })
+}
+
+/// The issuer's forced transfer: same semantics and audit `reason` as the
+/// governor's, restricted to the issuer's own assets.
+pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    reason: &str,
+) -> anyhow::Result<BlockUpdates> {
+    if reason.trim().is_empty() {
+        anyhow::bail!("a forced transfer needs a non-empty reason");
+    }
+    if reason.len() > MAX_REASON_LEN {
+        anyhow::bail!("reason is {} bytes, over the {MAX_REASON_LEN}-byte limit", reason.len());
+    }
+    let asset = require_issuer(view, action, asset_id)?;
+    let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
+    Ok(BlockUpdates {
+        assets,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    lost: &Address,
+    replacement: &Address,
+) -> anyhow::Result<BlockUpdates> {
+    if lost == replacement {
+        anyhow::bail!("recovery needs a different replacement address");
+    }
+    let asset = require_issuer(view, action, asset_id)?;
+    let (assets, holder_states) = circuit_rwa_asset::apply_recover(view, &asset, lost, replacement)?;
+    Ok(BlockUpdates {
+        assets,
+        holder_states,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +685,89 @@ mod tests {
     /// is deliberately *not* enough here, unlike freeze: moving someone
     /// else's holding without their signature is a regulatory power, not an
     /// issuer's housekeeping.
+    fn dispatch_at(action: &ChainAction, view: &BlockView<'_>, height: u64) -> anyhow::Result<BlockUpdates> {
+        crate::dispatch(action, view, &operator_lookup, &operator_validators_lookup, &[], height, &no_bls_owner)
+    }
+
+    #[test]
+    fn holder_controls_are_issuer_only_and_flow_through_dispatch() {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let stranger = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (issuer.clone(), funded(ACTION_FEE * 8)),
+                (stranger.clone(), funded(ACTION_FEE * 8)),
+            ]),
+            HashMap::new(),
+        );
+        let mut asset = Asset::new("gold", issuer.clone(), false);
+        asset.total_supply = 100;
+        view.put(&AssetKey("gold"), &asset).unwrap();
+        view.put(&xc_circuit::AssetBalanceKey { asset_id: "gold", owner: &issuer }, &60u128).unwrap();
+        view.put(&xc_circuit::AssetBalanceKey { asset_id: "gold", owner: &holder }, &40u128).unwrap();
+
+        let act = |sender: &Address, payload: ActionPayload| ChainAction { sender: sender.clone(), nonce: 0, signature: None, payload };
+
+        for payload in [
+            ActionPayload::BurnAsset { asset_id: "gold".into(), amount: 1 },
+            ActionPayload::SetHolderFrozen { asset_id: "gold".into(), holder: holder.clone(), frozen: true },
+            ActionPayload::LockHolderAmount { asset_id: "gold".into(), holder: holder.clone(), amount: 1 },
+            ActionPayload::IssuerForcedTransfer { asset_id: "gold".into(), from: holder.clone(), to: issuer.clone(), amount: 1, reason: "x".into() },
+            ActionPayload::RecoverHolder { asset_id: "gold".into(), lost: holder.clone(), replacement: stranger.clone() },
+        ] {
+            let err = dispatch_at(&act(&stranger, payload), &view, 0).unwrap_err();
+            assert!(err.to_string().contains("only the issuer"), "stranger must be refused: {err}");
+        }
+
+        let updates = dispatch_at(&act(&issuer, ActionPayload::BurnAsset { asset_id: "gold".into(), amount: 10 }), &view, 0).unwrap();
+        assert_eq!(updates.asset_registration.unwrap().total_supply, 90);
+        assert_eq!(updates.assets.0[&("gold".to_string(), issuer.clone())], 50);
+
+        let updates = dispatch_at(&act(&issuer, ActionPayload::LockHolderAmount { asset_id: "gold".into(), holder: holder.clone(), amount: 25 }), &view, 0).unwrap();
+        assert_eq!(updates.holder_states.0[&("gold".to_string(), holder.clone())].frozen_amount, 25);
+
+        let updates = dispatch_at(&act(&issuer, ActionPayload::IssuerForcedTransfer { asset_id: "gold".into(), from: holder.clone(), to: issuer.clone(), amount: 40, reason: "court order".into() }), &view, 0).unwrap();
+        assert_eq!(updates.assets.0[&("gold".to_string(), holder.clone())], 0);
+        let err = dispatch_at(&act(&issuer, ActionPayload::IssuerForcedTransfer { asset_id: "gold".into(), from: holder.clone(), to: issuer.clone(), amount: 1, reason: "  ".into() }), &view, 0).unwrap_err();
+        assert!(err.to_string().contains("non-empty reason"), "{err}");
+    }
+
+    #[test]
+    fn nonce_discipline_activates_at_the_configured_height_for_every_action() {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(issuer.clone(), funded(ACTION_FEE * 8))]), HashMap::new());
+        let register = |nonce: u64, id: &str| ChainAction {
+            sender: issuer.clone(),
+            nonce,
+            signature: None,
+            payload: ActionPayload::RegisterAsset { asset_id: id.into(), compliance_required: false, metadata: AssetMetadata::default() },
+        };
+        let before = crate::NONCE_DISCIPLINE_HEIGHT - 1;
+        let after = crate::NONCE_DISCIPLINE_HEIGHT;
+
+        // Legacy: any nonce is accepted and the account's nonce is untouched.
+        let updates = dispatch_at(&register(7, "a"), &view, before).unwrap();
+        assert_eq!(updates.accounts.0[&issuer].nonce, 0, "pre-activation history must replay unchanged");
+
+        // Strict: the nonce must match and is consumed.
+        let err = dispatch_at(&register(7, "b"), &view, after).unwrap_err();
+        assert!(err.to_string().contains("invalid nonce"), "{err}");
+        let updates = dispatch_at(&register(0, "b"), &view, after).unwrap();
+        assert_eq!(updates.accounts.0[&issuer].nonce, 1);
+        assert_eq!(updates.accounts.0[&issuer].balance, ACTION_FEE * 7, "fee still charged once");
+
+        // An action whose circuit already bumps the nonce is not bumped twice.
+        let issue = ChainAction { sender: issuer.clone(), nonce: 0, signature: None, payload: ActionPayload::IssueAsset { asset_id: "gold".into(), amount: 5 } };
+        let mut view = view;
+        view.put(&AssetKey("gold"), &Asset::new("gold", issuer.clone(), false)).unwrap();
+        let updates = dispatch_at(&issue, &view, after).unwrap();
+        assert_eq!(updates.accounts.0[&issuer].nonce, 1);
+    }
+
     #[test]
     fn forced_transfer_requires_the_governor_and_a_non_empty_reason() {
         let governor = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();

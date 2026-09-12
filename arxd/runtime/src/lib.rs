@@ -292,6 +292,51 @@ pub enum ActionPayload {
         amount: u128,
         reason: String,
     },
+    /// Issuer destroys `amount` of its own balance; `total_supply` follows.
+    /// Variant 21 — appended, so Retracer's mirror and the client codecs must
+    /// add it in this position.
+    BurnAsset {
+        asset_id: String,
+        amount: u128,
+    },
+    /// Issuer takes a holder out of circulation for one asset (or back in) —
+    /// T-REX `setAddressFrozen`. Variant 22.
+    SetHolderFrozen {
+        asset_id: String,
+        holder: Address,
+        frozen: bool,
+    },
+    /// Issuer locks `amount` of a holder's balance against compliant
+    /// transfers — T-REX `freezePartialTokens`. Variant 23.
+    LockHolderAmount {
+        asset_id: String,
+        holder: Address,
+        amount: u128,
+    },
+    /// Reverses `LockHolderAmount`. Variant 24.
+    UnlockHolderAmount {
+        asset_id: String,
+        holder: Address,
+        amount: u128,
+    },
+    /// The issuer's own forced transfer — T-REX `forcedTransfer` by an
+    /// agent — scoped to assets it issued, same audited `reason` as the
+    /// governor's `ForcedTransfer`. Variant 25.
+    IssuerForcedTransfer {
+        asset_id: String,
+        from: Address,
+        to: Address,
+        amount: u128,
+        reason: String,
+    },
+    /// Move everything `lost` holds of an asset to `replacement`, which must
+    /// pass the asset's compliance rules — T-REX `recoveryAddress`. Issuer
+    /// only. Variant 26.
+    RecoverHolder {
+        asset_id: String,
+        lost: Address,
+        replacement: Address,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -536,8 +581,51 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
         current_height,
         bls_pubkey_owner_lookup,
     )?;
+    consume_nonce(action, view, &mut updates, current_height)?;
     charge_action_fee(action, view, &mut updates)?;
     Ok(updates)
+}
+
+/// First height at which every action must carry — and advance — the
+/// sender's nonce. Before it, only the circuits that moved a balance checked
+/// the nonce (`account`, `staking`, `rwa-asset::apply_issue`/`transfer`), so
+/// `RegisterAsset`, the freezes, attestations and key registrations were
+/// applied at any nonce and never bumped it; devnet history up to here
+/// contains such blocks, and re-executing them under the strict rule would
+/// reject them. ponytail: a constant, not a chain-spec field — devnet is the
+/// only chain and this is its one activation.
+pub const NONCE_DISCIPLINE_HEIGHT: u64 = 64_000;
+
+/// Ensures the action consumed exactly one nonce. Circuits that already
+/// checked and bumped it leave the sender's entry at `current + 1` and are
+/// left alone; everything else is checked here and bumped, so no action can
+/// be replayed and no action can be applied out of order.
+fn consume_nonce<V: KvRead<Error = StorageError>>(
+    action: &ChainAction,
+    view: &V,
+    updates: &mut BlockUpdates,
+    current_height: u64,
+) -> anyhow::Result<()> {
+    if current_height < NONCE_DISCIPLINE_HEIGHT {
+        return Ok(());
+    }
+    let current = view
+        .get(&AccountKey(&action.sender))?
+        .map(|entry| entry.nonce)
+        .unwrap_or(0);
+    let mut entry = match updates.accounts.0.get(&action.sender) {
+        Some(entry) => entry.clone(),
+        None => view.get(&AccountKey(&action.sender))?.unwrap_or_default(),
+    };
+    if entry.nonce != current {
+        return Ok(());
+    }
+    if action.nonce != current {
+        anyhow::bail!("invalid nonce for {}: expected {current}, got {}", action.sender, action.nonce);
+    }
+    entry.nonce = current + 1;
+    updates.accounts.0.insert(action.sender.clone(), entry);
+    Ok(())
 }
 
 /// Debits `ACTION_FEE` from `action.sender`'s balance on top of whatever
@@ -685,6 +773,22 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             amount,
             reason,
         } => asset::forced_transfer(view, action, asset_id, from, to, *amount, reason),
+        ActionPayload::BurnAsset { asset_id, amount } => asset::burn_asset(view, action, asset_id, *amount),
+        ActionPayload::SetHolderFrozen { asset_id, holder, frozen } => {
+            asset::set_holder_frozen(view, action, asset_id, holder, *frozen)
+        }
+        ActionPayload::LockHolderAmount { asset_id, holder, amount } => {
+            asset::lock_holder_amount(view, action, asset_id, holder, *amount, true)
+        }
+        ActionPayload::UnlockHolderAmount { asset_id, holder, amount } => {
+            asset::lock_holder_amount(view, action, asset_id, holder, *amount, false)
+        }
+        ActionPayload::IssuerForcedTransfer { asset_id, from, to, amount, reason } => {
+            asset::issuer_forced_transfer(view, action, asset_id, from, to, *amount, reason)
+        }
+        ActionPayload::RecoverHolder { asset_id, lost, replacement } => {
+            asset::recover_holder(view, action, asset_id, lost, replacement)
+        }
         ActionPayload::TransferAsset {
             asset_id,
             to,
@@ -1169,6 +1273,33 @@ mod client_signing_vectors {
              codecs pin this exact string"
         );
     }
+
+    /// Variants 21–26, one vector each so a codec that gets any index or
+    /// field order wrong fails here rather than on the chain. Nonce 2 for all
+    /// of them; `holder`/`from`/`lost` is BOB.
+    #[test]
+    fn holder_control_vectors_match_the_client_codecs() {
+        let bob = Address::parse(BOB).expect("valid");
+        let alice = Address::parse(ALICE).expect("valid");
+        let cases: [(&str, ActionPayload, &str); 6] = [
+            ("BurnAsset", ActionPayload::BurnAsset { asset_id: "gold".into(), amount: 1000 }, BURN_ASSET_VECTOR),
+            ("SetHolderFrozen", ActionPayload::SetHolderFrozen { asset_id: "gold".into(), holder: bob.clone(), frozen: true }, SET_HOLDER_FROZEN_VECTOR),
+            ("LockHolderAmount", ActionPayload::LockHolderAmount { asset_id: "gold".into(), holder: bob.clone(), amount: 1000 }, LOCK_HOLDER_AMOUNT_VECTOR),
+            ("UnlockHolderAmount", ActionPayload::UnlockHolderAmount { asset_id: "gold".into(), holder: bob.clone(), amount: 1000 }, UNLOCK_HOLDER_AMOUNT_VECTOR),
+            ("IssuerForcedTransfer", ActionPayload::IssuerForcedTransfer { asset_id: "gold".into(), from: bob.clone(), to: alice.clone(), amount: 1000, reason: "court".into() }, ISSUER_FORCED_TRANSFER_VECTOR),
+            ("RecoverHolder", ActionPayload::RecoverHolder { asset_id: "gold".into(), lost: bob, replacement: alice }, RECOVER_HOLDER_VECTOR),
+        ];
+        for (name, payload, expected) in cases {
+            assert_eq!(hex_signing_bytes(2, payload), expected, "{name} signing bytes changed — the client codecs pin this exact string");
+        }
+    }
+
+    const BURN_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021504676f6c64fbe803";
+    const SET_HOLDER_FROZEN_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021604676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b3501";
+    const LOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021704676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
+    const UNLOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021804676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
+    const ISSUER_FORCED_TRANSFER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021904676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737afbe80305636f757274";
+    const RECOVER_HOLDER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021a04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a";
 
     const REGISTER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c64010306020002010202434802444501fc40420f000108697066733a2f2f61";
     const REGISTER_ASSET_DEFAULT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c6400000000000000";

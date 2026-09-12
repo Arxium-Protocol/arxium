@@ -106,6 +106,13 @@ impl<'a> BlockView<'a> {
         Ok(())
     }
 
+    pub fn apply_holder_states(&mut self, updates: &HolderStateUpdates) -> Result<(), StorageError> {
+        for ((asset_id, holder), state) in &updates.0 {
+            self.put(&AssetHolderStateKey { asset_id, holder }, state)?;
+        }
+        Ok(())
+    }
+
     /// Folds a `RegisterAsset`/`IssueAsset` write into the view — see
     /// `apply_attestor_registration` below for why this goes through the
     /// view instead of a deferred `Vec`: without it, a same-block

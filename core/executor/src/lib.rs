@@ -13,8 +13,8 @@ use xc_primitives::{
 use xc_primitives::Asset;
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
-    BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker, OperatorUpdates, StakeUpdates,
-    StorageError, ValidatorSetSnapshot,
+    BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates, OperatorUpdates,
+    StakeUpdates, StorageError, ValidatorSetSnapshot,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -38,6 +38,7 @@ pub struct ExecutionOutcome<P> {
     pub bls_keys: Vec<BlsKeyRegistration>,
     pub operator: OperatorUpdates,
     pub assets: AssetBalanceUpdates,
+    pub holder_states: HolderStateUpdates,
     pub asset_registrations: Vec<Asset>,
     pub attestor_registrations: Vec<AttestorRegistration>,
     pub attestor_deregistrations: Vec<AttestorDeregistration>,
@@ -68,6 +69,8 @@ pub struct BlockUpdates {
     /// kept separate from `accounts` (the native token) so compliance gating
     /// never touches fees/staking. See `circuits/rwa-asset`.
     pub assets: AssetBalanceUpdates,
+    /// Per-holder freeze state touched by this action (`CF_ASSETS`, merkleized).
+    pub holder_states: HolderStateUpdates,
     /// Set only by `RegisterAsset` — a new `CF_ASSETS` (`asset_record:{id}`) registry entry.
     pub asset_registration: Option<Asset>,
     /// Set only by `RegisterAttestor` — a new `CF_ATTESTORS` entry.
@@ -93,6 +96,7 @@ pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpda
         bls_key: None,
         operator: OperatorUpdates::default(),
         assets: AssetBalanceUpdates::default(),
+        holder_states: HolderStateUpdates::default(),
         asset_registration: None,
         attestor_registration: None,
         attestor_deregistration: None,
@@ -549,13 +553,14 @@ where
         bls_keys,
         operator: operator_updates,
         assets: mut asset_updates,
+        holder_states,
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
         touched_keys,
     } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
     if applied.len() != claimed {
-        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -574,6 +579,7 @@ where
     view.apply_accounts(&account_updates)?;
     view.apply_stakes(&stake_updates)?;
     view.apply_asset_balances(&asset_updates)?;
+    view.apply_holder_states(&holder_states)?;
     let sealed_updates = on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
         .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
     account_updates.0.extend(sealed_updates.accounts.0);
@@ -594,7 +600,7 @@ where
     // actions locally actually produces — same principle as `ActionMismatch`
     // above, applied to state instead of the action list.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
@@ -635,7 +641,7 @@ where
     // `CF_META` rows, outside `is_state_key`, so they must not move the root.
     let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
 
-    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates];
+    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -735,6 +741,7 @@ where
     let mut operator_overlay = seed.operator.authorization;
     let mut operator_index_overlay = seed.operator.operator_index;
     let mut asset_overlay = seed.assets.0;
+    let mut holder_overlay = seed.holder_states.0;
     let mut asset_registrations: Vec<Asset> = seed.asset_registration.into_iter().collect();
     let mut attestor_registrations: Vec<AttestorRegistration> =
         seed.attestor_registration.into_iter().collect();
@@ -748,6 +755,7 @@ where
         validator_index: validator_index_overlay.clone(),
     })?;
     view.apply_asset_balances(&AssetBalanceUpdates(asset_overlay.clone()))?;
+    view.apply_holder_states(&HolderStateUpdates(holder_overlay.clone()))?;
     for registration in &attestor_registrations {
         view.apply_attestor_registration(registration)?;
     }
@@ -785,6 +793,8 @@ where
                 operator_index_overlay.extend(updates.operator.operator_index);
                 asset_overlay.extend(updates.assets.0.clone());
                 view.apply_asset_balances(&updates.assets)?;
+                holder_overlay.extend(updates.holder_states.0.clone());
+                view.apply_holder_states(&updates.holder_states)?;
                 if let Some(registration) = &updates.asset_registration {
                     view.apply_asset_registration(registration)?;
                 }
@@ -809,8 +819,9 @@ where
                 validator_index: validator_index_overlay.clone(),
             };
             let asset_snapshot = AssetBalanceUpdates(asset_overlay.clone());
+            let holder_snapshot = HolderStateUpdates(holder_overlay.clone());
             let mut snapshot_overlay: Vec<&dyn BatchWritable> =
-                vec![&account_snapshot, &stake_snapshot, &asset_snapshot];
+                vec![&account_snapshot, &stake_snapshot, &asset_snapshot, &holder_snapshot];
             snapshot_overlay.extend(attestor_registrations.iter().map(|r| r as &dyn BatchWritable));
             snapshot_overlay.extend(attestor_deregistrations.iter().map(|d| d as &dyn BatchWritable));
             roots.push(db.compute_state_root(&snapshot_overlay)?);
@@ -832,6 +843,7 @@ where
             operator_index: operator_index_overlay,
         },
         assets: AssetBalanceUpdates(asset_overlay),
+        holder_states: HolderStateUpdates(holder_overlay),
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
