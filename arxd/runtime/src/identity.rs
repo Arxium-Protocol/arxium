@@ -18,7 +18,10 @@ use crate::ChainAction;
 /// Spectrum's multi-attestor model: more than one regulated KYC provider
 /// can hold this authority at once, rather than one chain-spec-fixed
 /// address for the whole chain's lifetime.
-fn require_attestor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
+fn require_attestor<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+) -> anyhow::Result<()> {
     if view.get(&AttestorRecordKey(&action.sender))?.is_none() {
         anyhow::bail!("{} is not a registered attestor", action.sender);
     }
@@ -31,7 +34,10 @@ fn require_attestor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAct
 /// Deliberately a single fixed address for now, same walking-skeleton
 /// stage `require_attestor` used to be: a Compliance Committee
 /// (multi-sig/voting) is the deferred upgrade for this role.
-pub(crate) fn require_governor<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction) -> anyhow::Result<()> {
+pub(crate) fn require_governor<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+) -> anyhow::Result<()> {
     let governor = view
         .get(&GovernorKey)?
         .ok_or_else(|| anyhow::anyhow!("chain has no governor configured"))?;
@@ -57,7 +63,10 @@ pub(crate) fn register_attestor<V: KvRead<Error = StorageError>>(
     Ok(BlockUpdates {
         attestor_registration: Some(AttestorRegistration {
             attestor: attestor.clone(),
-            record: AttestorRecord { name: name.to_string(), registered_at: current_height },
+            record: AttestorRecord {
+                name: name.to_string(),
+                registered_at: current_height,
+            },
         }),
         ..Default::default()
     })
@@ -224,7 +233,10 @@ mod tests {
         );
         view.put(
             &AttestorRecordKey(&attestor),
-            &AttestorRecord { name: "test".to_string(), registered_at: 0 },
+            &AttestorRecord {
+                name: "test".to_string(),
+                registered_at: 0,
+            },
         )
         .unwrap();
 
@@ -232,7 +244,9 @@ mod tests {
             sender: attestor.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::RevokeAttestation { subject: alice.clone() },
+            payload: ActionPayload::RevokeAttestation {
+                subject: alice.clone(),
+            },
         };
 
         let updates = grant_attestation(
@@ -251,18 +265,31 @@ mod tests {
         view.apply_accounts(&updates.accounts).unwrap();
 
         // Narrower re-grant: Accredited is dropped, not kept.
-        let updates =
-            grant_attestation(&view, &action, &alice, "kyc-alice", &[ClaimTopic::Kyc], Some("DE"))
-                .unwrap();
+        let updates = grant_attestation(
+            &view,
+            &action,
+            &alice,
+            "kyc-alice",
+            &[ClaimTopic::Kyc],
+            Some("DE"),
+        )
+        .unwrap();
         let entry = &updates.accounts.0[&alice];
-        assert_eq!(entry.claims, vec![ClaimTopic::Kyc], "re-grant replaces, never merges");
+        assert_eq!(
+            entry.claims,
+            vec![ClaimTopic::Kyc],
+            "re-grant replaces, never merges"
+        );
         assert_eq!(entry.jurisdiction.as_deref(), Some("DE"));
         view.apply_accounts(&updates.accounts).unwrap();
 
         let updates = revoke_attestation(&view, &action, &alice).unwrap();
         let entry = &updates.accounts.0[&alice];
         assert!(entry.identity_hash.is_none());
-        assert!(entry.claims.is_empty(), "a revoked attestation must leave no claims standing");
+        assert!(
+            entry.claims.is_empty(),
+            "a revoked attestation must leave no claims standing"
+        );
         assert!(entry.jurisdiction.is_none());
     }
 
@@ -278,19 +305,27 @@ mod tests {
         );
         view.put(
             &AttestorRecordKey(&attestor),
-            &AttestorRecord { name: "test".to_string(), registered_at: 0 },
+            &AttestorRecord {
+                name: "test".to_string(),
+                registered_at: 0,
+            },
         )
         .unwrap();
         let action = ChainAction {
             sender: attestor,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::RevokeAttestation { subject: alice.clone() },
+            payload: ActionPayload::RevokeAttestation {
+                subject: alice.clone(),
+            },
         };
 
         for bad in ["ch", "CHE", "C", "C1"] {
             let err = grant_attestation(&view, &action, &alice, "h", &[], Some(bad)).unwrap_err();
-            assert!(err.to_string().contains("jurisdiction"), "code {bad:?}, got: {err}");
+            assert!(
+                err.to_string().contains("jurisdiction"),
+                "code {bad:?}, got: {err}"
+            );
         }
         assert!(grant_attestation(&view, &action, &alice, "h", &[], Some("CH")).is_ok());
         assert!(grant_attestation(&view, &action, &alice, "h", &[], None).is_ok());
@@ -298,12 +333,13 @@ mod tests {
 
     #[test]
     fn grant_attestation_then_verify_identity_credential_succeeds_end_to_end() {
-        use ark_std::rand::{rngs::StdRng, SeedableRng};
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
 
         let attestor = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let pk_bytes: &[u8] = include_bytes!("../../../circuits/identity-zk/pk.bin");
-        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
+        let pk =
+            circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
 
         let preimage = b"alice's secret preimage";
         let params = circuit_identity_zk::poseidon_params();
@@ -315,10 +351,20 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE * 2)), (attestor.clone(), funded(ACTION_FEE))]),
+            HashMap::from([
+                (alice.clone(), funded(ACTION_FEE * 2)),
+                (attestor.clone(), funded(ACTION_FEE)),
+            ]),
             HashMap::new(),
         );
-        view.put(&AttestorRecordKey(&attestor), &AttestorRecord { name: "test".to_string(), registered_at: 0 }).unwrap();
+        view.put(
+            &AttestorRecordKey(&attestor),
+            &AttestorRecord {
+                name: "test".to_string(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
 
         let grant = Action {
             sender: attestor.clone(),
@@ -370,11 +416,12 @@ mod tests {
 
     #[test]
     fn verify_identity_credential_accepts_a_valid_proof() {
-        use ark_std::rand::{rngs::StdRng, SeedableRng};
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
 
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let pk_bytes: &[u8] = include_bytes!("../../../circuits/identity-zk/pk.bin");
-        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
+        let pk =
+            circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
 
         let preimage = b"alice's secret preimage";
         let params = circuit_identity_zk::poseidon_params();
@@ -390,7 +437,11 @@ mod tests {
         let mut account = funded(ACTION_FEE);
         account.identity_hash = Some(hex::encode(hash_bytes));
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), account)]),
+            HashMap::new(),
+        );
 
         let action = Action {
             sender: alice.clone(),
@@ -425,13 +476,19 @@ mod tests {
         let mut account = funded(ACTION_FEE);
         account.identity_hash = Some(hex::encode([0u8; 32]));
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), account)]),
+            HashMap::new(),
+        );
 
         let action = Action {
             sender: alice,
             nonce: 0,
             signature: None,
-            payload: ActionPayload::VerifyIdentityCredential { proof: vec![0xFFu8; 4] },
+            payload: ActionPayload::VerifyIdentityCredential {
+                proof: vec![0xFFu8; 4],
+            },
         };
 
         let err = crate::dispatch(
@@ -449,11 +506,12 @@ mod tests {
 
     #[test]
     fn verify_identity_credential_rejects_a_proof_for_the_wrong_hash() {
-        use ark_std::rand::{rngs::StdRng, SeedableRng};
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
 
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let pk_bytes: &[u8] = include_bytes!("../../../circuits/identity-zk/pk.bin");
-        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
+        let pk =
+            circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
 
         let preimage = b"alice's secret preimage";
         let mut rng = StdRng::seed_from_u64(7);
@@ -465,12 +523,17 @@ mod tests {
         let params = circuit_identity_zk::poseidon_params();
         let wrong_hash = circuit_identity_zk::credential_hash(&params, b"a different preimage");
         let mut wrong_hash_bytes = Vec::new();
-        ark_serialize::CanonicalSerialize::serialize_compressed(&wrong_hash, &mut wrong_hash_bytes).unwrap();
+        ark_serialize::CanonicalSerialize::serialize_compressed(&wrong_hash, &mut wrong_hash_bytes)
+            .unwrap();
 
         let mut account = funded(0);
         account.identity_hash = Some(hex::encode(wrong_hash_bytes));
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), account)]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), account)]),
+            HashMap::new(),
+        );
 
         let action = Action {
             sender: alice,

@@ -181,6 +181,44 @@ pub fn dissent_signing_bytes(
     buf
 }
 
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
+
+/// One BLS-signed precommit vote, in the shape `verify()` can check on its
+/// own: the signing bytes are recomputed from `height`/`block_hash`/`ep`
+/// rather than trusted as an opaque blob, same rule the rest of this crate
+/// follows. Must match `arxd_finality::precommit_signing_bytes`
+/// byte-for-byte — pinned by `precommit_signing_bytes_match_across_crates`
+/// in `arxd/node/src/lib.rs`, exactly as `dissent_signing_bytes` is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecommitAttestation {
+    pub height: u64,
+    /// Opaque, chain-internal block hash. Unlike `DissentAttestation`'s, this
+    /// one *is* load-bearing: it is covered by the signature, so a verifier
+    /// recomputes the signed bytes from it and two votes differing here are
+    /// two genuinely distinct signed messages. No `header_commitment` is
+    /// needed (or possible) — equivocation is proved by the voter having
+    /// signed two different messages at one height, not by what either
+    /// message says about a block this crate would have to hold.
+    pub block_hash: String,
+    /// Hex-encoded (`0x...`) 32-byte execution proof this vote commits to.
+    pub ep: String,
+    /// Hex-encoded (`0x...`) BLS signature (96 bytes) over `precommit_signing_bytes`.
+    pub signature: String,
+}
+
+/// The exact bytes a validator signs for a precommit vote — must match
+/// `arxd_finality::precommit_signing_bytes` byte-for-byte, the same
+/// cross-crate duplication (and for the same reason) as
+/// `dissent_signing_bytes` above.
+pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_PRECOMMIT);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, block_hash.as_bytes());
+    push_field(&mut buf, ep);
+    buf
+}
+
 const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v1";
 
 /// The exact bytes a dissenter signs to stake a claim on a whole block's
@@ -404,6 +442,26 @@ pub enum Fault {
         actions: Vec<String>,
         dissent_claim: BlockDissentClaim,
     },
+    /// A validator BLS-signed two different precommit messages at one
+    /// height. Unlike the three fault kinds above it needs no re-execution
+    /// and no second party: `verify()` alone names the culprit, exactly as
+    /// for `Equivocation` — the only difference is which key signed (BLS
+    /// finality key, not the proposer's Ed25519 chain key), so the culpable
+    /// pubkey must be resolved to an `Address` through the BLS key registry
+    /// rather than derived from the pubkey directly.
+    ///
+    /// The two votes are distinct iff their signing bytes differ, which
+    /// covers both ways a validator can equivocate: voting for two block
+    /// hashes at one height, and voting for one hash under two different
+    /// execution proofs (`ep` is part of the tally key in `arxd/finality`,
+    /// so both split a quorum the same way).
+    PrecommitEquivocation {
+        /// Hex-encoded (`0x...`) raw BLS12-381 public key (48 bytes) of the
+        /// culpable voter.
+        voter_pubkey: String,
+        height: u64,
+        precommits: [PrecommitAttestation; 2],
+    },
 }
 
 /// A complete, standalone evidence artifact.
@@ -482,6 +540,10 @@ pub enum VerifyError {
     BlockDissentSignatureInvalid,
     #[error("dissent_claim's computed_state_root is identical to the proposer's signed state_root — not a divergence")]
     BlockDivergenceNoDisagreement,
+    #[error("precommit {0} does not verify against voter_pubkey")]
+    PrecommitSignatureInvalid(usize),
+    #[error("the two cited precommits sign identical bytes, not distinct evidence")]
+    SamePrecommit,
 }
 
 /// What a verified artifact proves, once `verify()` accepts it. Two shapes:
@@ -756,6 +818,60 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 parties: vec![proposer_pubkey.clone(), dissent.voter_pubkey.clone()],
             })
         }
+        Fault::PrecommitEquivocation { voter_pubkey, height, precommits } => {
+            let pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
+            let pubkey_bytes: [u8; 48] = pubkey_bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| VerifyError::BadBlsPubkeyLength(pubkey_bytes.len()))?;
+            let voter = BlsPublicKey(pubkey_bytes);
+
+            if precommits[0].height != precommits[1].height {
+                return Err(VerifyError::HeightMismatch(
+                    precommits[0].height,
+                    precommits[1].height,
+                ));
+            }
+            if precommits[0].height != *height {
+                return Err(VerifyError::FaultHeightMismatch {
+                    claimed: *height,
+                    actual: precommits[0].height,
+                });
+            }
+
+            let mut signed = Vec::with_capacity(2);
+            for (i, precommit) in precommits.iter().enumerate() {
+                let ep_bytes = decode_hex("ep", &precommit.ep)?;
+                let ep_bytes: [u8; 32] = ep_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+                let sig_bytes = decode_hex("signature", &precommit.signature)?;
+                let sig_bytes: [u8; 96] = sig_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
+
+                let bytes = precommit_signing_bytes(precommit.height, &precommit.block_hash, &ep_bytes);
+                xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
+                    .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
+                signed.push(bytes);
+            }
+
+            // Signed bytes, not the raw signatures: BLS signing is
+            // deterministic here, so equal messages give equal signatures —
+            // but the property that actually makes this a fault is two
+            // *distinct messages* under one key, and that is what gets
+            // compared.
+            if signed[0] == signed[1] {
+                return Err(VerifyError::SamePrecommit);
+            }
+
+            Ok(Verdict::Culpable {
+                fault: "precommit_equivocation",
+                culpable_pubkey: voter_pubkey.clone(),
+            })
+        }
         Fault::ActionDivergence {
             proposer_pubkey,
             voter_pubkey,
@@ -929,6 +1045,84 @@ mod tests {
             fault: Fault::Equivocation { proposer_pubkey: pubkey, height, blocks },
             human_readable: serde_json::json!({}),
         }
+    }
+
+    fn precommit(sk: &xc_bls::BlsSecretKey, height: u64, block_hash: &str, ep: u8) -> PrecommitAttestation {
+        let ep = [ep; 32];
+        let signature = xc_bls::sign(sk, &precommit_signing_bytes(height, block_hash, &ep));
+        PrecommitAttestation {
+            height,
+            block_hash: block_hash.to_string(),
+            ep: format!("0x{}", hex::encode(ep)),
+            signature: format!("0x{}", hex::encode(signature.0)),
+        }
+    }
+
+    fn precommit_artifact(pubkey: &BlsPublicKey, height: u64, precommits: [PrecommitAttestation; 2]) -> EvidenceArtifact {
+        EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: "0xgenesis".to_string(),
+            fault: Fault::PrecommitEquivocation {
+                voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                height,
+                precommits,
+            },
+            human_readable: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn precommit_equivocation_names_the_double_signer() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let artifact =
+            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xbbb", 1)]);
+        assert_eq!(
+            verify(&artifact).unwrap(),
+            Verdict::Culpable {
+                fault: "precommit_equivocation",
+                culpable_pubkey: format!("0x{}", hex::encode(pk.0)),
+            }
+        );
+    }
+
+    #[test]
+    fn precommit_equivocation_covers_a_diverging_ep_on_one_block_hash() {
+        // Same block, two execution proofs: distinct signed messages, and
+        // they split a quorum exactly like two block hashes would.
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let artifact =
+            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 2)]);
+        assert!(matches!(verify(&artifact), Ok(Verdict::Culpable { .. })));
+    }
+
+    #[test]
+    fn precommit_equivocation_rejects_the_same_vote_twice() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let artifact =
+            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 1)]);
+        assert!(matches!(verify(&artifact), Err(VerifyError::SamePrecommit)));
+    }
+
+    #[test]
+    fn precommit_equivocation_rejects_votes_at_different_heights() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let artifact =
+            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 6, "0xaaa", 1)]);
+        assert!(matches!(verify(&artifact), Err(VerifyError::HeightMismatch(5, 6))));
+    }
+
+    #[test]
+    fn precommit_equivocation_rejects_a_vote_another_key_signed() {
+        // The whole claim is "one key signed both"; a second signer is two
+        // validators disagreeing, which is ordinary consensus.
+        let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
+        let (other_sk, _) = xc_bls::keygen_from_seed(&[8u8; 32]).unwrap();
+        let artifact = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xaaa", 1), precommit(&other_sk, 5, "0xbbb", 1)],
+        );
+        assert!(matches!(verify(&artifact), Err(VerifyError::PrecommitSignatureInvalid(1))));
     }
 
     #[test]

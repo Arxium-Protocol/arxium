@@ -29,11 +29,12 @@ pub(crate) fn authorize_operator(
     let validator = action.sender.clone();
     let mut operator_index = std::collections::BTreeMap::new();
     if let Some(previous) = operator_lookup(&validator)?
-        && &previous != operator {
-            let mut previous_list = operator_validators_lookup(&previous)?;
-            previous_list.retain(|v| v != &validator);
-            operator_index.insert(previous, previous_list);
-        }
+        && &previous != operator
+    {
+        let mut previous_list = operator_validators_lookup(&previous)?;
+        previous_list.retain(|v| v != &validator);
+        operator_index.insert(previous, previous_list);
+    }
     let mut new_list = operator_validators_lookup(operator)?;
     if !new_list.contains(&validator) {
         new_list.push(validator.clone());
@@ -44,7 +45,10 @@ pub(crate) fn authorize_operator(
     authorization.insert(validator, Some(operator.clone()));
 
     Ok(BlockUpdates {
-        operator: OperatorUpdates { authorization, operator_index },
+        operator: OperatorUpdates {
+            authorization,
+            operator_index,
+        },
         ..Default::default()
     })
 }
@@ -67,7 +71,10 @@ pub(crate) fn revoke_operator(
     authorization.insert(validator, None);
 
     Ok(BlockUpdates {
-        operator: OperatorUpdates { authorization, operator_index },
+        operator: OperatorUpdates {
+            authorization,
+            operator_index,
+        },
         ..Default::default()
     })
 }
@@ -85,12 +92,18 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(2 * ACTION_FEE))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(2 * ACTION_FEE))]),
+            HashMap::new(),
+        );
         let authorize = Action {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::AuthorizeOperator { operator: bob.clone() },
+            payload: ActionPayload::AuthorizeOperator {
+                operator: bob.clone(),
+            },
         };
 
         let updates = crate::dispatch(
@@ -104,21 +117,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            updates.operator.authorization.get(&alice).cloned().flatten(),
+            updates
+                .operator
+                .authorization
+                .get(&alice)
+                .cloned()
+                .flatten(),
             Some(bob.clone())
         );
         assert_eq!(
-            updates.operator.operator_index.get(&bob).cloned().unwrap_or_default(),
+            updates
+                .operator
+                .operator_index
+                .get(&bob)
+                .cloned()
+                .unwrap_or_default(),
             vec![alice.clone()]
         );
 
         // Once authorized, revoking must be reflected in the same two places
         // — forward record cleared, reverse index no longer lists alice.
-        let operator_lookup_after = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
+        let operator_lookup_after =
+            make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
         let alice_for_closure = alice.clone();
         let bob_for_closure = bob.clone();
         let operator_validators_lookup_after = move |op: &Address| {
-            Ok(if *op == bob_for_closure { vec![alice_for_closure.clone()] } else { Vec::new() })
+            Ok(if *op == bob_for_closure {
+                vec![alice_for_closure.clone()]
+            } else {
+                Vec::new()
+            })
         };
         let revoke = Action {
             sender: alice.clone(),
@@ -136,7 +164,10 @@ mod tests {
             &no_bls_owner,
         )
         .unwrap();
-        assert_eq!(updates.operator.authorization.get(&alice).cloned(), Some(None));
+        assert_eq!(
+            updates.operator.authorization.get(&alice).cloned(),
+            Some(None)
+        );
         assert!(
             updates
                 .operator

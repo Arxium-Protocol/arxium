@@ -204,6 +204,21 @@ pub struct PrecommitVote {
     pub ep: [u8; 32],
 }
 
+/// Two precommits one validator signed at the same height — a provable,
+/// attributable safety fault (whitepaper §9.3), the finality-vote
+/// counterpart to `xc_evidence::EquivocationEvidence`'s two blocks. Both
+/// votes have already had their signatures and validator-set membership
+/// checked by `tally_vote` before this is emitted, so a consumer only has
+/// to turn them into an artifact, never re-litigate whether they're real.
+///
+/// Carries whole `PrecommitVote`s rather than a pre-built artifact so this
+/// crate stays free of `xc-artifact` (same reason it hands out
+/// `DissentRecord`s and lets `arxd/node` build the `DissentAttestation`).
+#[derive(Clone)]
+pub struct PrecommitEquivocation {
+    pub votes: [PrecommitVote; 2],
+}
+
 /// One validator's BLS-signed claim that `round` at `height` timed out with
 /// no block produced — gossiped over `arxd/network`'s round-timeout topic
 /// and fed back into `spawn_finality` on every node, including the signer's
@@ -325,6 +340,9 @@ pub fn spawn_finality<P>(
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
     dissent_tx: Sender<DissentRecord>,
+    // Every precommit equivocation this node observes, for `arxd/node` to
+    // turn into an evidence artifact and an on-chain slash report.
+    equivocation_tx: Sender<PrecommitEquivocation>,
     chain_lock: Arc<Mutex<()>>,
 ) -> thread::JoinHandle<()>
 where
@@ -610,7 +628,7 @@ where
                     // so waiting for VoteObserved would leave every validator
                     // counting only its peers' votes.
                     if let Err(err) =
-                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote.clone())
+                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, &equivocation_tx, vote.clone())
                     {
                         warn!("finality: failed to process local precommit vote: {err}");
                     }
@@ -622,7 +640,7 @@ where
                 }
                 FinalityEvent::VoteObserved(vote) => {
                     if let Err(err) =
-                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, vote)
+                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, &equivocation_tx, vote)
                     {
                         warn!("finality: failed to process precommit vote: {err}");
                     }
@@ -652,6 +670,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     chain_lock: &Mutex<()>,
     tallies: &mut VoteTallies,
     my_votes: &mut HashMap<u64, PrecommitVote>,
+    equivocation_tx: &Sender<PrecommitEquivocation>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
     if db.get_finality_record(vote.height)?.is_some() {
@@ -686,6 +705,47 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
             vote.voter, vote.height
         );
         return Ok(());
+    }
+
+    // Equivocation check, deliberately *after* the signature and
+    // validator-set checks above and *before* this vote joins a tally: by
+    // here the vote is known to be a genuine signature from a validator of
+    // this height, which is exactly what makes a second one under a
+    // different tally key a provable fault rather than noise. `my_votes`
+    // only ever stopped this node double-voting locally; nothing looked at
+    // peers until now.
+    //
+    // Scans this height's other `(block_hash, ep)` buckets for the same
+    // voter. O(buckets) per vote, and an honest height has exactly one
+    // bucket — a height with enough buckets for this to cost anything is
+    // one where the scan is doing its job.
+    let prior = tallies.get(&vote.height).and_then(|by_key| {
+        by_key
+            .iter()
+            // Same message: an ordinary duplicate or rebroadcast, not a fault.
+            .filter(|((block_hash, ep), _)| (block_hash.as_str(), *ep) != (vote.block_hash.as_str(), vote.ep))
+            .find_map(|((block_hash, ep), signers)| {
+                signers.get(&vote.voter).map(|sig| (block_hash.clone(), *ep, sig.clone()))
+            })
+    });
+    if let Some((prior_hash, prior_ep, prior_signature)) = prior {
+        warn!(
+            "finality: {} precommitted twice at height {}, reporting equivocation",
+            vote.voter, vote.height
+        );
+        metrics::counter!("arxium_precommit_equivocations_detected_total").increment(1);
+        let _ = equivocation_tx.send(PrecommitEquivocation {
+            votes: [
+                PrecommitVote {
+                    height: vote.height,
+                    block_hash: prior_hash,
+                    voter: vote.voter.clone(),
+                    signature: prior_signature,
+                    ep: prior_ep,
+                },
+                vote.clone(),
+            ],
+        });
     }
 
     let vote_record = PrecommitVoteRecord {
@@ -996,6 +1056,13 @@ fn handle_dissent(
 
 #[cfg(test)]
 mod tests {
+    /// For the tallying tests that aren't about equivocation: the receiver
+    /// is dropped immediately, and `tally_vote` already ignores send
+    /// failures (a node with nobody listening still has to keep tallying).
+    fn equivocation_tx_for_test() -> Sender<PrecommitEquivocation> {
+        std::sync::mpsc::channel().0
+    }
+
     use super::*;
     use ed25519_dalek::SigningKey;
     use std::sync::mpsc;
@@ -1135,6 +1202,61 @@ mod tests {
     }
 
     #[test]
+    fn a_validator_precommitting_twice_at_one_height_is_reported_and_still_tallied() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        // Four validators, so one voter never reaches quorum on its own and
+        // the height stays open across all three votes below.
+        let mut validators = vec![addr.clone()];
+        for i in 2u8..5 {
+            let key = SigningKey::from_bytes(&[i; 32]);
+            validators.push(Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap());
+        }
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }])
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+        let ep = [1u8; 32];
+        let vote = |block_hash: &str| PrecommitVote {
+            height: 5,
+            block_hash: block_hash.to_string(),
+            voter: addr.clone(),
+            signature: xc_bls::sign(&sk, &precommit_signing_bytes(5, block_hash, &ep)),
+            ep,
+        };
+        let mut tally = |v: PrecommitVote| {
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &tx, v).unwrap()
+        };
+
+        tally(vote("0xaaa"));
+        // A rebroadcast of the same vote is not a fault.
+        tally(vote("0xaaa"));
+        assert!(rx.try_recv().is_err());
+
+        tally(vote("0xbbb"));
+        let reported = rx.try_recv().expect("expected a reported equivocation");
+        assert_eq!(reported.votes[0].block_hash, "0xaaa");
+        assert_eq!(reported.votes[1].block_hash, "0xbbb");
+        assert!(reported.votes.iter().all(|v| v.voter == addr && v.height == 5));
+        // Reporting does not drop the vote: withholding it from the tally
+        // would let an equivocator stall a height instead of losing stake.
+        assert_eq!(tallies[&5].len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn quorum_is_two_thirds_plus_one() {
         assert_eq!(quorum(1), 1);
         assert_eq!(quorum(3), 3);
@@ -1182,7 +1304,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
             assert!(db.get_finality_record(5).unwrap().is_none());
         }
 
@@ -1194,7 +1316,7 @@ mod tests {
             signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
             ep,
         };
-        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
+        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
 
         let record = db
             .get_finality_record(5)
@@ -1247,7 +1369,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
         }
         drop(tallies);
 
@@ -1287,6 +1409,7 @@ mod tests {
             &Mutex::new(()),
             &mut reloaded,
             &mut reloaded_my_votes,
+            &equivocation_tx_for_test(),
             vote,
         )
         .unwrap();
@@ -1346,7 +1469,7 @@ mod tests {
                 signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, vote).unwrap();
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
         }
 
         assert!(
@@ -1556,6 +1679,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -1608,6 +1732,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -1658,6 +1783,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -1706,6 +1832,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -1753,6 +1880,7 @@ mod tests {
             vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -2031,6 +2159,7 @@ mod tests {
             _vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 
@@ -2078,6 +2207,7 @@ mod tests {
             _vote_tx,
             round_timeout_tx,
             dissent_tx,
+            equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
         );
 

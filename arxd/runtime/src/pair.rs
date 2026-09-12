@@ -5,7 +5,7 @@
 // command can't depend on that crate (it already depends on `node`), and
 // pulling in a full HTTP client for one signed POST/GET-poll loop isn't
 // worth it.
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -20,7 +20,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 // polling past the point the server has already dropped the session.
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(300);
 
-fn http(method: &str, node: &str, path: &str, body: Option<&str>, token: Option<&str>) -> Result<(u16, String)> {
+fn http(
+    method: &str,
+    node: &str,
+    path: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect(node).with_context(|| format!("connect to {node}"))?;
     let body = body.unwrap_or_default();
     let auth_header = token
@@ -87,7 +93,9 @@ fn wait_for_operator(node: &str, token: Option<&str>, nonce: &str) -> Result<Add
                 return Ok(response.operator);
             }
             202 => {}
-            404 => bail!("pairing session expired before the app confirmed it — run `arxd pair` again"),
+            404 => {
+                bail!("pairing session expired before the app confirmed it — run `arxd pair` again")
+            }
             other => bail!("GET /pairing/{nonce} -> {other}: {body}"),
         }
         if Instant::now() >= deadline {
@@ -144,7 +152,13 @@ fn sign_and_submit(
 /// agnostic key material); never serialized or transmitted anywhere — only
 /// the resulting signed `AuthorizeOperator`/`RevokeOperator` action is sent
 /// over the wire.
-pub fn run(seed: &[u8; 32], sender: &Address, node: &str, token: Option<&str>, revoke: bool) -> Result<()> {
+pub fn run(
+    seed: &[u8; 32],
+    sender: &Address,
+    node: &str,
+    token: Option<&str>,
+    revoke: bool,
+) -> Result<()> {
     let key = SigningKey::from_bytes(seed);
     let sender = sender.clone();
 

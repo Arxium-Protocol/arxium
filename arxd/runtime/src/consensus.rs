@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{
+    BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey,
+};
 use xc_executor::BlockUpdates;
 use xc_primitives::Address;
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
 
-use crate::{ChainAction, ChainBlock};
 use crate::staking::is_authorized;
+use crate::{ChainAction, ChainBlock};
 
 /// Validates BLS public-key bytes against their proof of possession and
 /// returns the key sized.
@@ -62,22 +64,34 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     };
     let equivocator = xc_evidence::verify_equivocation(&evidence)
         .map_err(|err| anyhow::anyhow!("invalid equivocation evidence: {err}"))?;
-    if view.get(&EvidenceMarkerKey { height: block_a.height, proposer: &equivocator })?.is_some() {
+    if view
+        .get(&EvidenceMarkerKey {
+            height: block_a.height,
+            proposer: &equivocator,
+        })?
+        .is_some()
+    {
         anyhow::bail!(
             "equivocation evidence for {equivocator} at height {} already processed",
             block_a.height
         );
     }
 
-    let masters = view.get(&StakeByValidatorKey(&equivocator))?.unwrap_or_default();
-    let master = masters.first().cloned().ok_or_else(|| {
-        anyhow::anyhow!("{equivocator} has no stake to slash for equivocation")
-    })?;
+    let masters = view
+        .get(&StakeByValidatorKey(&equivocator))?
+        .unwrap_or_default();
+    let master = masters
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{equivocator} has no stake to slash for equivocation"))?;
     let allocation = view
-        .get(&StakeKey { master: &master, validator: &equivocator })?
+        .get(&StakeKey {
+            master: &master,
+            validator: &equivocator,
+        })?
         .ok_or_else(|| anyhow::anyhow!("{equivocator} has no active stake allocation to slash"))?;
-    let total = allocation.active_amount
-        + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let total =
+        allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
 
     let (accounts, stakes) = circuit_staking::apply_slash(
         view,
@@ -129,9 +143,9 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
 
     // Fail closed: a chain with no seeded genesis hash cannot tell its own
     // faults from another chain's, and slashing is not the place to guess.
-    let chain_genesis = view
-        .get(&GenesisHashKey)?
-        .ok_or_else(|| anyhow::anyhow!("this chain has no seeded genesis hash to check the artifact against"))?;
+    let chain_genesis = view.get(&GenesisHashKey)?.ok_or_else(|| {
+        anyhow::anyhow!("this chain has no seeded genesis hash to check the artifact against")
+    })?;
     if !genesis_hash_matches(&chain_genesis, &artifact.genesis_hash) {
         anyhow::bail!(
             "evidence artifact was produced against genesis {}, this chain's genesis is {chain_genesis}",
@@ -139,16 +153,70 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         );
     }
 
-    let (outcome, height, proposer_pubkey, voter_pubkey) = match &artifact.fault {
-        xc_artifact::Fault::ActionDivergence { proposer_pubkey, voter_pubkey, height, .. } => {
+    // `reason` rides along with the culprit because not every fault that
+    // arrives here is an execution fault: a precommit equivocation is a
+    // double-sign (whitepaper §9.3), and the slash record must say so.
+    let (outcome, height, proposer_pubkey, voter_pubkey, reason) = match &artifact.fault {
+        xc_artifact::Fault::ActionDivergence {
+            proposer_pubkey,
+            voter_pubkey,
+            height,
+            ..
+        } => {
             let outcome = crate::adjudicate::adjudicate_action_divergence(&artifact)
                 .map_err(|err| anyhow::anyhow!("adjudication failed: {err}"))?;
-            (outcome, *height, proposer_pubkey.clone(), voter_pubkey.clone())
+            (
+                outcome,
+                *height,
+                proposer_pubkey.clone(),
+                voter_pubkey.clone(),
+                circuit_staking::SlashReason::ExecutionFault,
+            )
         }
-        xc_artifact::Fault::BlockDivergence { proposer_pubkey, voter_pubkey, height, .. } => {
+        xc_artifact::Fault::BlockDivergence {
+            proposer_pubkey,
+            voter_pubkey,
+            height,
+            ..
+        } => {
             let outcome = crate::adjudicate::adjudicate_block_divergence(&artifact)
                 .map_err(|err| anyhow::anyhow!("adjudication failed: {err}"))?;
-            (outcome, *height, proposer_pubkey.clone(), voter_pubkey.clone())
+            (
+                outcome,
+                *height,
+                proposer_pubkey.clone(),
+                voter_pubkey.clone(),
+                circuit_staking::SlashReason::ExecutionFault,
+            )
+        }
+        // No replay, no second party: two BLS signatures over two different
+        // precommit messages at one height are the whole proof, so
+        // `xc_artifact::verify` names the culprit outright — the same shape
+        // `Fault::Equivocation` has, which is why this one can ride this
+        // action instead of needing its own. `proposer_pubkey` is empty
+        // because the fault has no proposer; the culpability match below
+        // compares against it first and an empty string can never equal a
+        // hex-encoded key.
+        xc_artifact::Fault::PrecommitEquivocation {
+            voter_pubkey,
+            height,
+            ..
+        } => {
+            let verdict = xc_artifact::verify(&artifact)
+                .map_err(|err| anyhow::anyhow!("invalid precommit equivocation artifact: {err}"))?;
+            let xc_artifact::Verdict::Culpable {
+                culpable_pubkey, ..
+            } = verdict
+            else {
+                anyhow::bail!("precommit equivocation did not name a culprit");
+            };
+            (
+                crate::adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey },
+                *height,
+                String::new(),
+                voter_pubkey.clone(),
+                circuit_staking::SlashReason::DoubleSign,
+            )
         }
         xc_artifact::Fault::Equivocation { .. } => {
             anyhow::bail!(
@@ -175,7 +243,11 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     // `Address` it was registered under (`RegisterBlsKey`/`JoinValidator`) —
     // there is no direct BLS-pubkey-to-`Address` derivation.
     let culprit = if culpable_pubkey == proposer_pubkey {
-        let bytes = hex::decode(proposer_pubkey.strip_prefix("0x").unwrap_or(&proposer_pubkey))?;
+        let bytes = hex::decode(
+            proposer_pubkey
+                .strip_prefix("0x")
+                .unwrap_or(&proposer_pubkey),
+        )?;
         Address::from_pubkey_bytes(&bytes)?
     } else if culpable_pubkey == voter_pubkey {
         let bytes = hex::decode(voter_pubkey.strip_prefix("0x").unwrap_or(&voter_pubkey))?;
@@ -188,32 +260,48 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         anyhow::bail!("adjudicator named a pubkey that matches neither party in the artifact");
     };
 
-    if view.get(&EvidenceMarkerKey { height, proposer: &culprit })?.is_some() {
-        anyhow::bail!("execution fault evidence for {culprit} at height {height} already processed");
+    if view
+        .get(&EvidenceMarkerKey {
+            height,
+            proposer: &culprit,
+        })?
+        .is_some()
+    {
+        anyhow::bail!(
+            "execution fault evidence for {culprit} at height {height} already processed"
+        );
     }
 
-    let masters = view.get(&StakeByValidatorKey(&culprit))?.unwrap_or_default();
+    let masters = view
+        .get(&StakeByValidatorKey(&culprit))?
+        .unwrap_or_default();
     let master = masters
         .first()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no stake to slash for an execution fault"))?;
     let allocation = view
-        .get(&StakeKey { master: &master, validator: &culprit })?
+        .get(&StakeKey {
+            master: &master,
+            validator: &culprit,
+        })?
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
-    let total = allocation.active_amount
-        + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let total =
+        allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
 
     let (accounts, stakes) = circuit_staking::apply_slash(
         view,
         &culprit,
         xc_evidence::slash_amount(total),
-        circuit_staking::SlashReason::ExecutionFault,
+        reason,
         current_height,
     )?;
     Ok(BlockUpdates {
         accounts,
         stakes,
-        evidence: Some(EvidenceMarker { height, proposer: culprit }),
+        evidence: Some(EvidenceMarker {
+            height,
+            proposer: culprit,
+        }),
         ..Default::default()
     })
 }
@@ -237,9 +325,10 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
     }
     let bytes = validated_bls_pubkey(pubkey, pop)?;
     if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
-        && &owner != validator {
-            anyhow::bail!("BLS pubkey already registered to {owner}");
-        }
+        && &owner != validator
+    {
+        anyhow::bail!("BLS pubkey already registered to {owner}");
+    }
     let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
         // Effective one block later, same delay as `ValidatorSetSnapshot` —
@@ -294,8 +383,11 @@ mod tests {
                 self_allocation(&equivocator, 10_000),
             )]),
         );
-        view.put(&StakeByValidatorKey(&equivocator), &vec![equivocator.clone()])
-            .unwrap();
+        view.put(
+            &StakeByValidatorKey(&equivocator),
+            &vec![equivocator.clone()],
+        )
+        .unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -333,6 +425,105 @@ mod tests {
     }
 
     #[test]
+    fn precommit_equivocation_artifact_slashes_the_double_signer() {
+        let voter = Address::from_pubkey_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[4u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let precommit = |block_hash: &str| {
+            let ep = [1u8; 32];
+            xc_artifact::PrecommitAttestation {
+                height: 5,
+                block_hash: block_hash.to_string(),
+                ep: format!("0x{}", hex::encode(ep)),
+                signature: format!(
+                    "0x{}",
+                    hex::encode(
+                        xc_bls::sign(
+                            &sk,
+                            &xc_artifact::precommit_signing_bytes(5, block_hash, &ep)
+                        )
+                        .0
+                    )
+                ),
+            }
+        };
+        let artifact = xc_artifact::EvidenceArtifact {
+            artifact_version: xc_artifact::ARTIFACT_VERSION,
+            genesis_hash: "0xfeed".to_string(),
+            fault: xc_artifact::Fault::PrecommitEquivocation {
+                voter_pubkey: format!("0x{}", hex::encode(pk.0)),
+                height: 5,
+                precommits: [precommit("0xaaa"), precommit("0xbbb")],
+            },
+            human_readable: serde_json::json!({}),
+        };
+
+        let reporter = Address::from_pubkey_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let sub_account = circuit_staking::stake_subaccount(&voter);
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (sub_account, funded(10_000)),
+                (reporter.clone(), funded(ACTION_FEE)),
+            ]),
+            HashMap::from([(
+                (voter.clone(), voter.clone()),
+                self_allocation(&voter, 10_000),
+            )]),
+        );
+        view.put(&StakeByValidatorKey(&voter), &vec![voter.clone()])
+            .unwrap();
+        view.put(&GenesisHashKey, &"feed".to_string()).unwrap();
+
+        // The culprit signs with a BLS key, which has no address derivation —
+        // the registry lookup is the only way back to who gets slashed.
+        let voter_for_lookup = voter.clone();
+        let bls_owner = move |_: &BlsPublicKey| Ok(Some(voter_for_lookup.clone()));
+        let action = Action {
+            sender: reporter.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::SubmitExecutionFault {
+                artifact_json: serde_json::to_string(&artifact).unwrap(),
+            },
+        };
+        let updates = crate::dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &bls_owner,
+        )
+        .unwrap();
+
+        // Same full-stake slash as block equivocation (whitepaper §9.3):
+        // the allocation is removed outright, not reduced.
+        assert!(
+            updates
+                .stakes
+                .allocations
+                .get(&(voter.clone(), voter.clone()))
+                .unwrap()
+                .is_none()
+        );
+        let marker = updates.evidence.expect("must write an evidence marker");
+        assert_eq!(marker.height, 5);
+        assert_eq!(marker.proposer, voter);
+    }
+
+    #[test]
     fn equivocation_evidence_rejected_when_already_processed() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
@@ -341,8 +532,14 @@ mod tests {
 
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
-        view.put(&EvidenceMarkerKey { height: 5, proposer: &equivocator }, &())
-            .unwrap();
+        view.put(
+            &EvidenceMarkerKey {
+                height: 5,
+                proposer: &equivocator,
+            },
+            &(),
+        )
+        .unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -371,7 +568,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -404,7 +605,11 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -435,7 +640,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let (sk, pubkey) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -458,7 +667,10 @@ mod tests {
             &owned_by_self,
         )
         .expect("re-registering your own key should stay a no-op success");
-        assert_eq!(updates.bls_key.expect("expected a bls_key update").address, alice);
+        assert_eq!(
+            updates.bls_key.expect("expected a bls_key update").address,
+            alice
+        );
     }
 
     #[test]
@@ -503,8 +715,11 @@ mod tests {
     fn register_bls_key_rejects_a_well_formed_key_with_someone_elses_proof_of_possession() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = temp_db();
-        let view =
-            seeded_view(&db, HashMap::from([(alice.clone(), funded(ACTION_FEE))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::new(),
+        );
         let (_, unowned) = xc_bls::keygen_from_seed(&[21u8; 32]).unwrap();
         let (other_sk, _) = xc_bls::keygen_from_seed(&[22u8; 32]).unwrap();
         let action = Action {
@@ -582,7 +797,10 @@ mod tests {
         // the fault kind itself is what rejects it.
         let err = submit_execution_fault(&view, &foreign_artifact_json("0xAAAA"), 1, &no_bls_owner)
             .unwrap_err();
-        assert!(err.to_string().contains("SubmitEquivocationEvidence"), "{err}");
+        assert!(
+            err.to_string().contains("SubmitEquivocationEvidence"),
+            "{err}"
+        );
     }
 
     #[test]

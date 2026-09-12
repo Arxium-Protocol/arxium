@@ -49,9 +49,24 @@ pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
 /// to an empty/`None` result on a storage error rather than panicking, since
 /// a malformed or out-of-range request from a peer must never take the node
 /// down.
-pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, request: SyncRequest) -> SyncResponse<Block<P>> {
+/// Where a `Blocks { from }` page ends. Certified history only, unless the
+/// peer already holds all of it (`from > watermark`): then it is at the same
+/// frontier a live peer would reach by gossip, and the provisional tip is
+/// what it is missing — gossip delivers once, and a validator that was down
+/// for that delivery would otherwise never see the block it has to vote on.
+pub(crate) fn blocks_page_end(from: u64, watermark: u64, tip: u64) -> u64 {
+    if watermark == 0 || from > watermark { tip } else { watermark }
+}
+
+pub(crate) fn build_sync_response<P: Payload>(
+    db: &ArxiumDb,
+    peer: PeerId,
+    request: SyncRequest,
+) -> SyncResponse<Block<P>> {
     match request {
-        SyncRequest::Status => SyncResponse::<Block<P>>::Status { tip_height: local_tip_height(db) },
+        SyncRequest::Status => SyncResponse::<Block<P>>::Status {
+            tip_height: local_tip_height(db),
+        },
         SyncRequest::Blocks { from } => {
             // Bodies are served only up to what a quorum has certified. A
             // block past that is still provisional here — `arxd_finality`
@@ -64,15 +79,17 @@ pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, reque
             //
             // ponytail: a chain with no certificate at all falls back to the
             // tip, so a fresh or single-node devnet still syncs before its
-            // first height finalizes. Once anything has finalized, the clamp
-            // is unconditional — a chain that has stopped finalizing stops
-            // handing out history to build on, which is the intent. `watermark
-            // == 0` cannot instead mean "genesis finalized": the advance loop
-            // in `stage_watermark_advance` begins at `watermark + 1`, so height
-            // 0 is never a certification target and 0 reads unambiguously as
-            // "nothing finalized yet". The fallback is therefore bounded to
-            // pre-first-finality, and monotonicity keeps it there — once
-            // height 1 finalizes the clamp is on permanently.
+            // first height finalizes. `watermark == 0` cannot instead mean
+            // "genesis finalized": the advance loop in `stage_watermark_advance`
+            // begins at `watermark + 1`, so height 0 is never a certification
+            // target and 0 reads unambiguously as "nothing finalized yet".
+            //
+            // The one other exception is a peer already *at* the watermark
+            // (`blocks_page_end`): it is not catching up on certified history
+            // but standing where gossip would hand it the provisional tip —
+            // and gossip only does that once. A validator restarted after its
+            // peer proposed would otherwise ask for the tip forever while the
+            // proposer waits for its vote; two validators deadlock that way.
             let tip_height = local_tip_height(db);
             //
             // The watermark, not the highest certificate: it is contiguous
@@ -83,7 +100,7 @@ pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, reque
                 warn!("failed to read finalized watermark for sync response to {peer}: {err}");
                 0
             });
-            let to = if watermark == 0 { tip_height } else { watermark };
+            let to = blocks_page_end(from, watermark, tip_height);
             let blocks = db.get_block_range::<P>(from, to).unwrap_or_else(|err| {
                 warn!("failed to read blocks {from}..={to} for sync response to {peer}: {err}");
                 Vec::new()
@@ -159,7 +176,10 @@ pub(crate) fn build_sync_response<P: Payload>(db: &ArxiumDb, peer: PeerId, reque
 ///
 /// Returns the updated tracker and the number of consecutive rounds the tip
 /// has been stuck at its current height (0 if this round made progress).
-pub(crate) fn advance_stuck_tip(stuck_tip: Option<(u64, u32)>, local_tip: u64) -> (Option<(u64, u32)>, u32) {
+pub(crate) fn advance_stuck_tip(
+    stuck_tip: Option<(u64, u32)>,
+    local_tip: u64,
+) -> (Option<(u64, u32)>, u32) {
     match stuck_tip {
         Some((height, rounds)) if height == local_tip => {
             let rounds = rounds + 1;
@@ -263,7 +283,11 @@ mod tests {
     // directly instead of only through a live swarm.
 
     fn certify(db: &ArxiumDb, height: u64) {
-        let block_hash = db.get_block::<()>(height).unwrap().expect("block to certify").hash();
+        let block_hash = db
+            .get_block::<()>(height)
+            .unwrap()
+            .expect("block to certify")
+            .hash();
         db.write_batch(&xc_storage::FinalityRecord {
             height,
             block_hash,
@@ -292,16 +316,34 @@ mod tests {
         };
         // 4 and 5 are held locally and reported by `Status`, but they are
         // still provisional — a peer must not build on them.
-        assert_eq!(blocks.iter().map(|b| b.height).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
 
         // Hashes are deliberately not clamped: a diverged peer resolving a
         // fork has to be able to compare the unfinalized tip too.
-        let SyncResponse::Hashes(hashes) =
-            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Hashes { from: 0, to: 99 })
-        else {
+        let SyncResponse::Hashes(hashes) = build_sync_response::<()>(
+            &db,
+            PeerId::random(),
+            SyncRequest::Hashes { from: 0, to: 99 },
+        ) else {
             panic!("expected Hashes response");
         };
         assert_eq!(hashes.len(), 6);
+    }
+
+    #[test]
+    fn a_peer_at_the_watermark_is_served_the_provisional_tip() {
+        // The devnet deadlock: watermark 61913, tip 61914, restarted peer asks from 61914.
+        assert_eq!(blocks_page_end(61914, 61913, 61914), 61914);
+        // Several provisional blocks are all served.
+        assert_eq!(blocks_page_end(11, 10, 13), 13);
+        // A peer behind the watermark gets certified history only.
+        assert_eq!(blocks_page_end(5, 10, 13), 10);
+        assert_eq!(blocks_page_end(10, 10, 13), 10);
+        // Nothing finalized yet: the tip, as before.
+        assert_eq!(blocks_page_end(1, 0, 3), 3);
     }
 
     #[test]
@@ -323,7 +365,8 @@ mod tests {
         let db = temp_db();
         db.write_batch(&block(0)).unwrap();
         db.write_batch(&block(1)).unwrap();
-        let SyncResponse::Blocks(blocks) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 50 })
+        let SyncResponse::Blocks(blocks) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 50 })
         else {
             panic!("expected Blocks response");
         };
@@ -336,11 +379,15 @@ mod tests {
         for h in 0..=3 {
             db.write_batch(&block(h)).unwrap();
         }
-        let SyncResponse::Blocks(blocks) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 0 })
+        let SyncResponse::Blocks(blocks) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Blocks { from: 0 })
         else {
             panic!("expected Blocks response");
         };
-        assert_eq!(blocks.iter().map(|b| b.height).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -348,22 +395,29 @@ mod tests {
         let db = temp_db();
         db.write_batch(&block(0)).unwrap();
         db.write_batch(&block(1)).unwrap();
-        let SyncResponse::Hashes(hashes) =
-            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Hashes { from: 0, to: 999 })
-        else {
+        let SyncResponse::Hashes(hashes) = build_sync_response::<()>(
+            &db,
+            PeerId::random(),
+            SyncRequest::Hashes { from: 0, to: 999 },
+        ) else {
             panic!("expected Hashes response");
         };
         // Clamped to the real tip (1), not the peer's claimed upper bound.
-        assert_eq!(hashes.iter().map(|(h, _)| *h).collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            hashes.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]
     fn certificate_request_for_an_unfinalized_height_returns_none_not_a_panic() {
         let db = temp_db();
         db.write_batch(&block(0)).unwrap();
-        let SyncResponse::Certificate { height, record } =
-            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Certificate { height: 0 })
-        else {
+        let SyncResponse::Certificate { height, record } = build_sync_response::<()>(
+            &db,
+            PeerId::random(),
+            SyncRequest::Certificate { height: 0 },
+        ) else {
             panic!("expected Certificate response");
         };
         assert_eq!(height, 0);
@@ -373,9 +427,11 @@ mod tests {
     #[test]
     fn certificate_request_for_a_height_never_reached_returns_none_not_a_panic() {
         let db = temp_db();
-        let SyncResponse::Certificate { record, .. } =
-            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Certificate { height: 12345 })
-        else {
+        let SyncResponse::Certificate { record, .. } = build_sync_response::<()>(
+            &db,
+            PeerId::random(),
+            SyncRequest::Certificate { height: 12345 },
+        ) else {
             panic!("expected Certificate response");
         };
         assert_eq!(record, None);
@@ -384,7 +440,9 @@ mod tests {
     #[test]
     fn node_info_on_an_empty_chain_reports_tip_zero_with_no_hash() {
         let db = temp_db();
-        let SyncResponse::NodeInfo(info) = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::NodeInfo) else {
+        let SyncResponse::NodeInfo(info) =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::NodeInfo)
+        else {
             panic!("expected NodeInfo response");
         };
         assert_eq!(info.tip_height, 0);
@@ -399,7 +457,8 @@ mod tests {
         db.write_batch(&block(0)).unwrap();
         db.write_batch(&block(1)).unwrap();
         db.write_batch(&block(2)).unwrap();
-        let SyncResponse::Status { tip_height } = build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Status)
+        let SyncResponse::Status { tip_height } =
+            build_sync_response::<()>(&db, PeerId::random(), SyncRequest::Status)
         else {
             panic!("expected Status response");
         };

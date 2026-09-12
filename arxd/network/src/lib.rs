@@ -1,9 +1,9 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod identity;
 mod discovery;
 mod gossip;
+pub mod identity;
 mod recovery;
 mod sync;
 mod transport;
@@ -22,8 +22,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use std::thread;
+use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -33,14 +33,14 @@ use xc_primitives::{Action, Block};
 use xc_storage::{ArxiumDb, FinalityRecord};
 
 use discovery::{dial_bootnodes, dial_discovered};
-use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use gossip::{
-    actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip, round_timeouts_topic,
+    actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip,
+    round_timeouts_topic,
 };
+use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use sync::{
-    MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse,
-    advance_stuck_tip, local_tip_height,
-    send_sync_request,
+    MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse, advance_stuck_tip,
+    local_tip_height, send_sync_request,
 };
 use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
@@ -340,7 +340,11 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
         return;
     }
     let round_timeouts_topic = gossipsub::IdentTopic::new(round_timeouts_topic(chain_id));
-    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&round_timeouts_topic) {
+    if let Err(err) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&round_timeouts_topic)
+    {
         let _ = ready_tx.send(Err(err.into()));
         return;
     }

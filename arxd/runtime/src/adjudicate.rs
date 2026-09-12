@@ -67,8 +67,8 @@
 
 use xc_artifact::{ActionClaim, EvidenceArtifact, Fault, StateProof};
 use xc_circuit::{
-    AccountKey, AssetBalanceKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, KeySpec, KvRead, OperatorKey,
-    StakeByValidatorKey, StakeKey,
+    AccountKey, AssetBalanceKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, KeySpec, KvRead,
+    OperatorKey, StakeByValidatorKey, StakeKey,
 };
 use xc_executor::BlockUpdates;
 use xc_poe::state_trie::{InclusionProof, ProofBackedTrie};
@@ -101,7 +101,8 @@ const MAX_ADJUDICATED_ACTIONS: usize = 4096;
 fn is_unreplayable_fault_submission(payload: &crate::ActionPayload) -> bool {
     matches!(
         payload,
-        crate::ActionPayload::SubmitExecutionFault { .. } | crate::ActionPayload::SubmitEquivocationEvidence { .. }
+        crate::ActionPayload::SubmitExecutionFault { .. }
+            | crate::ActionPayload::SubmitEquivocationEvidence { .. }
     )
 }
 
@@ -139,7 +140,9 @@ pub enum AdjudicationOutcome {
 /// this function, it's this function correctly declining to guess. `Err` is
 /// reserved for a structurally invalid artifact (should already have been
 /// caught by `xc_artifact::verify()`, called internally first).
-pub fn adjudicate_action_divergence(artifact: &EvidenceArtifact) -> Result<AdjudicationOutcome, AdjudicateError> {
+pub fn adjudicate_action_divergence(
+    artifact: &EvidenceArtifact,
+) -> Result<AdjudicationOutcome, AdjudicateError> {
     xc_artifact::verify(artifact)?;
     let Fault::ActionDivergence {
         proposer_pubkey,
@@ -208,7 +211,9 @@ pub fn adjudicate_action_divergence(artifact: &EvidenceArtifact) -> Result<Adjud
 /// list is actually the one the proposer signed for. This function does
 /// that first, by recomputing `tx_root` and checking it against the
 /// header's signed value, before trusting anything replayed from it.
-pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<AdjudicationOutcome, AdjudicateError> {
+pub fn adjudicate_block_divergence(
+    artifact: &EvidenceArtifact,
+) -> Result<AdjudicationOutcome, AdjudicateError> {
     xc_artifact::verify(artifact)?;
     let Fault::BlockDivergence {
         proposer_pubkey,
@@ -248,11 +253,12 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         })
         .collect::<Result<Vec<crate::ChainAction>, AdjudicateError>>()?;
 
-    let computed_tx_root =
-        xc_poe::tx_root(&decoded_actions).map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
+    let computed_tx_root = xc_poe::tx_root(&decoded_actions)
+        .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
     if computed_tx_root != decode_root(&block_attestation.header.tx_root)? {
         return Ok(AdjudicationOutcome::Disagreement {
-            reason: "the supplied action list doesn't hash to the block header's signed tx_root".to_string(),
+            reason: "the supplied action list doesn't hash to the block header's signed tx_root"
+                .to_string(),
         });
     }
 
@@ -260,12 +266,17 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
     let proofs = decode_proofs(&dissent_claim.proofs)?;
     let mut trie = match ProofBackedTrie::from_proofs(parent_root, &proofs) {
         Ok(trie) => trie,
-        Err(_) => return Ok(AdjudicationOutcome::Disagreement { reason: "a supplied proof does not verify".to_string() }),
+        Err(_) => {
+            return Ok(AdjudicationOutcome::Disagreement {
+                reason: "a supplied proof does not verify".to_string(),
+            });
+        }
     };
 
     // operator_index (reverse operator lookup) has no proof shape — same split as
     // AssetIndexKey vs. AssetKey — so it always fails closed.
-    let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    let fail_closed_list =
+        |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
 
     for action in &decoded_actions {
         if matches!(action.payload, crate::ActionPayload::LeaveValidator { .. }) {
@@ -283,9 +294,12 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
         }
 
         let view = ProofBackedView { trie };
-        let operator_lookup = |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
+        let operator_lookup =
+            |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
         let bls_pubkey_owner_lookup =
-            |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { view.get(&BlsPubkeyOwnerKey(pk)) };
+            |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> {
+                view.get(&BlsPubkeyOwnerKey(pk))
+            };
         let updates = crate::dispatch(
             action,
             &view,
@@ -328,15 +342,20 @@ pub fn adjudicate_block_divergence(artifact: &EvidenceArtifact) -> Result<Adjudi
     let proposed_matches = computed_root == decode_root(&block_attestation.header.state_root)?;
     let dissent_matches = computed_root == decode_root(&dissent_claim.computed_state_root)?;
     match (proposed_matches, dissent_matches) {
-        (true, false) => Ok(AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey.clone() }),
-        (false, true) => Ok(AdjudicationOutcome::Culpable { culpable_pubkey: proposer_pubkey.clone() }),
+        (true, false) => Ok(AdjudicationOutcome::Culpable {
+            culpable_pubkey: voter_pubkey.clone(),
+        }),
+        (false, true) => Ok(AdjudicationOutcome::Culpable {
+            culpable_pubkey: proposer_pubkey.clone(),
+        }),
         // `verify()` already requires the two claimed roots to differ, so
         // both matching independent replay is not reachable; kept as a
         // `Disagreement` rather than `unreachable!()` so a bug upstream
         // fails safe instead of panicking an adjudicator.
         _ => Ok(AdjudicationOutcome::Disagreement {
-            reason: "neither party's claimed final state root matches independently replaying the block"
-                .to_string(),
+            reason:
+                "neither party's claimed final state root matches independently replaying the block"
+                    .to_string(),
         }),
     }
 }
@@ -348,7 +367,10 @@ enum ReplayResult {
 
 fn decode_root(root: &str) -> Result<[u8; 32], AdjudicateError> {
     let bytes = hex::decode(root.strip_prefix("0x").unwrap_or(root))?;
-    bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(root.to_string()))
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| AdjudicateError::BadRoot(root.to_string()))
 }
 
 /// Expands a compressed [`StateProof`] (`siblings_bitmap` + only the
@@ -361,13 +383,25 @@ fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, Adjudicat
         .iter()
         .map(|p| {
             let key_hash = hex::decode(p.key_hash.strip_prefix("0x").unwrap_or(&p.key_hash))?;
-            let key_hash: [u8; 32] =
-                key_hash.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(p.key_hash.clone()))?;
-            let value = p.value.as_deref().map(|v| hex::decode(v.strip_prefix("0x").unwrap_or(v))).transpose()?;
+            let key_hash: [u8; 32] = key_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| AdjudicateError::BadRoot(p.key_hash.clone()))?;
+            let value = p
+                .value
+                .as_deref()
+                .map(|v| hex::decode(v.strip_prefix("0x").unwrap_or(v)))
+                .transpose()?;
 
-            let bitmap = hex::decode(p.siblings_bitmap.strip_prefix("0x").unwrap_or(&p.siblings_bitmap))?;
-            let bitmap: [u8; 32] =
-                bitmap.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(p.siblings_bitmap.clone()))?;
+            let bitmap = hex::decode(
+                p.siblings_bitmap
+                    .strip_prefix("0x")
+                    .unwrap_or(&p.siblings_bitmap),
+            )?;
+            let bitmap: [u8; 32] = bitmap
+                .as_slice()
+                .try_into()
+                .map_err(|_| AdjudicateError::BadRoot(p.siblings_bitmap.clone()))?;
             let mut non_default = p.siblings.iter();
             let mut siblings = Vec::with_capacity(256);
             for level in 0..256 {
@@ -376,7 +410,10 @@ fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, Adjudicat
                         .next()
                         .ok_or_else(|| AdjudicateError::BadRoot(p.siblings_bitmap.clone()))?;
                     let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
-                    bytes.as_slice().try_into().map_err(|_| AdjudicateError::BadRoot(s.clone()))?
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| AdjudicateError::BadRoot(s.clone()))?
                 } else {
                     defaults[255 - level]
                 };
@@ -386,7 +423,11 @@ fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, Adjudicat
                 return Err(AdjudicateError::BadRoot(p.siblings_bitmap.clone()));
             }
 
-            Ok(InclusionProof { key_hash, value, siblings })
+            Ok(InclusionProof {
+                key_hash,
+                value,
+                siblings,
+            })
         })
         .collect()
 }
@@ -398,7 +439,11 @@ fn decode_proofs(proofs: &[StateProof]) -> Result<Vec<InclusionProof>, Adjudicat
 /// claims' signatures are bound to — threaded straight into `dispatch`
 /// since `Stake`/`Unstake`'s unbonding math depends on the real value, not
 /// a placeholder.
-fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Result<ReplayResult, AdjudicateError> {
+fn replay(
+    action: &crate::ChainAction,
+    claim: &ActionClaim,
+    height: u64,
+) -> Result<ReplayResult, AdjudicateError> {
     // `LeaveValidator` needs the live validator set as a plain parameter,
     // not a `KvRead` lookup — there's no proof shape for that, so this is
     // the one variant checked before even trying to build a view.
@@ -419,16 +464,24 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
     let proofs = decode_proofs(&claim.proofs)?;
     let trie = match ProofBackedTrie::from_proofs(pre_root, &proofs) {
         Ok(trie) => trie,
-        Err(_) => return Ok(ReplayResult::Unprovable("a supplied proof does not verify".to_string())),
+        Err(_) => {
+            return Ok(ReplayResult::Unprovable(
+                "a supplied proof does not verify".to_string(),
+            ));
+        }
     };
     let view = ProofBackedView { trie };
 
     // operator_index (reverse operator lookup) has no proof shape — same split as
     // AssetIndexKey vs. AssetKey — so it always fails closed.
-    let fail_closed_list = |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
-    let operator_lookup = |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
+    let fail_closed_list =
+        |_: &Address| -> Result<Vec<Address>, StorageError> { Err(StorageError::UnprovenRead) };
+    let operator_lookup =
+        |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
     let bls_pubkey_owner_lookup =
-        |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> { view.get(&BlsPubkeyOwnerKey(pk)) };
+        |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> {
+            view.get(&BlsPubkeyOwnerKey(pk))
+        };
 
     let updates = crate::dispatch(
         action,
@@ -444,9 +497,9 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
         Ok(updates) => updates,
         Err(err) => {
             return match err.downcast_ref::<StorageError>() {
-                Some(StorageError::UnprovenRead) => {
-                    Ok(ReplayResult::Unprovable(format!("this action's dispatch needs unprovable state: {err}")))
-                }
+                Some(StorageError::UnprovenRead) => Ok(ReplayResult::Unprovable(format!(
+                    "this action's dispatch needs unprovable state: {err}"
+                ))),
                 // A real, deterministic rejection (bad nonce, insufficient
                 // balance, ...) — both an honest proposer and an honest
                 // dissenter would compute the same rejection, so this is
@@ -464,7 +517,11 @@ fn replay(action: &crate::ChainAction, claim: &ActionClaim, height: u64) -> Resu
     for (key, value) in state_entries(&updates) {
         match trie.apply(xc_poe::state_trie::hash_key(&key), value) {
             Ok(_) => {}
-            Err(_) => return Ok(ReplayResult::Unprovable("the update touches a key outside the proven set".to_string())),
+            Err(_) => {
+                return Ok(ReplayResult::Unprovable(
+                    "the update touches a key outside the proven set".to_string(),
+                ));
+            }
         }
     }
     Ok(ReplayResult::Root(trie.root()))
@@ -488,14 +545,15 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     let config = bincode::config::standard();
     let mut entries = Vec::new();
     for (address, entry) in &updates.accounts.0 {
-        let value = bincode::serde::encode_to_vec(entry, config).expect("AccountEntry always encodes");
+        let value =
+            bincode::serde::encode_to_vec(entry, config).expect("AccountEntry always encodes");
         entries.push((AccountKey(address).encode(), Some(value)));
     }
     for ((master, validator), allocation) in &updates.stakes.allocations {
         let key = StakeKey { master, validator }.encode();
-        let value = allocation
-            .as_ref()
-            .map(|a| bincode::serde::encode_to_vec(a, config).expect("StakeAllocation always encodes"));
+        let value = allocation.as_ref().map(|a| {
+            bincode::serde::encode_to_vec(a, config).expect("StakeAllocation always encodes")
+        });
         entries.push((key, value));
     }
     for (validator, masters) in &updates.stakes.validator_index {
@@ -503,7 +561,10 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         let value = if masters.is_empty() {
             None
         } else {
-            Some(bincode::serde::encode_to_vec(masters, config).expect("Vec<Address> always encodes"))
+            Some(
+                bincode::serde::encode_to_vec(masters, config)
+                    .expect("Vec<Address> always encodes"),
+            )
         };
         entries.push((key, value));
     }
@@ -514,27 +575,34 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     }
     if let Some(registration) = &updates.asset_registration {
         let key = xc_circuit::AssetKey(&registration.asset_id).encode();
-        let value = bincode::serde::encode_to_vec(registration, config).expect("Asset always encodes");
+        let value =
+            bincode::serde::encode_to_vec(registration, config).expect("Asset always encodes");
         entries.push((key, Some(value)));
     }
     if let Some(registration) = &updates.attestor_registration {
         let key = AttestorRecordKey(&registration.attestor).encode();
-        let value = bincode::serde::encode_to_vec(&registration.record, config).expect("AttestorRecord always encodes");
+        let value = bincode::serde::encode_to_vec(&registration.record, config)
+            .expect("AttestorRecord always encodes");
         entries.push((key, Some(value)));
     }
     if let Some(deregistration) = &updates.attestor_deregistration {
         entries.push((AttestorRecordKey(&deregistration.0).encode(), None));
     }
     if let Some(registration) = &updates.bls_key {
-        let value = bincode::serde::encode_to_vec(registration.pubkey, config).expect("BlsPublicKey always encodes");
+        let value = bincode::serde::encode_to_vec(registration.pubkey, config)
+            .expect("BlsPublicKey always encodes");
         entries.push((BlsKeyKey(&registration.address).encode(), Some(value)));
-        let owner_value =
-            bincode::serde::encode_to_vec(&registration.address, config).expect("Address always encodes");
-        entries.push((BlsPubkeyOwnerKey(&registration.pubkey).encode(), Some(owner_value)));
+        let owner_value = bincode::serde::encode_to_vec(&registration.address, config)
+            .expect("Address always encodes");
+        entries.push((
+            BlsPubkeyOwnerKey(&registration.pubkey).encode(),
+            Some(owner_value),
+        ));
         if let Some(previous) = &registration.previous_pubkey
-            && previous != &registration.pubkey {
-                entries.push((BlsPubkeyOwnerKey(previous).encode(), None));
-            }
+            && previous != &registration.pubkey
+        {
+            entries.push((BlsPubkeyOwnerKey(previous).encode(), None));
+        }
     }
     entries
 }
@@ -580,7 +648,7 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use sha2::Digest;
-    use xc_artifact::{StateProof, ARTIFACT_VERSION};
+    use xc_artifact::{ARTIFACT_VERSION, StateProof};
     use xc_storage::{AccountUpdates, ArxiumDb};
 
     fn temp_db() -> ArxiumDb {
@@ -594,7 +662,10 @@ mod tests {
     }
 
     fn entry(balance: u128) -> xc_primitives::AccountEntry {
-        xc_primitives::AccountEntry { balance, ..Default::default() }
+        xc_primitives::AccountEntry {
+            balance,
+            ..Default::default()
+        }
     }
 
     fn hex_proof(proof: xc_poe::state_trie::InclusionProof) -> StateProof {
@@ -603,7 +674,10 @@ mod tests {
             key_hash: format!("0x{}", hex::encode(proof.key_hash)),
             value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
             siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
-            siblings: non_default.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
+            siblings: non_default
+                .iter()
+                .map(|s| format!("0x{}", hex::encode(s)))
+                .collect(),
         }
     }
 
@@ -621,8 +695,11 @@ mod tests {
     fn the_three_bitmap_expansions_agree_with_each_other() {
         let db = temp_db();
         let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(alice.clone(), entry(500))])))
-            .unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+            alice.clone(),
+            entry(500),
+        )])))
+        .unwrap();
         let root = db.compute_state_root(&[]).unwrap();
         let alice_key = format!("account:{alice}").into_bytes();
         let raw_proof = db.prove(&alice_key, &root).unwrap();
@@ -635,8 +712,10 @@ mod tests {
              siblings xc_poe::compress started from"
         );
 
-        let root_bytes: [u8; 32] =
-            hex::decode(root.strip_prefix("0x").unwrap()).unwrap().try_into().unwrap();
+        let root_bytes: [u8; 32] = hex::decode(root.strip_prefix("0x").unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
         xc_artifact::verify_state_proof(root_bytes, &state_proof)
             .expect("xc_artifact::verify_state_proof must accept the same compressed proof against the real root");
     }
@@ -675,9 +754,13 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::Transfer { to: bob.clone(), amount: 40 },
+            payload: crate::ActionPayload::Transfer {
+                to: bob.clone(),
+                amount: 40,
+            },
         };
-        let action_bytes = bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
+        let action_bytes =
+            bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
 
         // The real result, for the honest (proposer's) side.
         let view = xc_storage::BlockView::new(&db);
@@ -708,7 +791,10 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::Transfer { to: bob.clone(), amount: dissent_amount },
+            payload: crate::ActionPayload::Transfer {
+                to: bob.clone(),
+                amount: dissent_amount,
+            },
         };
         let dissent_view = xc_storage::BlockView::new(&dissent_db);
         let dissent_updates = crate::dispatch(
@@ -737,17 +823,28 @@ mod tests {
         let action_index = 0u64;
 
         let proposed_msg = xc_artifact::action_claim_signing_bytes(
-            height, action_index, &action_bytes_hash, &pre_root, &real_post_root,
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &real_post_root,
         );
         let proposed_claim = ActionClaim {
             pre_state_root: pre_root.clone(),
             post_state_root: real_post_root,
             proofs: proofs.clone(),
-            signature: format!("0x{}", hex::encode(proposer_key.sign(&proposed_msg).to_bytes())),
+            signature: format!(
+                "0x{}",
+                hex::encode(proposer_key.sign(&proposed_msg).to_bytes())
+            ),
         };
 
         let dissent_msg = xc_artifact::action_claim_signing_bytes(
-            height, action_index, &action_bytes_hash, &pre_root, &dissent_post_root,
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &dissent_post_root,
         );
         let dissent_claim = ActionClaim {
             pre_state_root: pre_root,
@@ -785,7 +882,12 @@ mod tests {
     fn a_dissenter_with_a_wrong_claimed_amount_is_named_culpable() {
         let scenario = build_scenario(999); // dissenter claims a different amount than really happened
         let outcome = adjudicate_action_divergence(&scenario.artifact).unwrap();
-        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: scenario.voter_pubkey });
+        assert_eq!(
+            outcome,
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: scenario.voter_pubkey
+            }
+        );
     }
 
     /// Both sides computing the identical (correct) result isn't actually
@@ -808,8 +910,11 @@ mod tests {
     fn an_unprovable_action_type_resolves_to_disagreement_not_a_guess() {
         let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = temp_db();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(alice.clone(), entry(1_000_000_000))])))
-            .unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+            alice.clone(),
+            entry(1_000_000_000),
+        )])))
+        .unwrap();
         let pre_root = db.compute_state_root(&[]).unwrap();
 
         let action: crate::ChainAction = xc_primitives::Action {
@@ -829,7 +934,8 @@ mod tests {
                 },
             },
         };
-        let action_bytes = bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
+        let action_bytes =
+            bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
         let action_bytes_hash: [u8; 32] = sha2::Sha256::digest(&action_bytes).into();
 
         let alice_key = format!("account:{alice}").into_bytes();
@@ -845,16 +951,29 @@ mod tests {
         let height = 5u64;
         let action_index = 0u64;
 
-        let proposed_msg =
-            xc_artifact::action_claim_signing_bytes(height, action_index, &action_bytes_hash, &pre_root, &fake_post_a);
-        let dissent_msg =
-            xc_artifact::action_claim_signing_bytes(height, action_index, &action_bytes_hash, &pre_root, &fake_post_b);
+        let proposed_msg = xc_artifact::action_claim_signing_bytes(
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &fake_post_a,
+        );
+        let dissent_msg = xc_artifact::action_claim_signing_bytes(
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &fake_post_b,
+        );
 
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: "0xgenesis".to_string(),
             fault: Fault::ActionDivergence {
-                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                proposer_pubkey: format!(
+                    "0x{}",
+                    hex::encode(proposer_key.verifying_key().as_bytes())
+                ),
                 voter_pubkey: format!("0x{}", hex::encode(voter_pk.0)),
                 height,
                 action_index,
@@ -863,13 +982,19 @@ mod tests {
                     pre_state_root: pre_root.clone(),
                     post_state_root: fake_post_a,
                     proofs: proofs.clone(),
-                    signature: format!("0x{}", hex::encode(proposer_key.sign(&proposed_msg).to_bytes())),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(proposer_key.sign(&proposed_msg).to_bytes())
+                    ),
                 },
                 dissent_claim: ActionClaim {
                     pre_state_root: pre_root,
                     post_state_root: fake_post_b,
                     proofs,
-                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)
+                    ),
                 },
             },
             human_readable: serde_json::json!({}),
@@ -904,17 +1029,24 @@ mod tests {
         let governor = xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
         let carol = xc_primitives::Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
         db.write_batch(&GovernorSeed(governor.clone())).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(governor.clone(), entry(1_000_000_000))])))
-            .unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+            governor.clone(),
+            entry(1_000_000_000),
+        )])))
+        .unwrap();
         let pre_root = db.compute_state_root(&[]).unwrap();
 
         let action: crate::ChainAction = xc_primitives::Action {
             sender: governor.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::RegisterAttestor { attestor: carol.clone(), name: "kyc-provider".to_string() },
+            payload: crate::ActionPayload::RegisterAttestor {
+                attestor: carol.clone(),
+                name: "kyc-provider".to_string(),
+            },
         };
-        let action_bytes = bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
+        let action_bytes =
+            bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
         // Must match the height `replay` below actually dispatches at (the
         // artifact's `height`), not a stand-in 0 — unlike `Transfer`,
         // `RegisterAttestor` bakes `current_height` into the record it
@@ -935,22 +1067,31 @@ mod tests {
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
-        db.write_batch(real_updates.attestor_registration.as_ref().unwrap()).unwrap();
+        db.write_batch(real_updates.attestor_registration.as_ref().unwrap())
+            .unwrap();
         let real_post_root = db.compute_state_root(&[]).unwrap();
 
         // The dissenter's claimed result: a different registered name for
         // the same attestor, computed against a separate copy of the
         // pre-state so it doesn't disturb `db`'s already-committed real one.
         let dissent_db = temp_db();
-        dissent_db.write_batch(&GovernorSeed(governor.clone())).unwrap();
         dissent_db
-            .write_batch(&AccountUpdates(std::collections::BTreeMap::from([(governor.clone(), entry(1_000_000_000))])))
+            .write_batch(&GovernorSeed(governor.clone()))
+            .unwrap();
+        dissent_db
+            .write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+                governor.clone(),
+                entry(1_000_000_000),
+            )])))
             .unwrap();
         let dissent_action: crate::ChainAction = xc_primitives::Action {
             sender: governor.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::RegisterAttestor { attestor: carol.clone(), name: "wrong-name".to_string() },
+            payload: crate::ActionPayload::RegisterAttestor {
+                attestor: carol.clone(),
+                name: "wrong-name".to_string(),
+            },
         };
         let dissent_view = xc_storage::BlockView::new(&dissent_db);
         let dissent_updates = crate::dispatch(
@@ -964,7 +1105,9 @@ mod tests {
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
-        dissent_db.write_batch(dissent_updates.attestor_registration.as_ref().unwrap()).unwrap();
+        dissent_db
+            .write_batch(dissent_updates.attestor_registration.as_ref().unwrap())
+            .unwrap();
         let dissent_post_root = dissent_db.compute_state_root(&[]).unwrap();
 
         let governor_key = xc_circuit::GovernorKey.encode();
@@ -982,17 +1125,28 @@ mod tests {
         let action_index = 0u64;
 
         let proposed_msg = xc_artifact::action_claim_signing_bytes(
-            height, action_index, &action_bytes_hash, &pre_root, &real_post_root,
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &real_post_root,
         );
         let proposed_claim = ActionClaim {
             pre_state_root: pre_root.clone(),
             post_state_root: real_post_root,
             proofs: proofs.clone(),
-            signature: format!("0x{}", hex::encode(proposer_key.sign(&proposed_msg).to_bytes())),
+            signature: format!(
+                "0x{}",
+                hex::encode(proposer_key.sign(&proposed_msg).to_bytes())
+            ),
         };
 
         let dissent_msg = xc_artifact::action_claim_signing_bytes(
-            height, action_index, &action_bytes_hash, &pre_root, &dissent_post_root,
+            height,
+            action_index,
+            &action_bytes_hash,
+            &pre_root,
+            &dissent_post_root,
         );
         let dissent_claim = ActionClaim {
             pre_state_root: pre_root,
@@ -1006,7 +1160,10 @@ mod tests {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: "0xgenesis".to_string(),
             fault: Fault::ActionDivergence {
-                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                proposer_pubkey: format!(
+                    "0x{}",
+                    hex::encode(proposer_key.verifying_key().as_bytes())
+                ),
                 voter_pubkey: voter_pubkey.clone(),
                 height,
                 action_index,
@@ -1018,7 +1175,12 @@ mod tests {
         };
 
         let outcome = adjudicate_action_divergence(&artifact).unwrap();
-        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey });
+        assert_eq!(
+            outcome,
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter_pubkey
+            }
+        );
     }
 
     /// Builds a real single-action `BlockDivergence` block: alice sends bob
@@ -1041,7 +1203,10 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::Transfer { to: bob.clone(), amount: 40 },
+            payload: crate::ActionPayload::Transfer {
+                to: bob.clone(),
+                amount: 40,
+            },
         };
         let actions = vec![action.clone()];
         let tx_root = xc_poe::tx_root(&actions).unwrap();
@@ -1071,7 +1236,10 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::Transfer { to: bob.clone(), amount: dissent_amount },
+            payload: crate::ActionPayload::Transfer {
+                to: bob.clone(),
+                amount: dissent_amount,
+            },
         };
         let dissent_view = xc_storage::BlockView::new(&dissent_db);
         let dissent_updates = crate::dispatch(
@@ -1108,7 +1276,10 @@ mod tests {
         let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
         let block_attestation = xc_artifact::BlockAttestation {
             header: header.clone(),
-            signature: format!("0x{}", hex::encode(proposer_key.sign(&header_bytes).to_bytes())),
+            signature: format!(
+                "0x{}",
+                hex::encode(proposer_key.sign(&header_bytes).to_bytes())
+            ),
         };
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
         let dissent_msg = xc_artifact::block_divergence_signing_bytes(
@@ -1132,12 +1303,18 @@ mod tests {
                 block_attestation,
                 actions: vec![format!(
                     "0x{}",
-                    hex::encode(bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap())
+                    hex::encode(
+                        bincode::serde::encode_to_vec(&action, bincode::config::standard())
+                            .unwrap()
+                    )
                 )],
                 dissent_claim: xc_artifact::BlockDissentClaim {
                     computed_state_root: dissent_state_root,
                     proofs,
-                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)
+                    ),
                 },
             },
             human_readable: serde_json::json!({}),
@@ -1154,7 +1331,12 @@ mod tests {
     fn a_dissenter_with_a_wrong_block_result_is_named_culpable() {
         let (artifact, _proposer_pubkey, voter_pubkey) = build_block_scenario(999);
         let outcome = adjudicate_block_divergence(&artifact).unwrap();
-        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: voter_pubkey });
+        assert_eq!(
+            outcome,
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter_pubkey
+            }
+        );
     }
 
     /// Same scenario, but this time the *proposer*'s claimed final root is
@@ -1168,7 +1350,12 @@ mod tests {
         // dissent_amount == the real amount, so the dissenter is honest;
         // the proposer's claim is made wrong instead, below.
         let (mut artifact, proposer_pubkey, _voter_pubkey) = build_block_scenario(40);
-        let Fault::BlockDivergence { parent_state_root, block_attestation, dissent_claim, .. } = &mut artifact.fault
+        let Fault::BlockDivergence {
+            parent_state_root,
+            block_attestation,
+            dissent_claim,
+            ..
+        } = &mut artifact.fault
         else {
             unreachable!()
         };
@@ -1177,7 +1364,10 @@ mod tests {
         bogus_header.state_root = format!("0x{}", hex::encode([0xCCu8; 32]));
         let bogus_bytes = xc_artifact::signing_bytes_for(&bogus_header).unwrap();
         let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
-        block_attestation.signature = format!("0x{}", hex::encode(proposer_key.sign(&bogus_bytes).to_bytes()));
+        block_attestation.signature = format!(
+            "0x{}",
+            hex::encode(proposer_key.sign(&bogus_bytes).to_bytes())
+        );
         block_attestation.header = bogus_header;
 
         // Re-bind the (still honest, unchanged) dissent claim to the new
@@ -1190,10 +1380,16 @@ mod tests {
             parent_state_root,
             &dissent_claim.computed_state_root,
         );
-        dissent_claim.signature = format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0));
+        dissent_claim.signature =
+            format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0));
 
         let outcome = adjudicate_block_divergence(&artifact).unwrap();
-        assert_eq!(outcome, AdjudicationOutcome::Culpable { culpable_pubkey: proposer_pubkey });
+        assert_eq!(
+            outcome,
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: proposer_pubkey
+            }
+        );
     }
 
     /// If the dissenter's supplied `actions` don't actually hash to the
@@ -1203,7 +1399,9 @@ mod tests {
     #[test]
     fn a_mismatched_action_list_resolves_to_disagreement() {
         let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
-        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else { unreachable!() };
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
+            unreachable!()
+        };
         let other_action: crate::ChainAction = xc_primitives::Action {
             sender: xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
             nonce: 0,
@@ -1213,8 +1411,12 @@ mod tests {
                 amount: 1,
             },
         };
-        actions[0] =
-            format!("0x{}", hex::encode(bincode::serde::encode_to_vec(&other_action, bincode::config::standard()).unwrap()));
+        actions[0] = format!(
+            "0x{}",
+            hex::encode(
+                bincode::serde::encode_to_vec(&other_action, bincode::config::standard()).unwrap()
+            )
+        );
 
         let outcome = adjudicate_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
@@ -1246,7 +1448,9 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::SubmitExecutionFault { artifact_json: "{}".to_string() },
+            payload: crate::ActionPayload::SubmitExecutionFault {
+                artifact_json: "{}".to_string(),
+            },
         };
         let actions = vec![nested_action.clone()];
         let tx_root = xc_poe::tx_root(&actions).unwrap();
@@ -1278,29 +1482,45 @@ mod tests {
         let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
         let block_attestation = xc_artifact::BlockAttestation {
             header: header.clone(),
-            signature: format!("0x{}", hex::encode(proposer_key.sign(&header_bytes).to_bytes())),
+            signature: format!(
+                "0x{}",
+                hex::encode(proposer_key.sign(&header_bytes).to_bytes())
+            ),
         };
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
-        let dissent_msg =
-            xc_artifact::block_divergence_signing_bytes(5, &header_commitment, &parent_root, &fake_post_b);
+        let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            5,
+            &header_commitment,
+            &parent_root,
+            &fake_post_b,
+        );
 
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: "0xgenesis".to_string(),
             fault: Fault::BlockDivergence {
-                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                proposer_pubkey: format!(
+                    "0x{}",
+                    hex::encode(proposer_key.verifying_key().as_bytes())
+                ),
                 voter_pubkey: format!("0x{}", hex::encode(voter_pk.0)),
                 height: 5,
                 parent_state_root: parent_root,
                 block_attestation,
                 actions: vec![format!(
                     "0x{}",
-                    hex::encode(bincode::serde::encode_to_vec(&nested_action, bincode::config::standard()).unwrap())
+                    hex::encode(
+                        bincode::serde::encode_to_vec(&nested_action, bincode::config::standard())
+                            .unwrap()
+                    )
                 )],
                 dissent_claim: xc_artifact::BlockDissentClaim {
                     computed_state_root: fake_post_b,
                     proofs,
-                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)
+                    ),
                 },
             },
             human_readable: serde_json::json!({}),
@@ -1316,7 +1536,9 @@ mod tests {
     #[test]
     fn an_oversized_action_list_resolves_to_disagreement_without_decoding() {
         let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
-        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else { unreachable!() };
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
+            unreachable!()
+        };
         // Not valid encodings — proves the cap is checked before decoding.
         *actions = vec!["0xnot-a-real-action".to_string(); MAX_ADJUDICATED_ACTIONS + 1];
 
@@ -1357,7 +1579,11 @@ mod tests {
             .map(|i| Address::from_pubkey_bytes(&[(i % 256) as u8; 32]).unwrap())
             .collect();
         db.write_batch(&AccountUpdates(
-            addrs.iter().cloned().map(|a| (a, entry(1_000_000_000))).collect(),
+            addrs
+                .iter()
+                .cloned()
+                .map(|a| (a, entry(1_000_000_000)))
+                .collect(),
         ))
         .unwrap();
         let parent_root = db.compute_state_root(&[]).unwrap();
@@ -1369,9 +1595,21 @@ mod tests {
                 sender: addrs[2 * i].clone(),
                 nonce: 0,
                 signature: Some(hex::encode([0xABu8; 64])),
-                payload: crate::ActionPayload::Transfer { to: addrs[2 * i + 1].clone(), amount: 1 },
+                payload: crate::ActionPayload::Transfer {
+                    to: addrs[2 * i + 1].clone(),
+                    amount: 1,
+                },
             };
-            crate::dispatch(&action, &view, &no_operator, &no_operator_validators, &[], 0, &no_bls_owner).unwrap();
+            crate::dispatch(
+                &action,
+                &view,
+                &no_operator,
+                &no_operator_validators,
+                &[],
+                0,
+                &no_bls_owner,
+            )
+            .unwrap();
             actions.push(action);
         }
         let touched_keys = view.touched_keys();
@@ -1399,7 +1637,9 @@ mod tests {
             .map(|a| {
                 format!(
                     "0x{}",
-                    hex::encode(bincode::serde::encode_to_vec(a, bincode::config::standard()).unwrap())
+                    hex::encode(
+                        bincode::serde::encode_to_vec(a, bincode::config::standard()).unwrap()
+                    )
                 )
             })
             .collect();

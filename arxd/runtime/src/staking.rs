@@ -50,13 +50,14 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     // validator already at/above it topping up further shouldn't be
     // re-charged the whole minimum again.
     let existing_active = view
-        .get(&StakeKey { master: &action.sender, validator })?
+        .get(&StakeKey {
+            master: &action.sender,
+            validator,
+        })?
         .map(|a| a.active_amount)
         .unwrap_or(0);
     if existing_active + stake < MIN_VALIDATOR_STAKE {
-        anyhow::bail!(
-            "stake {stake} is below the minimum validator stake {MIN_VALIDATOR_STAKE}"
-        );
+        anyhow::bail!("stake {stake} is below the minimum validator stake {MIN_VALIDATOR_STAKE}");
     }
     let (accounts, stakes) = circuit_staking::apply_stake(
         view,
@@ -70,9 +71,10 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     // never in the set without the ability to vote.
     let bytes = validated_bls_pubkey(bls_pubkey, bls_pop)?;
     if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
-        && &owner != validator {
-            anyhow::bail!("BLS pubkey already registered to {owner}");
-        }
+        && &owner != validator
+    {
+        anyhow::bail!("BLS pubkey already registered to {owner}");
+    }
     // `bls_pubkey` here is informational, like `stake`:
     // `ValidatorSetSnapshot` persists neither, and the authoritative
     // registration is the `bls_key` update below.
@@ -136,14 +138,20 @@ pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
         .next()
         .unwrap_or_else(|| action.sender.clone());
     let self_stake = view
-        .get(&StakeKey { master: &master, validator })?
+        .get(&StakeKey {
+            master: &master,
+            validator,
+        })?
         .ok_or_else(|| anyhow::anyhow!("{master} has no stake in {validator} to unstake"))?;
     // The master's own nonce, not `action.sender`'s — this action's
     // own replay protection already happened at admission (keyed on
     // `action.sender`'s nonce); `apply_unstake`'s nonce check is
     // master-account bookkeeping, meaningless against a different
     // account's counter when `master != action.sender`.
-    let master_nonce = view.get(&AccountKey(&master))?.map(|entry| entry.nonce).unwrap_or(0);
+    let master_nonce = view
+        .get(&AccountKey(&master))?
+        .map(|entry| entry.nonce)
+        .unwrap_or(0);
     let (accounts, stakes) = circuit_staking::apply_unstake(
         view,
         &master,
@@ -177,7 +185,11 @@ pub(crate) fn stake<V: KvRead<Error = StorageError>>(
         amount,
         current_height,
     )?;
-    Ok(BlockUpdates { accounts, stakes, ..Default::default() })
+    Ok(BlockUpdates {
+        accounts,
+        stakes,
+        ..Default::default()
+    })
 }
 
 /// MW-signature-only partial or full unstake, subject to
@@ -200,7 +212,11 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
         amount,
         current_height,
     )?;
-    Ok(BlockUpdates { accounts, stakes, ..Default::default() })
+    Ok(BlockUpdates {
+        accounts,
+        stakes,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -220,7 +236,9 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+            payload: ActionPayload::LeaveValidator {
+                validator: alice.clone(),
+            },
         };
 
         let err = match crate::dispatch(
@@ -246,13 +264,18 @@ mod tests {
         let view = seeded_view(
             &db,
             HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
-            HashMap::from([((alice.clone(), alice.clone()), self_allocation(&alice, 2_000))]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, 2_000),
+            )]),
         );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+            payload: ActionPayload::LeaveValidator {
+                validator: alice.clone(),
+            },
         };
 
         let updates = crate::dispatch(
@@ -375,7 +398,11 @@ mod tests {
     fn join_validator_rejected_with_insufficient_balance() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(100))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(100))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -408,7 +435,11 @@ mod tests {
     fn join_validator_rejected_below_minimum_stake() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(alice.clone(), funded(10_000))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(10_000))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: alice.clone(),
             nonce: 0,
@@ -451,7 +482,9 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+            payload: ActionPayload::LeaveValidator {
+                validator: alice.clone(),
+            },
         };
 
         let updates = crate::dispatch(
@@ -521,7 +554,9 @@ mod tests {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+            payload: ActionPayload::LeaveValidator {
+                validator: alice.clone(),
+            },
         };
 
         let err = crate::dispatch(
@@ -542,7 +577,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(bob.clone(), funded(5_000))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(bob.clone(), funded(5_000))]),
+            HashMap::new(),
+        );
         let action = Action {
             sender: bob,
             nonce: 0,
@@ -650,16 +689,20 @@ mod tests {
                 },
             )]),
         );
-        view.put(&StakeByValidatorKey(&alice), &vec![bob.clone()]).unwrap();
+        view.put(&StakeByValidatorKey(&alice), &vec![bob.clone()])
+            .unwrap();
         // Current state after revoke-then-reauthorize: charlie, not bob, is
         // now alice's authorized operator.
-        let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), charlie.clone())]));
+        let operator_lookup =
+            make_operator_lookup(HashMap::from([(alice.clone(), charlie.clone())]));
 
         let action = Action {
             sender: charlie.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::LeaveValidator { validator: alice.clone() },
+            payload: ActionPayload::LeaveValidator {
+                validator: alice.clone(),
+            },
         };
 
         let updates = crate::dispatch(
@@ -673,7 +716,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice));
+        assert!(
+            matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice)
+        );
         let allocation = updates
             .stakes
             .allocations
@@ -681,7 +726,10 @@ mod tests {
             .unwrap()
             .clone()
             .unwrap();
-        assert!(allocation.unbonding.is_some(), "unstake must land on the real funder's allocation");
+        assert!(
+            allocation.unbonding.is_some(),
+            "unstake must land on the real funder's allocation"
+        );
         assert_eq!(allocation.active_amount, 0);
     }
 
@@ -690,7 +738,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(bob.clone(), funded(5_000))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(bob.clone(), funded(5_000))]),
+            HashMap::new(),
+        );
         // No entry for alice: same state as after a `RevokeOperator`.
         let operator_lookup = make_operator_lookup(HashMap::new());
         let action = Action {

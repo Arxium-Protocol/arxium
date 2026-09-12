@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use xc_artifact::{
     BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault,
-    ARTIFACT_VERSION,
+    PrecommitAttestation, ARTIFACT_VERSION,
 };
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
@@ -101,6 +101,20 @@ pub enum EvidenceEvent<P> {
         voter: String,
         voter_pubkey: String,
         dissent_claim: BlockDissentClaim,
+    },
+    /// A validator signed two conflicting precommits at one height,
+    /// detected by `arxd/finality`'s tally. Carries the already-hex-encoded
+    /// attestations for the same reason `ExecutionDisagreement` carries a
+    /// `DissentAttestation`: the signing and detection live in
+    /// `arxd/finality`, and this crate only needs enough to write the
+    /// artifact and report it.
+    PrecommitEquivocation {
+        /// Bech32 address of the culpable voter — artifact filename and
+        /// dedup key, same role `voter` plays for `BlockDivergence`.
+        voter: Address,
+        voter_pubkey: String,
+        height: u64,
+        precommits: [PrecommitAttestation; 2],
     },
 }
 
@@ -233,6 +247,45 @@ fn write_disagreement_artifact<P: Serialize>(
         }
         Err(err) => warn!("evidence: failed to encode disagreement artifact for {proposer}: {err}"),
     }
+}
+
+/// Builds a `PrecommitEquivocation` artifact and writes it to
+/// `<evidence_dir>/<height>-precommit-equivocation-<voter>.json`. Returns
+/// the artifact whether or not the write succeeded — unlike the fraud-proof
+/// path, nothing here is derived from what lands on disk, so a full disk
+/// must not be what stops a provable double-sign from being reported.
+fn write_precommit_equivocation_artifact(
+    evidence_dir: &Path,
+    genesis_hash: [u8; 32],
+    voter: &Address,
+    voter_pubkey: &str,
+    height: u64,
+    precommits: [PrecommitAttestation; 2],
+) -> EvidenceArtifact {
+    let artifact = EvidenceArtifact {
+        artifact_version: ARTIFACT_VERSION,
+        genesis_hash: format!("0x{}", hex::encode(genesis_hash)),
+        human_readable: serde_json::json!({
+            "voter": voter.to_string(),
+            "block_hash_a": precommits[0].block_hash,
+            "block_hash_b": precommits[1].block_hash,
+        }),
+        fault: Fault::PrecommitEquivocation {
+            voter_pubkey: voter_pubkey.to_string(),
+            height,
+            precommits,
+        },
+    };
+
+    let path = evidence_dir.join(format!("{height}-precommit-equivocation-{voter}.json"));
+    match std::fs::create_dir_all(evidence_dir).and_then(|()| {
+        let bytes = serde_json::to_vec_pretty(&artifact).expect("artifact always encodes");
+        std::fs::write(&path, bytes)
+    }) {
+        Ok(()) => info!("evidence: wrote artifact {}", path.display()),
+        Err(err) => warn!("evidence: failed to write artifact {}: {err}", path.display()),
+    }
+    artifact
 }
 
 /// Builds and writes a `BlockDivergence` artifact — the fraud-proof
@@ -435,6 +488,38 @@ where
                                     warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
                                 }
                             }
+                        }
+                    }
+                    continue;
+                }
+                EvidenceEvent::PrecommitEquivocation { voter, voter_pubkey, height, precommits } => {
+                    let artifact = write_precommit_equivocation_artifact(
+                        &evidence_dir,
+                        genesis_hash,
+                        &voter,
+                        &voter_pubkey,
+                        height,
+                        precommits,
+                    );
+                    // Same one-attempt-per-(height, culprit) rule the
+                    // divergence path uses, and for the same reason: every
+                    // later vote from the same equivocator re-detects the
+                    // fault, and all those submissions would race for one
+                    // (sender, nonce) mempool slot. `EvidenceMarkerKey` is
+                    // keyed the same way on-chain, so this is never
+                    // stricter than the chain.
+                    if !fault_attempted.insert((height, voter.clone()))
+                        || build_execution_fault_action.is_none()
+                    {
+                        continue;
+                    }
+                    let build = build_execution_fault_action.as_ref().expect("checked above");
+                    let Some(action) = build(artifact) else { continue };
+                    let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                    match guard.push(action) {
+                        Ok(()) => info!("evidence: submitted precommit equivocation against {voter}"),
+                        Err(err) => {
+                            warn!("evidence: failed to submit precommit equivocation for {voter}: {err}")
                         }
                     }
                     continue;
