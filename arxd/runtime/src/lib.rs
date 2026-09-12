@@ -337,6 +337,14 @@ pub enum ActionPayload {
         lost: Address,
         replacement: Address,
     },
+    /// Issuer mints straight into a verified investor's balance — T-REX
+    /// `mint(to)`. `to` passes the asset's compliance rules; the issuer,
+    /// which never holds the units, is not checked. Variant 27.
+    IssueAssetTo {
+        asset_id: String,
+        to: Address,
+        amount: u128,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -789,6 +797,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::RecoverHolder { asset_id, lost, replacement } => {
             asset::recover_holder(view, action, asset_id, lost, replacement)
         }
+        ActionPayload::IssueAssetTo { asset_id, to, amount } => asset::issue_asset_to(view, action, asset_id, to, *amount),
         ActionPayload::TransferAsset {
             asset_id,
             to,
@@ -1294,6 +1303,17 @@ mod client_signing_vectors {
         }
     }
 
+    /// Variant 27, nonce 2, recipient BOB.
+    #[test]
+    fn issue_asset_to_vector_matches_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(2, ActionPayload::IssueAssetTo { asset_id: "gold".into(), to: Address::parse(BOB).expect("valid"), amount: 1000 }),
+            ISSUE_ASSET_TO_VECTOR,
+            "IssueAssetTo signing bytes changed — the client codecs pin this exact string"
+        );
+    }
+
+    const ISSUE_ASSET_TO_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021b04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
     const BURN_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021504676f6c64fbe803";
     const SET_HOLDER_FROZEN_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021604676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b3501";
     const LOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021704676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";

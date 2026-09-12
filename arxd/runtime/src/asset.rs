@@ -325,6 +325,25 @@ pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
     })
 }
 
+pub(crate) fn issue_asset_to<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset_id: &str,
+    to: &Address,
+    amount: u128,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset_id)?;
+    if amount == 0 {
+        anyhow::bail!("issue amount must be positive");
+    }
+    let assets = circuit_rwa_asset::apply_issue_to(view, &mut asset, to, amount)?;
+    Ok(BlockUpdates {
+        assets,
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
 pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,

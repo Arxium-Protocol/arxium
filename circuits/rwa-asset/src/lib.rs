@@ -284,6 +284,37 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     Ok((accounts, assets))
 }
 
+/// T-REX `mint(to)`: supply created straight into a verified investor's
+/// balance. `to` must pass the asset's rules; the issuer is not checked —
+/// it never holds the units, which is the point for an issuer that is not
+/// itself an attested party. Nonce handling is left to the runtime's generic
+/// discipline (this was added after `NONCE_DISCIPLINE_HEIGHT`).
+pub fn apply_issue_to<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    to: &Address,
+    amount: u128,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    if asset.frozen {
+        return Err(RwaError::AssetFrozen { asset_id: asset.asset_id.clone() });
+    }
+    check_party(view, asset, to)?;
+    let resulting = asset
+        .total_supply
+        .checked_add(amount)
+        .ok_or_else(|| RwaError::SupplyOverflow { asset_id: asset.asset_id.clone() })?;
+    if let Some(cap) = asset.max_supply
+        && resulting > cap
+    {
+        return Err(RwaError::SupplyCapExceeded { asset_id: asset.asset_id.clone(), cap, resulting, amount });
+    }
+    let existing = view
+        .get(&AssetBalanceKey { asset_id: &asset.asset_id, owner: to })?
+        .unwrap_or(0);
+    asset.total_supply = resulting;
+    Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_id.clone(), to.clone()), existing + amount)])))
+}
+
 fn holder_state<V: KvRead<Error = StorageError>>(view: &V, asset: &Asset, holder: &Address) -> Result<HolderState, RwaError> {
     Ok(view
         .get(&AssetHolderStateKey { asset_id: &asset.asset_id, holder })?
@@ -510,6 +541,29 @@ mod tests {
         assert!(matches!(err, RwaError::UnlockExceedsLocked { .. }), "{err}");
         db.write_batch(&apply_lock_amount(&db, &asset, &holder, 30, false).unwrap()).unwrap();
         assert!(apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 50).is_ok(), "everything spendable again");
+    }
+
+    #[test]
+    fn issue_to_mints_into_a_compliant_recipient_and_respects_the_cap() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let investor = addr(2);
+        let mut asset = Asset::new("gold", issuer.clone(), true);
+        asset.max_supply = Some(100);
+
+        // Issuer is not attested; that must not matter. Investor is not yet: refused.
+        let err = apply_issue_to(&db, &mut asset, &investor, 40).unwrap_err();
+        assert!(matches!(err, RwaError::NotCompliant { .. }), "{err}");
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            investor.clone(),
+            AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() },
+        )])))
+        .unwrap();
+        let assets = apply_issue_to(&db, &mut asset, &investor, 40).unwrap();
+        assert_eq!(assets.0[&("gold".to_string(), investor.clone())], 40);
+        assert_eq!(asset.total_supply, 40);
+        let err = apply_issue_to(&db, &mut asset, &investor, 61).unwrap_err();
+        assert!(matches!(err, RwaError::SupplyCapExceeded { .. }), "{err}");
     }
 
     #[test]
