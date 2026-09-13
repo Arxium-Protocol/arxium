@@ -62,7 +62,9 @@ impl ChainSpec {
 /// from genesis state changes. A node refuses a raw spec at a version it
 /// doesn't know rather than writing entries it would misread — the failure
 /// mode a plain, unversioned artifact format had no way to catch.
-pub const RAW_FORMAT_VERSION: u32 = 1;
+/// 1 -> 2: `validator_set:*` became a weighted map and genesis gained
+/// `validator_status:*` and `chain_params` rows (storage schema 8).
+pub const RAW_FORMAT_VERSION: u32 = 2;
 
 /// One `(column_family, key, value)` triple, hex-encoded for JSON transport.
 #[derive(Debug, Serialize, Deserialize)]
