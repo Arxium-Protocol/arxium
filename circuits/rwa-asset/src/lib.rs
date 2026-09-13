@@ -226,7 +226,7 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
     let accounts = AccountUpdates(BTreeMap::from([(sender.clone(), entry)]));
     let assets = AssetBalanceUpdates(BTreeMap::from([(
         (asset.asset_id.clone(), sender.clone()),
-        existing_balance + amount,
+        credit(&asset.asset_id, existing_balance, amount)?,
     )]));
     Ok((accounts, assets))
 }
@@ -321,13 +321,21 @@ pub fn apply_issue_to<V: KvRead<Error = StorageError>>(
         .get(&AssetBalanceKey { asset_id: &asset.asset_id, owner: to })?
         .unwrap_or(0);
     asset.total_supply = resulting;
-    Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_id.clone(), to.clone()), existing + amount)])))
+    let credited = credit(&asset.asset_id, existing, amount)?;
+    Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_id.clone(), to.clone()), credited)])))
 }
 
 fn holder_state<V: KvRead<Error = StorageError>>(view: &V, asset: &Asset, holder: &Address) -> Result<HolderState, RwaError> {
     Ok(view
         .get(&AssetHolderStateKey { asset_id: &asset.asset_id, holder })?
         .unwrap_or_default())
+}
+
+/// A balance credit. Every credit is already bounded by `total_supply`'s
+/// own `checked_add`, but that argument lives in a different variable —
+/// keep the overflow check local so it doesn't have to be reconstructed.
+fn credit(asset_id: &str, balance: u128, amount: u128) -> Result<u128, RwaError> {
+    balance.checked_add(amount).ok_or_else(|| RwaError::SupplyOverflow { asset_id: asset_id.to_string() })
 }
 
 /// Issuer burns `amount` from its own balance; `total_supply` follows. Only
@@ -476,7 +484,7 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
 
     Ok(AssetBalanceUpdates(BTreeMap::from([
         ((asset.asset_id.clone(), from.clone()), from_balance - amount),
-        ((asset.asset_id.clone(), to.clone()), to_balance + amount),
+        ((asset.asset_id.clone(), to.clone()), credit(&asset.asset_id, to_balance, amount)?),
     ])))
 }
 
