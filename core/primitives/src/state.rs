@@ -314,7 +314,7 @@ impl Asset {
 /// every `GrantAttestation`/`RevokeAttestation`, so membership must be
 /// provable in the state root the same way balances are.
 /// Per-(asset, holder) compliance state an issuer controls after issuance —
-/// the T-REX `setAddressFrozen` / `freezePartialTokens` pair. A new key
+/// the address freeze and the partial lock. A new key
 /// (`AssetHolderStateKey`) rather than fields on the balance row, so adding
 /// it changes no existing bincode layout. Absent means the default: not
 /// frozen, nothing locked.

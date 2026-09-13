@@ -300,14 +300,14 @@ pub enum ActionPayload {
         amount: u128,
     },
     /// Issuer takes a holder out of circulation for one asset (or back in) —
-    /// T-REX `setAddressFrozen`. Variant 22.
+    /// Variant 22.
     SetHolderFrozen {
         asset_id: String,
         holder: Address,
         frozen: bool,
     },
     /// Issuer locks `amount` of a holder's balance against compliant
-    /// transfers — T-REX `freezePartialTokens`. Variant 23.
+    /// transfers. Variant 23.
     LockHolderAmount {
         asset_id: String,
         holder: Address,
@@ -319,8 +319,7 @@ pub enum ActionPayload {
         holder: Address,
         amount: u128,
     },
-    /// The issuer's own forced transfer — T-REX `forcedTransfer` by an
-    /// agent — scoped to assets it issued, same audited `reason` as the
+    /// The issuer's own forced transfer, scoped to assets it issued, same audited `reason` as the
     /// governor's `ForcedTransfer`. Variant 25.
     IssuerForcedTransfer {
         asset_id: String,
@@ -330,15 +329,14 @@ pub enum ActionPayload {
         reason: String,
     },
     /// Move everything `lost` holds of an asset to `replacement`, which must
-    /// pass the asset's compliance rules — T-REX `recoveryAddress`. Issuer
+    /// pass the asset's compliance rules. Issuer
     /// only. Variant 26.
     RecoverHolder {
         asset_id: String,
         lost: Address,
         replacement: Address,
     },
-    /// Issuer mints straight into a verified investor's balance — T-REX
-    /// `mint(to)`. `to` passes the asset's compliance rules; the issuer,
+    /// Issuer mints straight into a verified investor's balance. `to` passes the asset's compliance rules; the issuer,
     /// which never holds the units, is not checked. Variant 27.
     IssueAssetTo {
         asset_id: String,

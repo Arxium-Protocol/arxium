@@ -111,7 +111,7 @@ fn check_party<V: KvRead<Error = StorageError>>(
     let entry = view.get(&AccountKey(party))?;
 
     // An issuer-frozen holder is out of circulation in both directions,
-    // whatever its claims say (T-REX `setAddressFrozen`).
+    // whatever its claims say.
     if holder_state(view, asset, party)?.frozen {
         return Err(RwaError::HolderFrozen { asset_id: asset.asset_id.clone(), address: party.clone() });
     }
@@ -293,7 +293,7 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     Ok((accounts, assets))
 }
 
-/// T-REX `mint(to)`: supply created straight into a verified investor's
+/// Supply created straight into a verified investor's
 /// balance. `to` must pass the asset's rules; the issuer is not checked —
 /// it never holds the units, which is the point for an issuer that is not
 /// itself an attested party. Nonce handling is left to the runtime's generic
@@ -362,7 +362,7 @@ pub fn apply_burn<V: KvRead<Error = StorageError>>(
     Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_id.clone(), issuer.clone()), balance - amount)])))
 }
 
-/// T-REX `setAddressFrozen`: the whole holder in or out of circulation.
+/// Address freeze: the whole holder in or out of circulation.
 pub fn apply_set_holder_frozen<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &Asset,
@@ -374,7 +374,7 @@ pub fn apply_set_holder_frozen<V: KvRead<Error = StorageError>>(
     Ok(HolderStateUpdates(BTreeMap::from([((asset.asset_id.clone(), holder.clone()), state)])))
 }
 
-/// T-REX `freezePartialTokens` / `unfreezePartialTokens`: lock or release
+/// Partial lock / unlock: lock or release
 /// `amount` units of `holder`'s balance. A lock may never exceed the balance,
 /// an unlock never the locked amount.
 pub fn apply_lock_amount<V: KvRead<Error = StorageError>>(
@@ -403,7 +403,7 @@ pub fn apply_lock_amount<V: KvRead<Error = StorageError>>(
     Ok(HolderStateUpdates(BTreeMap::from([((asset.asset_id.clone(), holder.clone()), state)])))
 }
 
-/// T-REX `recoveryAddress`: move everything `lost` holds of `asset` — balance
+/// Wallet recovery: move everything `lost` holds of `asset` — balance
 /// and freeze state alike — to `replacement`, which must itself pass the
 /// asset's compliance rules (a lost wallet is not a way around KYC). The lost
 /// wallet is left with nothing and a clean state.
@@ -423,7 +423,7 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
     let lost_state = holder_state(view, asset, lost)?;
     let mut replacement_state = holder_state(view, asset, replacement)?;
     replacement_state.frozen_amount = replacement_state.frozen_amount.saturating_add(lost_state.frozen_amount);
-    // T-REX carries the address freeze over too: recovery moves a holder,
+    // The address freeze travels too: recovery moves a holder,
     // it doesn't launder a frozen one.
     replacement_state.frozen |= lost_state.frozen;
     let id = asset.asset_id.clone();
