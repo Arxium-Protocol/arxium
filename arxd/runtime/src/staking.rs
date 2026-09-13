@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{AccountKey, BlsKeyKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{AccountKey, BlsKeyKey, ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, ValidatorChange, ValidatorEntry};
+use xc_primitives::{Address, ValidatorStatus, epoch_of};
 use xc_storage::{BlsKeyRegistration, StorageError};
 
 use crate::ChainAction;
-use crate::consensus::validated_bls_pubkey;
+use crate::consensus::{next_epoch_start, validated_bls_pubkey};
 
 /// 100,000 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM). Below
 /// this, `JoinValidator` is rejected before `circuit_staking::apply_stake`
@@ -46,6 +46,7 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
     if !is_authorized(&action.sender, validator, operator_lookup)? {
         anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
     }
+    check_join_admission(view, validator)?;
     // The floor is on total self-stake, not this call's delta — a
     // validator already at/above it topping up further shouldn't be
     // re-charged the whole minimum again.
@@ -67,41 +68,66 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
         stake,
         current_height,
     )?;
-    // Registered in the same block as the join, so the validator is
-    // never in the set without the ability to vote.
+    // Registered with the join, effective at the same boundary the
+    // validator can first be in the set, so it is never a member without
+    // the ability to vote.
     let bytes = validated_bls_pubkey(bls_pubkey, bls_pop)?;
     if let Some(owner) = bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
         && &owner != validator
     {
         anyhow::bail!("BLS pubkey already registered to {owner}");
     }
-    // `bls_pubkey` here is informational, like `stake`:
-    // `ValidatorSetSnapshot` persists neither, and the authoritative
-    // registration is the `bls_key` update below.
-    let change = ValidatorChange::Join(
-        validator.clone(),
-        ValidatorEntry {
-            stake,
-            bls_pubkey: Some(hex::encode(bytes)),
-            bls_pop: Some(hex::encode(bls_pop)),
-        },
-    );
     let previous_pubkey = view.get(&BlsKeyKey(validator))?;
-    Ok(BlockUpdates {
+    let mut updates = BlockUpdates {
         accounts,
         stakes,
-        validator_change: Some(change),
         bls_key: Some(BlsKeyRegistration {
             address: validator.clone(),
             pubkey: xc_bls::BlsPublicKey(bytes),
-            // Same one-block delay as the `ValidatorSetSnapshot` this join
-            // produces — the validator isn't eligible to vote until
-            // `current_height + 1` either, so the key becomes valid then too.
-            effective_height: current_height + 1,
+            effective_height: next_epoch_start(view, current_height)?,
             previous_pubkey,
         }),
         ..Default::default()
+    };
+    updates.validator_statuses.0.insert(validator.clone(), Some(status_after_join(view, validator)?));
+    Ok(updates)
+}
+
+/// Admission rules a join must clear before any stake moves — shared by
+/// `admission_precheck` (mempool) and `dispatch`, so a rejected join is
+/// rejected the same way in both places. A tombstoned address never
+/// re-enters; with `validator_attestation_required` the validator address
+/// must carry an attestation (the same `identity_hash` the asset layer
+/// gates on, granted through the attestor registry).
+pub(crate) fn check_join_admission<V: KvRead<Error = StorageError>>(view: &V, validator: &Address) -> anyhow::Result<()> {
+    if view.get(&ValidatorStatusKey(validator))? == Some(ValidatorStatus::Tombstoned) {
+        anyhow::bail!("{validator} is tombstoned and can never rejoin the validator set");
+    }
+    let params = view.get(&ChainParamsKey)?.unwrap_or_default();
+    if params.validator_attestation_required
+        && view.get(&AccountKey(validator))?.and_then(|e| e.identity_hash).is_none()
+    {
+        anyhow::bail!("{validator} has no attestation, and this chain requires one to validate");
+    }
+    Ok(())
+}
+
+/// A join never touches the active set directly: a newcomer waits as
+/// `Pending` for the boundary; a current member topping up stays `Active`;
+/// a jailed one stays jailed (more stake is not an early release); one that
+/// announced leaving and re-joins is back to waiting.
+fn status_after_join<V: KvRead<Error = StorageError>>(view: &V, validator: &Address) -> Result<ValidatorStatus, StorageError> {
+    Ok(match view.get(&ValidatorStatusKey(validator))? {
+        Some(ValidatorStatus::Active) => ValidatorStatus::Active,
+        Some(jailed @ ValidatorStatus::Jailed { .. }) => jailed,
+        _ => ValidatorStatus::Pending,
     })
+}
+
+/// Blocks an unbonding batch started at `height` stays locked for — see
+/// `circuit_staking::UNBONDING_EPOCHS`.
+fn unbonding_blocks<V: KvRead<Error = StorageError>>(view: &V) -> Result<u64, StorageError> {
+    Ok(circuit_staking::unbonding_blocks(view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length))
 }
 
 pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
@@ -159,13 +185,17 @@ pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
         validator,
         self_stake.active_amount,
         current_height,
+        unbonding_blocks(view)?,
     )?;
-    Ok(BlockUpdates {
-        accounts,
-        stakes,
-        validator_change: Some(ValidatorChange::Leave(validator.clone())),
-        ..Default::default()
-    })
+    // Keeps voting until the boundary; the stake is already unbonding and
+    // stays slashable for the whole unbonding window.
+    let epoch_length = view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length;
+    let mut updates = BlockUpdates { accounts, stakes, ..Default::default() };
+    updates.validator_statuses.0.insert(
+        validator.clone(),
+        Some(ValidatorStatus::Leaving { from_epoch: epoch_of(current_height, epoch_length) + 1 }),
+    );
+    Ok(updates)
 }
 
 /// MW-signature-only stake into a validator's sub-account
@@ -193,7 +223,7 @@ pub(crate) fn stake<V: KvRead<Error = StorageError>>(
 }
 
 /// MW-signature-only partial or full unstake, subject to
-/// `circuit_staking::UNBONDING_BLOCKS`. See `circuit_staking::apply_unstake`.
+/// `circuit_staking::UNBONDING_EPOCHS`. See `circuit_staking::apply_unstake`.
 /// There is deliberately no `Slash` variant — slashing is never
 /// user-submitted, so it's unreachable from RPC/mempool by construction
 /// (see `circuit_staking::apply_slash`).
@@ -211,6 +241,7 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
         validator,
         amount,
         current_height,
+        unbonding_blocks(view)?,
     )?;
     Ok(BlockUpdates {
         accounts,
@@ -288,7 +319,7 @@ mod tests {
             &no_bls_owner,
         )
         .unwrap();
-        assert!(matches!(updates.validator_change, Some(ValidatorChange::Leave(a)) if a == alice));
+        assert!(matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. }))));
     }
 
     #[test]
@@ -324,7 +355,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice)
+            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending)))
         );
         assert_eq!(
             updates.accounts.0.get(&alice).unwrap().balance,
@@ -499,7 +530,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice)
+            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. })))
         );
         let allocation = updates
             .stakes
@@ -518,7 +549,7 @@ mod tests {
         assert_eq!(unbonding.amount, MIN_VALIDATOR_STAKE);
         assert_eq!(
             unbonding.unlock_at_height,
-            5 + circuit_staking::UNBONDING_BLOCKS
+            5 + circuit_staking::unbonding_blocks(xc_primitives::ChainParams::default().epoch_length)
         );
         // No balance credited back yet — still sitting in the sub-account, slashable.
         assert_eq!(
@@ -642,7 +673,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice)
+            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending)))
         );
         // The operator's own balance funds a delegated join, same as a
         // third-party `Stake` action would.
@@ -717,7 +748,7 @@ mod tests {
         .unwrap();
 
         assert!(
-            matches!(updates.validator_change, Some(ValidatorChange::Leave(ref a)) if *a == alice)
+            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. })))
         );
         let allocation = updates
             .stakes
@@ -854,7 +885,7 @@ mod tests {
         .expect("a well-formed join must succeed");
 
         assert!(
-            matches!(updates.validator_change, Some(ValidatorChange::Join(ref a, _)) if *a == alice),
+            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending))),
             "the join itself must still be applied",
         );
         let registration = updates

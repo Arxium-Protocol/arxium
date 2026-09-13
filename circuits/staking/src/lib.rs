@@ -15,8 +15,16 @@ use xc_storage::{AccountUpdates, StakeUpdates, StorageError};
 /// the doc comments on the originals in `xc_primitives::state` for why.
 pub use xc_primitives::{reward_pool_account, stake_subaccount, treasury_account};
 
-/// Devnet stub — tune once real economics are decided.
-pub const UNBONDING_BLOCKS: u64 = 100;
+/// How long unstaked coins stay locked — and slashable — before they return
+/// to the master. In epochs, so it scales with the chain's own epoch length
+/// (`ChainParams::epoch_length`); see `unbonding_blocks`.
+pub const UNBONDING_EPOCHS: u64 = 21;
+
+/// `UNBONDING_EPOCHS` in blocks for a chain with `epoch_length`-block
+/// epochs — what `apply_unstake` adds to the current height.
+pub fn unbonding_blocks(epoch_length: u64) -> u64 {
+    UNBONDING_EPOCHS * epoch_length.max(1)
+}
 
 /// 4.3 ARX/block in IUM — whitepaper §9.1/9.3 Y1 target (750M-ARX pool,
 /// 15% of the 5B fixed non-mintable supply, emitted to validators).
@@ -42,13 +50,22 @@ pub const MAX_DELEGATION_PER_VALIDATOR: u128 = 10_000_000 * 1_000_000_000;
 /// stored block, so there's nothing to prove.
 const DOWNTIME_SLASH_BPS: u128 = 1;
 
-/// Stub taxonomy — no consensus fault-detection exists yet in this
-/// codebase; extend when a real fault detector lands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashReason {
     DoubleSign,
     Downtime,
     ExecutionFault,
+}
+
+impl SlashReason {
+    /// Whether this fault ends the validator's life on the chain. Downtime
+    /// jails (temporary); a signing or execution fault tombstones — and a
+    /// tombstoned validator is never slashed again for the same class of
+    /// fault, so a misconfigured signer replaying hundreds of old blocks is
+    /// punished once, not once per detection.
+    pub fn tombstones(self) -> bool {
+        !matches!(self, SlashReason::Downtime)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -213,6 +230,7 @@ pub fn apply_unstake<V: KvRead<Error = StorageError>>(
     validator: &Address,
     amount: u128,
     now_height: u64,
+    unbonding_blocks: u64,
 ) -> Result<(AccountUpdates, StakeUpdates), StakingError> {
     if amount == 0 {
         return Err(StakingError::ZeroAmount);
@@ -238,7 +256,7 @@ pub fn apply_unstake<V: KvRead<Error = StorageError>>(
     }
 
     existing.active_amount -= amount;
-    existing.unbonding = Some(Unbonding { amount, unlock_at_height: now_height + UNBONDING_BLOCKS });
+    existing.unbonding = Some(Unbonding { amount, unlock_at_height: now_height + unbonding_blocks });
     existing.updated_at = now_height;
     master_entry.nonce += 1;
 
@@ -299,8 +317,10 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
     // fail in for a money-boundary bug: worst case a slash burns less than
     // the ledger says, never the reverse.
     sub_entry.balance = sub_entry.balance.saturating_sub(slash_amount);
-    // ponytail: burned, not credited anywhere — deliberate v1 default. A
-    // treasury-credit would go right here once that circuit exists.
+    // Burned, not credited anywhere — all of it, every reason. A treasury
+    // that profits from punishing validators has an incentive problem and an
+    // ownership question nobody pre-incorporation can answer; burning is
+    // accretive to every other holder and reversible by governance later.
 
     let mut account_updates = BTreeMap::new();
     account_updates.insert(sub_account, sub_entry);
@@ -403,6 +423,8 @@ pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
 mod tests {
     use super::*;
     use xc_storage::ArxiumDb;
+
+    const UNBONDING_BLOCKS: u64 = 100;
 
     fn temp_db() -> ArxiumDb {
         let path = std::env::temp_dir().join(format!("arxium-test-staking-{}", uuid_like()));
@@ -516,6 +538,7 @@ mod tests {
             &validator,
             200,
             50,
+            UNBONDING_BLOCKS,
         )
         .unwrap();
         commit(&db, accounts, stakes);
@@ -556,6 +579,7 @@ mod tests {
             &validator,
             200,
             2,
+            UNBONDING_BLOCKS,
         )
         .unwrap();
         commit(&db, accounts, stakes);
@@ -567,6 +591,7 @@ mod tests {
             &validator,
             100,
             3,
+            UNBONDING_BLOCKS,
         )
         .unwrap_err();
         assert!(matches!(err, StakingError::AlreadyUnbonding { .. }));
@@ -596,6 +621,7 @@ mod tests {
             &validator,
             200,
             2,
+            UNBONDING_BLOCKS,
         )
         .unwrap();
         commit(&db, accounts, stakes);
@@ -616,6 +642,38 @@ mod tests {
         assert_eq!(allocation.unbonding.unwrap().amount, 150, "remainder spills into unbonding");
         let sub = stake_subaccount(&validator);
         assert_eq!(db.get_account(&sub).unwrap().unwrap().balance, 150, "burned, no credit anywhere");
+    }
+
+    /// D3: every slashed unit leaves circulation. Total supply (the sum of
+    /// every touched balance) drops by exactly the slash, and no account —
+    /// treasury included — is credited.
+    #[test]
+    fn slash_burns_the_full_amount_and_credits_nobody() {
+        let db = temp_db();
+        let master = addr(1);
+        let validator = addr(2);
+        write_balance(&db, &master, 1000);
+        let (accounts, stakes) = apply_stake(&db, &master, 0, &validator, 500, 1).unwrap();
+        commit(&db, accounts, stakes);
+        let before: u128 = [master.clone(), stake_subaccount(&validator), treasury_account(), reward_pool_account()]
+            .iter()
+            .map(|a| db.get_account(a).unwrap().map(|e| e.balance).unwrap_or(0))
+            .sum();
+
+        let (accounts, stakes) = apply_slash(&db, &validator, 120, SlashReason::ExecutionFault, 3).unwrap();
+        // Only the sub-account row changes, and only downward.
+        assert_eq!(accounts.0.len(), 1);
+        let (touched, entry) = accounts.0.iter().next().unwrap();
+        assert_eq!(*touched, stake_subaccount(&validator));
+        assert_eq!(entry.balance, 380);
+        commit(&db, accounts, stakes);
+
+        let after: u128 = [master.clone(), stake_subaccount(&validator), treasury_account(), reward_pool_account()]
+            .iter()
+            .map(|a| db.get_account(a).unwrap().map(|e| e.balance).unwrap_or(0))
+            .sum();
+        assert_eq!(before - after, 120);
+        assert_eq!(db.get_account(&treasury_account()).unwrap().map(|e| e.balance).unwrap_or(0), 0);
     }
 
     #[test]
@@ -682,6 +740,7 @@ mod tests {
             &validator,
             200,
             2,
+            UNBONDING_BLOCKS,
         )
         .unwrap();
         commit(&db, accounts, stakes);

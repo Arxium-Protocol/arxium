@@ -3,10 +3,11 @@
 
 use xc_bls::BlsPublicKey;
 use xc_circuit::{
-    BlsKeyKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey,
+    BlsKeyKey, ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey,
+    ValidatorStatusKey,
 };
 use xc_executor::BlockUpdates;
-use xc_primitives::Address;
+use xc_primitives::{Address, ValidatorStatus};
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
 
 use crate::staking::is_authorized;
@@ -77,38 +78,12 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
         );
     }
 
-    let masters = view
-        .get(&StakeByValidatorKey(&equivocator))?
-        .unwrap_or_default();
-    let master = masters
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("{equivocator} has no stake to slash for equivocation"))?;
-    let allocation = view
-        .get(&StakeKey {
-            master: &master,
-            validator: &equivocator,
-        })?
-        .ok_or_else(|| anyhow::anyhow!("{equivocator} has no active stake allocation to slash"))?;
-    let total =
-        allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
-
-    let (accounts, stakes) = circuit_staking::apply_slash(
-        view,
-        &equivocator,
-        xc_evidence::slash_amount(total),
-        circuit_staking::SlashReason::DoubleSign,
-        current_height,
-    )?;
-    Ok(BlockUpdates {
-        accounts,
-        stakes,
-        evidence: Some(EvidenceMarker {
-            height: block_a.height,
-            proposer: equivocator,
-        }),
-        ..Default::default()
-    })
+    let mut updates = fault_slash(view, &equivocator, circuit_staking::SlashReason::DoubleSign, current_height)?;
+    updates.evidence = Some(EvidenceMarker {
+        height: block_a.height,
+        proposer: equivocator,
+    });
+    Ok(updates)
 }
 
 /// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
@@ -272,38 +247,54 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         );
     }
 
-    let masters = view
-        .get(&StakeByValidatorKey(&culprit))?
-        .unwrap_or_default();
+    let mut updates = fault_slash(view, &culprit, reason, current_height)?;
+    updates.evidence = Some(EvidenceMarker {
+        height,
+        proposer: culprit,
+    });
+    Ok(updates)
+}
+
+/// The one slash for a tombstoning fault. A validator already
+/// `Tombstoned` is not slashed again — it was punished once for the class
+/// of fault, and every further artifact against it (a misconfigured signer
+/// replaying hundreds of old heights) records its marker and nothing else.
+/// Otherwise burns `xc_evidence::slash_amount` of its whole stake and
+/// tombstones it: permanent, address-scoped, no re-entry with any stake.
+fn fault_slash<V: KvRead<Error = StorageError>>(
+    view: &V,
+    culprit: &Address,
+    reason: circuit_staking::SlashReason,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    debug_assert!(reason.tombstones());
+    let mut updates = BlockUpdates::default();
+    if view.get(&ValidatorStatusKey(culprit))? == Some(ValidatorStatus::Tombstoned) {
+        return Ok(updates);
+    }
+    let masters = view.get(&StakeByValidatorKey(culprit))?.unwrap_or_default();
     let master = masters
         .first()
         .cloned()
-        .ok_or_else(|| anyhow::anyhow!("{culprit} has no stake to slash for an execution fault"))?;
+        .ok_or_else(|| anyhow::anyhow!("{culprit} has no stake to slash for {reason:?}"))?;
     let allocation = view
-        .get(&StakeKey {
-            master: &master,
-            validator: &culprit,
-        })?
+        .get(&StakeKey { master: &master, validator: culprit })?
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
-    let total =
-        allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let total = allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let (accounts, stakes) =
+        circuit_staking::apply_slash(view, culprit, xc_evidence::slash_amount(total), reason, current_height)?;
+    updates.accounts = accounts;
+    updates.stakes = stakes;
+    updates.validator_statuses.0.insert(culprit.clone(), Some(ValidatorStatus::Tombstoned));
+    Ok(updates)
+}
 
-    let (accounts, stakes) = circuit_staking::apply_slash(
-        view,
-        &culprit,
-        xc_evidence::slash_amount(total),
-        reason,
-        current_height,
-    )?;
-    Ok(BlockUpdates {
-        accounts,
-        stakes,
-        evidence: Some(EvidenceMarker {
-            height,
-            proposer: culprit,
-        }),
-        ..Default::default()
-    })
+/// First height of the epoch after the one `current_height` is in — when
+/// a key registered now starts verifying, so keys and membership activate
+/// together at the boundary.
+pub(crate) fn next_epoch_start<V: KvRead<Error = StorageError>>(view: &V, current_height: u64) -> Result<u64, StorageError> {
+    let epoch_length = view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length;
+    Ok(xc_primitives::boundary_of(xc_primitives::epoch_of(current_height, epoch_length), epoch_length) + 1)
 }
 
 /// Registers `validator`'s BLS pubkey for finality-certificate
@@ -331,12 +322,13 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
     }
     let previous_pubkey = view.get(&BlsKeyKey(validator))?;
     Ok(BlockUpdates {
-        // Effective one block later, same delay as `ValidatorSetSnapshot` —
-        // see `BlsKeyRegistration`'s doc comment.
+        // Effective at the next epoch boundary, when the set itself next
+        // changes — votes for the rest of this epoch verify under the old
+        // key (`get_bls_pubkey_at` is height-scoped).
         bls_key: Some(BlsKeyRegistration {
             address: validator.clone(),
             pubkey: xc_bls::BlsPublicKey(bytes),
-            effective_height: current_height + 1,
+            effective_height: next_epoch_start(view, current_height)?,
             previous_pubkey,
         }),
         ..Default::default()

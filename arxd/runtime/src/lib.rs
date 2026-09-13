@@ -15,6 +15,7 @@ mod account;
 pub mod adjudicate;
 mod asset;
 mod consensus;
+mod epoch;
 mod identity;
 mod pair;
 mod specs;
@@ -107,7 +108,7 @@ pub enum ActionPayload {
         amount: u128,
     },
     /// MW-signature-only partial or full unstake, subject to
-    /// `circuit_staking::UNBONDING_BLOCKS`. See `circuit_staking::apply_unstake`.
+    /// `circuit_staking::UNBONDING_EPOCHS`. See `circuit_staking::apply_unstake`.
     /// There is deliberately no `Slash` variant here — slashing is never
     /// user-submitted, so it's unreachable from RPC/mempool by construction
     /// (see `circuit_staking::apply_slash`).
@@ -406,6 +407,22 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
             let (downtime_accounts, downtime_stakes) =
                 circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
+            // A missed slot that actually cost stake also jails: out of the
+            // set from the next boundary, back the epoch after. Tombstoned
+            // stays tombstoned; a jail already running is left alone.
+            if !downtime_stakes.allocations.is_empty() {
+                let epoch_length = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default().epoch_length;
+                let jailed = xc_primitives::ValidatorStatus::Jailed {
+                    until_epoch: xc_primitives::epoch_of(height, epoch_length) + 2,
+                };
+                match view.get(&xc_circuit::ValidatorStatusKey(&primary))? {
+                    Some(xc_primitives::ValidatorStatus::Tombstoned)
+                    | Some(xc_primitives::ValidatorStatus::Jailed { .. }) => {}
+                    _ => {
+                        updates.validator_statuses.0.insert(primary.clone(), Some(jailed));
+                    }
+                }
+            }
             updates.accounts.0.extend(downtime_accounts.0);
             updates
                 .stakes
@@ -416,6 +433,11 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
                 .validator_index
                 .extend(downtime_stakes.validator_index);
         }
+        // Epoch boundary: the one place the set changes. Runs last so it
+        // sees this block's slash/jail above through the same view.
+        let boundary = epoch::boundary_hook(view, height)?;
+        updates.validator_statuses.0.extend(boundary.validator_statuses.0);
+        updates.validator_set = boundary.validator_set;
         Ok(updates)
     }
 
@@ -513,6 +535,7 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
             if !staking::is_authorized(&action.sender, validator, &operator_lookup)? {
                 anyhow::bail!("{} is not authorized to manage {validator}", action.sender);
             }
+            staking::check_join_admission(db, validator)?;
             let bytes = consensus::validated_bls_pubkey(bls_pubkey, bls_pop)?;
             if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
                 && &owner != validator
@@ -535,7 +558,7 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
             }
             let tip_height = db.get_tip_height()?.unwrap_or(0);
             let validators = db.get_validator_set_at(tip_height)?;
-            if !validators.contains(validator) {
+            if !validators.contains_key(validator) {
                 anyhow::bail!("{validator} is not a current validator");
             }
             if validators.len() <= 1 {
@@ -934,11 +957,7 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
-        db.write_batches(&[&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: validators.to_vec(),
-        }])
-        .unwrap();
+        db.write_batches(&[&ValidatorSetSnapshot::equal_power(0, validators)]).unwrap();
         db
     }
 
