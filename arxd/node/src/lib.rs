@@ -113,10 +113,12 @@ mod reject_severity_tests {
 mod dissent_cross_crate_tests {
     #[test]
     fn dissent_signing_bytes_match_across_crates() {
+        let genesis = [1u8; 32];
         let header_commitment = [4u8; 32];
         let ep = [7u8; 32];
         assert_eq!(
             arxd_finality::dissent_signing_bytes(
+                &genesis,
                 5,
                 "0xblock",
                 "0xstate",
@@ -125,6 +127,7 @@ mod dissent_cross_crate_tests {
                 "state_root_mismatch"
             ),
             xc_artifact::dissent_signing_bytes(
+                &genesis,
                 5,
                 "0xblock",
                 "0xstate",
@@ -141,10 +144,11 @@ mod dissent_cross_crate_tests {
     /// signed.
     #[test]
     fn precommit_signing_bytes_match_across_crates() {
+        let genesis = [1u8; 32];
         let ep = [7u8; 32];
         assert_eq!(
-            arxd_finality::precommit_signing_bytes(5, "0xblock", &ep),
-            xc_artifact::precommit_signing_bytes(5, "0xblock", &ep),
+            arxd_finality::precommit_signing_bytes(&genesis, 5, "0xblock", &ep),
+            xc_artifact::precommit_signing_bytes(&genesis, 5, "0xblock", &ep),
         );
     }
 
@@ -904,6 +908,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     let header_commitment: [u8; 32] =
                                         Sha256::digest(candidate.signing_bytes(proposer)).into();
                                     let msg = dissent_signing_bytes(
+                                        &genesis_hash,
                                         height,
                                         &block_hash,
                                         &state_root,
@@ -992,6 +997,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                             Ok(proofs) => {
                                                 let claim_msg =
                                                     xc_artifact::block_divergence_signing_bytes(
+                                                        &genesis_hash,
                                                         height,
                                                         &header_commitment,
                                                         &parent_state_root,

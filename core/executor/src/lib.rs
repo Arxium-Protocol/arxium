@@ -347,7 +347,7 @@ fn verify_round_certificate(
         pubkeys.push(pubkey);
     }
 
-    let msg = round_timeout_signing_bytes(height, round - 1, parent_hash);
+    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, height, round - 1, parent_hash);
     xc_bls::verify_aggregate(&msg, &pubkeys, &cert.aggregate_signature)
         .map_err(|_| AcceptBlockError::RoundCertificateInvalid { height, round })
 }
@@ -957,7 +957,11 @@ mod tests {
 
     fn temp_db() -> ArxiumDb {
         let path = std::env::temp_dir().join(format!("arxium-test-executor-{}", uuid_like()));
-        ArxiumDb::open(&path).unwrap()
+        let db = ArxiumDb::open(&path).unwrap();
+        // `verify_round_certificate` binds the genesis hash; seed one as
+        // `arxd/genesis` would.
+        db.write_batch(&xc_storage::GenesisHash(format!("0x{}", hex::encode([0xa1u8; 32])))).unwrap();
+        db
     }
 
     // ponytail: nanos alone collide often enough under parallel test

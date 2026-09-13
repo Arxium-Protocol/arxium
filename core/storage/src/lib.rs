@@ -81,6 +81,13 @@ pub enum StorageError {
     #[error("not a valid state root (expected \"0x\" + 64 hex chars): {0}")]
     InvalidRoot(String),
 
+    /// `GenesisHashKey` was never seeded (a database initialized before
+    /// `arxd/genesis` started writing it). Every BLS signing-bytes function
+    /// binds the genesis hash, so without it nothing can be signed or
+    /// verified — fail closed rather than sign for an unknown chain.
+    #[error("this chain has no seeded genesis hash (meta:genesis_hash) — re-initialize from the chain spec")]
+    MissingGenesisHash,
+
     /// Not produced by `ArxiumDb` itself — this is the sentinel a
     /// proof-backed, database-free `KvRead` implementation (Part 3 Stage 4's
     /// adjudicator) returns for a read it cannot answer either way: a key
@@ -1689,6 +1696,15 @@ impl ArxiumDb {
     /// `arxd/genesis`. `None` on a chain initialized before this was seeded.
     pub fn genesis_hash(&self) -> Result<Option<String>, StorageError> {
         KvRead::get(self, &GenesisHashKey)
+    }
+
+    /// `genesis_hash` as the raw 32 bytes every BLS signing-bytes function
+    /// (`precommit_signing_bytes`, `round_timeout_signing_bytes`, ...) binds,
+    /// so a signature from one Arxium chain can never verify on another.
+    /// Fails closed on an unseeded chain — see `StorageError::MissingGenesisHash`.
+    pub fn genesis_hash_bytes(&self) -> Result<[u8; 32], StorageError> {
+        let root = self.genesis_hash()?.ok_or(StorageError::MissingGenesisHash)?;
+        decode_root(&root)
     }
 }
 

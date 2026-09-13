@@ -40,7 +40,9 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 
 /// Frozen once shipped: an artifact written today must still verify in ten
 /// years, so this never changes meaning, only grows new `Fault` variants.
-pub const ARTIFACT_VERSION: u32 = 2;
+/// v3: every BLS signing-bytes function binds `genesis_hash`, so a v2
+/// artifact's signatures cannot be re-checked under v3 rules.
+pub const ARTIFACT_VERSION: u32 = 3;
 
 /// The fields a proposer's signature actually covers (mirrors
 /// `xc_primitives::block::BlockSigningPayload` byte-for-byte, so
@@ -149,7 +151,11 @@ pub struct DissentAttestation {
     pub signature: String,
 }
 
-const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v2";
+// Every domain tag below is followed by the chain's genesis hash, so a
+// signature produced on one Arxium chain can never verify on another —
+// `verify()` recomputes the message from the artifact's own `genesis_hash`,
+// which is what makes that field signature-bound rather than a bare claim.
+const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v3";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -163,6 +169,7 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// in `arxd/node/src/lib.rs` (the only crate that already depends on both),
 /// mirroring `signing_bytes_for`/`CanonicalHeader` above.
 pub fn dissent_signing_bytes(
+    genesis: &[u8; 32],
     height: u64,
     block_hash: &str,
     state_root: &str,
@@ -172,6 +179,7 @@ pub fn dissent_signing_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_DISSENT);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, state_root.as_bytes());
@@ -181,7 +189,7 @@ pub fn dissent_signing_bytes(
     buf
 }
 
-const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v2";
 
 /// One BLS-signed precommit vote, in the shape `verify()` can check on its
 /// own: the signing bytes are recomputed from `height`/`block_hash`/`ep`
@@ -210,16 +218,17 @@ pub struct PrecommitAttestation {
 /// `arxd_finality::precommit_signing_bytes` byte-for-byte, the same
 /// cross-crate duplication (and for the same reason) as
 /// `dissent_signing_bytes` above.
-pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+pub fn precommit_signing_bytes(genesis: &[u8; 32], height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_PRECOMMIT);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, ep);
     buf
 }
 
-const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v1";
+const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v2";
 
 /// The exact bytes a dissenter signs to stake a claim on a whole block's
 /// final state root — `Fault::BlockDivergence`'s unilateral counterpart to
@@ -229,6 +238,7 @@ const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v1";
 /// can't be recomputed by a verifier holding only this artifact), the
 /// agreed starting root, and the dissenter's own claimed final root.
 pub fn block_divergence_signing_bytes(
+    genesis: &[u8; 32],
     height: u64,
     header_commitment: &[u8; 32],
     parent_state_root: &str,
@@ -236,6 +246,7 @@ pub fn block_divergence_signing_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_BLOCK_DIVERGENCE);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, header_commitment);
     push_field(&mut buf, parent_state_root.as_bytes());
@@ -265,7 +276,7 @@ pub struct BlockDissentClaim {
     pub signature: String,
 }
 
-const DOMAIN_ACTION_CLAIM: &[u8] = b"arxium/action_claim/v1";
+const DOMAIN_ACTION_CLAIM: &[u8] = b"arxium/action_claim/v2";
 
 /// The exact bytes a party signs to stake a claim on one action's effect —
 /// binds height, position in the block, the action's own content (via its
@@ -275,6 +286,7 @@ const DOMAIN_ACTION_CLAIM: &[u8] = b"arxium/action_claim/v1";
 /// trusting anything the artifact merely asserts, same rule as
 /// `signing_bytes_for`/`dissent_signing_bytes` above.
 pub fn action_claim_signing_bytes(
+    genesis: &[u8; 32],
     height: u64,
     action_index: u64,
     action_bytes_hash: &[u8; 32],
@@ -283,6 +295,7 @@ pub fn action_claim_signing_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_ACTION_CLAIM);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, &action_index.to_le_bytes());
     push_field(&mut buf, action_bytes_hash);
@@ -695,6 +708,9 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
     if artifact.artifact_version != ARTIFACT_VERSION {
         return Err(VerifyError::UnsupportedVersion(artifact.artifact_version));
     }
+    // Every BLS message below is recomputed with this in it, so an artifact
+    // claiming the wrong chain simply fails signature verification.
+    let genesis = decode_hex_32("genesis_hash", &artifact.genesis_hash)?;
 
     match &artifact.fault {
         Fault::Equivocation { proposer_pubkey, height, blocks } => {
@@ -803,6 +819,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
 
             let dissent_msg = dissent_signing_bytes(
+                &genesis,
                 dissent.height,
                 &dissent.block_hash,
                 &dissent.state_root,
@@ -852,7 +869,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                     .try_into()
                     .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
 
-                let bytes = precommit_signing_bytes(precommit.height, &precommit.block_hash, &ep_bytes);
+                let bytes = precommit_signing_bytes(&genesis, precommit.height, &precommit.block_hash, &ep_bytes);
                 xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
                     .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
                 signed.push(bytes);
@@ -902,6 +919,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             }
 
             let proposed_msg = action_claim_signing_bytes(
+                &genesis,
                 *height,
                 *action_index,
                 &action_bytes_hash,
@@ -918,6 +936,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 .map_err(|_| VerifyError::ProposedClaimSignatureInvalid)?;
 
             let dissent_msg = action_claim_signing_bytes(
+                &genesis,
                 *height,
                 *action_index,
                 &action_bytes_hash,
@@ -988,6 +1007,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             }
 
             let dissent_msg = block_divergence_signing_bytes(
+                &genesis,
                 *height,
                 &header_commitment,
                 parent_state_root,
@@ -1017,6 +1037,13 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chain every test artifact claims; must be real 32-byte hex now
+    /// that `verify()` decodes it into the signed message.
+    pub(crate) const GENESIS: [u8; 32] = [0xa1; 32];
+    fn genesis_hex() -> String {
+        format!("0x{}", hex::encode(GENESIS))
+    }
     use ed25519_dalek::{Signer, SigningKey};
 
     fn header(height: u64, tx_root: u8, proposer: &str) -> CanonicalHeader {
@@ -1041,7 +1068,7 @@ mod tests {
         let pubkey = format!("0x{}", hex::encode(key.verifying_key().as_bytes()));
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::Equivocation { proposer_pubkey: pubkey, height, blocks },
             human_readable: serde_json::json!({}),
         }
@@ -1049,7 +1076,7 @@ mod tests {
 
     fn precommit(sk: &xc_bls::BlsSecretKey, height: u64, block_hash: &str, ep: u8) -> PrecommitAttestation {
         let ep = [ep; 32];
-        let signature = xc_bls::sign(sk, &precommit_signing_bytes(height, block_hash, &ep));
+        let signature = xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, height, block_hash, &ep));
         PrecommitAttestation {
             height,
             block_hash: block_hash.to_string(),
@@ -1061,7 +1088,7 @@ mod tests {
     fn precommit_artifact(pubkey: &BlsPublicKey, height: u64, precommits: [PrecommitAttestation; 2]) -> EvidenceArtifact {
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::PrecommitEquivocation {
                 voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
                 height,
@@ -1228,6 +1255,7 @@ mod tests {
     #[test]
     fn frozen_dissent_signing_bytes_vector() {
         let bytes = dissent_signing_bytes(
+            &[0xa1; 32],
             5,
             "0xblockhash",
             "0xstateroot",
@@ -1237,7 +1265,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(&bytes),
-            "110000000000000061727869756d2f64697373656e742f7632080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f742000000000000000090909090909090909090909090909090909090909090909090909090909090920000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
+            "110000000000000061727869756d2f64697373656e742f76332000000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f742000000000000000090909090909090909090909090909090909090909090909090909090909090920000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
         );
     }
 
@@ -1262,6 +1290,7 @@ mod tests {
         let header_commitment: [u8; 32] =
             Sha256::digest(signing_bytes_for(disputed_header).unwrap()).into();
         let msg = dissent_signing_bytes(
+            &GENESIS,
             height,
             "0xblockhash",
             state_root,
@@ -1295,7 +1324,7 @@ mod tests {
             dissent_attestation(voter_sk, voter_pubkey, height, "0xdifferentstate", &disputed_header);
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::ExecutionDisagreement {
                 proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
                 height,
@@ -1304,6 +1333,37 @@ mod tests {
             },
             human_readable: serde_json::json!({}),
         }
+    }
+
+    /// Cross-chain replay: a validator running one BLS key on two Arxium
+    /// networks. Its perfectly honest precommits at height H on each chain
+    /// (different block hashes) get wrapped in one artifact stamped with
+    /// chain A's genesis. `genesis_hash` used to be an unsigned label, so
+    /// chain A's `submit_execution_fault` would pass its string compare and
+    /// slash for a "double sign" that never happened on A. Now the message
+    /// binds the genesis, so a vote signed under B's genesis fails here.
+    #[test]
+    fn precommit_signed_for_another_chain_does_not_verify() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[5u8; 32]).unwrap();
+        let on_a = precommit(&sk, 5, "0xblock_on_a", 1);
+        let other_genesis = [0xb2u8; 32];
+        let ep = [2u8; 32];
+        let sig = xc_bls::sign(&sk, &precommit_signing_bytes(&other_genesis, 5, "0xblock_on_b", &ep));
+        let on_b = PrecommitAttestation {
+            height: 5,
+            block_hash: "0xblock_on_b".to_string(),
+            ep: format!("0x{}", hex::encode(ep)),
+            signature: format!("0x{}", hex::encode(sig.0)),
+        };
+        let art = precommit_artifact(&pk, 5, [on_a, on_b]);
+        assert!(matches!(verify(&art), Err(VerifyError::PrecommitSignatureInvalid(1))));
+
+        // And the label itself is now load-bearing: relabel a genuine
+        // artifact to another chain and every signature in it stops verifying.
+        let mut relabeled = precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xa", 1), precommit(&sk, 5, "0xb", 1)]);
+        assert!(verify(&relabeled).is_ok());
+        relabeled.genesis_hash = format!("0x{}", hex::encode(other_genesis));
+        assert!(matches!(verify(&relabeled), Err(VerifyError::PrecommitSignatureInvalid(0))));
     }
 
     /// The exploit this fix closes: a real dissent at height H, signed
@@ -1325,6 +1385,38 @@ mod tests {
             *proposed = attestation(&proposer, header(5, 99, "arx1proposer"));
         }
         assert!(matches!(verify(&art), Err(VerifyError::DissentTargetsDifferentBlock)));
+    }
+
+    /// Regenerates `tools/arx-verify/examples/disagreement.json` from the
+    /// same fixture `valid_execution_disagreement_verifies_as_disagreement_not_culpable`
+    /// checks, with the README's genesis. Re-run whenever the signing bytes
+    /// or `ARTIFACT_VERSION` change:
+    /// `cargo test -p xc-artifact regenerate_arx_verify_disagreement_example -- --ignored`
+    #[test]
+    #[ignore]
+    fn regenerate_arx_verify_disagreement_example() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let mut art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
+        art.genesis_hash = "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff".to_string();
+        // The README's genesis, not the tests' — re-sign the dissent for it.
+        let genesis = decode_hex_32("genesis_hash", &art.genesis_hash).unwrap();
+        let Fault::ExecutionDisagreement { proposed, dissent, .. } = &mut art.fault else { unreachable!() };
+        let msg = dissent_signing_bytes(
+            &genesis,
+            dissent.height,
+            &dissent.block_hash,
+            &dissent.state_root,
+            &decode_hex_32("header_commitment", &dissent.header_commitment).unwrap(),
+            &decode_hex_32("ep", &dissent.ep).unwrap(),
+            &dissent.reason,
+        );
+        dissent.signature = format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &msg).0));
+        let _ = proposed;
+        art.human_readable = serde_json::json!({ "note": "devnet soak run, height 5" });
+        verify(&art).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/arx-verify/examples/disagreement.json");
+        std::fs::write(path, serde_json::to_string_pretty(&art).unwrap() + "\n").unwrap();
     }
 
     #[test]
@@ -1361,7 +1453,7 @@ mod tests {
         let dissent = dissent_attestation(&voter_sk, &voter_pk, 5, "0xstate", &disputed_header);
         let art = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::ExecutionDisagreement {
                 proposer_pubkey: format!("0x{}", hex::encode(proposer.verifying_key().as_bytes())),
                 height: 5,
@@ -1395,34 +1487,34 @@ mod tests {
     /// differently between the signer and verifier).
     #[test]
     fn dissent_signing_bytes_is_deterministic_and_field_sensitive() {
-        let base = dissent_signing_bytes(5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch");
+        let base = dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch");
         assert_eq!(
             base,
-            dissent_signing_bytes(5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(6, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 6, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(5, "0xother", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xother", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(5, "0xblock", "0xother", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xother", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(5, "0xblock", "0xstate", &[8u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[8u8; 32], &[1u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(5, "0xblock", "0xstate", &[9u8; 32], &[2u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[2u8; 32], "state_root_mismatch")
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "action_mismatch")
+            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "action_mismatch")
         );
     }
 
@@ -1500,6 +1592,7 @@ mod tests {
         ) -> ActionClaim {
             let action_bytes_hash: [u8; 32] = Sha256::digest(&fx.action_bytes).into();
             let msg = action_claim_signing_bytes(
+                &GENESIS,
                 fx.height,
                 fx.action_index,
                 &action_bytes_hash,
@@ -1525,7 +1618,7 @@ mod tests {
         fn artifact_with(fx: &Fixture, proposed_claim: ActionClaim, dissent_claim: ActionClaim) -> EvidenceArtifact {
             EvidenceArtifact {
                 artifact_version: ARTIFACT_VERSION,
-                genesis_hash: "0xgenesis".to_string(),
+                genesis_hash: genesis_hex(),
                 fault: Fault::ActionDivergence {
                     proposer_pubkey: format!("0x{}", hex::encode(fx.proposer_key.verifying_key().as_bytes())),
                     voter_pubkey: format!("0x{}", hex::encode(fx.voter_pk.0)),
@@ -1745,7 +1838,7 @@ mod tests {
             let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
             let parent_state_root = format!("0x{}", hex::encode(parent_root));
             let computed_state_root = format!("0x{}", hex::encode(computed_root));
-            let msg = block_divergence_signing_bytes(fx.height, &header_commitment, &parent_state_root, &computed_state_root);
+            let msg = block_divergence_signing_bytes(&GENESIS, fx.height, &header_commitment, &parent_state_root, &computed_state_root);
             BlockDissentClaim {
                 computed_state_root,
                 proofs,
@@ -1761,7 +1854,7 @@ mod tests {
         ) -> EvidenceArtifact {
             EvidenceArtifact {
                 artifact_version: ARTIFACT_VERSION,
-                genesis_hash: "0xgenesis".to_string(),
+                genesis_hash: genesis_hex(),
                 fault: Fault::BlockDivergence {
                     proposer_pubkey: format!("0x{}", hex::encode(fx.proposer_key.verifying_key().as_bytes())),
                     voter_pubkey: format!("0x{}", hex::encode(fx.voter_pk.0)),

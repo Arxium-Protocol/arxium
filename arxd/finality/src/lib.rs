@@ -25,9 +25,11 @@ type VoteTallies = HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, Bls
 
 // Domain tags, mixed into what gets signed, so a signature over a precommit
 // can never be replayed as a dissent (or a round-timeout vote, or vice versa)
-// even though they can share fields (height).
-const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v1";
-const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v2";
+// even though they can share fields (height). The chain's genesis hash
+// follows the tag so it can't be replayed on another Arxium chain either
+// (`ArxiumDb::genesis_hash_bytes` is where every site here gets it).
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v2";
+const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v3";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -35,9 +37,10 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Exact bytes a validator signs for a precommit vote.
-pub fn precommit_signing_bytes(height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+pub fn precommit_signing_bytes(genesis: &[u8; 32], height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_PRECOMMIT);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, ep);
@@ -91,7 +94,10 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
         }
     }
 
-    let msg = precommit_signing_bytes(record.height, &record.block_hash, &record.ep);
+    let Ok(genesis) = db.genesis_hash_bytes() else {
+        return false;
+    };
+    let msg = precommit_signing_bytes(&genesis, record.height, &record.block_hash, &record.ep);
     xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).is_ok()
 }
 
@@ -103,6 +109,7 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
 /// in `arxd/node/src/lib.rs` (the only crate that already depends on both),
 /// mirroring `xc_artifact::signing_bytes_for` vs. `core/primitives`.
 pub fn dissent_signing_bytes(
+    genesis: &[u8; 32],
     height: u64,
     block_hash: &str,
     state_root: &str,
@@ -112,6 +119,7 @@ pub fn dissent_signing_bytes(
 ) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_DISSENT);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, state_root.as_bytes());
@@ -439,6 +447,16 @@ where
             Err(err) => warn!("finality: failed to reload persisted round-timeout votes: {err}"),
         }
 
+        // Read once: it never changes, and every vote this thread signs
+        // binds it. An unseeded chain can't sign for anyone, so stop here.
+        let genesis = match db.genesis_hash_bytes() {
+            Ok(genesis) => genesis,
+            Err(err) => {
+                warn!("finality: cannot sign votes without a genesis hash, stopping: {err}");
+                return;
+            }
+        };
+
         loop {
             let event = match events.recv_timeout(VOTE_REBROADCAST_INTERVAL) {
                 Ok(event) => event,
@@ -471,6 +489,7 @@ where
                                     match db.get_block::<P>(next_height.saturating_sub(1)) {
                                         Ok(Some(parent)) => {
                                             let msg = round_timeout_signing_bytes(
+                                                &genesis,
                                                 next_height,
                                                 round,
                                                 &parent.hash(),
@@ -612,7 +631,7 @@ where
                     };
                     let ep =
                         xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root);
-                    let msg = precommit_signing_bytes(block.height, &hash, &ep);
+                    let msg = precommit_signing_bytes(&genesis, block.height, &hash, &ep);
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {
                         height: block.height,
@@ -689,7 +708,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = precommit_signing_bytes(vote.height, &vote.block_hash, &vote.ep);
+    let msg = precommit_signing_bytes(&db.genesis_hash_bytes()?, vote.height, &vote.block_hash, &vote.ep);
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping vote from {} with an invalid signature",
@@ -896,7 +915,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = round_timeout_signing_bytes(vote.height, vote.round, &parent.hash());
+    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, vote.height, vote.round, &parent.hash());
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping round-timeout vote from {} with an invalid signature",
@@ -1002,6 +1021,7 @@ fn handle_dissent(
     };
     let reason = dissent.reason.as_str();
     let msg = dissent_signing_bytes(
+        &db.genesis_hash_bytes()?,
         dissent.height,
         &dissent.block_hash,
         &dissent.state_root,
@@ -1094,8 +1114,15 @@ mod tests {
                 .as_nanos(),
             COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        (ArxiumDb::open(&dir).expect("open test db"), dir)
+        let db = ArxiumDb::open(&dir).expect("open test db");
+        // Every signing-bytes function binds the genesis hash, so a test DB
+        // must have one seeded exactly like `arxd/genesis` does.
+        db.write_batch(&xc_storage::GenesisHash(format!("0x{}", hex::encode(GENESIS))))
+            .expect("seed genesis hash");
+        (db, dir)
     }
+
+    const GENESIS: [u8; 32] = [0xa1; 32];
 
     /// Pins `dissent_signing_bytes`'s exact output against a hardcoded hex
     /// vector, twinned with `frozen_dissent_signing_bytes_vector` in
@@ -1109,6 +1136,7 @@ mod tests {
     #[test]
     fn frozen_dissent_signing_bytes_vector() {
         let bytes = dissent_signing_bytes(
+            &[0xa1; 32],
             5,
             "0xblockhash",
             "0xstateroot",
@@ -1118,7 +1146,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(&bytes),
-            "110000000000000061727869756d2f64697373656e742f7632080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f742000000000000000090909090909090909090909090909090909090909090909090909090909090920000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
+            "110000000000000061727869756d2f64697373656e742f76332000000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1080000000000000005000000000000000b000000000000003078626c6f636b686173680b0000000000000030787374617465726f6f742000000000000000090909090909090909090909090909090909090909090909090909090909090920000000000000000707070707070707070707070707070707070707070707070707070707070707130000000000000073746174655f726f6f745f6d69736d61746368",
         );
     }
 
@@ -1232,7 +1260,7 @@ mod tests {
             height: 5,
             block_hash: block_hash.to_string(),
             voter: addr.clone(),
-            signature: xc_bls::sign(&sk, &precommit_signing_bytes(5, block_hash, &ep)),
+            signature: xc_bls::sign(&sk, &precommit_signing_bytes(&GENESIS, 5, block_hash, &ep)),
             ep,
         };
         let mut tally = |v: PrecommitVote| {
@@ -1301,7 +1329,7 @@ mod tests {
                 height: 5,
                 block_hash: block_hash.clone(),
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1313,7 +1341,7 @@ mod tests {
             height: 5,
             block_hash: block_hash.clone(),
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
             ep,
         };
         tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1366,7 +1394,7 @@ mod tests {
                 height: 5,
                 block_hash: block_hash.clone(),
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1401,7 +1429,7 @@ mod tests {
             height: 5,
             block_hash: block_hash.clone(),
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
             ep,
         };
         tally_vote::<()>(
@@ -1466,7 +1494,7 @@ mod tests {
                 height: 5,
                 block_hash: block_hash.clone(),
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1509,6 +1537,7 @@ mod tests {
         let ep = [9u8; 32];
         let reason = DissentReason::StateRootMismatch;
         let msg = dissent_signing_bytes(
+            &GENESIS,
             height,
             block_hash,
             &state_root,
@@ -2011,7 +2040,7 @@ mod tests {
             height,
             round,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(height, round, parent_hash)),
+            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(&GENESIS, height, round, parent_hash)),
         }
     }
 

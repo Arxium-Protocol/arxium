@@ -651,6 +651,12 @@ mod tests {
     use xc_artifact::{ARTIFACT_VERSION, StateProof};
     use xc_storage::{AccountUpdates, ArxiumDb};
 
+    /// The chain every test artifact claims; bound into each BLS message.
+    const GENESIS: [u8; 32] = [0xa1; 32];
+    fn genesis_hex() -> String {
+        format!("0x{}", hex::encode(GENESIS))
+    }
+
     fn temp_db() -> ArxiumDb {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -823,6 +829,7 @@ mod tests {
         let action_index = 0u64;
 
         let proposed_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -840,6 +847,7 @@ mod tests {
         };
 
         let dissent_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -859,7 +867,7 @@ mod tests {
         Scenario {
             artifact: EvidenceArtifact {
                 artifact_version: ARTIFACT_VERSION,
-                genesis_hash: "0xgenesis".to_string(),
+                genesis_hash: genesis_hex(),
                 fault: Fault::ActionDivergence {
                     proposer_pubkey,
                     voter_pubkey: voter_pubkey.clone(),
@@ -952,6 +960,7 @@ mod tests {
         let action_index = 0u64;
 
         let proposed_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -959,6 +968,7 @@ mod tests {
             &fake_post_a,
         );
         let dissent_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -968,7 +978,7 @@ mod tests {
 
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::ActionDivergence {
                 proposer_pubkey: format!(
                     "0x{}",
@@ -1125,6 +1135,7 @@ mod tests {
         let action_index = 0u64;
 
         let proposed_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -1142,6 +1153,7 @@ mod tests {
         };
 
         let dissent_msg = xc_artifact::action_claim_signing_bytes(
+            &GENESIS,
             height,
             action_index,
             &action_bytes_hash,
@@ -1158,7 +1170,7 @@ mod tests {
         let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::ActionDivergence {
                 proposer_pubkey: format!(
                     "0x{}",
@@ -1283,6 +1295,7 @@ mod tests {
         };
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
         let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            &GENESIS,
             5,
             &header_commitment,
             &parent_root,
@@ -1294,7 +1307,7 @@ mod tests {
 
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::BlockDivergence {
                 proposer_pubkey: proposer_pubkey.clone(),
                 voter_pubkey: voter_pubkey.clone(),
@@ -1375,6 +1388,7 @@ mod tests {
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&bogus_bytes).into();
         let (voter_sk, _) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            &GENESIS,
             5,
             &header_commitment,
             parent_state_root,
@@ -1489,6 +1503,7 @@ mod tests {
         };
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
         let dissent_msg = xc_artifact::block_divergence_signing_bytes(
+            &GENESIS,
             5,
             &header_commitment,
             &parent_root,
@@ -1497,7 +1512,7 @@ mod tests {
 
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
-            genesis_hash: "0xgenesis".to_string(),
+            genesis_hash: genesis_hex(),
             fault: Fault::BlockDivergence {
                 proposer_pubkey: format!(
                     "0x{}",

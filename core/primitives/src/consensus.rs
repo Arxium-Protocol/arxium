@@ -104,8 +104,11 @@ pub struct RoundCertificate {
 }
 
 // Domain tag, mixed into what gets signed, so a round-timeout vote can never
-// be replayed as some other kind of signed message.
-const DOMAIN_ROUND_TIMEOUT: &[u8] = b"arxium/round_timeout/v2";
+// be replayed as some other kind of signed message. The genesis hash is
+// pushed right after it (v3) so a vote can't be replayed on another Arxium
+// chain either — gossip topics keep the wrong chain's votes from arriving,
+// this keeps them from *verifying* if they do.
+const DOMAIN_ROUND_TIMEOUT: &[u8] = b"arxium/round_timeout/v3";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
@@ -121,11 +124,14 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// Binds `parent_hash` (v2; v1 bound only `height`/`round`) — without it, a
 /// vote saying "height H round R timed out" verifies against any parent, so
 /// it is replayable across competing histories at the same height. Binding
-/// the parent makes a certificate meaningful only for the specific chain it
-/// was signed against.
-pub fn round_timeout_signing_bytes(height: u64, round: u32, parent_hash: &str) -> Vec<u8> {
+/// the parent makes a certificate meaningful only for the specific history
+/// it was signed against; binding `genesis` (v3) makes it meaningful only
+/// for the specific *chain* — a validator running one BLS key on two Arxium
+/// networks can't have a vote from one counted on the other.
+pub fn round_timeout_signing_bytes(genesis: &[u8; 32], height: u64, round: u32, parent_hash: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_ROUND_TIMEOUT);
+    push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
     push_field(&mut buf, &round.to_le_bytes());
     push_field(&mut buf, parent_hash.as_bytes());

@@ -444,7 +444,7 @@ mod tests {
                     hex::encode(
                         xc_bls::sign(
                             &sk,
-                            &xc_artifact::precommit_signing_bytes(5, block_hash, &ep)
+                            &xc_artifact::precommit_signing_bytes(&[0xa1; 32], 5, block_hash, &ep)
                         )
                         .0
                     )
@@ -453,7 +453,7 @@ mod tests {
         };
         let artifact = xc_artifact::EvidenceArtifact {
             artifact_version: xc_artifact::ARTIFACT_VERSION,
-            genesis_hash: "0xfeed".to_string(),
+            genesis_hash: format!("0x{}", hex::encode([0xa1u8; 32])),
             fault: xc_artifact::Fault::PrecommitEquivocation {
                 voter_pubkey: format!("0x{}", hex::encode(pk.0)),
                 height: 5,
@@ -483,7 +483,7 @@ mod tests {
         );
         view.put(&StakeByValidatorKey(&voter), &vec![voter.clone()])
             .unwrap();
-        view.put(&GenesisHashKey, &"feed".to_string()).unwrap();
+        view.put(&GenesisHashKey, &hex::encode([0xa1u8; 32])).unwrap();
 
         // The culprit signs with a BLS key, which has no address derivation —
         // the registry lookup is the only way back to who gets slashed.

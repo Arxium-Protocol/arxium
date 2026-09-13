@@ -1,5 +1,5 @@
 {
-  "artifact_version": 2,
+  "artifact_version": 3,
   "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
   "fault": "execution_disagreement",
   "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
@@ -25,7 +25,7 @@
     "reason": "state_root_mismatch",
     "voter": "arx1voter",
     "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b",
-    "signature": "0x95df08766e56845d1f4deb3828377d2a753f576da76b4d783aa8b290d1eb5a7fa163a2c9b389123305ebca220adf5f7512f6eeab6c77c402a1240300de3b90a699ae8de5f769ef78a8acc42fef28994a54a49944bf8f6db53008fa20a5738719"
+    "signature": "0x97a9484c0aa6cd1ac1e7fbc2c69d6ed68c5e2339d58bb89dafd6730b5cb7f516080be2beced7c99128c47a73bacabd880de6d09fd3829880fb61beac4eb2abc72b793f9d4edfa35aa2f19484d356f5bcdb54af10513a7b4c883f2030b3fe2c10"
   },
   "human_readable": {
     "note": "devnet soak run, height 5"
