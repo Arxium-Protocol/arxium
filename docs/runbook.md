@@ -319,7 +319,7 @@ curl -s localhost:30333/finality
 Quorum is by **voting power**, not head-count: every epoch the active set's
 stake is mapped onto 10,000 units of power (capped at 10% per validator once
 the set is past ten), and a certificate needs signers holding at least 6,667
-of them. `GET /validators` lists each member's power. `quorum_reachable` is
+of them. `GET /validators` lists the members; `GET /validators/power` their power. `quorum_reachable` is
 therefore about how much *power* holds a BLS key — one keyless validator that
 happens to hold a large share can block finality on its own.
 
@@ -789,8 +789,8 @@ keys and membership always activate together.
 
 All slashed stake is burned; nothing is credited to the treasury.
 
-`GET /validators` returns `{address: voting_power}` for the set at the tip
-(or `?height=`). A validator's own status has no RPC yet — read it from the
+`GET /validators` returns the sorted member list at the tip (or `?height=`),
+`GET /validators/power` the same set as `{address: voting_power}`. A validator's own status has no RPC yet — read it from the
 node log at the boundary, or from Retracer once it renders the new statuses.
 
 ## Divergence recovery — live-proven 2026-09-08

@@ -454,6 +454,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/attestors", get(get_attestors::<P>))
                 .route("/attestors/{address}", get(get_attestor::<P>))
                 .route("/validators", get(get_validators::<P>))
+                .route("/validators/power", get(get_validator_power::<P>))
                 .route("/finality", get(get_finality::<P>))
                 .route("/operators/{address}/validators", get(get_operator_validators::<P>))
                 .route(
@@ -1192,8 +1193,34 @@ async fn get_validators<P: Payload>(
         None => tip_height,
     };
 
-    // `{address: voting_power}` — was a bare address list before the set
-    // went stake-weighted; the keys are the old list.
+    // Membership only, sorted — the shape Retracer's uptime view and the
+    // proposer formula (`sorted(set)[height % len]`) consume. Weights are
+    // on `/validators/power`.
+    match state.db.validator_addresses_at(height) {
+        Ok(validators) => Json(validators).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `{address: voting_power}` for the set at `?height=` (default: tip) —
+/// the units `GET /finality`'s `quorum` is measured in.
+async fn get_validator_power<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(query): Query<ValidatorSetQuery>,
+) -> Response {
+    let tip_height = match state.db.get_tip_height() {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let height = match query.height {
+        Some(requested) if requested > tip_height => {
+            return (StatusCode::BAD_REQUEST, format!("height {requested} is above the chain tip {tip_height}"))
+                .into_response();
+        }
+        Some(requested) => requested,
+        None => tip_height,
+    };
     match state.db.get_validator_set_at(height) {
         Ok(validators) => Json(validators.into_iter().map(|(a, p)| (a.to_string(), p.0)).collect::<BTreeMap<_, _>>())
             .into_response(),
