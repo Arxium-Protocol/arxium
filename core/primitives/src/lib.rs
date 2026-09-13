@@ -10,6 +10,7 @@ mod block;
 mod consensus;
 pub mod keyfile;
 mod state;
+mod validator_set;
 
 pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
@@ -17,6 +18,10 @@ pub use block::{Block, RawBlock};
 pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, quorum,
     round_timeout_signing_bytes,
+};
+pub use validator_set::{
+    QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
+    is_boundary, power_cap, quorum_reached, signed_power,
 };
 pub use state::{
     HolderState,
