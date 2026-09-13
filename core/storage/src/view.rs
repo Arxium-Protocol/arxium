@@ -118,6 +118,24 @@ impl<'a> BlockView<'a> {
     /// view instead of a deferred `Vec`: without it, a same-block
     /// `RegisterAsset` followed by `IssueAsset` or a duplicate
     /// `RegisterAsset` reads stale (pre-block) state.
+    pub fn apply_validator_statuses(&mut self, updates: &ValidatorStatusUpdates) -> Result<(), StorageError> {
+        for (address, status) in &updates.0 {
+            match status {
+                Some(status) => self.put(&ValidatorStatusKey(address), status)?,
+                None => self.delete(&ValidatorStatusKey(address)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The database under this overlay, for range scans the overlay can't
+    /// answer (there is no prefix iteration over an in-memory diff). Read
+    /// single keys back through the view afterwards so in-block changes to
+    /// the scanned rows are still seen.
+    pub fn db(&self) -> &'a ArxiumDb {
+        self.db
+    }
+
     pub fn apply_asset_registration(&mut self, asset: &Asset) -> Result<(), StorageError> {
         self.put(&AssetKey(&asset.asset_id), asset)
     }

@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
-use xc_primitives::{Address, Block, quorum, round_timeout_signing_bytes};
+use xc_primitives::{Address, Block, quorum_reached, round_timeout_signing_bytes};
 use xc_storage::{
     ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord, RoundCertificate,
     RoundTimeoutVoteRecord,
@@ -77,10 +77,10 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
     if unique.len() != record.signers.len() {
         return false;
     }
-    if !unique.iter().all(|signer| validators.contains(signer)) {
+    if !unique.iter().all(|signer| validators.contains_key(signer)) {
         return false;
     }
-    if record.signers.len() < quorum(validators.len()) {
+    if !quorum_reached(&validators, record.signers.iter()) {
         return false;
     }
 
@@ -718,7 +718,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     }
 
     let validators = db.get_validator_set_at(vote.height)?;
-    if !validators.contains(&vote.voter) {
+    if !validators.contains_key(&vote.voter) {
         warn!(
             "finality: dropping vote from {}, not a validator at height {}",
             vote.voter, vote.height
@@ -786,7 +786,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     // reaching quorum still leaves it recoverable on restart.
     db.write_batches(&[&vote_record])?;
 
-    if signers.len() < quorum(validators.len()) {
+    if !quorum_reached(&validators, signers.keys()) {
         return Ok(());
     }
 
@@ -925,7 +925,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     }
 
     let validators = db.get_validator_set_at(vote.height)?;
-    if !validators.contains(&vote.voter) {
+    if !validators.contains_key(&vote.voter) {
         warn!(
             "finality: dropping round-timeout vote from {}, not a validator at height {}",
             vote.voter, vote.height
@@ -948,7 +948,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     // reaching quorum still leaves it recoverable on restart.
     db.write_batches(&[&vote_record])?;
 
-    if signers.len() < quorum(validators.len()) {
+    if !quorum_reached(&validators, signers.keys()) {
         return Ok(());
     }
 
@@ -1038,7 +1038,7 @@ fn handle_dissent(
     }
 
     let validators = db.get_validator_set_at(dissent.height)?;
-    if !validators.contains(&dissent.voter) {
+    if !validators.contains_key(&dissent.voter) {
         warn!(
             "finality: dropping dissent from {}, not a validator at height {}",
             dissent.voter, dissent.height
@@ -1249,7 +1249,7 @@ mod tests {
             let key = SigningKey::from_bytes(&[i; 32]);
             validators.push(Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap());
         }
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
             .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1284,12 +1284,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Equal stakes: 3 of 4 (7,500) reach `QUORUM_POWER`, 2 of 4 (5,000)
+    /// don't — same head-counts as the old 2/3+1 rule, now by power.
     #[test]
-    fn quorum_is_two_thirds_plus_one() {
-        assert_eq!(quorum(1), 1);
-        assert_eq!(quorum(3), 3);
-        assert_eq!(quorum(4), 3);
-        assert_eq!(quorum(7), 5);
+    fn equal_power_quorum_matches_the_old_head_count() {
+        let addrs: Vec<Address> = (1u8..=4).map(|i| Address::from_pubkey_bytes(&[i; 32]).unwrap()).collect();
+        let set = xc_storage::ValidatorSetSnapshot::equal_power(0, &addrs).validators;
+        assert!(!quorum_reached(&set, addrs.iter().take(2)));
+        assert!(quorum_reached(&set, addrs.iter().take(3)));
     }
 
     #[test]
@@ -1311,10 +1313,7 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: validators.clone(),
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1375,10 +1374,7 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators,
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1456,7 +1452,7 @@ mod tests {
     #[test]
     fn votes_agreeing_on_block_hash_but_disagreeing_on_ep_do_not_aggregate() {
         let (db, dir) = open_test_db();
-        let addrs_and_keys: Vec<(Address, BlsSecretKey)> = (0u8..3)
+        let addrs_and_keys: Vec<(Address, BlsSecretKey)> = (0u8..4)
             .map(|i| {
                 let ed_key = SigningKey::from_bytes(&[i + 1; 32]);
                 let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
@@ -1472,10 +1468,7 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators,
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1485,8 +1478,8 @@ mod tests {
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
 
-        // quorum() of 3 validators is 3 — two votes on ep_a, one on ep_b:
-        // neither group reaches quorum even though all three agree on
+        // Four equal validators (2,500 each) — two votes on ep_a, two on
+        // ep_b: neither group reaches quorum even though all four agree on
         // block_hash.
         for (i, (addr, sk)) in addrs_and_keys.iter().enumerate() {
             let ep = if i < 2 { ep_a } else { ep_b };
@@ -1520,7 +1513,7 @@ mod tests {
                 .get(&(block_hash, ep_b))
                 .unwrap()
                 .len(),
-            1
+            2
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1570,10 +1563,7 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
         .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
@@ -1602,10 +1592,7 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
         .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
@@ -1647,10 +1634,7 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
         .unwrap();
 
         // Signed with a key that doesn't match the registered pubkey for `addr`.
@@ -1689,10 +1673,7 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
         .unwrap();
 
         let (event_tx, event_rx) = mpsc::channel();
@@ -1794,10 +1775,7 @@ mod tests {
                 effective_height: 0,
                 previous_pubkey: None,
             },
-            &xc_storage::ValidatorSetSnapshot {
-                effective_height: 0,
-                validators: vec![addr.clone(), peer],
-            },
+            &xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone(), peer]),
         ])
         .unwrap();
 
@@ -1986,11 +1964,8 @@ mod tests {
     /// so a change there cannot silently alter what counts as final.
     #[test]
     fn quorum_matches_the_shared_consensus_rule() {
-        assert_eq!(quorum(1), 1);
-        assert_eq!(quorum(2), 2);
-        assert_eq!(quorum(3), 3);
-        assert_eq!(quorum(4), 3);
-        assert_eq!(quorum(7), 5);
+        assert_eq!(xc_primitives::QUORUM_POWER, 6_667);
+        assert_eq!(xc_primitives::TOTAL_VOTING_POWER, 10_000);
     }
 
     fn round_timeout_validators(db: &ArxiumDb, count: u8) -> Vec<(Address, BlsSecretKey)> {
@@ -2010,10 +1985,7 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
-            effective_height: 0,
-            validators,
-        }])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
         .unwrap();
         addrs_and_keys
     }
@@ -2042,6 +2014,79 @@ mod tests {
             voter: addr.clone(),
             signature: xc_bls::sign(sk, &round_timeout_signing_bytes(&GENESIS, height, round, parent_hash)),
         }
+    }
+
+    /// Twelve validators with a BLS key each: four "large" at the 1,000 cap
+    /// and eight small at 750. Used by the weighted-quorum tests below.
+    fn weighted_validators(db: &ArxiumDb) -> Vec<(Address, BlsSecretKey)> {
+        let addrs_and_keys = round_timeout_validators(db, 12);
+        let stakes: std::collections::BTreeMap<Address, u128> = addrs_and_keys
+            .iter()
+            .enumerate()
+            .map(|(i, (a, _))| (a.clone(), if i < 4 { 100 } else { 10 }))
+            .collect();
+        let validators = xc_primitives::assign_voting_power(&stakes);
+        assert_eq!(validators[&addrs_and_keys[0].0], xc_primitives::VotingPower(1_000));
+        assert_eq!(validators[&addrs_and_keys[11].0], xc_primitives::VotingPower(750));
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        addrs_and_keys
+    }
+
+    /// V2, precommit path: eight small signers (8 of 12 by count, 6,000 by
+    /// power) do not finalize — under the old 2/3+1 head-count rule (9 of
+    /// 12) they wouldn't either, but four large + four small (8 of 12,
+    /// 7,000) now does, and nine small-only signers wouldn't verify.
+    #[test]
+    fn precommit_quorum_is_by_power_not_head_count() {
+        let (db, dir) = open_test_db();
+        let keys = weighted_validators(&db);
+        let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
+        let ep = [1u8; 32];
+        let vote = |i: usize| PrecommitVote {
+            height: 5,
+            block_hash: block_hash.clone(),
+            voter: keys[i].0.clone(),
+            signature: xc_bls::sign(&keys[i].1, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+            ep,
+        };
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+        for i in 4..12 {
+            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(i)).unwrap();
+        }
+        assert!(db.get_finality_record(5).unwrap().is_none(), "8 small signers hold 6,000 < 6,667");
+        // One large signer adds 1,000: 6,000 → 7,000, past quorum.
+        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(0)).unwrap();
+        let record = db.get_finality_record(5).unwrap().expect("7,000 ≥ 6,667 finalizes");
+        assert_eq!(record.signers.len(), 9);
+        assert!(verify_finality_record(&db, &record));
+
+        // And the inverse on the verifier: a record with the eight small
+        // signers only, however honestly aggregated, is not a certificate.
+        let mut short = record.clone();
+        short.signers.retain(|s| s != &keys[0].0);
+        assert!(!verify_finality_record(&db, &short), "membership check passes, power check must not");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// V2, round-timeout path: same set, same arithmetic.
+    #[test]
+    fn round_timeout_quorum_is_by_power_not_head_count() {
+        let (db, dir) = open_test_db();
+        let keys = weighted_validators(&db);
+        let parent = parent_block_for(&db, 4);
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+        for (addr, sk) in &keys[4..12] {
+            tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
+                .unwrap();
+        }
+        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "8 of 12 by count is 6,000 by power");
+        let (addr, sk) = &keys[0];
+        tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
+            .unwrap();
+        assert_eq!(db.get_round_certificate(5, 0).unwrap().unwrap().signers.len(), 9);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Mirrors `no_finality_record_below_quorum_then_one_appears_at_quorum`:
@@ -2132,7 +2177,9 @@ mod tests {
     #[test]
     fn a_vote_for_an_already_certified_round_is_a_no_op() {
         let (db, dir) = open_test_db();
-        let addrs_and_keys = round_timeout_validators(&db, 3);
+        // Four equal validators: the third vote certifies (7,500), the
+        // fourth is already a no-op against the persisted certificate.
+        let addrs_and_keys = round_timeout_validators(&db, 4);
         let parent = parent_block_for(&db, 4);
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
@@ -2148,7 +2195,7 @@ mod tests {
         }
         assert_eq!(db.current_round(5).unwrap(), 1);
 
-        // A 4th, unregistered voter's vote arrives after certification.
+        // A 5th, unregistered voter's vote arrives after certification.
         let late_key = SigningKey::from_bytes(&[9u8; 32]);
         let late_addr = Address::from_pubkey_bytes(late_key.verifying_key().as_bytes()).unwrap();
         let (late_sk, _pk) = xc_bls::keygen_from_seed(&[99u8; 32]).unwrap();
@@ -2218,10 +2265,7 @@ mod tests {
                 effective_height: 0,
                 previous_pubkey: None,
             },
-            &xc_storage::ValidatorSetSnapshot {
-                effective_height: 0,
-                validators: vec![addr.clone(), peer],
-            },
+            &xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone(), peer]),
         ])
         .unwrap();
 

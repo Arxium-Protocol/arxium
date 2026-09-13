@@ -16,8 +16,7 @@ pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
 pub use block::{Block, RawBlock};
 pub use consensus::{
-    MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, quorum,
-    round_timeout_signing_bytes,
+    MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, round_timeout_signing_bytes,
 };
 pub use validator_set::{
     ChainParams, MAX_VALIDATOR_SET, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
@@ -26,8 +25,7 @@ pub use validator_set::{
 pub use state::{
     HolderState,
     reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, AssetClass,
-    AssetMetadata, AttestorRecord, ClaimTopic, CountryCode, Snapshot, StakeAllocation, Unbonding, ValidatorChange,
-    ValidatorEntry,
+    AssetMetadata, AttestorRecord, ClaimTopic, CountryCode, Snapshot, StakeAllocation, Unbonding, ValidatorEntry,
 };
 
 /// Ceiling for any single bincode-decoded value read from untrusted bytes

@@ -6,15 +6,16 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::BTreeMap;
 use xc_primitives::{
-    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, RoundCertificate, SignatureError,
-    ValidatorChange, eligible_proposer, quorum, round_timeout_signing_bytes,
+    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, QUORUM_POWER, RoundCertificate, SignatureError, VotingPower,
+    eligible_proposer, round_timeout_signing_bytes, signed_power,
 };
 use xc_primitives::Asset;
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
     BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates, OperatorUpdates,
-    StakeUpdates, StorageError, ValidatorSetSnapshot,
+    StakeUpdates, StorageError, ValidatorSetSnapshot, ValidatorStatusUpdates,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -32,7 +33,7 @@ pub struct ExecutionOutcome<P> {
     /// rather than failing the block.
     pub applied: Vec<Action<P>>,
     pub accounts: AccountUpdates,
-    pub validator_changes: Vec<ValidatorChange>,
+    pub validator_statuses: ValidatorStatusUpdates,
     pub stakes: StakeUpdates,
     pub evidence_markers: Vec<EvidenceMarker>,
     pub bls_keys: Vec<BlsKeyRegistration>,
@@ -55,7 +56,14 @@ pub struct ExecutionOutcome<P> {
 #[derive(Debug, Default)]
 pub struct BlockUpdates {
     pub accounts: AccountUpdates,
-    pub validator_change: Option<ValidatorChange>,
+    /// Validator standing changed by this action (`JoinValidator` →
+    /// `Pending`, `LeaveValidator` → `Leaving`, a fault → `Jailed`/
+    /// `Tombstoned`) or by the boundary hook (`Active`, clearing `Leaving`).
+    pub validator_statuses: ValidatorStatusUpdates,
+    /// Set only by `on_block_sealed`, only at an epoch boundary: the
+    /// stake-weighted set that takes effect at the next height. Ignored on
+    /// a per-action dispatch — membership never changes mid-epoch.
+    pub validator_set: Option<BTreeMap<Address, VotingPower>>,
     pub stakes: StakeUpdates,
     /// Set only by `SubmitEquivocationEvidence` — marks the evidence
     /// processed so it can't be resubmitted for a repeat slash.
@@ -88,41 +96,7 @@ pub struct BlockUpdates {
 pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpdates, StorageError> {
     let due = db.get_allocations_with_unbonding_due(height)?;
     let (accounts, stakes) = circuit_staking::resolve_due_unbonding(db, due)?;
-    Ok(BlockUpdates {
-        accounts,
-        validator_change: None,
-        stakes,
-        evidence: None,
-        bls_key: None,
-        operator: OperatorUpdates::default(),
-        assets: AssetBalanceUpdates::default(),
-        holder_states: HolderStateUpdates::default(),
-        asset_registration: None,
-        attestor_registration: None,
-        attestor_deregistration: None,
-    })
-}
-
-/// Folds `changes` (in order) onto `set`, dedupes, and sorts — the same
-/// deterministic shape `expected_proposer` requires. A join for an address
-/// already present, or a leave for one that isn't, is a no-op rather than an
-/// error here: `dispatch` is where membership preconditions (e.g. "can't
-/// leave the last validator") get enforced before a `ValidatorChange` is
-/// ever produced.
-pub fn apply_validator_changes(mut set: Vec<Address>, changes: &[ValidatorChange]) -> Vec<Address> {
-    for change in changes {
-        match change {
-            ValidatorChange::Join(address, _entry) => {
-                if !set.contains(address) {
-                    set.push(address.clone());
-                }
-            }
-            ValidatorChange::Leave(address) => set.retain(|a| a != address),
-        }
-    }
-    set.sort();
-    set.dedup();
-    set
+    Ok(BlockUpdates { accounts, stakes, ..Default::default() })
 }
 
 #[derive(Error, Debug)]
@@ -176,14 +150,15 @@ pub enum AcceptBlockError {
         cert_round: u32,
     },
     #[error(
-        "block {height} round {round} certificate has only {signers} signer(s), quorum of {quorum} validators is {needed}"
+        "block {height} round {round} certificate's {signers} signer(s) hold {power} voting power, quorum is {needed}"
     )]
     RoundCertificateBelowQuorum {
         height: u64,
         round: u32,
         signers: usize,
-        quorum: usize,
-        needed: usize,
+        /// Voting power the listed member signers hold, out of `TOTAL_VOTING_POWER`.
+        power: u32,
+        needed: u32,
     },
     #[error(
         "block {height} round {round} certificate lists {signers} signer(s) but there are only {validators} validator(s) at this height"
@@ -277,8 +252,8 @@ impl AcceptBlockError {
 }
 
 /// Checks that `cert` actually proves `round - 1` timed out for this block:
-/// it names the right height/round, carries at least `quorum(validators)`
-/// distinct signers who are all members of `validators`, and its aggregate
+/// it names the right height/round, its distinct member signers hold at
+/// least `QUORUM_POWER` of `validators`' voting power, and its aggregate
 /// signature verifies against `round_timeout_signing_bytes` for that height/
 /// round/parent. Distinctness matters — without it a validator holding a
 /// single real vote could list itself N times and aggregate its own
@@ -289,7 +264,7 @@ fn verify_round_certificate(
     height: u64,
     round: u32,
     parent_hash: &str,
-    validators: &[Address],
+    validators: &BTreeMap<Address, VotingPower>,
 ) -> Result<(), AcceptBlockError> {
     if cert.height != height || cert.round != round - 1 {
         return Err(AcceptBlockError::RoundCertificateMismatch {
@@ -300,14 +275,17 @@ fn verify_round_certificate(
         });
     }
 
-    let needed = quorum(validators.len());
-    if cert.signers.len() < needed {
+    // Power-weighted, computed over distinct members only (`signed_power`
+    // dedupes and ignores outsiders), so a padded list can't inflate it; the
+    // per-signer membership loop below still rejects the padding itself.
+    let power = signed_power(validators, cert.signers.iter());
+    if power < QUORUM_POWER {
         return Err(AcceptBlockError::RoundCertificateBelowQuorum {
             height,
             round,
             signers: cert.signers.len(),
-            quorum: validators.len(),
-            needed,
+            power,
+            needed: QUORUM_POWER,
         });
     }
 
@@ -327,7 +305,7 @@ fn verify_round_certificate(
 
     let mut pubkeys = Vec::with_capacity(cert.signers.len());
     for (i, signer) in cert.signers.iter().enumerate() {
-        if cert.signers[..i].contains(signer) || !validators.contains(signer) {
+        if cert.signers[..i].contains(signer) || !validators.contains_key(signer) {
             return Err(AcceptBlockError::RoundCertificateUnknownSigner {
                 height,
                 round,
@@ -501,7 +479,8 @@ where
     // takes effect at `block.height + 1` (see `ValidatorSetSnapshot`), so
     // this is also the pre-block set `dispatch` should validate
     // JoinValidator/LeaveValidator preconditions against below.
-    let validators = db.get_validator_set_at(block.height)?;
+    let validator_set = db.get_validator_set_at(block.height)?;
+    let validators: Vec<Address> = validator_set.keys().cloned().collect();
     // Which round this height is in is carried on the block itself, not
     // read from this node's local `db.current_round` (see
     // `Arxium_OpenItems.md` §7, B1c — this replaced the earlier B1b design,
@@ -522,7 +501,7 @@ where
             return Err(AcceptBlockError::UnexpectedRoundCertificate { height: block.height });
         }
         Some(cert) => {
-            verify_round_certificate(db, cert, block.height, round, &block.parent_hash, &validators)?;
+            verify_round_certificate(db, cert, block.height, round, &block.parent_hash, &validator_set)?;
         }
     }
     let expected = eligible_proposer(&validators, block.height, round);
@@ -547,7 +526,7 @@ where
     let ExecutionOutcome {
         applied,
         accounts: mut account_updates,
-        validator_changes,
+        mut validator_statuses,
         stakes: mut stake_updates,
         evidence_markers,
         bls_keys,
@@ -580,27 +559,27 @@ where
     view.apply_stakes(&stake_updates)?;
     view.apply_asset_balances(&asset_updates)?;
     view.apply_holder_states(&holder_states)?;
+    view.apply_validator_statuses(&validator_statuses)?;
     let sealed_updates = on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
         .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
     account_updates.0.extend(sealed_updates.accounts.0);
     stake_updates.allocations.extend(sealed_updates.stakes.allocations);
     stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
     asset_updates.0.extend(sealed_updates.assets.0);
+    validator_statuses.0.extend(sealed_updates.validator_statuses.0);
 
-    let new_validator_set = if validator_changes.is_empty() {
-        None
-    } else {
-        Some(ValidatorSetSnapshot {
-            effective_height: block.height + 1,
-            validators: apply_validator_changes(validators, &validator_changes),
-        })
-    };
+    // Only the boundary hook ever hands back a set; it takes effect at the
+    // next height, the first block of the new epoch.
+    let new_validator_set = sealed_updates
+        .validator_set
+        .map(|validators| ValidatorSetSnapshot { effective_height: block.height + 1, validators });
 
     // A proposer's claimed post-block state must match what re-executing its
     // actions locally actually produces — same principle as `ActionMismatch`
     // above, applied to state instead of the action list.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
+        let mut overlay: Vec<&dyn BatchWritable> =
+            vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
@@ -641,7 +620,8 @@ where
     // `CF_META` rows, outside `is_state_key`, so they must not move the root.
     let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
 
-    let mut writables: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
+    let mut writables: Vec<&dyn BatchWritable> =
+        vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -733,7 +713,7 @@ where
     // before this loop — so a same-block `Stake` action sees a just-cleared
     // `unbonding` slot instead of hitting "already unbonding".
     let mut overlay = seed.accounts.0;
-    let mut validator_changes: Vec<ValidatorChange> = seed.validator_change.into_iter().collect();
+    let mut status_overlay = seed.validator_statuses;
     let mut stake_overlay = seed.stakes.allocations;
     let mut validator_index_overlay = seed.stakes.validator_index;
     let mut evidence_markers: Vec<EvidenceMarker> = seed.evidence.into_iter().collect();
@@ -756,6 +736,7 @@ where
     })?;
     view.apply_asset_balances(&AssetBalanceUpdates(asset_overlay.clone()))?;
     view.apply_holder_states(&HolderStateUpdates(holder_overlay.clone()))?;
+    view.apply_validator_statuses(&status_overlay)?;
     for registration in &attestor_registrations {
         view.apply_attestor_registration(registration)?;
     }
@@ -783,7 +764,8 @@ where
             Ok(updates) => {
                 overlay.extend(updates.accounts.0.clone());
                 view.apply_accounts(&updates.accounts)?;
-                validator_changes.extend(updates.validator_change);
+                status_overlay.0.extend(updates.validator_statuses.0.clone());
+                view.apply_validator_statuses(&updates.validator_statuses)?;
                 stake_overlay.extend(updates.stakes.allocations.clone());
                 validator_index_overlay.extend(updates.stakes.validator_index.clone());
                 view.apply_stakes(&updates.stakes)?;
@@ -821,7 +803,7 @@ where
             let asset_snapshot = AssetBalanceUpdates(asset_overlay.clone());
             let holder_snapshot = HolderStateUpdates(holder_overlay.clone());
             let mut snapshot_overlay: Vec<&dyn BatchWritable> =
-                vec![&account_snapshot, &stake_snapshot, &asset_snapshot, &holder_snapshot];
+                vec![&account_snapshot, &stake_snapshot, &asset_snapshot, &holder_snapshot, &status_overlay];
             snapshot_overlay.extend(attestor_registrations.iter().map(|r| r as &dyn BatchWritable));
             snapshot_overlay.extend(attestor_deregistrations.iter().map(|d| d as &dyn BatchWritable));
             roots.push(db.compute_state_root(&snapshot_overlay)?);
@@ -831,7 +813,7 @@ where
     Ok(ExecutionOutcome {
         applied,
         accounts: AccountUpdates(overlay),
-        validator_changes,
+        validator_statuses: status_overlay,
         stakes: StakeUpdates {
             allocations: stake_overlay,
             validator_index: validator_index_overlay,
@@ -897,13 +879,14 @@ mod tests {
                 accounts: apply_transfer(view, &action.sender, action.nonce, to, *amount)?,
                 ..Default::default()
             }),
-            TestPayload::Join => Ok(BlockUpdates {
-                validator_change: Some(ValidatorChange::Join(
-                    action.sender.clone(),
-                    xc_primitives::ValidatorEntry { stake: 0, bls_pubkey: None, bls_pop: None },
-                )),
-                ..Default::default()
-            }),
+            TestPayload::Join => {
+                let mut updates = BlockUpdates::default();
+                updates
+                    .validator_statuses
+                    .0
+                    .insert(action.sender.clone(), Some(xc_primitives::ValidatorStatus::Pending));
+                Ok(updates)
+            }
             // Mirrors `arxd_runtime::asset::{register_asset, resolve_asset}`'s
             // duplicate-check/lookup, without the private runtime code: what's
             // under test here is whether a same-block registration is visible
@@ -952,8 +935,22 @@ mod tests {
             updates.stakes.allocations.extend(downtime_stakes.allocations);
             updates.stakes.validator_index.extend(downtime_stakes.validator_index);
         }
+        // A toy boundary hook: every `TEST_EPOCH_LENGTH` blocks, the set
+        // becomes everyone with a status row, equally weighted — enough to
+        // prove the executor applies a sealed set at the right height.
+        if xc_primitives::is_boundary(height, TEST_EPOCH_LENGTH) {
+            let joined = view.db().all_validator_statuses()?;
+            // Only tests that write status rows opt into rotation; the
+            // rest pre-compute roots without a snapshot in the overlay.
+            if !joined.is_empty() {
+                let members: Vec<Address> = validators.iter().cloned().chain(joined.into_keys()).collect();
+                updates.validator_set = Some(ValidatorSetSnapshot::equal_power(height + 1, &members).validators);
+            }
+        }
         Ok(updates)
     }
+
+    const TEST_EPOCH_LENGTH: u64 = 3;
 
     fn temp_db() -> ArxiumDb {
         let path = std::env::temp_dir().join(format!("arxium-test-executor-{}", uuid_like()));
@@ -1041,10 +1038,7 @@ mod tests {
         let bob_key = SigningKey::from_bytes(&[8u8; 32]);
         let bob = Address::from_pubkey_bytes(bob_key.verifying_key().as_bytes()).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![alice.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
@@ -1066,12 +1060,27 @@ mod tests {
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
         assert_eq!(accepted.actions.len(), 1, "join action must be applied");
 
-        // Block 1 itself is still decided by the pre-join set.
-        assert_eq!(db.get_validator_set_at(1).unwrap(), vec![alice.clone()]);
-        // Bob only becomes a validator starting block 2.
+        // Block 1 itself is still decided by the pre-join set, and so is
+        // block 2: the join only lands at the epoch boundary (height 2 with
+        // a 3-block epoch), effective from height 3.
+        assert_eq!(db.validator_addresses_at(1).unwrap(), vec![alice.clone()]);
+        assert_eq!(db.validator_addresses_at(2).unwrap(), vec![alice.clone()]);
+        let block2 = Block {
+            height: 2,
+            parent_hash: accepted.hash(),
+            timestamp: 2,
+            actions: vec![],
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        };
+        accept_block_computing_root(&db, block2, &alice, &alice_key).unwrap();
         let mut expected = vec![alice, bob];
         expected.sort();
-        assert_eq!(db.get_validator_set_at(2).unwrap(), expected);
+        assert_eq!(db.validator_addresses_at(3).unwrap(), expected);
     }
 
     #[test]
@@ -1099,9 +1108,9 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let ExecutionOutcome { applied, accounts: updates, validator_changes, .. } =
+        let ExecutionOutcome { applied, accounts: updates, validator_statuses, .. } =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
-        assert!(validator_changes.is_empty());
+        assert!(validator_statuses.0.is_empty());
         assert_eq!(
             applied.len(),
             2,
@@ -1261,10 +1270,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let validator = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![alice.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
@@ -1313,10 +1319,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let validator = Address::from_pubkey_bytes(&[14u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![alice.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
@@ -1412,10 +1415,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[11u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
@@ -1571,11 +1571,8 @@ mod tests {
         let mut sorted = [(key_a, addr_a), (key_b, addr_b)];
         sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![sorted[0].1.clone(), sorted[1].1.clone()],
-        })
-        .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[sorted[0].1.clone(), sorted[1].1.clone()]))
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -1783,10 +1780,7 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let bob = Address::from_pubkey_bytes(&[32u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![alice.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
         .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
@@ -1835,6 +1829,35 @@ mod tests {
     /// upper bound the quadratic distinctness scan is limited only by the
     /// wire size cap. Signers must be distinct members of the validator set,
     /// so anything longer than the set is rejected outright.
+    /// V2: a certificate is judged by the voting power its signers hold,
+    /// not by how many of them there are. Twelve validators, four large
+    /// (capped at 1,000 each) and eight small (750 each): eight signers can
+    /// be 6,000 (all small — short) or 7,000 (four large + four small —
+    /// quorum). Same head-count, opposite verdicts.
+    #[test]
+    fn round_certificate_quorum_is_by_power_not_head_count() {
+        let db = temp_db();
+        let addr = |i: u8| Address::from_pubkey_bytes(&[i; 32]).unwrap();
+        let stakes: BTreeMap<Address, u128> =
+            (1u8..=12).map(|i| (addr(i), if i <= 4 { 100 } else { 10 })).collect();
+        let set = xc_primitives::assign_voting_power(&stakes);
+        assert_eq!(set[&addr(1)].0, 1_000);
+        assert_eq!(set[&addr(12)].0, 750);
+        let all_small: Vec<Address> = (5u8..=12).map(addr).collect();
+        let mixed: Vec<Address> = (1u8..=8).map(addr).collect();
+        let cert = |signers: &[Address]| RoundCertificate {
+            height: 7,
+            round: 0,
+            signers: signers.to_vec(),
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        };
+        let err = verify_round_certificate(&db, &cert(&all_small), 7, 1, "parent", &set).unwrap_err();
+        assert!(matches!(err, AcceptBlockError::RoundCertificateBelowQuorum { power: 6_000, .. }), "{err:?}");
+        // Past the power check; fails later on the (unregistered) BLS keys.
+        let err = verify_round_certificate(&db, &cert(&mixed), 7, 1, "parent", &set).unwrap_err();
+        assert!(matches!(err, AcceptBlockError::RoundCertificateUnknownSigner { .. }), "{err:?}");
+    }
+
     #[test]
     fn a_round_certificate_listing_more_signers_than_validators_is_rejected() {
         let db = temp_db();
@@ -1850,7 +1873,8 @@ mod tests {
             signers,
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
         };
-        let err = verify_round_certificate(&db, &cert, 7, 1, "parent", &validators).unwrap_err();
+        let set = ValidatorSetSnapshot::equal_power(0, &validators).validators;
+        let err = verify_round_certificate(&db, &cert, 7, 1, "parent", &set).unwrap_err();
         assert!(
             matches!(
                 err,

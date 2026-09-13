@@ -25,7 +25,7 @@ use anyhow::Result;
 use xc_runtime_api::ChainRuntime;
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address, Asset, ValidatorChange};
+use xc_primitives::{Action, Address, Asset};
 use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
 
 /// toy-chain has no `RegisterAsset` action or registry — there is exactly
@@ -56,7 +56,7 @@ fn dispatch(
     action: &RwaAction,
     view: &BlockView<'_>,
     issuer: &Address,
-) -> anyhow::Result<(AccountUpdates, AssetBalanceUpdates, Option<ValidatorChange>)> {
+) -> anyhow::Result<(AccountUpdates, AssetBalanceUpdates)> {
     let mut asset = toy_asset(issuer);
     let (accounts, assets) = match &action.payload {
         RwaPayload::Issue { amount } => {
@@ -71,7 +71,7 @@ fn dispatch(
             *amount,
         )?,
     };
-    Ok((accounts, assets, None))
+    Ok((accounts, assets))
 }
 
 struct ToyRuntime;
@@ -99,13 +99,8 @@ impl ChainRuntime for ToyRuntime {
 
     fn dispatch(action: &RwaAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
         let issuer = Address::parse(ISSUER).expect("ISSUER is a valid address");
-        let (accounts, assets, validator_change) = dispatch(action, ctx.view, &issuer)?;
-        Ok(BlockUpdates {
-            accounts,
-            assets,
-            validator_change,
-            ..Default::default()
-        })
+        let (accounts, assets) = dispatch(action, ctx.view, &issuer)?;
+        Ok(BlockUpdates { accounts, assets, ..Default::default() })
     }
 
     // toy-chain has no block-level economics of its own (no reward pool, no

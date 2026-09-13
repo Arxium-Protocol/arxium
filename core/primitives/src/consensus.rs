@@ -5,22 +5,6 @@ use crate::Address;
 use serde::{Deserialize, Serialize};
 use xc_bls::BlsSignature;
 
-/// How many validators must precommit to a block before it is final: 2/3 of
-/// the set plus one, counted by head rather than weighted by stake.
-///
-/// Lives here rather than in `arxd/finality` because it is a consensus rule,
-/// not a role-specific one, and two callers need it: the subsystem that
-/// tallies precommits, and the RPC layer that reports how far the current set
-/// is from reaching it. `core/` may not depend on `arxd/`, so a copy in each
-/// would be two definitions of one rule, free to drift.
-///
-/// Not stake-weighted, deliberately: `eligible_proposer` ignores stake too, so
-/// weighting finality alone would be incoherent. Both change together or
-/// neither does.
-pub fn quorum(validator_count: usize) -> usize {
-    2 * validator_count / 3 + 1
-}
-
 /// How far ahead of the validating node's own wall clock a block's timestamp
 /// may be before the block is rejected (`xc_executor::accept_block`).
 ///
@@ -45,9 +29,13 @@ pub fn quorum(validator_count: usize) -> usize {
 pub const MAX_FUTURE_DRIFT_SECS: u64 = 30;
 
 /// Deterministic round-robin: sorts the validator set and picks by height
-/// modulo its size. No stake weighting — the set can change over time (see
-/// `ValidatorChange`), but within a single height every node computes the
-/// same primary proposer from the same set.
+/// modulo its size. Deliberately *not* stake-weighted even though voting
+/// power is (`xc_primitives::quorum_reached`): every node derives the
+/// expected proposer from the set and the height alone, which is what lets
+/// `apply_downtime_slash` punish a missed slot with no evidence submitted.
+/// Weighting it would add a second consensus input to that rule for no
+/// gain — influence already tracks stake where it matters, in votes — and
+/// would compound a large validator's advantage twice.
 pub fn expected_proposer(validators: &[Address], height: u64) -> Option<Address> {
     eligible_proposer(validators, height, 0)
 }

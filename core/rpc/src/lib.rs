@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -23,7 +23,7 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address, Asset, Block, Limits, quorum};
+use xc_primitives::{Action, Address, Asset, Block, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power};
 use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
@@ -1096,9 +1096,13 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
     };
 
     let mut voters = 0usize;
-    for validator in &validators {
+    let mut keyed: Vec<&Address> = Vec::new();
+    for validator in validators.keys() {
         match state.db.get_bls_pubkey(validator) {
-            Ok(Some(_)) => voters += 1,
+            Ok(Some(_)) => {
+                voters += 1;
+                keyed.push(validator);
+            }
             Ok(None) => {}
             Err(err) => {
                 warn!("failed to read BLS key for {validator}: {err}");
@@ -1106,6 +1110,9 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
             }
         }
     }
+    // Quorum is by voting power, so what matters is how much of it can
+    // actually sign — a keyless whale can block finality on its own.
+    let voting_power_with_bls_key = signed_power(&validators, keyed);
 
     let finalized_height = match state.db.get_finalized_height() {
         Ok(height) => height,
@@ -1134,7 +1141,6 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         }
     };
 
-    let required = quorum(validators.len());
     Json(serde_json::json!({
         // null rather than absent: a client must be able to tell "nothing has
         // finalized yet" from "this node is too old to have the field".
@@ -1151,10 +1157,13 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         "final_watermark": final_watermark,
         "validators": validators.len(),
         "validators_with_bls_key": voters,
-        "quorum": required,
+        "total_voting_power": TOTAL_VOTING_POWER,
+        "voting_power_with_bls_key": voting_power_with_bls_key,
+        // Voting power a certificate needs, out of `total_voting_power`.
+        "quorum": QUORUM_POWER,
         // The whole point: false means no amount of waiting will finalize
-        // anything, because not enough of the set can even vote.
-        "quorum_reachable": voters >= required,
+        // anything, because not enough of the set's power can even vote.
+        "quorum_reachable": voting_power_with_bls_key >= QUORUM_POWER,
     }))
     .into_response()
 }
@@ -1183,8 +1192,11 @@ async fn get_validators<P: Payload>(
         None => tip_height,
     };
 
+    // `{address: voting_power}` — was a bare address list before the set
+    // went stake-weighted; the keys are the old list.
     match state.db.get_validator_set_at(height) {
-        Ok(validators) => Json(validators).into_response(),
+        Ok(validators) => Json(validators.into_iter().map(|(a, p)| (a.to_string(), p.0)).collect::<BTreeMap<_, _>>())
+            .into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1809,6 +1821,7 @@ mod tests {
                 .db
                 .write_batch(&Snapshot {
                     height: 0,
+                    params: Default::default(),
                     chain_name: "test".into(),
                     accounts: BTreeMap::from([(
                         sender.clone(),
@@ -1904,6 +1917,7 @@ mod tests {
                 .db
                 .write_batch(&Snapshot {
                     height: 0,
+                    params: Default::default(),
                     chain_name: "test-chain".into(),
                     accounts: BTreeMap::new(),
                     validators: BTreeMap::new(),
@@ -2096,6 +2110,7 @@ mod tests {
                 .db
                 .write_batch(&Snapshot {
                     height: 0,
+                    params: Default::default(),
                     chain_name: "test-chain".into(),
                     accounts: BTreeMap::new(),
                     validators: BTreeMap::new(),
@@ -2108,10 +2123,7 @@ mod tests {
             state.db.write_batch(&genesis).unwrap();
             state
                 .db
-                .write_batch(&xc_storage::ValidatorSetSnapshot {
-                    effective_height: 0,
-                    validators: vec![validator.clone()],
-                })
+                .write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(0, &[validator.clone()]))
                 .unwrap();
 
             let resp = get_finality::<TestPayload>(State(state.clone())).await;
@@ -2124,7 +2136,8 @@ mod tests {
             assert!(json["finalized_height"].is_null());
             assert_eq!(json["validators"], 1);
             assert_eq!(json["validators_with_bls_key"], 0);
-            assert_eq!(json["quorum"], 1);
+            assert_eq!(json["quorum"], QUORUM_POWER);
+            assert_eq!(json["voting_power_with_bls_key"], 0);
             assert_eq!(
                 json["quorum_reachable"], false,
                 "a set with no BLS keys can never finalize, and must say so",

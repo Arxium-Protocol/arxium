@@ -139,17 +139,6 @@ pub fn treasury_account() -> Address {
     Address::from_pubkey_bytes(&digest).expect("sha256 digest is always 32 bytes")
 }
 
-/// A membership change to the round-robin validator set, produced by a
-/// chain-specific dispatch (e.g. `ActionPayload::JoinValidator`) and applied
-/// generically by `xc_executor::accept_block`/`produce_block` — chain-agnostic
-/// like `expected_proposer` itself, since any `P`-chain wanting round-robin
-/// PoS needs the same join/leave bookkeeping.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ValidatorChange {
-    Join(Address, ValidatorEntry),
-    Leave(Address),
-}
-
 /// Broad regulatory category, recorded so downstream consumers (Retracer's
 /// listings, Console's filters) don't have to infer it from the asset id.
 /// Purely descriptive — nothing in the runtime gates on it.

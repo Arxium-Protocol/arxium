@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use xc_executor::{ExecutionOutcome, execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address, Block, eligible_proposer, quorum};
+use xc_primitives::{Action, Address, Block, QUORUM_POWER, eligible_proposer, signed_power};
 use xc_runtime_api::ChainRuntime;
 use xc_runtime_api::DispatchCtx;
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
@@ -61,12 +61,12 @@ pub fn produce_block<R: ChainRuntime>(
     // Pre-block set — matches `xc_executor::accept_block`'s
     // `get_validator_set_at(block.height)` exactly, so a self-produced block
     // and a gossiped/synced one fold JoinValidator/LeaveValidator the same way.
-    let validators = db.get_validator_set_at(next_height)?;
+    let validators = db.validator_addresses_at(next_height)?;
     let seed = resolve_matured_unbonding(db, next_height)?;
     let ExecutionOutcome {
         applied,
         accounts: mut account_updates,
-        validator_changes,
+        mut validator_statuses,
         stakes: mut stake_updates,
         evidence_markers,
         bls_keys,
@@ -102,6 +102,7 @@ pub fn produce_block<R: ChainRuntime>(
     // Same whole-block economics `accept_block` applies to a gossiped block
     // — a locally-produced block must pay itself the same way, or a solo
     // validator would never see its own reward pool debited/credited.
+    let mut snapshot = None;
     if let Some((address, _)) = proposer {
         let fees_collected = applied.len() as u128 * R::action_fee();
         let mut view = xc_storage::BlockView::new(db);
@@ -109,6 +110,7 @@ pub fn produce_block<R: ChainRuntime>(
         view.apply_stakes(&stake_updates)?;
         view.apply_asset_balances(&asset_updates)?;
         view.apply_holder_states(&holder_states)?;
+        view.apply_validator_statuses(&validator_statuses)?;
         let sealed_updates =
             R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
         account_updates.0.extend(sealed_updates.accounts.0);
@@ -119,23 +121,20 @@ pub fn produce_block<R: ChainRuntime>(
             .validator_index
             .extend(sealed_updates.stakes.validator_index);
         asset_updates.0.extend(sealed_updates.assets.0);
+        validator_statuses.0.extend(sealed_updates.validator_statuses.0);
+        // Same rule as `accept_block`: only the boundary hook returns a
+        // set, and it takes effect at the next height.
+        snapshot = sealed_updates
+            .validator_set
+            .map(|validators| ValidatorSetSnapshot { effective_height: next_height + 1, validators });
     }
-
-    let snapshot = if validator_changes.is_empty() {
-        None
-    } else {
-        Some(ValidatorSetSnapshot {
-            effective_height: next_height + 1,
-            validators: xc_executor::apply_validator_changes(validators, &validator_changes),
-        })
-    };
 
     // The root a validator on the receiving end will independently
     // recompute from the same overlay before accepting this block — must be
     // known before signing, since the signature covers it.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
         let mut overlay: Vec<&dyn BatchWritable> =
-            vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
+            vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
         }
@@ -239,8 +238,11 @@ pub fn produce_block<R: ChainRuntime>(
     // signed above is unaffected.
     let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
 
+    // `holder_states` was missing here until the weighted set landed: the
+    // proposer signed a root that included it, then never persisted it, so
+    // its next root disagreed with every peer's after any freeze/lock.
     let mut writables: Vec<&dyn BatchWritable> =
-        vec![&account_updates, &stake_updates, &asset_updates];
+        vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -362,13 +364,17 @@ pub fn produce_loop<R: ChainRuntime>(
                 // symptom but a warn per dropped vote. Exported so the
                 // shortfall is alertable before it matters:
                 //   arxium_validators_with_bls_key < arxium_finality_quorum
-                let voters = validators
-                    .iter()
+                let keyed: Vec<&Address> = validators
+                    .keys()
                     .filter(|v| db.get_bls_pubkey(v).ok().flatten().is_some())
-                    .count();
+                    .collect();
                 gauge!("arxium_validators_total").set(validators.len() as f64);
-                gauge!("arxium_validators_with_bls_key").set(voters as f64);
-                gauge!("arxium_finality_quorum").set(quorum(validators.len()) as f64);
+                gauge!("arxium_validators_with_bls_key").set(keyed.len() as f64);
+                // Power, not heads: the alertable comparison is
+                //   arxium_voting_power_with_bls_key < arxium_finality_quorum
+                gauge!("arxium_voting_power_with_bls_key").set(signed_power(&validators, keyed) as f64);
+                gauge!("arxium_finality_quorum").set(QUORUM_POWER as f64);
+                let validators: Vec<Address> = validators.into_keys().collect();
 
                 // Eligibility itself no longer comes from `elapsed` — see
                 // `xc_primitives::eligible_proposer`'s doc comment (B1b).
@@ -583,6 +589,7 @@ mod tests {
         );
         db.write_batch(&Snapshot {
             height: 0,
+            params: Default::default(),
             chain_name: "test".into(),
             accounts,
             validators: BTreeMap::new(),
@@ -647,10 +654,7 @@ mod tests {
                     .as_nanos(),
             ));
             let db = ArxiumDb::open(&dir).expect("open test db");
-            db.write_batch(&ValidatorSetSnapshot {
-                effective_height: 0,
-                validators: validators.clone(),
-            })
+            db.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
             .unwrap();
             let genesis: ChainBlock = xc_primitives::Block::genesis(0);
             db.write_batches(&[&genesis]).unwrap();
@@ -686,10 +690,7 @@ mod tests {
             // Re-validate on a fresh chain holding the same history, the way a
             // peer receiving these over gossip would.
             let peer = ArxiumDb::open(&dir.join("peer")).expect("open peer db");
-            peer.write_batch(&ValidatorSetSnapshot {
-                effective_height: 0,
-                validators: validators.clone(),
-            })
+            peer.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
             .unwrap();
             peer.write_batches(&[&genesis]).unwrap();
 
@@ -749,10 +750,7 @@ mod tests {
 
         let key = SigningKey::from_bytes(&[22u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr.clone()],
-        })
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
         .unwrap();
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
