@@ -1830,21 +1830,21 @@ mod tests {
     /// wire size cap. Signers must be distinct members of the validator set,
     /// so anything longer than the set is rejected outright.
     /// V2: a certificate is judged by the voting power its signers hold,
-    /// not by how many of them there are. Twelve validators, four large
-    /// (capped at 1,000 each) and eight small (750 each): eight signers can
-    /// be 6,000 (all small — short) or 7,000 (four large + four small —
-    /// quorum). Same head-count, opposite verdicts.
+    /// not by how many of them there are. Twenty validators, four large
+    /// (capped at 1,000 each) and sixteen small (375 each): sixteen signers
+    /// can be 6,000 (all small — short) or 8,500 (four large + twelve small
+    /// — quorum). Same head-count, opposite verdicts.
     #[test]
     fn round_certificate_quorum_is_by_power_not_head_count() {
         let db = temp_db();
         let addr = |i: u8| Address::from_pubkey_bytes(&[i; 32]).unwrap();
         let stakes: BTreeMap<Address, u128> =
-            (1u8..=12).map(|i| (addr(i), if i <= 4 { 100 } else { 10 })).collect();
+            (1u8..=20).map(|i| (addr(i), if i <= 4 { 100 } else { 10 })).collect();
         let set = xc_primitives::assign_voting_power(&stakes);
         assert_eq!(set[&addr(1)].0, 1_000);
-        assert_eq!(set[&addr(12)].0, 750);
-        let all_small: Vec<Address> = (5u8..=12).map(addr).collect();
-        let mixed: Vec<Address> = (1u8..=8).map(addr).collect();
+        assert_eq!(set[&addr(20)].0, 375);
+        let all_small: Vec<Address> = (5u8..=20).map(addr).collect();
+        let mixed: Vec<Address> = (1u8..=16).map(addr).collect();
         let cert = |signers: &[Address]| RoundCertificate {
             height: 7,
             round: 0,

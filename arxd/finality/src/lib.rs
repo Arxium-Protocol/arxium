@@ -2016,10 +2016,10 @@ mod tests {
         }
     }
 
-    /// Twelve validators with a BLS key each: four "large" at the 1,000 cap
-    /// and eight small at 750. Used by the weighted-quorum tests below.
+    /// Twenty validators with a BLS key each: four "large" at the 1,000 cap
+    /// and sixteen small at 375. Used by the weighted-quorum tests below.
     fn weighted_validators(db: &ArxiumDb) -> Vec<(Address, BlsSecretKey)> {
-        let addrs_and_keys = round_timeout_validators(db, 12);
+        let addrs_and_keys = round_timeout_validators(db, 20);
         let stakes: std::collections::BTreeMap<Address, u128> = addrs_and_keys
             .iter()
             .enumerate()
@@ -2027,15 +2027,14 @@ mod tests {
             .collect();
         let validators = xc_primitives::assign_voting_power(&stakes);
         assert_eq!(validators[&addrs_and_keys[0].0], xc_primitives::VotingPower(1_000));
-        assert_eq!(validators[&addrs_and_keys[11].0], xc_primitives::VotingPower(750));
+        assert_eq!(validators[&addrs_and_keys[19].0], xc_primitives::VotingPower(375));
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
         addrs_and_keys
     }
 
-    /// V2, precommit path: eight small signers (8 of 12 by count, 6,000 by
-    /// power) do not finalize — under the old 2/3+1 head-count rule (9 of
-    /// 12) they wouldn't either, but four large + four small (8 of 12,
-    /// 7,000) now does, and nine small-only signers wouldn't verify.
+    /// V2, precommit path: sixteen small signers (16 of 20 by count, 6,000
+    /// by power) do not finalize — under the old 2/3+1 head-count rule (14
+    /// of 20) they would have; one large signer more (7,000) does.
     #[test]
     fn precommit_quorum_is_by_power_not_head_count() {
         let (db, dir) = open_test_db();
@@ -2051,14 +2050,14 @@ mod tests {
         };
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
-        for i in 4..12 {
+        for i in 4..20 {
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(i)).unwrap();
         }
-        assert!(db.get_finality_record(5).unwrap().is_none(), "8 small signers hold 6,000 < 6,667");
+        assert!(db.get_finality_record(5).unwrap().is_none(), "16 small signers hold 6,000 < 6,667");
         // One large signer adds 1,000: 6,000 → 7,000, past quorum.
         tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(0)).unwrap();
         let record = db.get_finality_record(5).unwrap().expect("7,000 ≥ 6,667 finalizes");
-        assert_eq!(record.signers.len(), 9);
+        assert_eq!(record.signers.len(), 17);
         assert!(verify_finality_record(&db, &record));
 
         // And the inverse on the verifier: a record with the eight small
@@ -2077,15 +2076,15 @@ mod tests {
         let parent = parent_block_for(&db, 4);
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
-        for (addr, sk) in &keys[4..12] {
+        for (addr, sk) in &keys[4..20] {
             tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
                 .unwrap();
         }
-        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "8 of 12 by count is 6,000 by power");
+        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "16 of 20 by count is 6,000 by power");
         let (addr, sk) = &keys[0];
         tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
             .unwrap();
-        assert_eq!(db.get_round_certificate(5, 0).unwrap().unwrap().signers.len(), 9);
+        assert_eq!(db.get_round_certificate(5, 0).unwrap().unwrap().signers.len(), 17);
         std::fs::remove_dir_all(&dir).ok();
     }
 

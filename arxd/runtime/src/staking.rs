@@ -104,10 +104,8 @@ pub(crate) fn check_join_admission<V: KvRead<Error = StorageError>>(view: &V, va
         anyhow::bail!("{validator} is tombstoned and can never rejoin the validator set");
     }
     let params = view.get(&ChainParamsKey)?.unwrap_or_default();
-    if params.validator_attestation_required
-        && view.get(&AccountKey(validator))?.and_then(|e| e.identity_hash).is_none()
-    {
-        anyhow::bail!("{validator} has no attestation, and this chain requires one to validate");
+    if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, validator)? {
+        anyhow::bail!("{validator} has no attestation from a registered attestor, and this chain requires one to validate");
     }
     Ok(())
 }

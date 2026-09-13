@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use thiserror::Error;
-use xc_circuit::{AccountKey, AssetBalanceKey, AssetHolderStateKey, KvRead};
+use xc_circuit::{AccountKey, AssetBalanceKey, AssetHolderStateKey, AttestorRecordKey, KvRead};
 use xc_primitives::{AccountEntry, Address, Asset, ClaimTopic, CountryCode, HolderState};
 use xc_storage::{AccountUpdates, AssetBalanceUpdates, HolderStateUpdates, StorageError};
 
@@ -103,6 +103,25 @@ pub enum RwaError {
 /// deliberately not both applied: an asset listing topics has already said
 /// something more specific than "must be attested", and requiring the bool as
 /// well would make it impossible to express topic gating without it.
+/// Whether `address` holds a live attestation: an `identity_hash` granted
+/// by an attestor that is *still* in the registry. "Has an identity record"
+/// alone is not enough — an attestation from a since-deregistered attestor
+/// is exactly the case the registry exists to revoke. The validator
+/// admission gate (`ChainParams::validator_attestation_required`) uses this;
+/// `check_party` keeps its own, asset-specific claim checks.
+pub fn is_attested<V: KvRead<Error = StorageError>>(view: &V, address: &Address) -> Result<bool, StorageError> {
+    let Some(entry) = view.get(&AccountKey(address))? else { return Ok(false) };
+    if entry.identity_hash.is_none() {
+        return Ok(false);
+    }
+    match &entry.attested_by {
+        Some(attestor) => Ok(view.get(&AttestorRecordKey(attestor))?.is_some()),
+        // Attested before the registry recorded who did it: the only
+        // evidence is the hash itself. Accept, as the asset layer does.
+        None => Ok(true),
+    }
+}
+
 fn check_party<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &Asset,

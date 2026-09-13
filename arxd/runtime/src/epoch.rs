@@ -10,9 +10,9 @@
 use std::collections::BTreeMap;
 
 use tracing::warn;
-use xc_circuit::{AccountKey, ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
+use xc_circuit::{ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, MAX_VALIDATOR_SET, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary};
+use xc_primitives::{Address, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary};
 use xc_storage::{BlockView, StorageError};
 
 use crate::staking::MIN_VALIDATOR_STAKE;
@@ -47,17 +47,15 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
         if stake < MIN_VALIDATOR_STAKE {
             continue;
         }
-        if params.validator_attestation_required
-            && view.get(&AccountKey(address))?.and_then(|e| e.identity_hash).is_none()
-        {
+        if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, address)? {
             continue;
         }
         eligible.push((address.clone(), stake));
     }
-    // Top `MAX_VALIDATOR_SET` by stake; ties broken by address so every
+    // Top `max_validator_set` by stake; ties broken by address so every
     // node cuts the list at the same place.
     eligible.sort_by(|(a, sa), (b, sb)| sb.cmp(sa).then_with(|| a.cmp(b)));
-    eligible.truncate(MAX_VALIDATOR_SET);
+    eligible.truncate(params.max_validator_set.max(1));
 
     if eligible.len() < params.min_validator_set {
         warn!(

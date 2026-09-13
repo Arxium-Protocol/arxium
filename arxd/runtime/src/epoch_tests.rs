@@ -24,7 +24,7 @@ fn addr(n: u8) -> Address {
 }
 
 fn params() -> ChainParams {
-    ChainParams { epoch_length: EPOCH, validator_attestation_required: false, min_validator_set: 2 }
+    ChainParams { epoch_length: EPOCH, validator_attestation_required: false, min_validator_set: 2, max_validator_set: 100 }
 }
 
 /// Genesis-shaped db: `members` active with equal power, each self-staked
@@ -108,14 +108,14 @@ fn nothing_happens_off_a_boundary_and_a_pending_join_waits_for_it() {
 #[test]
 fn power_follows_stake_at_the_boundary() {
     let db = chain(&[1, 2], MIN_VALIDATOR_STAKE);
-    // Eleven more join so the 10% cap is live, one of them a whale.
-    for n in 3..=13 {
-        stake_to(&db, &addr(n), if n == 13 { 50 * MIN_VALIDATOR_STAKE } else { MIN_VALIDATOR_STAKE });
+    // Eighteen more join so the 10% cap is live, one of them a whale.
+    for n in 3..=20 {
+        stake_to(&db, &addr(n), if n == 20 { 50 * MIN_VALIDATOR_STAKE } else { MIN_VALIDATOR_STAKE });
         set_status(&db, &addr(n), Some(ValidatorStatus::Pending));
     }
     let set = seal(&db, boundary_of(0, EPOCH)).unwrap();
-    assert_eq!(set.len(), 13);
-    assert_eq!(set[&addr(13)], VotingPower(1_000), "capped at 10%");
+    assert_eq!(set.len(), 20);
+    assert_eq!(set[&addr(20)], VotingPower(1_000), "capped at 10%");
     assert!(set.values().all(|p| p.0 <= 1_000));
     assert_eq!(set.values().map(|p| p.0).sum::<u32>(), 10_000);
 }
@@ -211,11 +211,22 @@ fn the_attestation_gate_is_a_chain_param() {
     assert!(seal(&db, boundary_of(0, EPOCH)).unwrap().contains_key(&addr(3)));
 
     // On (mainnet): rejected at admission, and filtered at the boundary.
-    // 1 and 2 are attested so the set stays above the minimum and the
-    // filter — not the too-few fallback — is what drops 3.
+    // 1 and 2 are attested by a *registered* attestor so the set stays
+    // above the minimum and the filter — not the too-few fallback — is what
+    // drops 3; 3 has an identity record, but from an attestor that is no
+    // longer in the registry, which must not count.
     db.write_batch(&ChainParamsRow(ChainParams { validator_attestation_required: true, ..params() })).unwrap();
-    let attested = AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() };
-    db.write_batch(&AccountUpdates(BTreeMap::from([(addr(1), attested.clone()), (addr(2), attested)]))).unwrap();
+    let attestor = addr(9);
+    let gone = addr(8);
+    db.write_batch(&xc_storage::AttestorRegistration {
+        attestor: attestor.clone(),
+        record: xc_primitives::AttestorRecord { name: "kyc-co".into(), registered_at: 0 },
+    })
+    .unwrap();
+    let attested = AccountEntry { identity_hash: Some("kyc".into()), attested_by: Some(attestor), ..Default::default() };
+    let stale = AccountEntry { identity_hash: Some("kyc".into()), attested_by: Some(gone), ..Default::default() };
+    db.write_batch(&AccountUpdates(BTreeMap::from([(addr(1), attested.clone()), (addr(2), attested), (addr(3), stale)])))
+        .unwrap();
     let view = BlockView::new(&db);
     let err = crate::staking::check_join_admission(&view, &addr(3)).unwrap_err();
     assert!(err.to_string().contains("attestation"), "{err}");
@@ -223,4 +234,18 @@ fn the_attestation_gate_is_a_chain_param() {
     assert_eq!(set.len(), 2);
     assert!(!set.contains_key(&addr(3)));
     assert_eq!(status(&db, &addr(3)), Some(ValidatorStatus::Pending));
+}
+
+#[test]
+fn the_set_is_cut_at_max_validator_set_by_stake() {
+    let db = chain(&[1, 2], MIN_VALIDATOR_STAKE);
+    db.write_batch(&ChainParamsRow(ChainParams { max_validator_set: 3, ..params() })).unwrap();
+    for n in 3..=6 {
+        stake_to(&db, &addr(n), MIN_VALIDATOR_STAKE * n as u128);
+        set_status(&db, &addr(n), Some(ValidatorStatus::Pending));
+    }
+    let set = seal(&db, boundary_of(0, EPOCH)).unwrap();
+    assert_eq!(set.len(), 3);
+    assert!(set.contains_key(&addr(6)) && set.contains_key(&addr(5)) && set.contains_key(&addr(4)));
+    assert_eq!(status(&db, &addr(1)), Some(ValidatorStatus::Pending), "cut from the set, back to waiting");
 }

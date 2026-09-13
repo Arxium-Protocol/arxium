@@ -317,9 +317,10 @@ curl -s localhost:30333/finality
 ```
 
 Quorum is by **voting power**, not head-count: every epoch the active set's
-stake is mapped onto 10,000 units of power (capped at 10% per validator once
-the set is past ten), and a certificate needs signers holding at least 6,667
-of them. `GET /validators` lists the members; `GET /validators/power` their power. `quorum_reachable` is
+stake is mapped onto 10,000 units of power — proportional to stake, capped
+per validator at twice the equal share, never below 10% and never above
+3,333 (so no single validator can block finality once there are four) —
+and a certificate needs signers holding at least 6,667 of them. `GET /validators` lists the members; `GET /validators/power` their power. `quorum_reachable` is
 therefore about how much *power* holds a BLS key — one keyless validator that
 happens to hold a large share can block finality on its own.
 
@@ -771,16 +772,17 @@ for the next boundary:
 
 | You do / it happens | Status written | In the set from |
 |---|---|---|
-| `JoinValidator` (stake ≥ 100,000 ARX self-stake, BLS key + PoP) | `Pending` | the first block of the next epoch — not before |
+| `JoinValidator` (stake ≥ 100,000 ARX self-stake, BLS key + PoP) | `Pending` | the first block of the next epoch — not before. **A join landing in the last block of an epoch waits one epoch more**: the boundary reads candidates from committed state, and that block's writes aren't committed yet |
 | `LeaveValidator` | `Leaving` | you keep proposing and voting until the boundary, then drop; the stake unbonds for 21 epochs and stays slashable throughout |
 | Missed proposer slot (downtime) | `Jailed { until_epoch: current + 2 }` | out at the next boundary, eligible again two epochs on — no action needed |
 | Double-sign or execution fault (evidence submitted) | `Tombstoned` | never again, with any stake, from that address. Slashed once — further evidence at other heights records nothing more |
 | Stake drops below the floor, or outside the top 100 by stake | `Pending` | back in at a later boundary once it qualifies again |
 
 At the boundary the eligible validators (not tombstoned, not jailed, above the
-floor, attested if `params.validator_attestation_required` — off on devnet,
-on for mainnet) are ranked by total stake, the top 100 taken, and their power
-assigned proportionally with a 10% cap. If fewer than `params.min_validator_set`
+floor, attested — an `identity_hash` granted by an attestor *still in the
+registry* — if `params.validator_attestation_required`; off on devnet, on
+for mainnet) are ranked by total stake, the top `params.max_validator_set`
+(devnet: 20) taken, and their power assigned as above. If fewer than `params.min_validator_set`
 qualify the previous set is kept and the node logs
 `epoch boundary: too few eligible validators` — a set that cannot reach
 quorum is never written. A BLS key registered mid-epoch (`RegisterBlsKey`,

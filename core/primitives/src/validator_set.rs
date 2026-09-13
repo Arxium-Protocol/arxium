@@ -65,14 +65,18 @@ pub fn is_boundary(height: u64, epoch_length: u64) -> bool {
     (height + 1) % epoch_length.max(1) == 0
 }
 
-/// Per-validator power cap: 10% of the total, but never below an equal share
-/// of the set — so it is non-binding below eleven validators and binding
-/// above, with no activation step. The equal share rounds *up*: with six
-/// validators 10,000 doesn't divide, and a floor of 1,666 would leave four
-/// units nobody is allowed to hold.
+/// Per-validator power cap: twice the equal share, never below 10% and
+/// never above 3,333 — so stake actually weights at small n (a plain
+/// `max(10%, equal share)` collapses every set of ten or fewer to
+/// one-validator-one-vote, since the cap *is* the equal share there), and
+/// no single validator can ever hold the 3,334 that blocks finality on its
+/// own. The equal share (rounded up) stays as a hard floor because the cap
+/// must be reachable: with three validators someone has to hold 3,334.
 pub fn power_cap(n: usize) -> u32 {
     let n = n.max(1) as u32;
-    (TOTAL_VOTING_POWER / 10).max(TOTAL_VOTING_POWER.div_ceil(n))
+    (2 * TOTAL_VOTING_POWER / n)
+        .clamp(TOTAL_VOTING_POWER / 10, 3_333)
+        .max(TOTAL_VOTING_POWER.div_ceil(n))
 }
 
 /// Assigns `TOTAL_VOTING_POWER` across `stakes` proportionally, clamping
@@ -101,6 +105,11 @@ pub fn assign_voting_power(stakes: &BTreeMap<Address, u128>) -> BTreeMap<Address
         let mut assigned: BTreeMap<&Address, u32> = BTreeMap::new();
         let mut assigned_total = 0u32;
         for (address, stake) in &pool {
+            // `remaining_power ≤ 10_000` and `stake ≤ pool_total`, so the
+            // product is at most 10_000 × total supply — bounded by the
+            // 5 B ARX (5 × 10^18 IUM) fixed supply, ~5 × 10^22, against a
+            // u128 ceiling of ~3 × 10^38. The quotient is ≤ remaining_power
+            // and fits a u32 by construction.
             let share = if pool_total == 0 {
                 remaining_power / pool.len() as u32
             } else {
@@ -164,6 +173,10 @@ pub struct ChainParams {
     /// previous set is kept — never a set that cannot reach quorum.
     #[serde(default = "default_min_validator_set")]
     pub min_validator_set: usize,
+    /// Largest set the boundary hook writes: the top `max_validator_set`
+    /// by total stake among the eligible.
+    #[serde(default = "default_max_validator_set")]
+    pub max_validator_set: usize,
 }
 
 fn default_epoch_length() -> u64 {
@@ -172,6 +185,9 @@ fn default_epoch_length() -> u64 {
 fn default_min_validator_set() -> usize {
     4
 }
+fn default_max_validator_set() -> usize {
+    100
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -179,13 +195,10 @@ impl Default for ChainParams {
             epoch_length: default_epoch_length(),
             validator_attestation_required: false,
             min_validator_set: default_min_validator_set(),
+            max_validator_set: default_max_validator_set(),
         }
     }
 }
-
-/// Largest set the boundary hook writes: the top `MAX_VALIDATOR_SET` by
-/// total stake among the eligible.
-pub const MAX_VALIDATOR_SET: usize = 100;
 
 /// Where a validator stands with respect to the active set. Written by the
 /// staking dispatch (`Pending`/`Leaving`), the fault paths (`Jailed`/
@@ -258,13 +271,35 @@ mod tests {
     }
 
     #[test]
-    fn cap_is_equal_share_below_ten_and_ten_percent_above() {
+    fn cap_is_twice_the_equal_share_bounded_by_ten_percent_and_the_blocking_threshold() {
         assert_eq!(power_cap(1), 10_000);
-        assert_eq!(power_cap(4), 2_500);
-        assert_eq!(power_cap(6), 1_667);
-        assert_eq!(power_cap(10), 1_000);
-        assert_eq!(power_cap(11), 1_000);
+        assert_eq!(power_cap(2), 5_000);
+        assert_eq!(power_cap(3), 3_334, "someone must hold 3,334 at n=3");
+        assert_eq!(power_cap(4), 3_333);
+        assert_eq!(power_cap(6), 3_333);
+        assert_eq!(power_cap(7), 2_857);
+        assert_eq!(power_cap(10), 2_000);
+        assert_eq!(power_cap(20), 1_000);
         assert_eq!(power_cap(100), 1_000);
+        // Reachable everywhere: n × cap ≥ total.
+        for n in 1..=200usize {
+            assert!(n as u32 * power_cap(n) >= TOTAL_VOTING_POWER, "n={n}");
+        }
+        // Nobody can block finality alone once there are four or more.
+        for n in 4..=200usize {
+            assert!(power_cap(n) < TOTAL_VOTING_POWER - QUORUM_POWER + 1, "n={n}");
+        }
+    }
+
+    #[test]
+    fn stake_weights_at_small_n() {
+        // Six validators 5/4/3/2/1/1: no longer collapses to one-vote-each.
+        let set = assign_voting_power(&stakes(&[(1, 5), (2, 4), (3, 3), (4, 2), (5, 1), (6, 1)]));
+        check_invariants(&set);
+        assert_eq!(set[&addr(1)], VotingPower(3_125));
+        assert_eq!(set[&addr(2)], VotingPower(2_500));
+        assert_eq!(set[&addr(6)], VotingPower(625));
+        assert!(set[&addr(1)] > set[&addr(2)] && set[&addr(2)] > set[&addr(3)]);
     }
 
     #[test]
@@ -295,32 +330,30 @@ mod tests {
 
     #[test]
     fn whale_lands_exactly_at_cap_and_the_rest_absorb_the_excess() {
-        // 11 validators: cap binds at 1,000. One holds 99%.
+        // 20 validators: cap binds at 1,000. One holds 99%.
         let mut list = vec![(1u8, 99_000u128)];
-        list.extend((2..=11).map(|n| (n, 100u128)));
+        list.extend((2..=20).map(|n| (n, 100u128)));
         let set = assign_voting_power(&stakes(&list));
         check_invariants(&set);
         assert_eq!(set[&addr(1)], VotingPower(1_000));
-        assert_eq!(total(&set) - 1_000, 9_000);
-        // The other ten share the remaining 9,000 equally.
-        assert!((2..=11).all(|n| set[&addr(n)].0 == 900));
+        // The other nineteen share the remaining 9,000: 473 or 474 each.
+        assert!((2..=20).all(|n| (473..=474).contains(&set[&addr(n)].0)));
     }
 
     #[test]
     fn cascading_caps_terminate_and_stay_exact() {
-        // Two whales, then the cap re-binds on the next tier.
+        // Two whales, then the cap re-binds on the next tier (20 validators, cap 1,000).
         let list: Vec<(u8, u128)> =
             vec![(1, 50_000), (2, 40_000), (3, 5_000), (4, 3_000), (5, 1_000)]
                 .into_iter()
-                .chain((6..=12).map(|n| (n, 10)))
+                .chain((6..=20).map(|n| (n, 10)))
                 .collect();
         let set = assign_voting_power(&stakes(&list));
         check_invariants(&set);
-        assert_eq!(set[&addr(1)], VotingPower(1_000));
-        assert_eq!(set[&addr(2)], VotingPower(1_000));
-        assert_eq!(set[&addr(3)], VotingPower(1_000));
-        assert_eq!(set[&addr(4)], VotingPower(1_000));
-        assert_eq!(set[&addr(5)], VotingPower(1_000));
+        for n in 1..=5 {
+            assert_eq!(set[&addr(n)], VotingPower(1_000), "{n}");
+        }
+        assert!((6..=20).all(|n| (333..=334).contains(&set[&addr(n)].0)));
     }
 
     #[test]
@@ -342,30 +375,30 @@ mod tests {
 
     #[test]
     fn quorum_counts_power_not_heads_and_ignores_outsiders() {
-        // 4 validators, one with 70% of stake — cap is 2,500 so it lands there.
+        // 4 validators, one with 70% of stake — cap is 3,333 so it lands there
+        // and can never block alone; the other three split 6,667.
         let set = assign_voting_power(&stakes(&[(1, 70), (2, 10), (3, 10), (4, 10)]));
         check_invariants(&set);
-        assert_eq!(set[&addr(1)], VotingPower(2_500));
-        // Three by count (the small ones): 7,500 ≥ 6,667.
+        assert_eq!(set[&addr(1)], VotingPower(3_333));
+        // The three small ones together hold exactly quorum.
         assert!(quorum_reached(&set, [&addr(2), &addr(3), &addr(4)]));
-        // Whale plus one: 5,000 < 6,667 — a head-count 2-of-4 never was quorum either.
+        // Whale plus one small: ~5,556 < 6,667.
         assert!(!quorum_reached(&set, [&addr(1), &addr(2)]));
         // Non-member and duplicates count for nothing.
-        assert_eq!(signed_power(&set, [&addr(2), &addr(2), &addr(99)]), 2_500);
+        assert_eq!(signed_power(&set, [&addr(2), &addr(2), &addr(99)]), set[&addr(2)].0);
     }
 
     #[test]
     fn majority_by_count_can_be_below_quorum_by_power() {
-        // 8 validators, cap 1,250: three big ones clamp to the cap and the
-        // five tiny ones absorb the rest — everyone ends at exactly 1,250.
+        // 8 validators, cap 2,500: three big ones clamp to the cap (7,500)
+        // and the five tiny ones share 2,500. Five of eight by head-count is
+        // a quarter of the power; three of eight is quorum.
         let set = assign_voting_power(&stakes(&[(1, 1000), (2, 1000), (3, 1000), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]));
         check_invariants(&set);
         let tiny: Vec<Address> = (4..=8).map(addr).collect();
-        // 5 of 8 by head-count (the old 2/3+1 rule would say 6, so add one big): 6,250 < 6,667.
         assert!(!quorum_reached(&set, tiny.iter()));
-        assert!(!quorum_reached(&set, [&addr(1), &addr(2), &addr(3)]));
-        assert!(quorum_reached(&set, tiny.iter().chain([&addr(1)])));
-        assert!(quorum_reached(&set, set.keys()));
+        assert!(quorum_reached(&set, [&addr(1), &addr(2), &addr(3)]));
+        assert!(!quorum_reached(&set, tiny.iter().chain([&addr(1)])));
     }
 
     #[test]
