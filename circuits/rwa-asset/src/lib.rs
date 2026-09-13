@@ -72,6 +72,15 @@ pub enum RwaError {
         balance: u128,
         amount: u128,
     },
+    /// Balance ≤ total_supply is an invariant every mint/transfer keeps; a
+    /// burn that would take supply below zero means state is already
+    /// corrupt, so refuse rather than silently clamp it.
+    #[error("burning {amount} of {asset_id} exceeds its total supply of {total_supply}")]
+    BurnExceedsSupply {
+        asset_id: String,
+        total_supply: u128,
+        amount: u128,
+    },
     #[error("{address} is missing the {topic:?} claim required by {asset_id}")]
     MissingClaim {
         asset_id: String,
@@ -337,7 +346,11 @@ pub fn apply_burn<V: KvRead<Error = StorageError>>(
     if amount > balance {
         return Err(RwaError::BurnExceedsBalance { asset_id: asset.asset_id.clone(), balance, amount });
     }
-    asset.total_supply = asset.total_supply.saturating_sub(amount);
+    asset.total_supply = asset.total_supply.checked_sub(amount).ok_or_else(|| RwaError::BurnExceedsSupply {
+        asset_id: asset.asset_id.clone(),
+        total_supply: asset.total_supply,
+        amount,
+    })?;
     Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_id.clone(), issuer.clone()), balance - amount)])))
 }
 
@@ -402,6 +415,9 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
     let lost_state = holder_state(view, asset, lost)?;
     let mut replacement_state = holder_state(view, asset, replacement)?;
     replacement_state.frozen_amount = replacement_state.frozen_amount.saturating_add(lost_state.frozen_amount);
+    // T-REX carries the address freeze over too: recovery moves a holder,
+    // it doesn't launder a frozen one.
+    replacement_state.frozen |= lost_state.frozen;
     let id = asset.asset_id.clone();
     Ok((
         AssetBalanceUpdates(BTreeMap::from([
@@ -576,6 +592,12 @@ mod tests {
         assert_eq!(asset.total_supply, 70);
         let err = apply_burn(&db, &mut asset, &issuer, 101).unwrap_err();
         assert!(matches!(err, RwaError::BurnExceedsBalance { .. }), "{err}");
+
+        // Corrupt supply (below the issuer's own balance) is refused, not clamped to 0.
+        asset.total_supply = 10;
+        let err = apply_burn(&db, &mut asset, &issuer, 20).unwrap_err();
+        assert!(matches!(err, RwaError::BurnExceedsSupply { total_supply: 10, amount: 20, .. }), "{err}");
+        assert_eq!(asset.total_supply, 10);
     }
 
     #[test]
@@ -610,7 +632,13 @@ mod tests {
         assert_eq!(assets.0[&("gold".to_string(), lost.clone())], 0);
         assert_eq!(assets.0[&("gold".to_string(), replacement.clone())], 60);
         assert_eq!(states.0[&("gold".to_string(), replacement.clone())].frozen_amount, 15, "the lock travels with the balance");
+        assert!(!states.0[&("gold".to_string(), replacement.clone())].frozen);
         assert_eq!(states.0[&("gold".to_string(), lost.clone())], HolderState::default());
+
+        // A frozen lost wallet recovers into a frozen replacement.
+        db.write_batch(&apply_set_holder_frozen(&db, &asset, &lost, true).unwrap()).unwrap();
+        let (_, states) = apply_recover(&db, &asset, &lost, &replacement).unwrap();
+        assert!(states.0[&("gold".to_string(), replacement.clone())].frozen, "the address freeze travels too");
     }
 
     #[test]
