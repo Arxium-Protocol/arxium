@@ -26,7 +26,7 @@ fn main() {
             .get_validator_set_at(h)
             .unwrap()
             .into_iter()
-            .map(|a| a.to_string())
+            .map(|(a, p)| format!("{a}={}", p.0))
             .collect();
         if set != prev {
             println!("validator_set_at({h}) changed -> {set:?}");

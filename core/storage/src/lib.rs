@@ -13,13 +13,14 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, AssetIndexKey, AssetKey,
     AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec,
-    KvRead, OperatorKey, StakeByValidatorKey, StakeKey,
+    KvRead, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorStatusKey, ChainParamsKey,
 };
 use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
 };
 use xc_primitives::{
-    stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, Snapshot, StakeAllocation, HolderState,
+    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, ChainParams, HolderState,
+    Snapshot, StakeAllocation, ValidatorStatus, VotingPower,
 };
 #[cfg(test)]
 use xc_primitives::Action;
@@ -191,7 +192,15 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// and the delegated paths of `JoinValidator`/`LeaveValidator`/
 /// `RegisterBlsKey` resolve to `Culpable` under adjudication instead of
 /// always `Disagreement`. Same "wipe and resync" policy as the prior bumps.
-pub const SCHEMA_VERSION: u32 = 7;
+///
+/// Bumped 7 -> 8: the validator set went stake-weighted. `validator_set:*`
+/// rows are now a `BTreeMap<Address, VotingPower>` (were a sorted
+/// `Vec<Address>`), and two rows joined the trie: `validator_status:{addr}`
+/// (`ValidatorStatusKey`, `CF_VALIDATORS`) and `chain_params`
+/// (`ChainParamsKey`, `CF_GOVERNANCE`). The old bytes are not readable as
+/// the new shape, and nothing about the old set model is worth migrating —
+/// devnet resets to a fresh genesis (`arxium-devnet-2`).
+pub const SCHEMA_VERSION: u32 = 8;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -1397,7 +1406,7 @@ impl ArxiumDb {
     /// the set as it stood before that block, never one it could vote itself
     /// into. Falls back to an empty set only if genesis never wrote height 0
     /// (shouldn't happen on a bootstrapped chain).
-    pub fn get_validator_set_at(&self, height: u64) -> Result<Vec<Address>, StorageError> {
+    pub fn get_validator_set_at(&self, height: u64) -> Result<BTreeMap<Address, VotingPower>, StorageError> {
         let prefix = b"validator_set:";
         let seek_key = format!("validator_set:{height:020}");
         let mut iter = self
@@ -1413,7 +1422,42 @@ impl ArxiumDb {
                 return Ok(validators);
             }
         }
-        Ok(Vec::new())
+        Ok(BTreeMap::new())
+    }
+
+    /// Membership only — for the call sites that never weigh anything
+    /// (`eligible_proposer`, BLS key lookups). Sorted, as `eligible_proposer`
+    /// requires.
+    pub fn validator_addresses_at(&self, height: u64) -> Result<Vec<Address>, StorageError> {
+        Ok(self.get_validator_set_at(height)?.into_keys().collect())
+    }
+
+    /// Every validator with a status row — the candidate pool the boundary
+    /// hook filters. Full `validator_status:` scan, once per epoch, bounded
+    /// by how many addresses ever staked to join.
+    pub fn all_validator_statuses(&self) -> Result<BTreeMap<Address, ValidatorStatus>, StorageError> {
+        let prefix = b"validator_status:";
+        let mut out = BTreeMap::new();
+        let iter = self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let address = std::str::from_utf8(&key[prefix.len()..])
+                .ok()
+                .and_then(|s| Address::parse(s).ok())
+                .ok_or(StorageError::CorruptedMeta)?;
+            let (status, _len) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            out.insert(address, status);
+        }
+        Ok(out)
+    }
+
+    /// Genesis-fixed consensus parameters. Falls back to the defaults on a
+    /// chain seeded before `ChainParamsKey` existed.
+    pub fn chain_params(&self) -> Result<ChainParams, StorageError> {
+        Ok(KvRead::get(self, &ChainParamsKey)?.unwrap_or_default())
     }
 
     /// The contiguous finalized watermark: the highest H for which every
@@ -1773,23 +1817,53 @@ mod explorer_index_tests {
     #[test]
     fn validator_set_at_returns_latest_snapshot_at_or_before_height() {
         let db = temp_db();
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 0,
-            validators: vec![addr(1)],
-        })
-        .unwrap();
-        db.write_batch(&ValidatorSetSnapshot {
-            effective_height: 5,
-            validators: vec![addr(1), addr(2)],
-        })
-        .unwrap();
-        let mut expected_pair = vec![addr(1), addr(2)];
-        expected_pair.sort();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)])).unwrap();
+        let mut weighted = BTreeMap::new();
+        weighted.insert(addr(1), VotingPower(7_500));
+        weighted.insert(addr(2), VotingPower(2_500));
+        db.write_batch(&ValidatorSetSnapshot { effective_height: 5, validators: weighted.clone() }).unwrap();
 
-        assert_eq!(db.get_validator_set_at(0).unwrap(), vec![addr(1)]);
-        assert_eq!(db.get_validator_set_at(4).unwrap(), vec![addr(1)]);
-        assert_eq!(db.get_validator_set_at(5).unwrap(), expected_pair);
-        assert_eq!(db.get_validator_set_at(100).unwrap(), expected_pair);
+        assert_eq!(db.validator_addresses_at(0).unwrap(), vec![addr(1)]);
+        assert_eq!(db.get_validator_set_at(0).unwrap()[&addr(1)], VotingPower(10_000));
+        assert_eq!(db.validator_addresses_at(4).unwrap(), vec![addr(1)]);
+        // Weights survive the round trip, not just membership.
+        assert_eq!(db.get_validator_set_at(5).unwrap(), weighted);
+        assert_eq!(db.get_validator_set_at(100).unwrap(), weighted);
+        let mut pair = vec![addr(1), addr(2)];
+        pair.sort();
+        assert_eq!(db.validator_addresses_at(100).unwrap(), pair);
+    }
+
+    /// The set at the last block of an epoch and at the first block of the
+    /// next are two different rows, both retrievable after the fact.
+    #[test]
+    fn boundary_crossing_keeps_both_epochs_sets() {
+        let db = temp_db();
+        let epoch_length = 10;
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1), addr(2)])).unwrap();
+        let boundary = xc_primitives::boundary_of(0, epoch_length);
+        db.write_batch(&ValidatorSetSnapshot::equal_power(boundary + 1, &[addr(1), addr(2), addr(3)])).unwrap();
+        assert_eq!(db.get_validator_set_at(boundary).unwrap().len(), 2);
+        assert_eq!(db.get_validator_set_at(boundary + 1).unwrap().len(), 3);
+        assert_ne!(db.get_validator_set_at(boundary).unwrap(), db.get_validator_set_at(boundary + 1).unwrap());
+    }
+
+    #[test]
+    fn validator_statuses_round_trip_and_scan() {
+        let db = temp_db();
+        let mut updates = ValidatorStatusUpdates::default();
+        updates.0.insert(addr(1), Some(ValidatorStatus::Active));
+        updates.0.insert(addr(2), Some(ValidatorStatus::Jailed { until_epoch: 3 }));
+        db.write_batch(&updates).unwrap();
+        let all = db.all_validator_statuses().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[&addr(2)], ValidatorStatus::Jailed { until_epoch: 3 });
+        let mut delete = ValidatorStatusUpdates::default();
+        delete.0.insert(addr(1), None);
+        db.write_batch(&delete).unwrap();
+        assert_eq!(db.all_validator_statuses().unwrap().len(), 1);
+        // No params row seeded: defaults, not an error.
+        assert_eq!(db.chain_params().unwrap(), ChainParams::default());
     }
 
     #[test]
@@ -1799,6 +1873,7 @@ mod explorer_index_tests {
         validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
+            params: Default::default(),
             chain_name: "test".into(),
             accounts: Default::default(),
             validators,
@@ -1835,6 +1910,7 @@ mod explorer_index_tests {
         validators.insert(addr(2), xc_primitives::ValidatorEntry { stake: 2_000_000, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
+            params: Default::default(),
             chain_name: "test".into(),
             accounts: Default::default(),
             validators,
@@ -1864,6 +1940,7 @@ mod explorer_index_tests {
         validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 500, bls_pubkey: None, bls_pop: None });
         db.write_batch(&Snapshot {
             height: 0,
+            params: Default::default(),
             chain_name: "test".into(),
             accounts: Default::default(),
             validators,
@@ -2929,9 +3006,9 @@ mod divergence_recovery_tests {
         }
         assert_eq!(db.get_final_watermark().unwrap(), 4);
 
-        db.write_batch(&ValidatorSetSnapshot { effective_height: 0, validators: vec![addr(1)] }).unwrap();
-        db.write_batch(&ValidatorSetSnapshot { effective_height: 2, validators: vec![addr(1), addr(2)] }).unwrap();
-        db.write_batch(&ValidatorSetSnapshot { effective_height: 5, validators: vec![addr(3)] }).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(2, &[addr(1), addr(2)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(5, &[addr(3)])).unwrap();
 
         db.prune::<()>(4).unwrap();
 
@@ -2940,12 +3017,10 @@ mod divergence_recovery_tests {
         // (>= the cutoff) are guaranteed answerable after pruning. The one
         // effective at 2 survives because it's still the answer for every
         // retained height up to 4.
-        let mut at_4 = db.get_validator_set_at(4).unwrap();
-        at_4.sort();
         let mut expected = vec![addr(1), addr(2)];
         expected.sort();
-        assert_eq!(at_4, expected);
-        assert_eq!(db.get_validator_set_at(5).unwrap(), vec![addr(3)]);
+        assert_eq!(db.validator_addresses_at(4).unwrap(), expected);
+        assert_eq!(db.validator_addresses_at(5).unwrap(), vec![addr(3)]);
     }
 }
 

@@ -147,6 +147,46 @@ pub fn assign_voting_power(stakes: &BTreeMap<Address, u128>) -> BTreeMap<Address
     powers.into_iter().map(|(a, p)| (a.clone(), VotingPower(p))).collect()
 }
 
+/// Consensus parameters fixed at genesis and read from state at dispatch
+/// time — a spec field rather than a binary constant, so two chains differ by
+/// inspectable configuration and not by a magic number.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainParams {
+    /// Blocks per epoch. The validator set only changes at epoch boundaries.
+    #[serde(default = "default_epoch_length")]
+    pub epoch_length: u64,
+    /// Whether `JoinValidator` (and the boundary hook) require the validator
+    /// address to carry an attestation. Off on devnet so anyone can join;
+    /// on for mainnet.
+    #[serde(default)]
+    pub validator_attestation_required: bool,
+    /// Smallest set the boundary hook will ever write. If fewer qualify the
+    /// previous set is kept — never a set that cannot reach quorum.
+    #[serde(default = "default_min_validator_set")]
+    pub min_validator_set: usize,
+}
+
+fn default_epoch_length() -> u64 {
+    1_800
+}
+fn default_min_validator_set() -> usize {
+    4
+}
+
+impl Default for ChainParams {
+    fn default() -> Self {
+        Self {
+            epoch_length: default_epoch_length(),
+            validator_attestation_required: false,
+            min_validator_set: default_min_validator_set(),
+        }
+    }
+}
+
+/// Largest set the boundary hook writes: the top `MAX_VALIDATOR_SET` by
+/// total stake among the eligible.
+pub const MAX_VALIDATOR_SET: usize = 100;
+
 /// Where a validator stands with respect to the active set. Written by the
 /// staking dispatch (`Pending`/`Leaving`), the fault paths (`Jailed`/
 /// `Tombstoned`), and the epoch-boundary hook (`Active`, and clearing

@@ -90,12 +90,21 @@ impl BatchWritable for Snapshot {
                 bincode::serde::encode_to_vec(&sub_entry, config)?,
             ));
         }
-        let mut genesis_validators: Vec<Address> = self.validators.keys().cloned().collect();
-        genesis_validators.sort();
+        // Genesis set: powers from the spec's stakes, same rule the boundary
+        // hook applies later; every genesis validator starts `Active`.
+        let genesis_stakes: BTreeMap<Address, u128> =
+            self.validators.iter().map(|(a, v)| (a.clone(), v.stake)).collect();
         entries.push((
             b"validator_set:00000000000000000000".to_vec(),
-            bincode::serde::encode_to_vec(&genesis_validators, config)?,
+            bincode::serde::encode_to_vec(&assign_voting_power(&genesis_stakes), config)?,
         ));
+        for address in self.validators.keys() {
+            entries.push((
+                ValidatorStatusKey(address).encode(),
+                bincode::serde::encode_to_vec(&ValidatorStatus::Active, config)?,
+            ));
+        }
+        entries.push((ChainParamsKey.encode(), bincode::serde::encode_to_vec(&self.params, config)?));
         if let Some(attestor) = &self.attestor {
             // Seeds the multi-attestor registry with this chain-spec's
             // legacy single attestor field, so a spec written before the
@@ -114,26 +123,58 @@ impl BatchWritable for Snapshot {
     }
 }
 
-/// The round-robin validator set effective starting `effective_height`,
-/// written by `xc_executor::accept_block`/`produce_block` whenever a block
-/// contains a `ValidatorChange` — one full-set snapshot per change, looked up
-/// via `ArxiumDb::get_validator_set_at`. `effective_height` is the changing
-/// block's height + 1: the change can't affect who proposes the block that
-/// introduced it.
+/// The stake-weighted validator set effective starting `effective_height`,
+/// written by the epoch-boundary hook (through `xc_executor::accept_block`/
+/// `produce_block`) at the last block of each epoch — one full-set snapshot
+/// per epoch, looked up via `ArxiumDb::get_validator_set_at`.
+/// `effective_height` is the boundary height + 1, the first block of the
+/// next epoch: a set can never affect the block that introduced it.
 pub struct ValidatorSetSnapshot {
     pub effective_height: u64,
-    pub validators: Vec<Address>,
+    pub validators: BTreeMap<Address, VotingPower>,
+}
+
+impl ValidatorSetSnapshot {
+    /// A set where every listed validator holds equal stake — what a fresh
+    /// genesis of equally-funded validators produces. Mostly for tests and
+    /// tooling that only care about membership.
+    pub fn equal_power(effective_height: u64, validators: &[Address]) -> Self {
+        let stakes: BTreeMap<Address, u128> = validators.iter().map(|a| (a.clone(), 1)).collect();
+        Self { effective_height, validators: assign_voting_power(&stakes) }
+    }
 }
 
 impl BatchWritable for ValidatorSetSnapshot {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
-        let mut sorted = self.validators.clone();
-        sorted.sort();
+        // BTreeMap encodes in key order, so the bytes are a pure function
+        // of the set — the same property the old sorted Vec had.
         Ok(vec![(
             format!("validator_set:{:020}", self.effective_height).into_bytes(),
-            bincode::serde::encode_to_vec(&sorted, config)?,
+            bincode::serde::encode_to_vec(&self.validators, config)?,
         )])
+    }
+}
+
+/// Validator status rows touched by a block, keyed by validator; `None`
+/// deletes the row (a validator that has fully left).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ValidatorStatusUpdates(pub BTreeMap<Address, Option<ValidatorStatus>>);
+
+impl BatchWritable for ValidatorStatusUpdates {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        let config = bincode::config::standard();
+        self.0
+            .iter()
+            .filter_map(|(address, status)| status.as_ref().map(|s| (address, s)))
+            .map(|(address, status)| {
+                Ok((ValidatorStatusKey(address).encode(), bincode::serde::encode_to_vec(status, config)?))
+            })
+            .collect()
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(self.0.iter().filter(|(_, s)| s.is_none()).map(|(a, _)| ValidatorStatusKey(a).encode()).collect())
     }
 }
 

@@ -252,6 +252,30 @@ impl KeySpec for GenesisHashKey {
     }
 }
 
+/// A validator's standing with respect to the active set — see
+/// `xc_primitives::ValidatorStatus`. `CF_VALIDATORS`, merkleized: it decides
+/// who the next epoch's set may contain, and `Tombstoned` is the permanent
+/// bar to re-entry, so both must be provable.
+pub struct ValidatorStatusKey<'a>(pub &'a Address);
+impl KeySpec for ValidatorStatusKey<'_> {
+    const CF: &'static str = CF_VALIDATORS;
+    type Value = xc_primitives::ValidatorStatus;
+    fn encode(&self) -> Vec<u8> {
+        format!("validator_status:{}", self.0).into_bytes()
+    }
+}
+
+/// Genesis-fixed consensus parameters (`Snapshot::params`), read at dispatch
+/// and at every epoch boundary. `CF_GOVERNANCE` so they are in the root.
+pub struct ChainParamsKey;
+impl KeySpec for ChainParamsKey {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = xc_primitives::ChainParams;
+    fn encode(&self) -> Vec<u8> {
+        b"chain_params".to_vec()
+    }
+}
+
 /// Address allowed to `RegisterAttestor`/`DeregisterAttestor` — see
 /// `Snapshot::governor`. Lives in `CF_GOVERNANCE` (included in
 /// `is_state_key`) so both actions are provable to the proof-only

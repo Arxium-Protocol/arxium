@@ -20,7 +20,7 @@ pub use consensus::{
     round_timeout_signing_bytes,
 };
 pub use validator_set::{
-    QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
+    ChainParams, MAX_VALIDATOR_SET, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
     is_boundary, power_cap, quorum_reached, signed_power,
 };
 pub use state::{

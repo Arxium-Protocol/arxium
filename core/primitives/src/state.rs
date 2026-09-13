@@ -361,6 +361,10 @@ pub struct Snapshot {
     /// here. `Option`/`#[serde(default)]` for the same reason as `attestor`.
     #[serde(default)]
     pub governor: Option<Address>,
+    /// Epoch length, attestation gate, minimum set — see `ChainParams`.
+    /// Defaults so specs written before it existed still parse.
+    #[serde(default)]
+    pub params: crate::ChainParams,
 }
 
 impl Snapshot {
