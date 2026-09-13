@@ -16,7 +16,7 @@
 # machinery, fault injection and evidence/adjudication checks stripped out —
 # this only needs plain liveness, not a divergence to recover from.
 #
-# quorum(2) = 2*2/3 + 1 = 2, i.e. both validators must agree on every block —
+# two equal validators hold 5,000 power each against a 6,667 quorum, i.e. both must agree on every block —
 # exactly the property a round-self-certification bug would break first.
 set -euo pipefail
 

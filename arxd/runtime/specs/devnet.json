@@ -2,6 +2,7 @@
   "genesis_format": "plain",
   "height": 0,
   "chain_name": "corechain",
+  "params": {"epoch_length": 1800, "validator_attestation_required": false, "min_validator_set": 2},
   "accounts": {
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
       "balance": 100000000,

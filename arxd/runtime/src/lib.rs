@@ -16,6 +16,8 @@ pub mod adjudicate;
 mod asset;
 mod consensus;
 mod epoch;
+#[cfg(test)]
+mod epoch_tests;
 mod identity;
 mod pair;
 mod specs;
@@ -82,9 +84,9 @@ pub enum ActionPayload {
     },
     /// Removal from the validator set, routed through
     /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
-    /// before the `ValidatorChange::Leave` is allowed. Leaving drops the
-    /// validator from the proposer rotation immediately, but the stake sits
-    /// in `Unbonding` for `circuit_staking::UNBONDING_BLOCKS` — and stays
+    /// and a `Leaving` status. The validator keeps proposing and voting
+    /// until the epoch boundary, then drops; the stake sits in `Unbonding`
+    /// for `circuit_staking::UNBONDING_EPOCHS` — and stays
     /// slashable that whole time (`circuit_staking::apply_slash` treats
     /// unbonding funds as fair game). Rejected if `validator` isn't
     /// currently a validator, or if they're the last one — an empty

@@ -309,10 +309,19 @@ curl -s localhost:30333/finality
   "blocks_behind_tip": null,
   "validators": 2,
   "validators_with_bls_key": 0,
-  "quorum": 2,
+  "total_voting_power": 10000,
+  "voting_power_with_bls_key": 0,
+  "quorum": 6667,
   "quorum_reachable": false
 }
 ```
+
+Quorum is by **voting power**, not head-count: every epoch the active set's
+stake is mapped onto 10,000 units of power (capped at 10% per validator once
+the set is past ten), and a certificate needs signers holding at least 6,667
+of them. `GET /validators` lists each member's power. `quorum_reachable` is
+therefore about how much *power* holds a BLS key — one keyless validator that
+happens to hold a large share can block finality on its own.
 
 A validator's BLS key is bound to its registration — `JoinValidator` carries
 it, and genesis validators declare `bls_pubkey` in the chain spec — so a set
@@ -330,7 +339,7 @@ registering keys, not by restarting anything. The same numbers are exported
 for alerting:
 
 ```promql
-arxium_validators_with_bls_key < arxium_finality_quorum
+arxium_voting_power_with_bls_key < arxium_finality_quorum
 ```
 
 `finalized_height` climbing but `blocks_behind_tip` growing steadily is the
@@ -510,11 +519,11 @@ NUM_VALIDATORS=2 scripts/two-node-fault-harness.sh  # original two-node case
 FAULT_HEIGHT=20 scripts/two-node-fault-harness.sh  # override the fault height
 ```
 
-**Why 4, not 2, by default.** `quorum(n) = 2n/3 + 1` (`core/primitives/src/consensus.rs:20`)
-is 2 at n=2 — the faulty node's own vote is required for any quorum, so a
-two-node run can never demonstrate the honest side outvoting a faulty one.
-At n=4, quorum is 3 and the three honest nodes can reach it without the
-faulty node. See the 2026-09-06 re-run below for what that did and didn't
+**Why 4, not 2, by default.** Quorum is 6,667 of 10,000 voting power
+(`xc_primitives::QUORUM_POWER`); with two equal validators each holds 5,000,
+so the faulty node's own vote is required for any quorum and a two-node run
+can never demonstrate the honest side outvoting a faulty one. At n=4 each
+holds 2,500, three honest nodes reach 7,500 without the faulty one. See the 2026-09-06 re-run below for what that did and didn't
 settle.
 
 **The flag it exercises does not exist in a normal build.** `arxd`'s
@@ -551,7 +560,8 @@ proposer retry height 5. B's fault action sits in A's mempool forever, never
 mined, so the on-chain slash never lands.
 
 **This was originally logged as "Stage 3 unreachable without
-reorg/rollback." That claim was too strong — `quorum(2) = 2` means both
+reorg/rollback." That claim was too strong — two equal validators at 5,000
+power each means both
 validators, including the faulty one, must agree before *anything* advances
 past height 5; the deadlock is required by the math at n=2 regardless of
 reorg/rollback. It says nothing about whether Stage 3 is reachable when the
@@ -605,7 +615,7 @@ clean pass that wasn't a real test of anything:
   milliseconds of startup, before it ever got to propose anything, and in
   another, an honest node partway through the run. When it takes out one
   honest node's networking, the remaining live honest count drops to 2,
-  below `quorum(4) = 3`, and everyone left standing stalls for the rest of
+  below quorum (7,500 of 10,000 needs three of four), and everyone left standing stalls for the rest of
   the run — a real, arithmetic-grounded liveness failure, just one caused by
   a crash rather than by anything in the finality logic. It fires often
   enough (multiple times across ~25 runs total, at unpredictable points
@@ -752,6 +762,37 @@ pay for their own fault reports and the dedup guard matches the chain's own
 notion of "the same fault." `scripts/two-node-fault-harness.sh` is the
 acceptance signal Stage 3 was waiting on, and it now passes reliably.
 
+## Joining, leaving, jail and tombstone (epoch-based validator set)
+
+The active set changes **only at epoch boundaries** — the last block of every
+`epoch_length` blocks (a chain-spec parameter under `params`; devnet is 1,800
+blocks, about an hour at 2 s). Everything below is a status change that waits
+for the next boundary:
+
+| You do / it happens | Status written | In the set from |
+|---|---|---|
+| `JoinValidator` (stake ≥ 100,000 ARX self-stake, BLS key + PoP) | `Pending` | the first block of the next epoch — not before |
+| `LeaveValidator` | `Leaving` | you keep proposing and voting until the boundary, then drop; the stake unbonds for 21 epochs and stays slashable throughout |
+| Missed proposer slot (downtime) | `Jailed { until_epoch: current + 2 }` | out at the next boundary, eligible again two epochs on — no action needed |
+| Double-sign or execution fault (evidence submitted) | `Tombstoned` | never again, with any stake, from that address. Slashed once — further evidence at other heights records nothing more |
+| Stake drops below the floor, or outside the top 100 by stake | `Pending` | back in at a later boundary once it qualifies again |
+
+At the boundary the eligible validators (not tombstoned, not jailed, above the
+floor, attested if `params.validator_attestation_required` — off on devnet,
+on for mainnet) are ranked by total stake, the top 100 taken, and their power
+assigned proportionally with a 10% cap. If fewer than `params.min_validator_set`
+qualify the previous set is kept and the node logs
+`epoch boundary: too few eligible validators` — a set that cannot reach
+quorum is never written. A BLS key registered mid-epoch (`RegisterBlsKey`,
+or the one carried by `JoinValidator`) also takes effect at the boundary, so
+keys and membership always activate together.
+
+All slashed stake is burned; nothing is credited to the treasury.
+
+`GET /validators` returns `{address: voting_power}` for the set at the tip
+(or `?height=`). A validator's own status has no RPC yet — read it from the
+node log at the boundary, or from Retracer once it renders the new statuses.
+
 ## Divergence recovery — live-proven 2026-09-08
 
 The `68d2b26` divergence-recovery block added four assertions to
@@ -814,7 +855,7 @@ From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,
 but relevant once this runs multi-node or faces adversarial peers:
 
 - **Two-validator chains cannot outvote a faulty validator (not a bug —
-  `quorum(2) = 2`).** With only 2 validators, quorum requires both, so a
+  two equal validators hold 5,000 each against a 6,667 quorum).** With only 2 validators, quorum requires both, so a
   node that rejects its peer's block has no way to make progress no matter
   what machinery exists — this is arithmetic, not a missing feature. Confirmed
   live via `scripts/two-node-fault-harness.sh`; see above for what running at

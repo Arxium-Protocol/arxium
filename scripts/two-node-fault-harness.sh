@@ -32,7 +32,7 @@
 # the action-level self-incrimination check below, which tests the actual
 # property (nothing submitted, not nothing observed).
 #
-# NUM_VALIDATORS matters: quorum(n) = 2n/3 + 1, so at n=2 the faulty node's
+# NUM_VALIDATORS matters: quorum is 6,667 of 10,000 voting power, so at n=2 (5,000 each) the faulty node's
 # own vote is required for any quorum and the chain cannot advance past the
 # disputed height at all — that's a quorum degeneracy, not evidence that
 # reorg/rollback is required. Default here is 4 (quorum 3, faulty node

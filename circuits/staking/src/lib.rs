@@ -29,7 +29,7 @@ pub fn unbonding_blocks(epoch_length: u64) -> u64 {
 /// 4.3 ARX/block in IUM — whitepaper §9.1/9.3 Y1 target (750M-ARX pool,
 /// 15% of the 5B fixed non-mintable supply, emitted to validators).
 /// Flat devnet-stub rate, no 8%/yr decay curve — tune once real economics
-/// are decided, same as `UNBONDING_BLOCKS`.
+/// are decided.
 pub const REWARD_PER_BLOCK: u128 = 4_300_000_000;
 
 /// Fee split, whitepaper §9.4: 30% to the block proposer, 20% to treasury,

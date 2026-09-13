@@ -156,6 +156,17 @@ impl BatchWritable for ValidatorSetSnapshot {
     }
 }
 
+/// Writes the genesis-fixed consensus parameters row — what
+/// `Snapshot::batch_entries` seeds; exposed for tooling and tests that build
+/// a chain without a full genesis.
+pub struct ChainParamsRow(pub ChainParams);
+
+impl BatchWritable for ChainParamsRow {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        Ok(vec![(ChainParamsKey.encode(), bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?)])
+    }
+}
+
 /// Validator status rows touched by a block, keyed by validator; `None`
 /// deletes the row (a validator that has fully left).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

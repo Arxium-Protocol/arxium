@@ -555,6 +555,54 @@ mod tests {
         assert!(err.to_string().contains("already processed"));
     }
 
+    /// The Cosmos tombstone-cap lesson: a validator caught double-signing
+    /// is slashed and tombstoned once; further evidence at other heights
+    /// (the same misconfigured signer replaying old blocks) records its
+    /// marker and slashes nothing more.
+    #[test]
+    fn a_second_equivocation_against_a_tombstoned_validator_slashes_nothing() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let reporter = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        let db = temp_db();
+        let sub_account = circuit_staking::stake_subaccount(&equivocator);
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(sub_account.clone(), funded(10_000)), (reporter.clone(), funded(10 * ACTION_FEE))]),
+            HashMap::from([((equivocator.clone(), equivocator.clone()), self_allocation(&equivocator, 10_000))]),
+        );
+        view.put(&StakeByValidatorKey(&equivocator), &vec![equivocator.clone()]).unwrap();
+        let submit = |view: &_, height: u64, nonce: u64| {
+            let action = Action {
+                sender: reporter.clone(),
+                nonce,
+                signature: None,
+                payload: ActionPayload::SubmitEquivocationEvidence {
+                    block_a: Box::new(signed_chain_block(&key, height, 100)),
+                    block_b: Box::new(signed_chain_block(&key, height, 200)),
+                },
+            };
+            crate::dispatch(&action, view, &operator_lookup, &operator_validators_lookup, &[], 10, &no_bls_owner)
+                .unwrap()
+        };
+
+        let first = submit(&view, 5, 0);
+        assert!(first.accounts.0[&sub_account].balance < 10_000, "first offence slashes");
+        assert!(first.stakes.allocations.contains_key(&(equivocator.clone(), equivocator.clone())));
+        assert_eq!(first.validator_statuses.0[&equivocator], Some(ValidatorStatus::Tombstoned));
+        assert!(first.evidence.is_some());
+        view.apply_accounts(&first.accounts).unwrap();
+        view.apply_stakes(&first.stakes).unwrap();
+        view.apply_validator_statuses(&first.validator_statuses).unwrap();
+
+        let second = submit(&view, 6, 1);
+        // Only the reporter's own fee/nonce row moves — nothing of the validator's.
+        assert!(second.accounts.0.keys().all(|a| *a == reporter), "no validator balance moves");
+        assert!(second.stakes.allocations.is_empty(), "no stake moves");
+        assert!(second.validator_statuses.0.is_empty());
+        assert_eq!(second.evidence.map(|m| m.height), Some(6), "the marker is still recorded");
+    }
+
     #[test]
     fn register_bls_key_accepts_a_valid_pubkey() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
