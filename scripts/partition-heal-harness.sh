@@ -31,6 +31,17 @@
 # node follows the protocol exactly, one just cannot hear the others — and
 # none of the stake assertions apply. Same scaffolding, different fault.
 #
+# EPOCH_LENGTH (optional) makes the partition span an epoch boundary: the
+# genesis gets `params.epoch_length` set to it (and `min_validator_set: 3`,
+# so a 3-of-4 set is writable), and in the default mode the heal is held
+# back until the majority has finalized past the first boundary after
+# TARGET_H. While cut off the victim misses its slot, so the majority
+# slashes and jails it at that height and the boundary hook writes a
+# 3-validator set with fresh powers — the healed node then has to sync and
+# verify certificates signed by a set it never saw written live, and the run
+# asserts both sides agree on that set. If the run lasts to the second
+# boundary it also checks the jail lifts and the victim is readmitted.
+#
 # HEAL_WHEN selects which unwind path the run aims at — `finalized` (default)
 # for the peer-driven recovery, `votes` for arxd/finality's
 # enforce_certificate, which is unreachable in the default mode. See the
@@ -186,13 +197,17 @@ done
 # chain_name must be exactly this: arxd/node's ensure_fault_injection_allowed
 # refuses to boot with ARXD_BLOCK_PEERS set on any other chain, so a
 # mistyped --chain can never partition a real node.
-jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
+EPOCH_LENGTH="${EPOCH_LENGTH:-}"
+PARAMS='{}'
+[ -n "$EPOCH_LENGTH" ] && PARAMS="$(jq -n --argjson l "$EPOCH_LENGTH" '{epoch_length: $l, min_validator_set: 3}')"
+jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" --argjson params "$PARAMS" '{
     genesis_format: "plain",
     height: 0,
     chain_name: "arxium-fault-injection-harness",
     accounts: $accounts,
     validators: $validators,
-    boot_nodes: []
+    boot_nodes: [],
+    params: $params
 }' > "$ROOT/genesis.json"
 
 start_node() {
@@ -417,12 +432,21 @@ if [ "$HEAL_WHEN" = finalized ]; then
     # The majority is left alone to certify TARGET_H before the victim comes
     # back, so by the time it reconnects the precommit votes for that height
     # are already deleted (see the unwind check below).
-    echo "waiting for the majority to finalize past $TARGET_H..."
+    # With EPOCH_LENGTH the bar is the first boundary after TARGET_H, plus
+    # one: the set written at boundary B takes effect at B+1, so the
+    # majority must have finalized B+1 under the *new* set before the heal.
+    FINAL_BAR=$TARGET_H
+    if [ -n "$EPOCH_LENGTH" ]; then
+        BOUNDARY=$(( (TARGET_H / EPOCH_LENGTH + 1) * EPOCH_LENGTH - 1 ))
+        FINAL_BAR=$((BOUNDARY + 1))
+        echo "epoch boundary after $TARGET_H is $BOUNDARY; new set takes effect at $FINAL_BAR"
+    fi
+    echo "waiting for the majority to finalize past $FINAL_BAR..."
     deadline=$(($(date +%s) + CHAIN_TIMEOUT))
     majority_watermark=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
         majority_watermark="$(status_field "$RPC_MAJORITY" final_watermark)"
-        [ "$majority_watermark" -gt "$TARGET_H" ] && break
+        [ "$majority_watermark" -gt "$FINAL_BAR" ] && break
         sample_majority || true
         sleep 2
     done
@@ -585,6 +609,69 @@ else
 fi
 if grep -q "refusing to commit against finality" "$ROOT/node-$VICTIM.log"; then
     echo "  note: the ContradictsCertificate guard fired — its own block was re-offered and refused"
+fi
+
+if [ -n "$EPOCH_LENGTH" ] && [ "$HEAL_WHEN" = finalized ]; then
+    power_at() { { curl -sf "http://127.0.0.1:$1/validators/power?height=$2" || true; } | jq -cS .; }
+    echo "checking both sides hold the same validator set past the boundary ($FINAL_BAR)..."
+    majority_set="$(power_at "$RPC_MAJORITY" "$FINAL_BAR")"
+    victim_set="$(power_at "$RPC_VICTIM" "$FINAL_BAR")"
+    genesis_set="$(echo "$POWERS" | jq -cS .)"
+    echo "  genesis set:  $genesis_set"
+    echo "  set at $FINAL_BAR: $majority_set"
+    if [ -n "$majority_set" ] && [ "$majority_set" = "$victim_set" ]; then
+        echo "  ok: node $VICTIM agrees with the majority on the set at $FINAL_BAR"
+    else
+        echo "  FAIL: set at $FINAL_BAR differs — majority $majority_set, node $VICTIM '$victim_set'"
+        pass=false
+    fi
+    if [ "$majority_set" = "$genesis_set" ]; then
+        # Not a verdict on the chain — the boundary wrote the same set,
+        # which happens if the victim was never slashed for its missed slot.
+        # But then the run proved only that a no-op boundary is survivable.
+        inconclusive "the set at $FINAL_BAR equals the genesis set — the boundary changed nothing, so nothing about a set change was tested"
+    fi
+    if echo "$majority_set" | jq -e --arg a "${ADDRS[$VICTIM]}" 'has($a)' >/dev/null; then
+        echo "  note: node $VICTIM is still in the set (repowered, not dropped)"
+    else
+        echo "  ok: node $VICTIM was dropped from the set at $FINAL_BAR (jailed for the missed slot)"
+        # Jail lasts until epoch_of(TARGET_H) + 2: it should be back in the
+        # set written at the *second* boundary. Wait for it, since a set
+        # that shrinks and never grows back is the other half of the story.
+        # Unless it was staked exactly at the floor (the `arxd keys`
+        # default): the 1 bps downtime slash then leaves it below
+        # MIN_VALIDATOR_STAKE and the boundary hook rightly keeps it out
+        # until it tops up — which is why devnet's genesis validators are
+        # staked 10% above the floor. STAKES=1,1,1,2 or more to see the
+        # readmission; at the floor the expected outcome is "stays out".
+        READMIT_H=$(( (TARGET_H / EPOCH_LENGTH + 2) * EPOCH_LENGTH ))
+        expect_back=true
+        [ "${STAKE_MULT[$VICTIM]:-1}" -gt 1 ] || expect_back=false
+        echo "waiting for the second boundary: set at $READMIT_H should $([ $expect_back = true ] && echo contain || echo 'still exclude (slashed below the floor)') node $VICTIM..."
+        deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+        readmitted=false
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+            sample_majority || true
+            [ "$(status_field "$RPC_MAJORITY" final_watermark)" -ge "$READMIT_H" ] && { readmitted=true; break; }
+            sleep 2
+        done
+        if [ "$readmitted" = true ]; then
+            majority_set="$(power_at "$RPC_MAJORITY" "$READMIT_H")"
+            victim_set="$(power_at "$RPC_VICTIM" "$READMIT_H")"
+            echo "  set at $READMIT_H: $majority_set"
+            in_set=false
+            echo "$majority_set" | jq -e --arg a "${ADDRS[$VICTIM]}" 'has($a)' >/dev/null && in_set=true
+            if [ "$in_set" = "$expect_back" ] && [ "$majority_set" = "$victim_set" ]; then
+                echo "  ok: node $VICTIM $([ $in_set = true ] && echo readmitted || echo 'still out (below the floor after the slash)') at $READMIT_H and both sides agree on the set"
+            else
+                echo "  FAIL: at $READMIT_H majority holds $majority_set, node $VICTIM '$victim_set'"
+                pass=false
+            fi
+        else
+            echo "  FAIL: majority never finalized $READMIT_H within ${CHAIN_TIMEOUT}s"
+            pass=false
+        fi
+    fi
 fi
 
 echo "checking no majority node's tip ever moved backward..."
