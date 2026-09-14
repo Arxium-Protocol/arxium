@@ -5251,6 +5251,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "circuit-rwa-asset",
  "ed25519-dalek 3.0.0",
  "hex",
  "metrics",

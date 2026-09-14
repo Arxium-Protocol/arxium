@@ -528,14 +528,14 @@ impl BatchWritable for StakeUpdates {
 /// rather than touching `AccountUpdates`, which is what keeps regulated
 /// asset balances out of the native token balance.
 #[derive(Debug, Default)]
-pub struct AssetBalanceUpdates(pub BTreeMap<(String, Address), u128>);
+pub struct AssetBalanceUpdates(pub BTreeMap<(AssetRef, Address), u128>);
 
 impl BatchWritable for AssetBalanceUpdates {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
-        for ((asset_id, owner), balance) in &self.0 {
-            let key = AssetBalanceKey { asset_id, owner }.encode();
+        for ((asset, owner), balance) in &self.0 {
+            let key = AssetBalanceKey { asset, owner }.encode();
             let value = bincode::serde::encode_to_vec(balance, config)?;
             entries.push((key, value));
         }
@@ -557,13 +557,13 @@ impl BatchWritable for AssetBalanceUpdates {
 /// empty value here and writes nothing.
 #[derive(Debug, Default)]
 pub struct AssetIndexUpdates {
-    /// The full new registered-asset-id list, when a `RegisterAsset` in this
+    /// The full new registered-asset-ref list, when a `RegisterAsset` in this
     /// block added to it.
-    pub registry: Option<Vec<String>>,
-    /// `owner -> full new list of asset ids held`.
-    pub owners: BTreeMap<Address, Vec<String>>,
-    /// `asset_id -> full new list of holders with a non-zero balance`.
-    pub holders: BTreeMap<String, Vec<Address>>,
+    pub registry: Option<Vec<AssetRef>>,
+    /// `owner -> full new list of asset refs held`.
+    pub owners: BTreeMap<Address, Vec<AssetRef>>,
+    /// `asset_ref -> full new list of holders with a non-zero balance`.
+    pub holders: BTreeMap<AssetRef, Vec<Address>>,
 }
 
 impl AssetIndexUpdates {
@@ -582,29 +582,29 @@ impl BatchWritable for AssetIndexUpdates {
             let value = bincode::serde::encode_to_vec(ids, config)?;
             entries.push((AssetIndexKey.encode(), value));
         }
-        for (owner, asset_ids) in &self.owners {
-            let value = bincode::serde::encode_to_vec(asset_ids, config)?;
+        for (owner, refs) in &self.owners {
+            let value = bincode::serde::encode_to_vec(refs, config)?;
             entries.push((AccountAssetsKey(owner).encode(), value));
         }
-        for (asset_id, holders) in &self.holders {
+        for (asset, holders) in &self.holders {
             let value = bincode::serde::encode_to_vec(holders, config)?;
-            entries.push((AssetHoldersKey(asset_id).encode(), value));
+            entries.push((AssetHoldersKey(asset).encode(), value));
         }
         Ok(entries)
     }
 }
 
-/// `(asset_id, holder) -> new HolderState`, the issuer's per-holder freeze
+/// `(asset_ref, holder) -> new HolderState`, the issuer's per-holder freeze
 /// controls. `CF_ASSETS`, so part of the state root like the balances.
 #[derive(Debug, Default, Clone)]
-pub struct HolderStateUpdates(pub BTreeMap<(String, Address), HolderState>);
+pub struct HolderStateUpdates(pub BTreeMap<(AssetRef, Address), HolderState>);
 
 impl BatchWritable for HolderStateUpdates {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
         let mut entries = Vec::new();
-        for ((asset_id, holder), state) in &self.0 {
-            let key = AssetHolderStateKey { asset_id, holder }.encode();
+        for ((asset, holder), state) in &self.0 {
+            let key = AssetHolderStateKey { asset, holder }.encode();
             let value = bincode::serde::encode_to_vec(state, config)?;
             entries.push((key, value));
         }
@@ -615,7 +615,7 @@ impl BatchWritable for HolderStateUpdates {
 impl BatchWritable for Asset {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let config = bincode::config::standard();
-        let key = AssetKey(&self.asset_id).encode();
+        let key = AssetKey(&self.asset_ref).encode();
         let value = bincode::serde::encode_to_vec(self, config)?;
         Ok(vec![(key, value)])
     }

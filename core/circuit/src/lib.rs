@@ -14,7 +14,7 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use xc_bls::BlsPublicKey;
-use xc_primitives::{AccountEntry, Address, Asset, AttestorRecord, HolderState, StakeAllocation};
+use xc_primitives::{AccountEntry, Address, Asset, AssetRef, AttestorRecord, HolderState, StakeAllocation};
 
 pub const CF_META: &str = "meta";
 pub const CF_BLOCKS: &str = "blocks";
@@ -114,7 +114,14 @@ impl KeySpec for OperatorKey<'_> {
 /// not its balances (see `AssetBalanceKey`). Lives in `CF_ASSETS` (included in
 /// `is_state_key`) so `compliance_required` is merkleized and provable to a
 /// light client instead of sitting in `CF_META`.
-pub struct AssetKey<'a>(pub &'a str);
+///
+/// Keyed on the derived `AssetRef`, not the issuer-chosen `asset_id`: the ref
+/// already commits to `(issuer, asset_id)`, so a per-issuer duplicate is
+/// simply an existing record at the derived key — no separate alias index is
+/// needed to answer "does this issuer already have a `gold`". Every other
+/// asset key below follows the same rule. Prefixes are unchanged so
+/// `cf_for_key`'s routing is untouched.
+pub struct AssetKey<'a>(pub &'a AssetRef);
 impl KeySpec for AssetKey<'_> {
     const CF: &'static str = CF_ASSETS;
     type Value = Asset;
@@ -127,14 +134,14 @@ impl KeySpec for AssetKey<'_> {
 /// (`CF_ASSETS`, included in `is_state_key`) so regulated-asset balances are
 /// merkleized separately from the native token balance in `CF_ACCOUNTS`.
 pub struct AssetBalanceKey<'a> {
-    pub asset_id: &'a str,
+    pub asset: &'a AssetRef,
     pub owner: &'a Address,
 }
 impl KeySpec for AssetBalanceKey<'_> {
     const CF: &'static str = CF_ASSETS;
     type Value = u128;
     fn encode(&self) -> Vec<u8> {
-        format!("asset_balance:{}:{}", self.asset_id, self.owner).into_bytes()
+        format!("asset_balance:{}:{}", self.asset, self.owner).into_bytes()
     }
 }
 
@@ -142,21 +149,21 @@ impl KeySpec for AssetBalanceKey<'_> {
 /// `HolderState`). `CF_ASSETS`, merkleized: whether a holder is frozen is a
 /// fact a light client may need to prove.
 pub struct AssetHolderStateKey<'a> {
-    pub asset_id: &'a str,
+    pub asset: &'a AssetRef,
     pub holder: &'a Address,
 }
 impl KeySpec for AssetHolderStateKey<'_> {
     const CF: &'static str = CF_ASSETS;
     type Value = HolderState;
     fn encode(&self) -> Vec<u8> {
-        format!("asset_holder:{}:{}", self.asset_id, self.holder).into_bytes()
+        format!("asset_holder:{}:{}", self.asset, self.holder).into_bytes()
     }
 }
 
 /// Every address holding a non-zero balance of one asset — the cap table.
 /// Same reasoning as `AccountAssetsKey`: a maintained `CF_META` index, not a
 /// scan and not part of the state root.
-pub struct AssetHoldersKey<'a>(pub &'a str);
+pub struct AssetHoldersKey<'a>(pub &'a AssetRef);
 impl KeySpec for AssetHoldersKey<'_> {
     const CF: &'static str = CF_META;
     type Value = Vec<Address>;
@@ -165,7 +172,7 @@ impl KeySpec for AssetHoldersKey<'_> {
     }
 }
 
-/// Every registered asset id, as one list.
+/// Every registered asset ref, as one list.
 ///
 /// A maintained index rather than a prefix scan over `asset_record:`, for the
 /// same reason `meta:operator_index:` exists: listing is a read path and the
@@ -176,15 +183,15 @@ impl KeySpec for AssetHoldersKey<'_> {
 pub struct AssetIndexKey;
 impl KeySpec for AssetIndexKey {
     const CF: &'static str = CF_META;
-    type Value = Vec<String>;
+    type Value = Vec<AssetRef>;
     fn encode(&self) -> Vec<u8> {
         b"meta:asset_index".to_vec()
     }
 }
 
-/// Every asset id `owner` holds a balance row for.
+/// Every asset ref `owner` holds a balance row for.
 ///
-/// The reverse of `AssetBalanceKey`, which is keyed `{asset_id}:{owner}` and
+/// The reverse of `AssetBalanceKey`, which is keyed `{asset_ref}:{owner}` and
 /// so can only be scanned by asset, never by owner. A wallet asks the
 /// opposite question — "what does this account hold" — and answering it from
 /// the balance keys alone would mean reading every balance on the chain.
@@ -196,7 +203,7 @@ impl KeySpec for AssetIndexKey {
 pub struct AccountAssetsKey<'a>(pub &'a Address);
 impl KeySpec for AccountAssetsKey<'_> {
     const CF: &'static str = CF_META;
-    type Value = Vec<String>;
+    type Value = Vec<AssetRef>;
     fn encode(&self) -> Vec<u8> {
         format!("meta:account_assets:{}", self.0).into_bytes()
     }

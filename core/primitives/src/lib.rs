@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod action;
 mod address;
+mod asset_ref;
 mod block;
 mod consensus;
 pub mod keyfile;
@@ -14,6 +15,7 @@ mod validator_set;
 
 pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
+pub use asset_ref::{AssetRef, AssetRefError};
 pub use block::{Block, RawBlock};
 pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, round_timeout_signing_bytes,

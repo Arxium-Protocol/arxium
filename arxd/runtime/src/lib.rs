@@ -30,7 +30,7 @@ use xc_bls::BlsPublicKey;
 use xc_chain_spec::presets::PresetRegistry;
 use xc_circuit::{AccountKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address, AssetMetadata, ClaimTopic, CountryCode};
+use xc_primitives::{Action, Address, AssetMetadata, AssetRef, ClaimTopic, CountryCode};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
 /// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
@@ -197,34 +197,41 @@ pub enum ActionPayload {
     RevokeAttestation {
         subject: Address,
     },
-    /// Registers a new regulated asset, `sender` becoming its issuer.
-    /// Rejected if `asset_id` is already registered, or if `asset_id` /
+    /// Registers a new regulated asset, `sender` becoming its issuer. The
+    /// asset's chain-wide identity is `AssetRef::derive(sender, asset_id)`;
+    /// `asset_id` is only a slug, unique within the sender. Rejected if the
+    /// sender already has an asset with this slug, or if `asset_id` /
     /// `metadata` fail `asset::register_asset`'s validation.
+    ///
+    /// The only asset variant that still carries `asset_id: String` — it is
+    /// the slug being claimed. Every other asset variant names the asset by
+    /// `AssetRef`, so nothing downstream ever resolves by slug or symbol.
     ///
     /// `metadata` was added to this variant in place rather than as a new
     /// variant: bincode encodes struct-variant fields positionally, so this
     /// changes the encoding and old blocks carrying the two-field form no
     /// longer decode. That is acceptable only because devnet genesis is being
     /// reset alongside it — on a live chain this would need a new variant
-    /// appended instead. Retracer's hand-mirrored copy of this enum
+    /// appended instead. The `AssetRef` re-key happened on the same reasoning
+    /// in the same reset. Retracer's hand-mirrored copy of this enum
     /// (`crates/ingestion/src/corechain_payload.rs`) must gain the same
-    /// field, in this position, in the same release.
+    /// fields, in this position, in the same release.
     RegisterAsset {
         asset_id: String,
         compliance_required: bool,
         metadata: AssetMetadata,
     },
-    /// Mints `amount` of `asset_id` into the issuer's own asset balance —
+    /// Mints `amount` of `asset` into the issuer's own asset balance —
     /// only the registered issuer may call this. Native balance untouched.
     IssueAsset {
-        asset_id: String,
+        asset: AssetRef,
         amount: u128,
     },
     /// Compliance-gated transfer of a registered asset — distinct from
     /// `Transfer`, which only ever moves the native token and is never
     /// KYC-gated.
     TransferAsset {
-        asset_id: String,
+        asset: AssetRef,
         to: Address,
         amount: u128,
     },
@@ -255,7 +262,7 @@ pub enum ActionPayload {
     SubmitExecutionFault {
         artifact_json: String,
     },
-    /// Halts all transfers of `asset_id` until an `UnfreezeAsset` lands.
+    /// Halts all transfers of `asset` until an `UnfreezeAsset` lands.
     /// Issuance is deliberately unaffected — a freeze is about circulation,
     /// not about sealing the supply.
     ///
@@ -266,15 +273,15 @@ pub enum ActionPayload {
     /// same variants in the same order, or it will misdecode blocks rather
     /// than fail on them.
     FreezeAsset {
-        asset_id: String,
+        asset: AssetRef,
     },
     /// Lifts a `FreezeAsset`. Idempotent — unfreezing an asset that isn't
     /// frozen succeeds rather than erroring, so a governor never has to know
     /// the current flag to reach the state they want.
     UnfreezeAsset {
-        asset_id: String,
+        asset: AssetRef,
     },
-    /// Moves `amount` of `asset_id` from `from` to `to` without `from`'s
+    /// Moves `amount` of `asset` from `from` to `to` without `from`'s
     /// signature and without any compliance, claim, jurisdiction or freeze
     /// check — the chain governor only. This is the recovery and enforcement
     /// path for what compliance cannot express: a court-ordered
@@ -289,7 +296,7 @@ pub enum ActionPayload {
     /// Appended, like `FreezeAsset`/`UnfreezeAsset` above; the same note
     /// about Retracer's mirrored enum applies.
     ForcedTransfer {
-        asset_id: String,
+        asset: AssetRef,
         from: Address,
         to: Address,
         amount: u128,
@@ -299,33 +306,33 @@ pub enum ActionPayload {
     /// Variant 21 — appended, so Retracer's mirror and the client codecs must
     /// add it in this position.
     BurnAsset {
-        asset_id: String,
+        asset: AssetRef,
         amount: u128,
     },
     /// Issuer takes a holder out of circulation for one asset (or back in) —
     /// Variant 22.
     SetHolderFrozen {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         frozen: bool,
     },
     /// Issuer locks `amount` of a holder's balance against compliant
     /// transfers. Variant 23.
     LockHolderAmount {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         amount: u128,
     },
     /// Reverses `LockHolderAmount`. Variant 24.
     UnlockHolderAmount {
-        asset_id: String,
+        asset: AssetRef,
         holder: Address,
         amount: u128,
     },
     /// The issuer's own forced transfer, scoped to assets it issued, same audited `reason` as the
     /// governor's `ForcedTransfer`. Variant 25.
     IssuerForcedTransfer {
-        asset_id: String,
+        asset: AssetRef,
         from: Address,
         to: Address,
         amount: u128,
@@ -335,14 +342,14 @@ pub enum ActionPayload {
     /// pass the asset's compliance rules. Issuer
     /// only. Variant 26.
     RecoverHolder {
-        asset_id: String,
+        asset: AssetRef,
         lost: Address,
         replacement: Address,
     },
     /// Issuer mints straight into a verified investor's balance. `to` passes the asset's compliance rules; the issuer,
     /// which never holds the units, is not checked. Variant 27.
     IssueAssetTo {
-        asset_id: String,
+        asset: AssetRef,
         to: Address,
         amount: u128,
     },
@@ -784,8 +791,8 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             metadata,
             current_height,
         ),
-        ActionPayload::IssueAsset { asset_id, amount } => {
-            asset::issue_asset(view, action, asset_id, *amount)
+        ActionPayload::IssueAsset { asset, amount } => {
+            asset::issue_asset(view, action, asset, *amount)
         }
         ActionPayload::RegisterAttestor { attestor, name } => {
             identity::register_attestor(view, action, attestor, name, current_height)
@@ -793,39 +800,39 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::DeregisterAttestor { attestor } => {
             identity::deregister_attestor(view, action, attestor)
         }
-        ActionPayload::FreezeAsset { asset_id } => asset::set_frozen(view, action, asset_id, true),
-        ActionPayload::UnfreezeAsset { asset_id } => {
-            asset::set_frozen(view, action, asset_id, false)
+        ActionPayload::FreezeAsset { asset } => asset::set_frozen(view, action, asset, true),
+        ActionPayload::UnfreezeAsset { asset } => {
+            asset::set_frozen(view, action, asset, false)
         }
         ActionPayload::ForcedTransfer {
-            asset_id,
+            asset,
             from,
             to,
             amount,
             reason,
-        } => asset::forced_transfer(view, action, asset_id, from, to, *amount, reason),
-        ActionPayload::BurnAsset { asset_id, amount } => asset::burn_asset(view, action, asset_id, *amount),
-        ActionPayload::SetHolderFrozen { asset_id, holder, frozen } => {
-            asset::set_holder_frozen(view, action, asset_id, holder, *frozen)
+        } => asset::forced_transfer(view, action, asset, from, to, *amount, reason),
+        ActionPayload::BurnAsset { asset, amount } => asset::burn_asset(view, action, asset, *amount),
+        ActionPayload::SetHolderFrozen { asset, holder, frozen } => {
+            asset::set_holder_frozen(view, action, asset, holder, *frozen)
         }
-        ActionPayload::LockHolderAmount { asset_id, holder, amount } => {
-            asset::lock_holder_amount(view, action, asset_id, holder, *amount, true)
+        ActionPayload::LockHolderAmount { asset, holder, amount } => {
+            asset::lock_holder_amount(view, action, asset, holder, *amount, true)
         }
-        ActionPayload::UnlockHolderAmount { asset_id, holder, amount } => {
-            asset::lock_holder_amount(view, action, asset_id, holder, *amount, false)
+        ActionPayload::UnlockHolderAmount { asset, holder, amount } => {
+            asset::lock_holder_amount(view, action, asset, holder, *amount, false)
         }
-        ActionPayload::IssuerForcedTransfer { asset_id, from, to, amount, reason } => {
-            asset::issuer_forced_transfer(view, action, asset_id, from, to, *amount, reason)
+        ActionPayload::IssuerForcedTransfer { asset, from, to, amount, reason } => {
+            asset::issuer_forced_transfer(view, action, asset, from, to, *amount, reason)
         }
-        ActionPayload::RecoverHolder { asset_id, lost, replacement } => {
-            asset::recover_holder(view, action, asset_id, lost, replacement)
+        ActionPayload::RecoverHolder { asset, lost, replacement } => {
+            asset::recover_holder(view, action, asset, lost, replacement)
         }
-        ActionPayload::IssueAssetTo { asset_id, to, amount } => asset::issue_asset_to(view, action, asset_id, to, *amount),
+        ActionPayload::IssueAssetTo { asset, to, amount } => asset::issue_asset_to(view, action, asset, to, *amount),
         ActionPayload::TransferAsset {
-            asset_id,
+            asset,
             to,
             amount,
-        } => asset::transfer_asset(view, action, asset_id, to, *amount),
+        } => asset::transfer_asset(view, action, asset, to, *amount),
         ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
             view,
             artifact_json,
@@ -1199,6 +1206,16 @@ mod client_signing_vectors {
 
     const ALICE: &str = "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz";
     const BOB: &str = "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5";
+    /// `AssetRef::derive(ALICE, "gold")` — the same constant
+    /// `xc_primitives::asset_ref` pins, repeated here so a codec that gets
+    /// the derivation wrong fails on the vector rather than on the chain.
+    const ALICE_GOLD: &str = "arxasset1z8d4jt8yt0xtjm6lvk8umc9relegrwq4xu928eqxyjfcsnjuex6qe873qa";
+
+    fn gold() -> AssetRef {
+        let derived = AssetRef::derive(&Address::parse(ALICE).unwrap(), "gold").unwrap();
+        assert_eq!(derived.to_string(), ALICE_GOLD, "the pinned ref constant drifted from the derivation");
+        derived
+    }
 
     fn hex_signing_bytes(nonce: u64, payload: ActionPayload) -> String {
         let action = Action {
@@ -1212,15 +1229,16 @@ mod client_signing_vectors {
 
     /// `TransferAsset` is variant 14 — after `RegisterAsset` (12) and
     /// `IssueAsset` (13), which the wallet never builds. Its fields frame as
-    /// `{asset_id, to, amount}`, so the encoding is one more length-prefixed
-    /// string than `Transfer` carries before the amount varint.
+    /// `{asset, to, amount}`; `asset` is an `AssetRef`, which encodes exactly
+    /// like an `Address` (one length-prefixed bech32 string), so the codec's
+    /// address writer is reused as-is.
     #[test]
     fn transfer_asset_vector_matches_the_mobile_codecs() {
         assert_eq!(
             hex_signing_bytes(
                 3,
                 ActionPayload::TransferAsset {
-                    asset_id: "gold".to_string(),
+                    asset: gold(),
                     to: Address::parse(BOB).expect("valid recipient"),
                     amount: 1_000_000,
                 },
@@ -1231,15 +1249,13 @@ mod client_signing_vectors {
         );
     }
 
-    /// Kept as a constant so the value is greppable from the app repos.
-    const TRANSFER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a030e04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fc40420f00";
-
-    /// `RegisterAsset` is variant 12. This vector takes every branch of
-    /// `AssetMetadata` that a hand-written encoder can get wrong: a non-empty
-    /// `required_claims`, `Some` jurisdictions, a `max_supply` past the
-    /// single-byte varint range (so the `0xfc` u32 marker appears) and a
-    /// `Some` URI. The payload bytes match the fixture pinned in
-    /// Arx-Plus-Api's `TestCanonicalPayloadMatchesNodeEncoding`.
+    /// `RegisterAsset` is variant 12 and the one asset variant that still
+    /// carries the slug (`asset_id: String`) rather than a ref. This vector
+    /// takes every branch of `AssetMetadata` that a hand-written encoder can
+    /// get wrong: a non-empty `required_claims`, `Some` jurisdictions, a
+    /// `max_supply` past the single-byte varint range (so the `0xfc` u32
+    /// marker appears), a `Some` URI, and the two trailing display strings
+    /// `symbol`/`name`, which come *after* `metadata_uri`.
     #[test]
     fn register_asset_vector_matches_the_client_codecs() {
         assert_eq!(
@@ -1255,6 +1271,8 @@ mod client_signing_vectors {
                         allowed_jurisdictions: Some(vec!["CH".to_string(), "DE".to_string()]),
                         max_supply: Some(1_000_000),
                         metadata_uri: Some("ipfs://a".to_string()),
+                        symbol: "GOLD".to_string(),
+                        name: "Gold".to_string(),
                     },
                 },
             ),
@@ -1266,7 +1284,8 @@ mod client_signing_vectors {
 
     /// Every optional absent: `None` is one zero byte, not an empty
     /// collection — the difference between "unrestricted" and "nobody may
-    /// hold it" — and `required_claims: []` is a zero-length vec.
+    /// hold it" — and `required_claims: []` is a zero-length vec. `symbol`
+    /// and `name` are still present (they are mandatory on the chain).
     #[test]
     fn register_asset_default_vector_matches_the_client_codecs() {
         assert_eq!(
@@ -1275,7 +1294,11 @@ mod client_signing_vectors {
                 ActionPayload::RegisterAsset {
                     asset_id: "gold".to_string(),
                     compliance_required: false,
-                    metadata: AssetMetadata::default(),
+                    metadata: AssetMetadata {
+                        symbol: "GOLD".to_string(),
+                        name: "Gold".to_string(),
+                        ..AssetMetadata::default()
+                    },
                 },
             ),
             REGISTER_ASSET_DEFAULT_VECTOR,
@@ -1289,17 +1312,26 @@ mod client_signing_vectors {
     #[test]
     fn issue_asset_vector_matches_the_client_codecs() {
         assert_eq!(
-            hex_signing_bytes(
-                1,
-                ActionPayload::IssueAsset {
-                    asset_id: "gold".to_string(),
-                    amount: 1000
-                },
-            ),
+            hex_signing_bytes(1, ActionPayload::IssueAsset { asset: gold(), amount: 1000 }),
             ISSUE_ASSET_VECTOR,
             "IssueAsset signing bytes changed — the Console and Arx-Plus-Api \
              codecs pin this exact string"
         );
+    }
+
+    /// Variants 18–20 (freeze, unfreeze, governor forced transfer), nonce 2.
+    #[test]
+    fn freeze_and_forced_transfer_vectors_match_the_client_codecs() {
+        let bob = Address::parse(BOB).expect("valid");
+        let alice = Address::parse(ALICE).expect("valid");
+        let cases: [(&str, ActionPayload, &str); 3] = [
+            ("FreezeAsset", ActionPayload::FreezeAsset { asset: gold() }, FREEZE_ASSET_VECTOR),
+            ("UnfreezeAsset", ActionPayload::UnfreezeAsset { asset: gold() }, UNFREEZE_ASSET_VECTOR),
+            ("ForcedTransfer", ActionPayload::ForcedTransfer { asset: gold(), from: bob, to: alice, amount: 1000, reason: "court".into() }, FORCED_TRANSFER_VECTOR),
+        ];
+        for (name, payload, expected) in cases {
+            assert_eq!(hex_signing_bytes(2, payload), expected, "{name} signing bytes changed — the client codecs pin this exact string");
+        }
     }
 
     /// Variants 21–26, one vector each so a codec that gets any index or
@@ -1310,12 +1342,12 @@ mod client_signing_vectors {
         let bob = Address::parse(BOB).expect("valid");
         let alice = Address::parse(ALICE).expect("valid");
         let cases: [(&str, ActionPayload, &str); 6] = [
-            ("BurnAsset", ActionPayload::BurnAsset { asset_id: "gold".into(), amount: 1000 }, BURN_ASSET_VECTOR),
-            ("SetHolderFrozen", ActionPayload::SetHolderFrozen { asset_id: "gold".into(), holder: bob.clone(), frozen: true }, SET_HOLDER_FROZEN_VECTOR),
-            ("LockHolderAmount", ActionPayload::LockHolderAmount { asset_id: "gold".into(), holder: bob.clone(), amount: 1000 }, LOCK_HOLDER_AMOUNT_VECTOR),
-            ("UnlockHolderAmount", ActionPayload::UnlockHolderAmount { asset_id: "gold".into(), holder: bob.clone(), amount: 1000 }, UNLOCK_HOLDER_AMOUNT_VECTOR),
-            ("IssuerForcedTransfer", ActionPayload::IssuerForcedTransfer { asset_id: "gold".into(), from: bob.clone(), to: alice.clone(), amount: 1000, reason: "court".into() }, ISSUER_FORCED_TRANSFER_VECTOR),
-            ("RecoverHolder", ActionPayload::RecoverHolder { asset_id: "gold".into(), lost: bob, replacement: alice }, RECOVER_HOLDER_VECTOR),
+            ("BurnAsset", ActionPayload::BurnAsset { asset: gold(), amount: 1000 }, BURN_ASSET_VECTOR),
+            ("SetHolderFrozen", ActionPayload::SetHolderFrozen { asset: gold(), holder: bob.clone(), frozen: true }, SET_HOLDER_FROZEN_VECTOR),
+            ("LockHolderAmount", ActionPayload::LockHolderAmount { asset: gold(), holder: bob.clone(), amount: 1000 }, LOCK_HOLDER_AMOUNT_VECTOR),
+            ("UnlockHolderAmount", ActionPayload::UnlockHolderAmount { asset: gold(), holder: bob.clone(), amount: 1000 }, UNLOCK_HOLDER_AMOUNT_VECTOR),
+            ("IssuerForcedTransfer", ActionPayload::IssuerForcedTransfer { asset: gold(), from: bob.clone(), to: alice.clone(), amount: 1000, reason: "court".into() }, ISSUER_FORCED_TRANSFER_VECTOR),
+            ("RecoverHolder", ActionPayload::RecoverHolder { asset: gold(), lost: bob, replacement: alice }, RECOVER_HOLDER_VECTOR),
         ];
         for (name, payload, expected) in cases {
             assert_eq!(hex_signing_bytes(2, payload), expected, "{name} signing bytes changed — the client codecs pin this exact string");
@@ -1326,21 +1358,25 @@ mod client_signing_vectors {
     #[test]
     fn issue_asset_to_vector_matches_the_client_codecs() {
         assert_eq!(
-            hex_signing_bytes(2, ActionPayload::IssueAssetTo { asset_id: "gold".into(), to: Address::parse(BOB).expect("valid"), amount: 1000 }),
+            hex_signing_bytes(2, ActionPayload::IssueAssetTo { asset: gold(), to: Address::parse(BOB).expect("valid"), amount: 1000 }),
             ISSUE_ASSET_TO_VECTOR,
             "IssueAssetTo signing bytes changed — the client codecs pin this exact string"
         );
     }
 
-    const ISSUE_ASSET_TO_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021b04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
-    const BURN_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021504676f6c64fbe803";
-    const SET_HOLDER_FROZEN_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021604676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b3501";
-    const LOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021704676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
-    const UNLOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021804676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
-    const ISSUER_FORCED_TRANSFER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021904676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737afbe80305636f757274";
-    const RECOVER_HOLDER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021a04676f6c643e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a";
-
-    const REGISTER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c64010306020002010202434802444501fc40420f000108697066733a2f2f61";
-    const REGISTER_ASSET_DEFAULT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c6400000000000000";
-    const ISSUE_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a010d04676f6c64fbe803";
+    // Kept as constants so the values are greppable from the app repos.
+    const TRANSFER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a030e436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fc40420f00";
+    const REGISTER_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c64010306020002010202434802444501fc40420f000108697066733a2f2f6104474f4c4404476f6c64";
+    const REGISTER_ASSET_DEFAULT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a000c04676f6c640000000000000004474f4c4404476f6c64";
+    const ISSUE_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a010d436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161fbe803";
+    const FREEZE_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0212436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161";
+    const UNFREEZE_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0213436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161";
+    const FORCED_TRANSFER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0214436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737afbe80305636f757274";
+    const BURN_ASSET_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0215436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161fbe803";
+    const SET_HOLDER_FROZEN_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0216436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b3501";
+    const LOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0217436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
+    const UNLOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0218436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
+    const ISSUER_FORCED_TRANSFER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0219436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737afbe80305636f757274";
+    const RECOVER_HOLDER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021a436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a";
+    const ISSUE_ASSET_TO_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021b436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
 }

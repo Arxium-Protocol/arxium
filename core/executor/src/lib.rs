@@ -892,7 +892,8 @@ mod tests {
             // under test here is whether a same-block registration is visible
             // through `view`, not the registration logic itself.
             TestPayload::RegisterAsset { id, compliance_required } => {
-                if view.get(&AssetKey(id))?.is_some() {
+                let asset_ref = xc_primitives::AssetRef::derive(&action.sender, id)?;
+                if view.get(&AssetKey(&asset_ref))?.is_some() {
                     anyhow::bail!("asset {id} already registered");
                 }
                 Ok(BlockUpdates {
@@ -905,7 +906,8 @@ mod tests {
                 })
             }
             TestPayload::IssueAsset { id } => {
-                view.get(&AssetKey(id))?
+                let asset_ref = xc_primitives::AssetRef::derive(&action.sender, id)?;
+                view.get(&AssetKey(&asset_ref))?
                     .ok_or_else(|| anyhow::anyhow!("asset {id} not registered"))?;
                 Ok(BlockUpdates::default())
             }
@@ -1158,12 +1160,13 @@ mod tests {
         assert_eq!(applied.len(), 2, "IssueAsset must see the same-block registration");
     }
 
-    /// Stage 1A: two `RegisterAsset` for the same id in one block used to
+    /// Stage 1A: two `RegisterAsset` for the same slug in one block used to
     /// both "succeed" (the duplicate check read through `view`, which
     /// hadn't seen the first registration), letting the second silently
     /// overwrite the first's `issuer`/`compliance_required` — an issuer
-    /// hijack inside a block window. Now the second is rejected and the
-    /// first's fields survive.
+    /// hijack inside a block window. The same issuer's duplicate is now
+    /// rejected and the first's fields survive; a *different* issuer's
+    /// `gold` is a different `AssetRef` and lands alongside it.
     #[test]
     fn same_block_duplicate_register_asset_second_rejected_first_survives() {
         let db = temp_db();
@@ -1174,15 +1177,18 @@ mod tests {
 
         let actions = vec![
             signed_action(&alice_key, &alice, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: true }),
+            signed_action(&alice_key, &alice, 1, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
             signed_action(&mallory_key, &mallory, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
         ];
 
         let ExecutionOutcome { applied, asset_registrations, .. } =
             execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
-        assert_eq!(applied.len(), 1, "the duplicate registration must be dropped");
-        assert_eq!(asset_registrations.len(), 1);
+        assert_eq!(applied.len(), 2, "the same-issuer duplicate must be dropped, the other issuer's kept");
+        assert_eq!(asset_registrations.len(), 2);
         assert_eq!(asset_registrations[0].issuer, alice, "first registration's issuer must survive");
         assert!(asset_registrations[0].compliance_required);
+        assert_eq!(asset_registrations[1].issuer, mallory);
+        assert_ne!(asset_registrations[0].asset_ref, asset_registrations[1].asset_ref);
     }
 
     /// Part 3 Stage 1's `inter_action_roots` mode: bisection needs "the

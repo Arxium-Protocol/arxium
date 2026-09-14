@@ -568,13 +568,13 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         };
         entries.push((key, value));
     }
-    for ((asset_id, owner), balance) in &updates.assets.0 {
-        let key = AssetBalanceKey { asset_id, owner }.encode();
+    for ((asset, owner), balance) in &updates.assets.0 {
+        let key = AssetBalanceKey { asset, owner }.encode();
         let value = bincode::serde::encode_to_vec(balance, config).expect("u128 always encodes");
         entries.push((key, Some(value)));
     }
     if let Some(registration) = &updates.asset_registration {
-        let key = xc_circuit::AssetKey(&registration.asset_id).encode();
+        let key = xc_circuit::AssetKey(&registration.asset_ref).encode();
         let value =
             bincode::serde::encode_to_vec(registration, config).expect("Asset always encodes");
         entries.push((key, Some(value)));

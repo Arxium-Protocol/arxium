@@ -19,7 +19,7 @@ use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
 };
 use xc_primitives::{
-    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AttestorRecord, Block, ChainParams, HolderState,
+    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, HolderState,
     Snapshot, StakeAllocation, ValidatorStatus, VotingPower,
 };
 #[cfg(test)]
@@ -598,19 +598,19 @@ impl ArxiumDb {
     }
 
     /// A registered asset's registry record (`issuer`/`compliance_required`),
-    /// if `asset_id` has been registered via `RegisterAsset`.
-    pub fn get_asset(&self, asset_id: &str) -> Result<Option<Asset>, StorageError> {
-        KvRead::get(self, &AssetKey(asset_id))
+    /// if `asset` has been registered via `RegisterAsset`.
+    pub fn get_asset(&self, asset: &AssetRef) -> Result<Option<Asset>, StorageError> {
+        KvRead::get(self, &AssetKey(asset))
     }
 
-    /// `owner`'s balance of `asset_id`, defaulting to 0 if never minted.
-    pub fn get_asset_balance(&self, asset_id: &str, owner: &Address) -> Result<u128, StorageError> {
-        Ok(KvRead::get(self, &AssetBalanceKey { asset_id, owner })?.unwrap_or(0))
+    /// `owner`'s balance of `asset`, defaulting to 0 if never minted.
+    pub fn get_asset_balance(&self, asset: &AssetRef, owner: &Address) -> Result<u128, StorageError> {
+        Ok(KvRead::get(self, &AssetBalanceKey { asset, owner })?.unwrap_or(0))
     }
 
-    /// Every registered asset id, in registration order. Empty on a chain
+    /// Every registered asset ref, in registration order. Empty on a chain
     /// where `RegisterAsset` has never run.
-    pub fn list_asset_ids(&self) -> Result<Vec<String>, StorageError> {
+    pub fn list_asset_refs(&self) -> Result<Vec<AssetRef>, StorageError> {
         Ok(KvRead::get(self, &AssetIndexKey)?.unwrap_or_default())
     }
 
@@ -619,22 +619,22 @@ impl ArxiumDb {
     /// which balances are gated before it offers a transfer.
     pub fn list_assets(&self) -> Result<Vec<Asset>, StorageError> {
         let mut assets = Vec::new();
-        for asset_id in self.list_asset_ids()? {
-            // An id in the index with no record would mean the two writes in
+        for asset_ref in self.list_asset_refs()? {
+            // A ref in the index with no record would mean the two writes in
             // `AssetIndexUpdates`/`Asset` came apart, which they cannot: both
             // go in one atomic batch. Skipped rather than errored so a single
             // bad row can't take out the whole listing.
-            if let Some(asset) = self.get_asset(&asset_id)? {
+            if let Some(asset) = self.get_asset(&asset_ref)? {
                 assets.push(asset);
             }
         }
         Ok(assets)
     }
 
-    /// Every asset id `owner` has a balance row for, including rows that have
+    /// Every asset ref `owner` has a balance row for, including rows that have
     /// since gone to zero — a balance is never deleted (see
     /// `apply_asset_balances`), so neither is its index entry.
-    pub fn get_account_assets(&self, owner: &Address) -> Result<Vec<String>, StorageError> {
+    pub fn get_account_assets(&self, owner: &Address) -> Result<Vec<AssetRef>, StorageError> {
         Ok(KvRead::get(self, &AccountAssetsKey(owner))?.unwrap_or_default())
     }
 
@@ -642,12 +642,12 @@ impl ArxiumDb {
     /// index has no entry: the index only exists from the release that added
     /// holder controls, so assets issued before it have balances but no
     /// index row until their next balance change. Bounded to one asset's
-    /// `asset_balance:{id}:` prefix, and metered like every other scan.
-    pub fn get_asset_holders(&self, asset_id: &str) -> Result<Vec<Address>, StorageError> {
-        if let Some(holders) = KvRead::get(self, &AssetHoldersKey(asset_id))? {
+    /// `asset_balance:{ref}:` prefix, and metered like every other scan.
+    pub fn get_asset_holders(&self, asset: &AssetRef) -> Result<Vec<Address>, StorageError> {
+        if let Some(holders) = KvRead::get(self, &AssetHoldersKey(asset))? {
             return Ok(holders);
         }
-        let prefix = format!("asset_balance:{asset_id}:");
+        let prefix = format!("asset_balance:{asset}:");
         let started = std::time::Instant::now();
         let mut rows = 0u64;
         let mut holders = Vec::new();
@@ -673,13 +673,13 @@ impl ArxiumDb {
         Ok(holders)
     }
 
-    pub fn get_holder_state(&self, asset_id: &str, holder: &Address) -> Result<HolderState, StorageError> {
-        Ok(KvRead::get(self, &AssetHolderStateKey { asset_id, holder })?.unwrap_or_default())
+    pub fn get_holder_state(&self, asset: &AssetRef, holder: &Address) -> Result<HolderState, StorageError> {
+        Ok(KvRead::get(self, &AssetHolderStateKey { asset, holder })?.unwrap_or_default())
     }
 
     /// The index rows implied by one block's asset effects: the registry list
-    /// grows by any newly registered ids, and each owner touched by a balance
-    /// change gains the ids it was touched for.
+    /// grows by any newly registered refs, and each owner touched by a balance
+    /// change gains the refs it was touched for.
     ///
     /// Same shape as `OperatorUpdates` — the caller reads the current value
     /// and hands storage the *full* new list, because `BatchWritable` has no
@@ -693,30 +693,30 @@ impl ArxiumDb {
         let mut updates = AssetIndexUpdates::default();
 
         if !registrations.is_empty() {
-            let mut ids = self.list_asset_ids()?;
-            let before = ids.len();
+            let mut refs = self.list_asset_refs()?;
+            let before = refs.len();
             for asset in registrations {
-                if !ids.contains(&asset.asset_id) {
-                    ids.push(asset.asset_id.clone());
+                if !refs.contains(&asset.asset_ref) {
+                    refs.push(asset.asset_ref.clone());
                 }
             }
-            if ids.len() != before {
-                updates.registry = Some(ids);
+            if refs.len() != before {
+                updates.registry = Some(refs);
             }
         }
 
         // Grouped by owner first so an owner touched for several assets in one
         // block is read once, not once per asset.
-        let mut by_owner: BTreeMap<&Address, Vec<&String>> = BTreeMap::new();
-        for (asset_id, owner) in balances.0.keys() {
-            by_owner.entry(owner).or_default().push(asset_id);
+        let mut by_owner: BTreeMap<&Address, Vec<&AssetRef>> = BTreeMap::new();
+        for (asset, owner) in balances.0.keys() {
+            by_owner.entry(owner).or_default().push(asset);
         }
-        for (owner, asset_ids) in by_owner {
+        for (owner, refs) in by_owner {
             let mut held = self.get_account_assets(owner)?;
             let before = held.len();
-            for asset_id in asset_ids {
-                if !held.contains(asset_id) {
-                    held.push(asset_id.clone());
+            for asset in refs {
+                if !held.contains(asset) {
+                    held.push(asset.clone());
                 }
             }
             if held.len() != before {
@@ -725,12 +725,12 @@ impl ArxiumDb {
         }
 
         // The cap table: a holder is listed while its balance is non-zero.
-        let mut by_asset: BTreeMap<&String, Vec<(&Address, u128)>> = BTreeMap::new();
-        for ((asset_id, owner), balance) in &balances.0 {
-            by_asset.entry(asset_id).or_default().push((owner, *balance));
+        let mut by_asset: BTreeMap<&AssetRef, Vec<(&Address, u128)>> = BTreeMap::new();
+        for ((asset, owner), balance) in &balances.0 {
+            by_asset.entry(asset).or_default().push((owner, *balance));
         }
-        for (asset_id, rows) in by_asset {
-            let mut holders = self.get_asset_holders(asset_id)?;
+        for (asset, rows) in by_asset {
+            let mut holders = self.get_asset_holders(asset)?;
             let before = holders.clone();
             for (owner, balance) in rows {
                 let listed = holders.iter().position(|h| h == owner);
@@ -741,7 +741,7 @@ impl ArxiumDb {
                 }
             }
             if holders != before {
-                updates.holders.insert(asset_id.clone(), holders);
+                updates.holders.insert(asset.clone(), holders);
             }
         }
 
@@ -2071,10 +2071,15 @@ mod asset_index_tests {
         Asset::new(id, issuer.clone(), gated)
     }
 
+    /// Every asset in these tests is issued by `addr(1)`.
+    fn r(id: &str) -> AssetRef {
+        AssetRef::derive(&addr(1), id).unwrap()
+    }
+
     fn balances(rows: &[(&str, &Address, u128)]) -> AssetBalanceUpdates {
         AssetBalanceUpdates(
             rows.iter()
-                .map(|(id, owner, amount)| ((id.to_string(), (*owner).clone()), *amount))
+                .map(|(id, owner, amount)| ((r(id), (*owner).clone()), *amount))
                 .collect(),
         )
     }
@@ -2092,7 +2097,7 @@ mod asset_index_tests {
         let index = db.asset_index_updates(std::slice::from_ref(&gold), &updates).unwrap();
         db.write_batches(&[&gold, &updates, &index]).unwrap();
 
-        assert_eq!(db.list_asset_ids().unwrap(), vec!["gold".to_string()]);
+        assert_eq!(db.list_asset_refs().unwrap(), vec![r("gold")]);
         let listed = db.list_assets().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].asset_id, "gold");
@@ -2100,9 +2105,9 @@ mod asset_index_tests {
 
         assert_eq!(
             db.get_account_assets(&holder).unwrap(),
-            vec!["gold".to_string()]
+            vec![r("gold")]
         );
-        assert_eq!(db.get_asset_balance("gold", &holder).unwrap(), 1_000);
+        assert_eq!(db.get_asset_balance(&r("gold"), &holder).unwrap(), 1_000);
         // An account that has never held anything gets an empty list, not an
         // error and not someone else's.
         assert!(db.get_account_assets(&addr(9)).unwrap().is_empty());
@@ -2123,19 +2128,19 @@ mod asset_index_tests {
         // Pre-index world: balances written with no holders row at all.
         let legacy = balances(&[("gold", &alice, 10), ("gold", &bob, 0), ("silver", &bob, 5)]);
         db.write_batches(&[&gold, &silver, &legacy]).unwrap();
-        assert_eq!(db.get_asset_holders("gold").unwrap(), vec![alice.clone()], "scan skips zero balances and other assets");
-        assert_eq!(db.get_asset_holders("silver").unwrap(), vec![bob.clone()]);
+        assert_eq!(db.get_asset_holders(&r("gold")).unwrap(), vec![alice.clone()], "scan skips zero balances and other assets");
+        assert_eq!(db.get_asset_holders(&r("silver")).unwrap(), vec![bob.clone()]);
 
         // From now on the index rules: bob buys in, alice sells out.
         let updates = balances(&[("gold", &bob, 4)]);
         let index = db.asset_index_updates(&[], &updates).unwrap();
-        assert_eq!(index.holders["gold"], vec![alice.clone(), bob.clone()], "seeded from the scan, then bob appended");
+        assert_eq!(index.holders[&r("gold")], vec![alice.clone(), bob.clone()], "seeded from the scan, then bob appended");
         db.write_batches(&[&updates, &index]).unwrap();
         let updates = balances(&[("gold", &alice, 0)]);
         let index = db.asset_index_updates(&[], &updates).unwrap();
-        assert_eq!(index.holders["gold"], vec![bob.clone()]);
+        assert_eq!(index.holders[&r("gold")], vec![bob.clone()]);
         db.write_batches(&[&updates, &index]).unwrap();
-        assert_eq!(db.get_asset_holders("gold").unwrap(), vec![bob]);
+        assert_eq!(db.get_asset_holders(&r("gold")).unwrap(), vec![bob]);
     }
 
     /// A second block must extend both lists rather than replace them —
@@ -2158,12 +2163,12 @@ mod asset_index_tests {
         db.write_batches(&[&silver, &second, &index]).unwrap();
 
         assert_eq!(
-            db.list_asset_ids().unwrap(),
-            vec!["gold".to_string(), "silver".to_string()]
+            db.list_asset_refs().unwrap(),
+            vec![r("gold"), r("silver")]
         );
         assert_eq!(
             db.get_account_assets(&holder).unwrap(),
-            vec!["gold".to_string(), "silver".to_string()]
+            vec![r("gold"), r("silver")]
         );
     }
 
@@ -2185,7 +2190,7 @@ mod asset_index_tests {
 
         assert_eq!(
             db.get_account_assets(&holder).unwrap(),
-            vec!["gold".to_string()]
+            vec![r("gold")]
         );
     }
 
@@ -2217,11 +2222,11 @@ mod asset_index_tests {
 
         assert_eq!(
             db.get_account_assets(&issuer).unwrap(),
-            vec!["gold".to_string()]
+            vec![r("gold")]
         );
         assert_eq!(
             db.get_account_assets(&recipient).unwrap(),
-            vec!["gold".to_string()]
+            vec![r("gold")]
         );
     }
 
@@ -2232,9 +2237,9 @@ mod asset_index_tests {
     fn index_rows_are_not_consensus_state() {
         let holder = addr(2);
         let index = AssetIndexUpdates {
-            registry: Some(vec!["gold".to_string()]),
-            owners: [(holder.clone(), vec!["gold".to_string()])].into_iter().collect(),
-            holders: [("gold".to_string(), vec![holder])].into_iter().collect(),
+            registry: Some(vec![r("gold")]),
+            owners: [(holder.clone(), vec![r("gold")])].into_iter().collect(),
+            holders: [(r("gold"), vec![holder])].into_iter().collect(),
         };
         for (key, _) in index.batch_entries().unwrap() {
             assert!(
@@ -2715,6 +2720,28 @@ mod merkle_state_root_tests {
         assert_eq!(db.compute_state_root(&[]).unwrap(), after_first);
     }
 
+    /// Two issuers' `gold` are two assets: distinct `AssetRef`s, distinct
+    /// merkleized keys, and both provable in the same trie. This is the
+    /// property the ref exists for — before it, the second registration
+    /// would have collided with the first.
+    #[test]
+    fn same_named_assets_from_two_issuers_occupy_distinct_keys_in_the_trie() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let alice_gold = asset("gold", addr(1), true);
+        let bob_gold = asset("gold", addr(2), false);
+        assert_ne!(alice_gold.asset_ref, bob_gold.asset_ref);
+        assert_ne!(alice_gold.batch_entries().unwrap()[0].0, bob_gold.batch_entries().unwrap()[0].0);
+
+        db.write_batches(&[&alice_gold, &bob_gold]).unwrap();
+        let root = db.compute_state_root(&[]).unwrap();
+        let root_bytes = decode_root(&root).unwrap();
+        for gold in [&alice_gold, &bob_gold] {
+            let proof = db.prove(&AssetKey(&gold.asset_ref).encode(), &root).unwrap();
+            assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
+            assert_eq!(db.get_asset(&gold.asset_ref).unwrap().unwrap().compliance_required, gold.compliance_required);
+        }
+    }
+
     /// `db.prove()` must produce a verifiable inclusion proof for the new
     /// `asset_record:` key, same as any other merkleized key.
     #[test]
@@ -2725,7 +2752,7 @@ mod merkle_state_root_tests {
         let root = db.compute_state_root(&[]).unwrap();
         let root_bytes = decode_root(&root).unwrap();
 
-        let key = format!("asset_record:{}", gold.asset_id).into_bytes();
+        let key = format!("asset_record:{}", gold.asset_ref).into_bytes();
         let proof = db.prove(&key, &root).unwrap();
         assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
         assert_eq!(
@@ -2944,7 +2971,7 @@ mod divergence_recovery_tests {
         commit(&db, 0, 1, 100);
 
         let gold = Asset::new("gold", addr(1), false);
-        let balances = AssetBalanceUpdates(BTreeMap::from([(("gold".to_string(), addr(1)), 5u128)]));
+        let balances = AssetBalanceUpdates(BTreeMap::from([((gold.asset_ref.clone(), addr(1)), 5u128)]));
         let index = db.asset_index_updates(std::slice::from_ref(&gold), &balances).unwrap();
         let state_root = db.compute_state_root(&[&gold, &balances]).unwrap();
         let block = Block::<()> {
@@ -2960,13 +2987,13 @@ mod divergence_recovery_tests {
             round_certificate: None,
         };
         db.write_block_batches(1, &[&gold, &balances, &index, &block], true).unwrap();
-        assert_eq!(db.list_asset_ids().unwrap(), vec!["gold".to_string()]);
-        assert_eq!(db.get_account_assets(&addr(1)).unwrap(), vec!["gold".to_string()]);
+        assert_eq!(db.list_asset_refs().unwrap(), vec![gold.asset_ref.clone()]);
+        assert_eq!(db.get_account_assets(&addr(1)).unwrap(), vec![gold.asset_ref.clone()]);
 
         db.revert_to::<()>(0).unwrap();
 
-        assert!(db.get_asset("gold").unwrap().is_none(), "merkleized registry record is gone");
-        assert!(db.list_asset_ids().unwrap().is_empty(), "and so is the index that pointed at it");
+        assert!(db.get_asset(&gold.asset_ref).unwrap().is_none(), "merkleized registry record is gone");
+        assert!(db.list_asset_refs().unwrap().is_empty(), "and so is the index that pointed at it");
         assert!(db.get_account_assets(&addr(1)).unwrap().is_empty());
     }
 

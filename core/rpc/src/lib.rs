@@ -23,7 +23,7 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address, Asset, Block, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power};
+use xc_primitives::{Action, Address, Asset, AssetRef, Block, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power};
 use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
@@ -445,12 +445,13 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
                 .route("/accounts/{address}/assets", get(get_account_assets::<P>))
                 .route(
-                    "/accounts/{address}/assets/{asset_id}",
+                    "/accounts/{address}/assets/{asset_ref}",
                     get(get_account_asset_balance::<P>),
                 )
                 .route("/assets", get(get_assets::<P>))
-                .route("/assets/{asset_id}", get(get_asset::<P>))
-                .route("/assets/{asset_id}/holders", get(get_asset_holders::<P>))
+                .route("/assets/alias/{issuer}/{asset_id}", get(get_asset_alias::<P>))
+                .route("/assets/{asset_ref}", get(get_asset::<P>))
+                .route("/assets/{asset_ref}/holders", get(get_asset_holders::<P>))
                 .route("/attestors", get(get_attestors::<P>))
                 .route("/attestors/{address}", get(get_attestor::<P>))
                 .route("/validators", get(get_validators::<P>))
@@ -823,7 +824,7 @@ async fn get_account_bls_key<P: Payload>(
 
 /// One row of `GET /accounts/{address}/assets`.
 ///
-/// Carries the registry fields alongside the balance rather than just the id:
+/// Carries the registry fields alongside the balance rather than just the ref:
 /// a wallet has to know whether an asset is compliance-gated before it can
 /// tell the holder why a transfer would be refused, and making that a second
 /// request per asset would put an N+1 on the one screen that lists them all.
@@ -832,25 +833,55 @@ async fn get_account_bls_key<P: Payload>(
 /// `compliance_required`: a frozen asset refuses every transfer, so a wallet
 /// that can't see the flag can only report the failure after the fact, and
 /// `balance` is a raw integer that cannot be rendered at all without the
-/// scale. The rest of the record (claims, jurisdictions, supply) is only
-/// needed on an asset's own screen, which can fetch `GET /assets`.
+/// scale. `symbol`/`name` are what the wallet shows next to the truncated
+/// `ref`; they identify nothing. The rest of the record (claims,
+/// jurisdictions, supply) is only needed on an asset's own screen, which can
+/// fetch `GET /assets/{ref}`.
 #[derive(serde::Serialize)]
 struct AccountAssetBalance {
+    #[serde(rename = "ref")]
+    asset_ref: AssetRef,
     asset_id: String,
+    symbol: String,
+    name: String,
     issuer: String,
+    issuer_attested: bool,
     compliance_required: bool,
     frozen: bool,
     decimals: u8,
     balance: u128,
 }
 
-/// Every regulated asset `address` holds a balance row for.
-///
-/// Includes rows that have gone to zero — a balance row is never deleted, and
-/// "you held this and now hold none" is a different statement from "you never
-/// held this". Answered from the `meta:account_assets:` index; the balance
-/// keys themselves are ordered `{asset_id}:{owner}` and cannot be scanned by
-/// owner.
+impl AccountAssetBalance {
+    fn new(db: &ArxiumDb, asset: Asset, balance: u128) -> Result<Self, StorageError> {
+        let issuer_attested = issuer_attested(db, &asset.issuer)?;
+        Ok(Self {
+            asset_ref: asset.asset_ref,
+            asset_id: asset.asset_id,
+            symbol: asset.symbol,
+            name: asset.name,
+            issuer: asset.issuer.to_string(),
+            issuer_attested,
+            compliance_required: asset.compliance_required,
+            frozen: asset.frozen,
+            decimals: asset.decimals,
+            balance,
+        })
+    }
+}
+
+/// The trust anchor a client shows beside a symbol: whether the issuer holds
+/// a live attestation. Symbols are not unique, so this — not the ticker — is
+/// what tells two `GOLD`s apart in an interface. Same rule as
+/// `circuit_rwa_asset::is_attested`.
+fn issuer_attested(db: &ArxiumDb, issuer: &Address) -> Result<bool, StorageError> {
+    circuit_rwa_asset::is_attested(db, issuer)
+}
+
+fn parse_ref(s: &str) -> Result<AssetRef, (StatusCode, String)> {
+    AssetRef::parse(s).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))
+}
+
 /// One row of an asset's cap table: balance plus the issuer's freeze state.
 #[derive(Serialize)]
 struct AssetHolderRow {
@@ -864,22 +895,26 @@ struct AssetHolderRow {
 /// `meta:asset_holders` index) with its balance and holder state.
 async fn get_asset_holders<P: Payload>(
     State(state): State<AppState<P>>,
-    Path(asset_id): Path<String>,
+    Path(asset_ref): Path<String>,
 ) -> Response {
-    match state.db.get_asset(&asset_id) {
+    let asset_ref = match parse_ref(&asset_ref) {
+        Ok(r) => r,
+        Err(bad) => return bad.into_response(),
+    };
+    match state.db.get_asset(&asset_ref) {
         Ok(Some(_)) => {}
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
-    let holders = match state.db.get_asset_holders(&asset_id) {
+    let holders = match state.db.get_asset_holders(&asset_ref) {
         Ok(holders) => holders,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
     let mut rows = Vec::with_capacity(holders.len());
     for address in holders {
         let (balance, holder_state) = match (
-            state.db.get_asset_balance(&asset_id, &address),
-            state.db.get_holder_state(&asset_id, &address),
+            state.db.get_asset_balance(&asset_ref, &address),
+            state.db.get_holder_state(&asset_ref, &address),
         ) {
             (Ok(balance), Ok(holder_state)) => (balance, holder_state),
             _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -889,6 +924,13 @@ async fn get_asset_holders<P: Payload>(
     Json(rows).into_response()
 }
 
+/// Every regulated asset `address` holds a balance row for.
+///
+/// Includes rows that have gone to zero — a balance row is never deleted, and
+/// "you held this and now hold none" is a different statement from "you never
+/// held this". Answered from the `meta:account_assets:` index; the balance
+/// keys themselves are ordered `{asset_ref}:{owner}` and cannot be scanned by
+/// owner.
 async fn get_account_assets<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
@@ -898,14 +940,14 @@ async fn get_account_assets<P: Payload>(
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
 
-    let asset_ids = match state.db.get_account_assets(&address) {
-        Ok(ids) => ids,
+    let refs = match state.db.get_account_assets(&address) {
+        Ok(refs) => refs,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    let mut balances = Vec::with_capacity(asset_ids.len());
-    for asset_id in asset_ids {
-        let asset = match state.db.get_asset(&asset_id) {
+    let mut balances = Vec::with_capacity(refs.len());
+    for asset_ref in refs {
+        let asset = match state.db.get_asset(&asset_ref) {
             Ok(Some(asset)) => asset,
             // Indexed but unregistered is impossible through the normal write
             // path (both rows land in one atomic batch), so skip rather than
@@ -913,18 +955,14 @@ async fn get_account_assets<P: Payload>(
             Ok(None) => continue,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        let balance = match state.db.get_asset_balance(&asset_id, &address) {
-            Ok(balance) => balance,
+        let row = state
+            .db
+            .get_asset_balance(&asset_ref, &address)
+            .and_then(|balance| AccountAssetBalance::new(&state.db, asset, balance));
+        match row {
+            Ok(row) => balances.push(row),
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-        balances.push(AccountAssetBalance {
-            asset_id,
-            issuer: asset.issuer.to_string(),
-            compliance_required: asset.compliance_required,
-            frozen: asset.frozen,
-            decimals: asset.decimals,
-            balance,
-        });
+        }
     }
 
     Json(balances).into_response()
@@ -935,71 +973,124 @@ async fn get_account_assets<P: Payload>(
 /// latter is a legitimate 200 with `balance: 0`.
 async fn get_account_asset_balance<P: Payload>(
     State(state): State<AppState<P>>,
-    Path((address, asset_id)): Path<(String, String)>,
+    Path((address, asset_ref)): Path<(String, String)>,
 ) -> Response {
     let address = match Address::parse(&address) {
         Ok(address) => address,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
+    let asset_ref = match parse_ref(&asset_ref) {
+        Ok(r) => r,
+        Err(bad) => return bad.into_response(),
+    };
 
-    let asset = match state.db.get_asset(&asset_id) {
+    let asset = match state.db.get_asset(&asset_ref) {
         Ok(Some(asset)) => asset,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
 
-    match state.db.get_asset_balance(&asset_id, &address) {
-        Ok(balance) => Json(AccountAssetBalance {
-            asset_id,
-            issuer: asset.issuer.to_string(),
-            compliance_required: asset.compliance_required,
-            frozen: asset.frozen,
-            decimals: asset.decimals,
-            balance,
-        })
-        .into_response(),
+    let row = state
+        .db
+        .get_asset_balance(&asset_ref, &address)
+        .and_then(|balance| AccountAssetBalance::new(&state.db, asset, balance));
+    match row {
+        Ok(row) => Json(row).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-/// Every asset registered on this chain, in registration order.
-/// The registry record plus `holders`, the cap-table size — one index read
-/// per asset, so a listing page does not need a request per row.
+/// The registry record plus what a client needs to render it safely without
+/// a second call: `holders` (the cap-table size) and `issuer_attested`. The
+/// record's own `asset_ref` field is surfaced as `ref`.
 #[derive(Serialize)]
-struct AssetWithHolders {
+struct AssetResponse {
+    #[serde(rename = "ref")]
+    asset_ref: AssetRef,
     #[serde(flatten)]
     asset: Asset,
+    issuer_attested: bool,
     holders: usize,
 }
 
-fn with_holders(db: &ArxiumDb, asset: Asset) -> Result<AssetWithHolders, StorageError> {
-    let holders = db.get_asset_holders(&asset.asset_id)?.len();
-    Ok(AssetWithHolders { asset, holders })
+fn asset_response(db: &ArxiumDb, asset: Asset) -> Result<AssetResponse, StorageError> {
+    let holders = db.get_asset_holders(&asset.asset_ref)?.len();
+    let issuer_attested = issuer_attested(db, &asset.issuer)?;
+    Ok(AssetResponse { asset_ref: asset.asset_ref.clone(), asset, issuer_attested, holders })
 }
 
-async fn get_assets<P: Payload>(State(state): State<AppState<P>>) -> Response {
+#[derive(serde::Deserialize)]
+struct AssetsQuery {
+    /// Restrict the listing to one issuer's assets.
+    issuer: Option<String>,
+}
+
+/// Every asset registered on this chain, in registration order — or, with
+/// `?issuer=`, just that issuer's.
+async fn get_assets<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(query): Query<AssetsQuery>,
+) -> Response {
+    let issuer = match query.issuer.as_deref().map(Address::parse).transpose() {
+        Ok(issuer) => issuer,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
     let assets = match state.db.list_assets() {
         Ok(assets) => assets,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    match assets.into_iter().map(|asset| with_holders(&state.db, asset)).collect::<Result<Vec<_>, _>>() {
+    let rows = assets
+        .into_iter()
+        .filter(|asset| issuer.as_ref().is_none_or(|issuer| &asset.issuer == issuer))
+        .map(|asset| asset_response(&state.db, asset))
+        .collect::<Result<Vec<_>, _>>();
+    match rows {
         Ok(rows) => Json(rows).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
-/// One asset's registry record — issuer, compliance flag, metadata and
-/// `holders` (cap-table size).
+/// One asset's registry record by ref — the canonical lookup.
 async fn get_asset<P: Payload>(
     State(state): State<AppState<P>>,
-    Path(asset_id): Path<String>,
+    Path(asset_ref): Path<String>,
 ) -> Response {
-    match state.db.get_asset(&asset_id) {
-        Ok(Some(asset)) => match with_holders(&state.db, asset) {
+    let asset_ref = match parse_ref(&asset_ref) {
+        Ok(r) => r,
+        Err(bad) => return bad.into_response(),
+    };
+    match state.db.get_asset(&asset_ref) {
+        Ok(Some(asset)) => match asset_response(&state.db, asset) {
             Ok(row) => Json(row).into_response(),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Slug resolution — "is this name taken?" for a register form. The ref is
+/// a pure function of `(issuer, asset_id)`, so this derives it and looks the
+/// record up; 404 means the slug is free for that issuer, and the response
+/// body carries the ref the registration would produce.
+async fn get_asset_alias<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path((issuer, asset_id)): Path<(String, String)>,
+) -> Response {
+    let issuer = match Address::parse(&issuer) {
+        Ok(issuer) => issuer,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let asset_ref = match AssetRef::derive(&issuer, &asset_id) {
+        Ok(r) => r,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    match state.db.get_asset(&asset_ref) {
+        Ok(Some(asset)) => match asset_response(&state.db, asset) {
+            Ok(row) => Json(row).into_response(),
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "ref": asset_ref }))).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -1886,6 +1977,74 @@ mod tests {
             let resp = submit_action(State(state.clone()), Ok(Json(valid))).await;
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
             assert_eq!(state.mempool.lock().unwrap().len(), 2);
+        });
+    }
+
+    /// Two issuers' `gold` on one chain: every asset endpoint resolves by
+    /// ref and hands back the right one, `?issuer=` narrows the listing, and
+    /// the alias route derives the ref for an unclaimed slug.
+    #[test]
+    fn asset_endpoints_resolve_by_ref_not_slug() {
+        use xc_storage::AssetBalanceUpdates;
+
+        async fn json(resp: Response) -> serde_json::Value {
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&body).unwrap()
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+            let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+            let mut alice_gold = Asset::new("gold", alice.clone(), true);
+            alice_gold.symbol = "GOLD".into();
+            let bob_gold = Asset::new("gold", bob.clone(), false);
+            let balances = AssetBalanceUpdates(BTreeMap::from([
+                ((alice_gold.asset_ref.clone(), bob.clone()), 7u128),
+                ((bob_gold.asset_ref.clone(), bob.clone()), 3u128),
+            ]));
+            let index = state.db.asset_index_updates(&[alice_gold.clone(), bob_gold.clone()], &balances).unwrap();
+            state.db.write_batches(&[&alice_gold, &bob_gold, &balances, &index]).unwrap();
+
+            let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json(resp).await;
+            assert_eq!(body["ref"], alice_gold.asset_ref.to_string());
+            assert_eq!(body["asset_id"], "gold");
+            assert_eq!(body["symbol"], "GOLD");
+            assert_eq!(body["issuer"], alice.to_string());
+            assert_eq!(body["issuer_attested"], false);
+            assert_eq!(body["holders"], 1);
+
+            // The slug is not a route: a non-ref path segment is a 400.
+            let resp = get_asset(State(state.clone()), Path("gold".into())).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: Some(bob.to_string()) })).await;
+            let body = json(resp).await;
+            assert_eq!(body.as_array().unwrap().len(), 1);
+            assert_eq!(body[0]["ref"], bob_gold.asset_ref.to_string());
+            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: None })).await;
+            assert_eq!(json(resp).await.as_array().unwrap().len(), 2);
+
+            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "gold".into()))).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(json(resp).await["ref"], bob_gold.asset_ref.to_string());
+            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "silver".into()))).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert_eq!(json(resp).await["ref"], AssetRef::derive(&bob, "silver").unwrap().to_string());
+
+            let resp = get_account_asset_balance(State(state.clone()), Path((bob.to_string(), alice_gold.asset_ref.to_string()))).await;
+            let body = json(resp).await;
+            assert_eq!(body["balance"], 7);
+            assert_eq!(body["issuer"], alice.to_string());
+            let resp = get_account_assets(State(state.clone()), Path(bob.to_string())).await;
+            let body = json(resp).await;
+            let rows = body.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            let bobs = rows.iter().find(|r| r["ref"] == bob_gold.asset_ref.to_string()).unwrap();
+            assert_eq!(bobs["balance"], 3);
         });
     }
 

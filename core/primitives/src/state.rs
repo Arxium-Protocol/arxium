@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::Address;
+use crate::{Address, AssetRef};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -214,8 +214,8 @@ pub struct Asset {
     pub allowed_jurisdictions: Option<Vec<CountryCode>>,
     /// `None` means uncapped. Enforced in `circuit_rwa_asset::apply_issue`.
     pub max_supply: Option<u128>,
-    /// Cumulative issued supply, maintained by `apply_issue`. Never
-    /// decreases — there's no burn action.
+    /// Cumulative issued supply, maintained by `apply_issue`/`apply_issue_to`
+    /// and reduced by `apply_burn` (`BurnAsset`, variant 21).
     pub total_supply: u128,
     /// Blocks every transfer of this asset while set. Issuance is
     /// deliberately still allowed; freezing is about circulation.
@@ -225,6 +225,17 @@ pub struct Asset {
     pub metadata_uri: Option<String>,
     /// Height of the block that registered this asset.
     pub registered_at: u64,
+    /// Display ticker, `[A-Z0-9]{1,12}`. Deliberately not unique anywhere —
+    /// nothing resolves by it; clients show it next to the truncated ref and
+    /// the issuer's attestation state.
+    pub symbol: String,
+    /// Human-readable display name, 1–64 bytes of free-form UTF-8.
+    pub name: String,
+    /// Chain-wide identity, `AssetRef::derive(issuer, asset_id)`. Stored
+    /// rather than re-derived on every read so the record is self-describing
+    /// to RPC and downstream readers. Every storage key for this asset is
+    /// keyed on it; `asset_id` is only unique within `issuer`.
+    pub asset_ref: AssetRef,
 }
 
 /// The issuer-supplied half of an `Asset`: everything `RegisterAsset` carries
@@ -244,6 +255,10 @@ pub struct AssetMetadata {
     pub allowed_jurisdictions: Option<Vec<CountryCode>>,
     pub max_supply: Option<u128>,
     pub metadata_uri: Option<String>,
+    /// Appended after `metadata_uri` — bincode is positional, so the codecs
+    /// that mirror this struct write these two last.
+    pub symbol: String,
+    pub name: String,
 }
 
 impl Asset {
@@ -253,9 +268,12 @@ impl Asset {
     /// care about id/issuer/gating don't each have to spell out nine
     /// defaults.
     pub fn new(asset_id: impl Into<String>, issuer: Address, compliance_required: bool) -> Self {
+        let asset_id = asset_id.into();
+        let asset_ref = AssetRef::derive(&issuer, &asset_id).expect("issuer is a valid address");
         Self {
-            asset_id: asset_id.into(),
+            asset_id,
             issuer,
+            asset_ref,
             compliance_required,
             asset_class: AssetClass::Other,
             decimals: 0,
@@ -266,6 +284,8 @@ impl Asset {
             frozen: false,
             metadata_uri: None,
             registered_at: 0,
+            symbol: String::new(),
+            name: String::new(),
         }
     }
 
@@ -274,6 +294,7 @@ impl Asset {
     /// are deliberately not settable by the issuer — a newly registered asset
     /// always starts with nothing issued and circulation open.
     pub fn register(
+        asset_ref: AssetRef,
         asset_id: impl Into<String>,
         issuer: Address,
         compliance_required: bool,
@@ -283,6 +304,7 @@ impl Asset {
         Self {
             asset_id: asset_id.into(),
             issuer,
+            asset_ref,
             compliance_required,
             asset_class: metadata.asset_class,
             decimals: metadata.decimals,
@@ -293,6 +315,8 @@ impl Asset {
             frozen: false,
             metadata_uri: metadata.metadata_uri,
             registered_at,
+            symbol: metadata.symbol,
+            name: metadata.name,
         }
     }
 }

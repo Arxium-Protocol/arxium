@@ -21,6 +21,7 @@ rand = { workspace = true }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-mempool = { workspace = true }
+circuit-rwa-asset = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }

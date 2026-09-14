@@ -100,15 +100,15 @@ impl<'a> BlockView<'a> {
     /// an upsert, mirroring `apply_accounts` (balances go to 0, never get
     /// deleted as a row).
     pub fn apply_asset_balances(&mut self, updates: &AssetBalanceUpdates) -> Result<(), StorageError> {
-        for ((asset_id, owner), balance) in &updates.0 {
-            self.put(&AssetBalanceKey { asset_id, owner }, balance)?;
+        for ((asset, owner), balance) in &updates.0 {
+            self.put(&AssetBalanceKey { asset, owner }, balance)?;
         }
         Ok(())
     }
 
     pub fn apply_holder_states(&mut self, updates: &HolderStateUpdates) -> Result<(), StorageError> {
-        for ((asset_id, holder), state) in &updates.0 {
-            self.put(&AssetHolderStateKey { asset_id, holder }, state)?;
+        for ((asset, holder), state) in &updates.0 {
+            self.put(&AssetHolderStateKey { asset, holder }, state)?;
         }
         Ok(())
     }
@@ -137,7 +137,7 @@ impl<'a> BlockView<'a> {
     }
 
     pub fn apply_asset_registration(&mut self, asset: &Asset) -> Result<(), StorageError> {
-        self.put(&AssetKey(&asset.asset_id), asset)
+        self.put(&AssetKey(&asset.asset_ref), asset)
     }
 
     /// Folds a `RegisterAttestor` write into the view — see `put`/`delete`

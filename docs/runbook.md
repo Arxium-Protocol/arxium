@@ -851,6 +851,49 @@ tolerate — and log — a non-firing fault as a clear FAIL rather than a
 silent pass). If you're citing an old "green run" as evidence rollback
 works, check it postdates this fix.
 
+## Asset references — what an `arxasset1…` is
+
+Since the V6 devnet reset a regulated asset is identified chain-wide by its
+**`AssetRef`**, not by the name its issuer chose:
+
+```
+AssetRef = SHA-256("arxium/asset/v1" || issuer_pubkey || 0x00 || asset_id)
+```
+
+rendered as bech32 with HRP `arxasset`. It is derived, never chosen: the
+issuer's identity is part of the preimage, so two issuers can both register
+`gold` and get two different refs, and nobody can squat on a ticker.
+
+- `asset_id` (`[a-z0-9_-]`, 1–64) is a slug, unique only within one issuer.
+- `symbol` (`[A-Z0-9]`, 1–12) and `name` (1–64 bytes) are **display only**.
+  They are not unique anywhere and the node never resolves anything by them.
+  Two `GOLD`s are told apart by the ref and by whether the issuer holds a
+  live attestation (`issuer_attested` in every asset response) — never by the
+  ticker.
+- Every action after `RegisterAsset` (`IssueAsset`, `TransferAsset`, the
+  freezes and holder controls) names the asset by ref. `RegisterAsset` is the
+  one that carries the slug, and the ref it produces is
+  `derive(sender, asset_id)`.
+
+Looking one up:
+
+```
+GET /assets/{ref}                       # canonical
+GET /assets?issuer={arx1…}               # one issuer's assets
+GET /assets/alias/{issuer}/{asset_id}    # "is this slug taken?" — 200 with the
+                                         # record, or 404 whose body carries the
+                                         # ref a registration would produce
+GET /assets/{ref}/holders
+GET /accounts/{address}/assets           # rows carry ref, asset_id, symbol, name
+GET /accounts/{address}/assets/{ref}
+```
+
+Storage keys (`asset_record:`, `asset_balance:`, `asset_holder:`, the
+`meta:asset_*` indexes) are all keyed on the ref; the prefixes are unchanged.
+The pinned `(arx132yw…, "gold")` → `arxasset1z8d4jt8yt0xtjm6lvk8umc9relegrwq4xu928eqxyjfcsnjuex6qe873qa`
+constant in `core/primitives/src/asset_ref.rs` is what a client codec should
+check its own derivation against.
+
 ## Known limitations worth an operator's awareness
 
 From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,
