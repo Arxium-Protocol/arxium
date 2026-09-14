@@ -6,15 +6,24 @@
 # advance, then heals and checks the isolated node abandons what it built
 # alone in favour of the chain the quorum certified.
 #
-# Why 4 and not 2. Quorum is 2n/3 + 1, so a 1/1 split leaves neither side
-# able to finalize: both stall, nothing diverges, and the run proves only
-# that a chain with no quorum stops — the quorum-degeneracy point
-# scripts/two-node-fault-harness.sh already makes in its header. At n=4
-# quorum is 3, so a 3/1 split is asymmetric in exactly the way the unwind
-# exists for: the majority keeps finalizing while the isolated node keeps
-# producing and locally committing blocks that never finalize. That
-# asymmetry is the precondition, and this script refuses to report a pass
-# without first proving it actually happened (see "Step 4" below).
+# Why 4 and not 2. Quorum is > 2/3 of voting power, so a 1/1 split leaves
+# neither side able to finalize: both stall, nothing diverges, and the run
+# proves only that a chain with no quorum stops — the quorum-degeneracy
+# point scripts/two-node-fault-harness.sh already makes in its header. At
+# n=4 with equal stake each node holds 2,500 of 10,000, so a 3/1 split is
+# asymmetric in exactly the way the unwind exists for: the majority keeps
+# finalizing while the isolated node keeps producing and locally committing
+# blocks that never finalize. That asymmetry is the precondition, and this
+# script refuses to report a pass without first proving it actually
+# happened (see "Step 4" below).
+#
+# STAKES (optional, comma-separated, one per node, in units of the default
+# self-stake) makes the set stake-weighted instead of equal. Quorum is by
+# voting power (xc_primitives::quorum_reached), so this is what proves the
+# weighted arithmetic converges, not just the equal case. The tightest
+# setting is the victim at the per-validator cap: STAKES=1,1,1,10 gives the
+# victim 3,333 and the majority exactly QUORUM_POWER (6,667) — one unit less
+# and the majority could not finalize alone.
 #
 # Separate script rather than a mode of two-node-fault-harness.sh: that one
 # arms a Byzantine node that lies about its own state_root and asserts
@@ -130,12 +139,15 @@ ACCOUNTS='{}'
 # does submit one doesn't rediscover the silent "insufficient balance for
 # the action fee" drop that cost a session there.
 ACCOUNT_FUNDING=$((100 * 1000000))
+# STAKES → per-node --stake, in multiples of the `arxd keys` default floor.
+IFS=, read -r -a STAKE_MULT <<<"${STAKES:-}"
+STAKE_FLOOR=$((100000 * 1000000000))
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DIRS[$i]="$ROOT/node-$i"
     mkdir -p "${DIRS[$i]}"
     RPC_PORTS[$i]=$((BASE_RPC_PORT + i))
     P2P_PORTS[$i]=$((BASE_P2P_PORT + i))
-    entry="$("$BIN" keys --base-path "${DIRS[$i]}" --json)"
+    entry="$("$BIN" keys --base-path "${DIRS[$i]}" --json --stake $((STAKE_FLOOR * ${STAKE_MULT[$i]:-1})))"
     ADDRS[$i]="$(echo "$entry" | jq -r 'keys[0]')"
     PEERS[$i]="$("$BIN" node-key --base-path "${DIRS[$i]}")"
     VALIDATORS="$(jq -s '.[0] * .[1]' <(echo "$VALIDATORS") <(echo "$entry"))"
@@ -224,6 +236,20 @@ done
 # Node 0 speaks for the majority side; the victim is queried directly.
 RPC_MAJORITY="${RPC_PORTS[0]}"
 RPC_VICTIM="${RPC_PORTS[$VICTIM]}"
+
+# Print the genesis voting powers and pin the two numbers the run depends
+# on: the victim alone is below quorum (or it could finalize while cut off,
+# and Step 4a's watermark check would be testing the wrong thing), and the
+# majority without it is at or above quorum (or it stalls instead of
+# finalizing). Read from the chain, not computed here, so it is the
+# arithmetic arxd actually runs that is being checked.
+POWERS="$(curl -sf "http://127.0.0.1:$RPC_MAJORITY/validators/power")"
+echo "genesis voting power: $(echo "$POWERS" | jq -c .)"
+VICTIM_POWER="$(echo "$POWERS" | jq -r --arg a "${ADDRS[$VICTIM]}" '.[$a] // 0')"
+MAJORITY_POWER=$((10000 - VICTIM_POWER))
+echo "  victim ${ADDRS[$VICTIM]} holds $VICTIM_POWER, majority holds $MAJORITY_POWER (quorum 6667)"
+[ "$VICTIM_POWER" -lt 6667 ] || { echo "victim alone reaches quorum — STAKES makes this run meaningless" >&2; exit 1; }
+[ "$MAJORITY_POWER" -ge 6667 ] || { echo "majority without the victim is below quorum — STAKES makes this run meaningless" >&2; exit 1; }
 
 status_field() { curl -sf "http://127.0.0.1:$1/status" | jq -r ".$2 // 0"; }
 # The majority's hash at height H, read as the child's parent_hash: /blocks
