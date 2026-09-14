@@ -197,10 +197,18 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// rows are now a `BTreeMap<Address, VotingPower>` (were a sorted
 /// `Vec<Address>`), and two rows joined the trie: `validator_status:{addr}`
 /// (`ValidatorStatusKey`, `CF_VALIDATORS`) and `chain_params`
-/// (`ChainParamsKey`, `CF_GOVERNANCE`). The old bytes are not readable as
+/// (`ChainParamsKey`, `CF_META`, outside the trie). The old bytes are not readable as
 /// the new shape, and nothing about the old set model is worth migrating —
 /// devnet resets to a fresh genesis (`arxium-devnet-2`).
-pub const SCHEMA_VERSION: u32 = 8;
+///
+/// Bumped 8 -> 9: `ChainParams` gained `max_validator_set`. The row is
+/// bincode (not self-describing), so a `#[serde(default)]` on the field
+/// does nothing for bytes already on disk — a version-8 row decodes as
+/// `UnexpectedEnd` and takes the boundary hook down with it. First actual
+/// forward migration (`migrate_8_to_9`): re-encode the row with the
+/// default. `chain_params` lives in `CF_META`, outside the state trie, so
+/// this does not touch any certified state root.
+pub const SCHEMA_VERSION: u32 = 9;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -386,11 +394,37 @@ impl ArxiumDb {
                     Ok(())
                 } else if found > SCHEMA_VERSION {
                     Err(StorageError::SchemaTooNew { found, supported: SCHEMA_VERSION })
+                } else if found == 8 {
+                    self.migrate_8_to_9()?;
+                    self.db.put_cf(meta, SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes())?;
+                    Ok(())
                 } else {
                     Err(StorageError::SchemaTooOld { found, supported: SCHEMA_VERSION })
                 }
             }
         }
+    }
+
+    /// See `SCHEMA_VERSION`'s 8 -> 9 note. A struct encodes as its fields in
+    /// order, so the version-8 row reads back as the 3-tuple of the fields it
+    /// had; the new field takes the serde default.
+    fn migrate_8_to_9(&self) -> Result<(), StorageError> {
+        let key = ChainParamsKey.encode();
+        let Some(bytes) = self.db.get_cf(self.cf(cf_for_key(&key)), &key)? else {
+            return Ok(());
+        };
+        let config = bincode::config::standard();
+        let ((epoch_length, validator_attestation_required, min_validator_set), _): ((u64, bool, usize), usize) =
+            bincode::serde::decode_from_slice(&bytes, config)?;
+        let params = ChainParams {
+            epoch_length,
+            validator_attestation_required,
+            min_validator_set,
+            ..ChainParams::default()
+        };
+        self.db
+            .put_cf(self.cf(cf_for_key(&key)), &key, bincode::serde::encode_to_vec(&params, config)?)?;
+        Ok(())
     }
 
     /// Column family handle for `name` — always present since `open` creates
@@ -1864,6 +1898,28 @@ mod explorer_index_tests {
         assert_eq!(db.all_validator_statuses().unwrap().len(), 1);
         // No params row seeded: defaults, not an error.
         assert_eq!(db.chain_params().unwrap(), ChainParams::default());
+    }
+
+    #[test]
+    fn schema_8_chain_params_row_migrates_to_9() {
+        let path = std::env::temp_dir().join(format!("arxium-test-storage-{}", uuid_like()));
+        {
+            // Stamp a version-8 DB holding the 3-field row v0.3.0 wrote.
+            let db = ArxiumDb::open(&path).unwrap();
+            let config = bincode::config::standard();
+            let old = bincode::serde::encode_to_vec((1800u64, false, 2usize), config).unwrap();
+            let key = ChainParamsKey.encode();
+            db.db.put_cf(db.cf(cf_for_key(&key)), &key, old).unwrap();
+            db.db.put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 8u32.to_le_bytes()).unwrap();
+            assert!(db.chain_params().is_err(), "the old row must not decode as the new struct");
+        }
+        let db = ArxiumDb::open(&path).unwrap();
+        assert_eq!(
+            db.chain_params().unwrap(),
+            ChainParams { epoch_length: 1800, validator_attestation_required: false, min_validator_set: 2, ..ChainParams::default() }
+        );
+        let stamped = db.db.get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY).unwrap().unwrap();
+        assert_eq!(u32::from_le_bytes(stamped.as_slice().try_into().unwrap()), SCHEMA_VERSION);
     }
 
     #[test]
