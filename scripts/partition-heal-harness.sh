@@ -77,6 +77,17 @@ CHAIN_TIMEOUT=300
 #              TARGET_H, tallies a quorum for a hash it disagrees with, and
 #              unwinds on its own evidence. The only way arxd/finality's
 #              enforce_certificate is reachable from a live network.
+#
+#              KNOWN INCONCLUSIVE since d7e2747 (2026-09-12): sync now serves
+#              the provisional tip to a peer standing at the watermark, so
+#              the moment the victim rejoins inside round 0 the majority
+#              pulls its (valid, round-0-proposer) block and adopts it — no
+#              divergence, nothing to unwind. Reproduced 2026-09-14 with
+#              equal and weighted stakes. Reaching enforce_certificate live
+#              now needs the heal to land between the majority's round-0
+#              timeout and its own commit of TARGET_H, a sub-second window a
+#              process restart cannot hit. Kept for the day that window is
+#              widened or the mode is redesigned; not a chain defect.
 HEAL_WHEN="${HEAL_WHEN:-finalized}"
 case "$HEAL_WHEN" in
     finalized|votes) ;;
