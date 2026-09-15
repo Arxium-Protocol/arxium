@@ -457,6 +457,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/validators", get(get_validators::<P>))
                 .route("/validators/power", get(get_validator_power::<P>))
                 .route("/finality", get(get_finality::<P>))
+                .route("/genesis-hash", get(get_genesis_hash::<P>))
                 .route("/operators/{address}/validators", get(get_operator_validators::<P>))
                 .route(
                     "/stake/{master}/{validator}",
@@ -701,6 +702,14 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let genesis_hash = match state.db.genesis_hash() {
+        Ok(Some(hash)) => hash,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            warn!("failed to read genesis hash: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     // Additive: existing consumers keep reading the three fields they know.
     // A wallet showing confirmations needs finality from the same call it
@@ -721,6 +730,7 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
 
     Json(serde_json::json!({
         "chain_name": chain_name,
+        "genesis_hash": genesis_hash,
         "tip_height": tip_height,
         "tip_hash": tip_hash,
         "finalized_height": finalized_height,
@@ -760,6 +770,17 @@ async fn get_account<P: Payload>(
     match state.db.get_account(&address) {
         Ok(Some(account)) => Json(account).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// The genesis state root bound into every BLS finality signature. External
+/// verifiers must pin this value rather than infer network identity from a
+/// mutable chain-name label.
+async fn get_genesis_hash<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    match state.db.genesis_hash() {
+        Ok(Some(genesis_hash)) => Json(serde_json::json!({ "genesis_hash": genesis_hash })).into_response(),
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
@@ -809,13 +830,37 @@ async fn get_delegated_stake<P: Payload>(
 async fn get_account_bls_key<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
+    Query(query): Query<ValidatorSetQuery>,
 ) -> Response {
     let address = match Address::parse(&address) {
         Ok(address) => address,
         Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
     };
 
-    match state.db.get_bls_pubkey(&address) {
+    let height = match query.height {
+        Some(requested) => match state.db.get_tip_height() {
+            Ok(Some(tip_height)) if requested <= tip_height => requested,
+            Ok(Some(tip_height)) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("height {requested} is above the chain tip {tip_height}"),
+                )
+                    .into_response();
+            }
+            Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+        None => match state.db.get_tip_height() {
+            Ok(Some(tip_height)) => tip_height,
+            Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
+    };
+
+    // Certificates must be checked against the key registered at their height.
+    // Reading the current key after rotation would incorrectly reject an old
+    // valid certificate or accept a forged historical one.
+    match state.db.get_bls_pubkey_at(&address, height) {
         Ok(Some(pubkey)) => Json(serde_json::json!({ "pubkey": pubkey })).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -2113,6 +2158,10 @@ mod tests {
                 })
                 .unwrap();
             state.db.write_batch(&genesis).unwrap();
+            state
+                .db
+                .write_batch(&xc_storage::GenesisHash(genesis.state_root.clone()))
+                .unwrap();
 
             let resp = get_status(State(state.clone())).await;
             assert_eq!(resp.status(), StatusCode::OK);
@@ -2123,6 +2172,7 @@ mod tests {
             assert_eq!(json["chain_name"], "test-chain");
             assert_eq!(json["tip_height"], 0);
             assert_eq!(json["tip_hash"], genesis.hash());
+            assert_eq!(json["genesis_hash"], genesis.state_root);
         });
     }
 
