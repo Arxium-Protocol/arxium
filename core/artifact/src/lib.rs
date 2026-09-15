@@ -32,7 +32,7 @@
 
 use std::sync::OnceLock;
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -745,7 +745,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                     .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
                 let signature = Signature::from_bytes(&sig_bytes);
                 verifying_key
-                    .verify(&bytes, &signature)
+                    .verify_strict(&bytes, &signature)
                     .map_err(|_| VerifyError::SignatureInvalid(i))?;
                 signed.push(bytes);
             }
@@ -785,7 +785,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 .try_into()
                 .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
             let signature = Signature::from_bytes(&sig_bytes);
-            verifying_key.verify(&bytes, &signature).map_err(|_| VerifyError::ProposedSignatureInvalid)?;
+            verifying_key.verify_strict(&bytes, &signature).map_err(|_| VerifyError::ProposedSignatureInvalid)?;
 
             let header_commitment_bytes = decode_hex("header_commitment", &dissent.header_commitment)?;
             let header_commitment_bytes: [u8; 32] = header_commitment_bytes
@@ -932,7 +932,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 .try_into()
                 .map_err(|_| VerifyError::BadSignatureLength(proposed_sig_bytes.len()))?;
             verifying_key
-                .verify(&proposed_msg, &Signature::from_bytes(&proposed_sig_bytes))
+                .verify_strict(&proposed_msg, &Signature::from_bytes(&proposed_sig_bytes))
                 .map_err(|_| VerifyError::ProposedClaimSignatureInvalid)?;
 
             let dissent_msg = action_claim_signing_bytes(
@@ -998,7 +998,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 .try_into()
                 .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
             verifying_key
-                .verify(&header_bytes, &Signature::from_bytes(&sig_bytes))
+                .verify_strict(&header_bytes, &Signature::from_bytes(&sig_bytes))
                 .map_err(|_| VerifyError::BlockAttestationSignatureInvalid)?;
             let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
 

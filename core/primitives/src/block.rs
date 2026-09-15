@@ -4,7 +4,7 @@
 use crate::action::{Action, RawAction, SignatureError};
 use crate::address::Address;
 use crate::consensus::RoundCertificate;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -192,7 +192,7 @@ impl<P: Serialize> Block<P> {
             VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| SignatureError::Invalid)?;
 
         verifying_key
-            .verify(&self.signing_bytes(proposer), &signature)
+            .verify_strict(&self.signing_bytes(proposer), &signature)
             .map_err(|_| SignatureError::Invalid)
     }
 }

@@ -455,6 +455,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/attestors", get(get_attestors::<P>))
                 .route("/attestors/{address}", get(get_attestor::<P>))
                 .route("/validators", get(get_validators::<P>))
+                .route("/validators/{address}", get(get_validator::<P>))
                 .route("/validators/power", get(get_validator_power::<P>))
                 .route("/finality", get(get_finality::<P>))
                 .route("/genesis-hash", get(get_genesis_hash::<P>))
@@ -1364,6 +1365,42 @@ async fn get_validator_power<P: Payload>(
     }
 }
 
+/// One validator's standing: its `ValidatorStatus` (Active / Pending /
+/// Jailed / Leaving / Tombstoned — the state the epoch hook and the fault
+/// paths already keep, previously unreachable over RPC), its voting power
+/// in the tip set (0 when not in it), whether a BLS key is registered, and
+/// its operator if any. 404 for an address that never staked to join.
+async fn get_validator<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Response {
+    let address = match Address::parse(&address) {
+        Ok(address) => address,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    let status = match state.db.get_validator_status(&address) {
+        Ok(Some(status)) => status,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let tip = state.db.get_tip_height().ok().flatten().unwrap_or(0);
+    let voting_power = match state.db.get_validator_set_at(tip) {
+        Ok(set) => set.into_iter().find(|(a, _)| a == &address).map(|(_, p)| p.0).unwrap_or(0),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let (Ok(bls), Ok(operator)) = (state.db.get_bls_pubkey(&address), state.db.get_operator(&address)) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    Json(serde_json::json!({
+        "address": address,
+        "status": status,
+        "voting_power": voting_power,
+        "bls_registered": bls.is_some(),
+        "operator": operator,
+    }))
+    .into_response()
+}
+
 /// Every validator address currently authorizing `address` to submit
 /// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` on its behalf (see
 /// `ActionPayload::AuthorizeOperator`) — drives a "your validators" listing
@@ -1384,22 +1421,24 @@ async fn get_operator_validators<P: Payload>(
 }
 
 /// Status of a submitted action: "pending" while it's still queued in the
-/// mempool, "confirmed" once a block including it is on the chain. An
-/// action that was dropped by the executor (bad signature, stale nonce)
-/// looks the same as one that was never submitted — 404 — since neither is
-/// persisted anywhere; that's a real gap if a client needs to distinguish
-/// "never sent" from "sent then rejected", not addressed here.
+/// mempool, "confirmed" once a block including it is on the chain, and
+/// "dropped" with the executor's reason when this node drained it and
+/// failed to apply it (bad nonce, insufficient balance…). The dropped
+/// record is an in-memory ring on the mempool, so it survives until ~1k
+/// later drops or a restart; after that the action is a 404 like one that
+/// was never sent.
 async fn get_action_status<P: Payload>(
     State(state): State<AppState<P>>,
     Path(signature): Path<String>,
 ) -> Response {
-    if state
-        .mempool
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .contains_signature(&signature)
     {
-        return Json(serde_json::json!({ "status": "pending" })).into_response();
+        let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
+        if mempool.contains_signature(&signature) {
+            return Json(serde_json::json!({ "status": "pending" })).into_response();
+        }
+        if let Some(reason) = mempool.dropped_reason(&signature) {
+            return Json(serde_json::json!({ "status": "dropped", "reason": reason })).into_response();
+        }
     }
 
     let height = match state.db.get_action_block_height(&signature) {

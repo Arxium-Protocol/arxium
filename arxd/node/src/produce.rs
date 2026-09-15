@@ -33,12 +33,25 @@ pub(crate) static INJECT_FAULT_AT_HEIGHT: std::sync::OnceLock<u64> = std::sync::
 /// turn it is to produce — the block gets signed. `produce_loop` never
 /// calls this with `None` (a non-validator node doesn't produce at all);
 /// unsigned blocks remain reachable here only from tests.
+#[cfg(test)]
 pub fn produce_block<R: ChainRuntime>(
     db: &ArxiumDb,
     actions: Vec<Action<R::Payload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
 ) -> Result<Block<R::Payload>> {
+    produce_block_reporting::<R>(db, actions, timestamp, proposer).map(|(block, _)| block)
+}
+
+/// `produce_block` plus the `(signature, reason)` of every action that was
+/// drained but not applied — what `produce_loop` hands the mempool so a
+/// status poll can name the rejection.
+pub fn produce_block_reporting<R: ChainRuntime>(
+    db: &ArxiumDb,
+    actions: Vec<Action<R::Payload>>,
+    timestamp: u64,
+    proposer: Option<(&Address, &SigningKey)>,
+) -> Result<(Block<R::Payload>, Vec<(String, String)>)> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let next_height = tip_height + 1;
     let parent: Block<R::Payload> = db
@@ -77,6 +90,7 @@ pub fn produce_block<R: ChainRuntime>(
         attestor_registrations,
         attestor_deregistrations,
         touched_keys: _,
+        dropped,
     } = execute_actions(
         db,
         actions,
@@ -270,7 +284,7 @@ pub fn produce_block<R: ChainRuntime>(
     // exactly as easily as a follower does, so it needs the same rollback.
     db.write_block_batches(new_block.height, &writables, true)?;
 
-    Ok(new_block)
+    Ok((new_block, dropped))
 }
 
 /// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
@@ -462,8 +476,11 @@ pub fn produce_loop<R: ChainRuntime>(
         // A bad action (forged signature, stale nonce) is skipped by execute_actions
         // and never reaches here; an Err means block-level bookkeeping itself failed
         // (e.g. storage), which is unexpected and logged rather than propagated.
-        match produce_block::<R>(db, pending, now, proposer) {
-            std::result::Result::Ok(block) => {
+        match produce_block_reporting::<R>(db, pending, now, proposer) {
+            std::result::Result::Ok((block, dropped)) => {
+                if !dropped.is_empty() {
+                    mempool.lock().unwrap_or_else(|e| e.into_inner()).note_dropped(dropped);
+                }
                 info!(
                     "produced block {} with {} action(s), hash={}",
                     block.height,
@@ -611,7 +628,15 @@ mod tests {
         let signature = alice_key.sign(&transfer.signing_bytes());
         transfer.signature = Some(hex::encode(signature.to_bytes()));
 
-        let block = produce_block::<CoreChainRuntime>(&db, vec![transfer], 1, None).unwrap();
+        // Same nonce twice: the replay is dropped, and the drop is reported
+        // by signature so a status poll can say why.
+        let replay = transfer.clone();
+        let (block, dropped) =
+            produce_block_reporting::<CoreChainRuntime>(&db, vec![transfer, replay.clone()], 1, None).unwrap();
+        assert_eq!(block.actions.len(), 1);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].0, replay.signature.unwrap());
+        assert!(dropped[0].1.contains("nonce"), "reason names the cause: {}", dropped[0].1);
 
         assert_eq!(block.height, 1);
         assert_eq!(

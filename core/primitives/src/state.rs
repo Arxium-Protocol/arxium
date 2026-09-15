@@ -236,6 +236,11 @@ pub struct Asset {
     /// to RPC and downstream readers. Every storage key for this asset is
     /// keyed on it; `asset_id` is only unique within `issuer`.
     pub asset_ref: AssetRef,
+    /// One-way: set by `LockIssuance`, never cleared. While set every
+    /// `IssueAsset`/`IssueAssetTo` is rejected, so a burn can no longer be
+    /// undone by re-minting into the room it freed under `max_supply` —
+    /// the same guarantee as revoking a mint authority elsewhere.
+    pub issuance_locked: bool,
 }
 
 /// The issuer-supplied half of an `Asset`: everything `RegisterAsset` carries
@@ -286,6 +291,7 @@ impl Asset {
             registered_at: 0,
             symbol: String::new(),
             name: String::new(),
+            issuance_locked: false,
         }
     }
 
@@ -317,6 +323,7 @@ impl Asset {
             registered_at,
             symbol: metadata.symbol,
             name: metadata.name,
+            issuance_locked: false,
         }
     }
 }

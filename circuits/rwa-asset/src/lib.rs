@@ -66,6 +66,8 @@ pub enum RwaError {
         locked: u128,
         amount: u128,
     },
+    #[error("issuance of {asset} is locked")]
+    IssuanceLocked { asset: AssetRef },
     #[error("burning {amount} of {asset} exceeds the issuer's balance of {balance}")]
     BurnExceedsBalance {
         asset: AssetRef,
@@ -204,6 +206,9 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
         });
     }
 
+    if asset.issuance_locked {
+        return Err(RwaError::IssuanceLocked { asset: asset.asset_ref.clone() });
+    }
     // Checked before any balance math so a rejected issue leaves nothing
     // half-applied. Overflow is its own error rather than a saturating
     // clamp: silently minting less than asked for is worse than failing.
@@ -323,6 +328,9 @@ pub fn apply_issue_to<V: KvRead<Error = StorageError>>(
     to: &Address,
     amount: u128,
 ) -> Result<AssetBalanceUpdates, RwaError> {
+    if asset.issuance_locked {
+        return Err(RwaError::IssuanceLocked { asset: asset.asset_ref.clone() });
+    }
     if asset.frozen {
         return Err(RwaError::AssetFrozen { asset: asset.asset_ref.clone() });
     }
@@ -607,6 +615,26 @@ mod tests {
         assert_eq!(asset.total_supply, 40);
         let err = apply_issue_to(&db, &mut asset, &investor, 61).unwrap_err();
         assert!(matches!(err, RwaError::SupplyCapExceeded { .. }), "{err}");
+    }
+
+    /// The burn-then-remint hole: under a cap, a burn frees room that a
+    /// fresh issue can refill. `issuance_locked` is what closes it.
+    #[test]
+    fn locked_issuance_refuses_every_mint_after_a_burn() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let mut asset = seeded_open_asset(&db, &issuer, 100);
+        asset.max_supply = Some(100);
+        apply_burn(&db, &mut asset, &issuer, 50).unwrap();
+        assert_eq!(asset.total_supply, 50);
+        // Unlocked: the burn reopened cap room, as on every other chain.
+        apply_issue(&db, &mut asset, &issuer, 1, 10).unwrap();
+        asset.issuance_locked = true;
+        let err = apply_issue(&db, &mut asset, &issuer, 2, 1).unwrap_err();
+        assert!(matches!(err, RwaError::IssuanceLocked { .. }), "{err}");
+        let err = apply_issue_to(&db, &mut asset, &issuer, 1).unwrap_err();
+        assert!(matches!(err, RwaError::IssuanceLocked { .. }), "{err}");
+        assert_eq!(asset.total_supply, 60, "a refused issue moves nothing");
     }
 
     #[test]

@@ -46,6 +46,10 @@ pub struct ExecutionOutcome<P> {
     /// Every Merkleized key read or written, but only when the caller asked
     /// for it via `record_touched_keys`; otherwise empty.
     pub touched_keys: Vec<Vec<u8>>,
+    /// `(signature, reason)` for every input action that was not applied,
+    /// so a producer can tell a polling client *why* — the block itself
+    /// only lists what landed.
+    pub dropped: Vec<(String, String)>,
 }
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -537,6 +541,7 @@ where
         attestor_registrations,
         attestor_deregistrations,
         touched_keys,
+        dropped: _,
     } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
@@ -709,6 +714,7 @@ where
     P: serde::Serialize,
 {
     let mut applied = Vec::with_capacity(actions.len());
+    let mut dropped = Vec::new();
     // Seeded from e.g. matured-unbonding resolution, run by the caller
     // before this loop — so a same-block `Stake` action sees a just-cleared
     // `unbonding` slot instead of hitting "already unbonding".
@@ -747,6 +753,7 @@ where
     for action in actions {
         if let Err(err) = action.verify_signature() {
             warn!("dropping action from {}: {err}", action.sender);
+            dropped.push((action.signature.clone().unwrap_or_default(), err.to_string()));
             continue;
         }
 
@@ -791,7 +798,10 @@ where
                 attestor_deregistrations.extend(updates.attestor_deregistration);
                 applied.push(action);
             }
-            Err(err) => warn!("dropping action from {}: {err}", action.sender),
+            Err(err) => {
+                warn!("dropping action from {}: {err}", action.sender);
+                dropped.push((action.signature.clone().unwrap_or_default(), err.to_string()));
+            }
         }
 
         if let Some(roots) = inter_action_roots.as_deref_mut() {
@@ -812,6 +822,7 @@ where
 
     Ok(ExecutionOutcome {
         applied,
+        dropped,
         accounts: AccountUpdates(overlay),
         validator_statuses: status_overlay,
         stakes: StakeUpdates {

@@ -25,338 +25,14 @@ mod staking;
 
 pub use staking::MIN_VALIDATOR_STAKE;
 
-use serde::{Deserialize, Serialize};
 use xc_bls::BlsPublicKey;
 use xc_chain_spec::presets::PresetRegistry;
 use xc_circuit::{AccountKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address, AssetMetadata, AssetRef, ClaimTopic, CountryCode};
+use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
-/// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
-/// themselves. A different chain (e.g. `examples/toy-chain`) defines its
-/// own payload type and dispatch instead of adding variants here.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum ActionPayload {
-    Transfer {
-        to: Address,
-        amount: u128,
-    },
-    /// Staking to join the validator set: routed through
-    /// `circuit_staking::apply_stake` with `master == sender`, so it's held
-    /// in the same `stake_subaccount` mechanism regular delegators use —
-    /// same balance check, same "already controlled by another master"
-    /// rejection, no new bookkeeping. Takes effect one block after this
-    /// action lands (`xc_executor::accept_block`'s effective-height rule) —
-    /// can't vote itself into this block's own proposer slot. `stake` on
-    /// `ValidatorEntry` is informational only; `ValidatorSetSnapshot` never
-    /// persists it, so the `StakeAllocation` for `(sender, validator)` is the
-    /// real source of truth for how much a validator has at stake.
-    ///
-    /// `sender == validator` for ordinary self-service joining. `sender !=
-    /// validator` is a *delegated* join — `sender` must be `validator`'s
-    /// authorized operator (see `AuthorizeOperator`), and `sender`'s own
-    /// balance funds the stake, same as a third-party `Stake` action. That
-    /// also means `sender` becomes `validator`'s stake master going forward
-    /// (`circuit_staking::apply_stake`'s single-master invariant) — the
-    /// validator can't separately self-stake later while a delegated master
-    /// holds that slot.
-    JoinValidator {
-        validator: Address,
-        stake: u128,
-        /// The validator's BLS finality key, registered atomically with the
-        /// join. Required, not optional: a validator without one is counted
-        /// toward the finality quorum while being unable to vote, so every
-        /// such validator raises the threshold and contributes nothing to
-        /// meeting it. Enough of them and the chain produces blocks forever
-        /// while finalizing nothing, with no symptom but a warning per
-        /// dropped vote.
-        ///
-        /// Carried in the action rather than required as a prior
-        /// `RegisterBlsKey` so joining is atomic and cannot half-succeed —
-        /// this is Cosmos's `MsgCreateValidator.pubkey`. `RegisterBlsKey`
-        /// remains, for rotating a key on an existing validator.
-        bls_pubkey: Vec<u8>,
-        /// Proof of possession for `bls_pubkey` — `xc_bls::prove_possession`,
-        /// printed alongside the key by `arxd keys`. Without it a rogue key
-        /// forges quorum certificates; see `consensus::validated_bls_pubkey`.
-        bls_pop: Vec<u8>,
-    },
-    /// Removal from the validator set, routed through
-    /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
-    /// and a `Leaving` status. The validator keeps proposing and voting
-    /// until the epoch boundary, then drops; the stake sits in `Unbonding`
-    /// for `circuit_staking::UNBONDING_EPOCHS` — and stays
-    /// slashable that whole time (`circuit_staking::apply_slash` treats
-    /// unbonding funds as fair game). Rejected if `validator` isn't
-    /// currently a validator, or if they're the last one — an empty
-    /// validator set means `expected_proposer` returns `None` forever and
-    /// the chain can never produce another block (the same deadlock hit live
-    /// this session from running `--bootnode` on two machines,
-    /// self-inflicted here instead).
-    ///
-    /// `sender == validator` for self-service leaving. `sender != validator`
-    /// is delegated — same authorization rule as `JoinValidator` — and the
-    /// unstaked funds return to whoever `validator`'s recorded master is
-    /// (`sender` in the self-service case, the authorized operator in the
-    /// delegated case), never anywhere else.
-    LeaveValidator {
-        validator: Address,
-    },
-    /// MW-signature-only stake into a validator's sub-account
-    /// (`circuit_staking::stake_subaccount`). See `circuit_staking::apply_stake`.
-    Stake {
-        validator: Address,
-        amount: u128,
-    },
-    /// MW-signature-only partial or full unstake, subject to
-    /// `circuit_staking::UNBONDING_EPOCHS`. See `circuit_staking::apply_unstake`.
-    /// There is deliberately no `Slash` variant here — slashing is never
-    /// user-submitted, so it's unreachable from RPC/mempool by construction
-    /// (see `circuit_staking::apply_slash`).
-    Unstake {
-        validator: Address,
-        amount: u128,
-    },
-    /// Proof that a validator signed two different blocks at the same
-    /// height — normally built and submitted by `xc_evidence::spawn_evidence_watcher`
-    /// when it observes a competing block, never hand-crafted by an
-    /// ordinary user. Anyone *could* submit one given the two blocks, but
-    /// `xc_evidence::verify_equivocation` is what actually gates the slash, not
-    /// who submitted it — so that's fine.
-    SubmitEquivocationEvidence {
-        block_a: Box<ChainBlock>,
-        block_b: Box<ChainBlock>,
-    },
-    /// Registers `validator`'s BLS pubkey for finality-certificate
-    /// precommit voting (`arxd/finality`). Any address may be registered —
-    /// the key is only meaningful once/if that address is also in the
-    /// validator set at some height; no membership check happens here.
-    /// `sender == validator` for self-registration; `sender != validator` is
-    /// delegated, same authorization rule as `JoinValidator`. This lets a
-    /// validator's operator register the key on its behalf without the
-    /// validator's own key ever leaving the machine it was generated on
-    /// (`arxd bls-key`).
-    RegisterBlsKey {
-        validator: Address,
-        pubkey: Vec<u8>,
-        /// Proof of possession for `pubkey` — see `JoinValidator::bls_pop`.
-        pop: Vec<u8>,
-    },
-    /// A Groth16 proof of knowledge of a preimage hashing (via
-    /// `circuit_identity_zk`'s Poseidon circuit) to the sender's existing
-    /// `AccountEntry.identity_hash`. Verified against the checked-in devnet
-    /// verifying key — see `circuits/identity-zk`'s module docs for why
-    /// that key isn't from a real trusted-setup ceremony. On success, marks
-    /// `zk_identity_verified` on the sender's account.
-    VerifyIdentityCredential {
-        proof: Vec<u8>,
-    },
-    /// Grants `operator` authority to submit `JoinValidator`/
-    /// `LeaveValidator`/`RegisterBlsKey` on the sender's behalf — self-signed
-    /// only, this is how a validator opts in to delegated management, never
-    /// something an operator can grant itself. Overwrites any previously
-    /// authorized operator (at most one at a time, mirroring
-    /// `circuit_staking::apply_stake`'s single-master invariant).
-    ///
-    /// Appended here rather than inserted among the existing variants —
-    /// `ActionPayload`'s wire format (bincode, used for gossip/sync, and
-    /// hand-mirrored by out-of-process codecs like Arx-Plus's Swift one)
-    /// encodes enum variants by discriminant index, so inserting earlier
-    /// would silently shift every later variant's index.
-    AuthorizeOperator {
-        operator: Address,
-    },
-    /// Revokes the sender's currently authorized operator, if any —
-    /// self-signed only, so a validator can always unilaterally cut off a
-    /// compromised or unwanted operator regardless of what that operator
-    /// does or doesn't do.
-    RevokeOperator,
-    /// Marks `subject` eligible (sets `AccountEntry.identity_hash`) — only
-    /// a registered attestor (membership in `CF_ATTESTORS`, managed via
-    /// `RegisterAttestor`/`DeregisterAttestor`) may submit this. Records
-    /// `sender` in `AccountEntry.attested_by` for accountability.
-    GrantAttestation {
-        subject: Address,
-        hash: String,
-        /// Which claim topics this attestation confers. Empty grants an
-        /// `identity_hash` and nothing topic-level, which is what every
-        /// attestation did before topics existed and is still enough for
-        /// assets that gate on `compliance_required`.
-        topics: Vec<ClaimTopic>,
-        /// Subject's jurisdiction, for assets restricting
-        /// `allowed_jurisdictions`. `None` leaves it unknown, and an asset
-        /// with a restriction rejects unknown rather than permitting it.
-        jurisdiction: Option<CountryCode>,
-    },
-    /// Reverses `GrantAttestation` — clears `identity_hash` and, since a
-    /// revoked KYC status shouldn't leave a stale ZK-verified flag around,
-    /// also clears `zk_identity_verified`. Any registered attestor may
-    /// revoke any attestation (permissive revocation), not just the one
-    /// that granted it.
-    RevokeAttestation {
-        subject: Address,
-    },
-    /// Registers a new regulated asset, `sender` becoming its issuer. The
-    /// asset's chain-wide identity is `AssetRef::derive(sender, asset_id)`;
-    /// `asset_id` is only a slug, unique within the sender. Rejected if the
-    /// sender already has an asset with this slug, or if `asset_id` /
-    /// `metadata` fail `asset::register_asset`'s validation.
-    ///
-    /// The only asset variant that still carries `asset_id: String` — it is
-    /// the slug being claimed. Every other asset variant names the asset by
-    /// `AssetRef`, so nothing downstream ever resolves by slug or symbol.
-    ///
-    /// `metadata` was added to this variant in place rather than as a new
-    /// variant: bincode encodes struct-variant fields positionally, so this
-    /// changes the encoding and old blocks carrying the two-field form no
-    /// longer decode. That is acceptable only because devnet genesis is being
-    /// reset alongside it — on a live chain this would need a new variant
-    /// appended instead. The `AssetRef` re-key happened on the same reasoning
-    /// in the same reset. Retracer's hand-mirrored copy of this enum
-    /// (`crates/ingestion/src/corechain_payload.rs`) must gain the same
-    /// fields, in this position, in the same release.
-    RegisterAsset {
-        asset_id: String,
-        compliance_required: bool,
-        metadata: AssetMetadata,
-    },
-    /// Mints `amount` of `asset` into the issuer's own asset balance —
-    /// only the registered issuer may call this. Native balance untouched.
-    IssueAsset {
-        asset: AssetRef,
-        amount: u128,
-    },
-    /// Compliance-gated transfer of a registered asset — distinct from
-    /// `Transfer`, which only ever moves the native token and is never
-    /// KYC-gated.
-    TransferAsset {
-        asset: AssetRef,
-        to: Address,
-        amount: u128,
-    },
-    /// Adds `attestor` to the trusted-attestor set (`identity::GovernorKey`
-    /// only, see `Snapshot.governor`) — the Trust Spectrum's multi-attestor
-    /// model: more than one regulated KYC provider can hold
-    /// `GrantAttestation`/`RevokeAttestation` rights at once. Rejected if
-    /// `attestor` is already registered.
-    RegisterAttestor {
-        attestor: Address,
-        name: String,
-    },
-    /// Removes `attestor` from the trusted-attestor set (`GovernorKey`
-    /// only). Any registered attestor may still revoke attestations that
-    /// `attestor` previously granted — see `identity::require_attestor`.
-    DeregisterAttestor {
-        attestor: Address,
-    },
-    /// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
-    /// artifact (JSON-serialized `xc_artifact::EvidenceArtifact`) for
-    /// on-chain adjudication and slashing — the counterpart to
-    /// `SubmitEquivocationEvidence` for the two fault kinds that need
-    /// chain-specific replay (see `adjudicate`) rather than a
-    /// context-free signature/proof check to name a culprit. Anyone may
-    /// submit one, same as equivocation evidence — `adjudicate::*` and the
-    /// artifact's own signatures are what gate the slash, not who
-    /// submitted it.
-    SubmitExecutionFault {
-        artifact_json: String,
-    },
-    /// Halts all transfers of `asset` until an `UnfreezeAsset` lands.
-    /// Issuance is deliberately unaffected — a freeze is about circulation,
-    /// not about sealing the supply.
-    ///
-    /// Appended here, not inserted: see `AuthorizeOperator` above for why
-    /// variant order is part of the wire format. Retracer keeps a
-    /// hand-mirrored copy of this enum
-    /// (`crates/ingestion/src/corechain_payload.rs`) that has to gain the
-    /// same variants in the same order, or it will misdecode blocks rather
-    /// than fail on them.
-    FreezeAsset {
-        asset: AssetRef,
-    },
-    /// Lifts a `FreezeAsset`. Idempotent — unfreezing an asset that isn't
-    /// frozen succeeds rather than erroring, so a governor never has to know
-    /// the current flag to reach the state they want.
-    UnfreezeAsset {
-        asset: AssetRef,
-    },
-    /// Moves `amount` of `asset` from `from` to `to` without `from`'s
-    /// signature and without any compliance, claim, jurisdiction or freeze
-    /// check — the chain governor only. This is the recovery and enforcement
-    /// path for what compliance cannot express: a court-ordered
-    /// reassignment, a sanctioned holder, a holder who has lost their key.
-    /// It still cannot mint: `from` must actually hold the balance.
-    ///
-    /// `reason` is mandatory and non-empty. It is not stored in state — it
-    /// lives in the block that carried the action, which is the durable,
-    /// replicated audit record a regulator would be shown, and keeping it out
-    /// of state avoids growing the trie with free-text an issuer controls.
-    ///
-    /// Appended, like `FreezeAsset`/`UnfreezeAsset` above; the same note
-    /// about Retracer's mirrored enum applies.
-    ForcedTransfer {
-        asset: AssetRef,
-        from: Address,
-        to: Address,
-        amount: u128,
-        reason: String,
-    },
-    /// Issuer destroys `amount` of its own balance; `total_supply` follows.
-    /// Variant 21 — appended, so Retracer's mirror and the client codecs must
-    /// add it in this position.
-    BurnAsset {
-        asset: AssetRef,
-        amount: u128,
-    },
-    /// Issuer takes a holder out of circulation for one asset (or back in) —
-    /// Variant 22.
-    SetHolderFrozen {
-        asset: AssetRef,
-        holder: Address,
-        frozen: bool,
-    },
-    /// Issuer locks `amount` of a holder's balance against compliant
-    /// transfers. Variant 23.
-    LockHolderAmount {
-        asset: AssetRef,
-        holder: Address,
-        amount: u128,
-    },
-    /// Reverses `LockHolderAmount`. Variant 24.
-    UnlockHolderAmount {
-        asset: AssetRef,
-        holder: Address,
-        amount: u128,
-    },
-    /// The issuer's own forced transfer, scoped to assets it issued, same audited `reason` as the
-    /// governor's `ForcedTransfer`. Variant 25.
-    IssuerForcedTransfer {
-        asset: AssetRef,
-        from: Address,
-        to: Address,
-        amount: u128,
-        reason: String,
-    },
-    /// Move everything `lost` holds of an asset to `replacement`, which must
-    /// pass the asset's compliance rules. Issuer
-    /// only. Variant 26.
-    RecoverHolder {
-        asset: AssetRef,
-        lost: Address,
-        replacement: Address,
-    },
-    /// Issuer mints straight into a verified investor's balance. `to` passes the asset's compliance rules; the issuer,
-    /// which never holds the units, is not checked. Variant 27.
-    IssueAssetTo {
-        asset: AssetRef,
-        to: Address,
-        amount: u128,
-    },
-}
-
-pub type ChainAction = Action<ActionPayload>;
-pub type ChainBlock = xc_primitives::Block<ActionPayload>;
+pub use arxd_payload::{ActionPayload, ChainAction, ChainBlock};
 
 /// CoreChain's `ChainRuntime` implementation — see `xc_runtime_api::ChainRuntime`
 /// for what this makes `arxd/node` generic over.
@@ -812,6 +488,11 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             reason,
         } => asset::forced_transfer(view, action, asset, from, to, *amount, reason),
         ActionPayload::BurnAsset { asset, amount } => asset::burn_asset(view, action, asset, *amount),
+        ActionPayload::LockIssuance { asset } => asset::lock_issuance(view, action, asset),
+        ActionPayload::TransferIssuer { asset, new_issuer } => asset::transfer_issuer(view, action, asset, new_issuer),
+        ActionPayload::SetAssetMetadataUri { asset, metadata_uri } => {
+            asset::set_metadata_uri(view, action, asset, metadata_uri.clone())
+        }
         ActionPayload::SetHolderFrozen { asset, holder, frozen } => {
             asset::set_holder_frozen(view, action, asset, holder, *frozen)
         }
@@ -1203,6 +884,7 @@ mod tests {
 #[cfg(test)]
 mod client_signing_vectors {
     use super::*;
+    use xc_primitives::{AssetMetadata, AssetRef, ClaimTopic};
 
     const ALICE: &str = "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz";
     const BOB: &str = "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5";
@@ -1354,6 +1036,31 @@ mod client_signing_vectors {
         }
     }
 
+    /// Variant 28, nonce 2.
+    #[test]
+    fn lock_issuance_vector_matches_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(2, ActionPayload::LockIssuance { asset: gold() }),
+            LOCK_ISSUANCE_VECTOR,
+            "LockIssuance signing bytes changed — the client codecs pin this exact string"
+        );
+    }
+
+    /// Variants 29 and 30, nonce 2.
+    #[test]
+    fn transfer_issuer_and_metadata_uri_vectors_match_the_client_codecs() {
+        assert_eq!(
+            hex_signing_bytes(2, ActionPayload::TransferIssuer { asset: gold(), new_issuer: Address::parse(BOB).expect("valid") }),
+            TRANSFER_ISSUER_VECTOR,
+            "TransferIssuer signing bytes changed — the client codecs pin this exact string"
+        );
+        assert_eq!(
+            hex_signing_bytes(2, ActionPayload::SetAssetMetadataUri { asset: gold(), metadata_uri: Some("ipfs://terms".into()) }),
+            SET_ASSET_METADATA_URI_VECTOR,
+            "SetAssetMetadataUri signing bytes changed — the client codecs pin this exact string"
+        );
+    }
+
     /// Variant 27, nonce 2, recipient BOB.
     #[test]
     fn issue_asset_to_vector_matches_the_client_codecs() {
@@ -1378,5 +1085,8 @@ mod client_signing_vectors {
     const UNLOCK_HOLDER_AMOUNT_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0218436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
     const ISSUER_FORCED_TRANSFER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a0219436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737afbe80305636f757274";
     const RECOVER_HOLDER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021a436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b353e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a";
+    const LOCK_ISSUANCE_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021c436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161";
+    const TRANSFER_ISSUER_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021d436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35";
+    const SET_ASSET_METADATA_URI_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021e436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161010c697066733a2f2f7465726d73";
     const ISSUE_ASSET_TO_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021b436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
 }

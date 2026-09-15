@@ -135,7 +135,15 @@ pub struct Mempool<P> {
     max_pending: usize,
     max_pending_bytes: usize,
     max_per_sender: usize,
+    // Actions this node drained and then failed to apply, newest last, so
+    // `GET /actions/{signature}` can answer "dropped: <reason>" instead of
+    // 404. In-memory and bounded — a restart forgets them, which is fine
+    // for a status poll. ponytail: only locally-produced blocks report
+    // here; an action dropped by another proposer's block just ages out.
+    dropped: VecDeque<(String, String)>,
 }
+
+const DROPPED_RING: usize = 1024;
 
 impl<P> Default for Mempool<P> {
     fn default() -> Self {
@@ -149,6 +157,7 @@ impl<P> Default for Mempool<P> {
             max_pending: limits.mempool_max_pending,
             max_pending_bytes: limits.mempool_max_bytes,
             max_per_sender: limits.mempool_max_per_sender,
+            dropped: VecDeque::new(),
         }
     }
 }
@@ -223,6 +232,20 @@ impl<P: Serialize> Mempool<P> {
 
     pub fn contains_signature(&self, signature: &str) -> bool {
         self.signatures.contains(signature)
+    }
+
+    /// Records why drained actions failed to apply; see `dropped_reason`.
+    pub fn note_dropped(&mut self, dropped: impl IntoIterator<Item = (String, String)>) {
+        for entry in dropped {
+            if self.dropped.len() == DROPPED_RING {
+                self.dropped.pop_front();
+            }
+            self.dropped.push_back(entry);
+        }
+    }
+
+    pub fn dropped_reason(&self, signature: &str) -> Option<&str> {
+        self.dropped.iter().rev().find(|(sig, _)| sig == signature).map(|(_, reason)| reason.as_str())
     }
 
     pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
@@ -379,6 +402,17 @@ mod tests {
 
         assert!(matches!(mempool.push(oversized), Err(MempoolError::TooLarge { .. })));
         assert!(mempool.is_empty(), "an oversized action must not have been queued");
+    }
+
+    #[test]
+    fn dropped_ring_answers_newest_reason_and_forgets_past_capacity() {
+        let mut mempool = Mempool::<u64>::new();
+        mempool.note_dropped([("a".to_string(), "first".to_string()), ("a".to_string(), "second".to_string())]);
+        assert_eq!(mempool.dropped_reason("a"), Some("second"));
+        assert_eq!(mempool.dropped_reason("b"), None);
+        mempool.note_dropped((0..DROPPED_RING).map(|i| (format!("s{i}"), "x".to_string())));
+        assert_eq!(mempool.dropped_reason("a"), None, "evicted once the ring wraps");
+        assert_eq!(mempool.dropped_reason("s0"), Some("x"));
     }
 
     #[test]

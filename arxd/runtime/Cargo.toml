@@ -13,6 +13,7 @@ hex = { workspace = true }
 ed25519-dalek = { workspace = true }
 qrcode = { version = "0.14", default-features = false }
 
+arxd-payload = { workspace = true }
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-circuit = { workspace = true }

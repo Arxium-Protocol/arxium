@@ -217,7 +217,11 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// migration that preserves the certified state roots: this ships with the
 /// V6 devnet reset (`reset-required` in the deployment automation), and the
 /// 8 -> 9 migration goes with it — any pre-10 database needs the reset.
-pub const SCHEMA_VERSION: u32 = 10;
+///
+/// Bumped 10 -> 11: `Asset` gained `issuance_locked` (`LockIssuance`,
+/// variant 28). Positional bincode again, and `asset_record:` is
+/// merkleized, so no in-place migration — devnet reset.
+pub const SCHEMA_VERSION: u32 = 11;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -553,6 +557,10 @@ impl ArxiumDb {
     /// single-master invariant.
     pub fn get_operator(&self, validator: &Address) -> Result<Option<Address>, StorageError> {
         KvRead::get(self, &OperatorKey(validator))
+    }
+
+    pub fn get_validator_status(&self, validator: &Address) -> Result<Option<ValidatorStatus>, StorageError> {
+        KvRead::get(self, &ValidatorStatusKey(validator))
     }
 
     /// One attestor's registry record, if `attestor` is currently registered.

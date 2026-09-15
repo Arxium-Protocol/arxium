@@ -372,6 +372,55 @@ pub(crate) fn issue_asset_to<V: KvRead<Error = StorageError>>(
     })
 }
 
+/// `LockIssuance`: issuer-only, one-way. Also pins `max_supply` to what is
+/// actually outstanding so the cap a reader sees is the real ceiling.
+pub(crate) fn lock_issuance<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    asset.issuance_locked = true;
+    asset.max_supply = Some(asset.total_supply);
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+/// `TransferIssuer`: the current issuer names its successor. `asset_ref`
+/// stays what it was (derived from the original issuer at registration), so
+/// every balance key and every link survives the handover.
+pub(crate) fn transfer_issuer<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    new_issuer: &Address,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    new_issuer.pubkey_bytes().map_err(|e| anyhow::anyhow!("new issuer {new_issuer} is not a valid address: {e}"))?;
+    asset.issuer = new_issuer.clone();
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+/// `SetAssetMetadataUri`: issuer-only; `None` clears it.
+pub(crate) fn set_metadata_uri<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    metadata_uri: Option<String>,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    asset.metadata_uri = metadata_uri;
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
 pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -815,6 +864,32 @@ mod tests {
     /// issuer's housekeeping.
     fn dispatch_at(action: &ChainAction, view: &BlockView<'_>, height: u64) -> anyhow::Result<BlockUpdates> {
         crate::dispatch(action, view, &operator_lookup, &operator_validators_lookup, &[], height, &no_bls_owner)
+    }
+
+    /// The handover moves every issuer right, and the old key keeps none.
+    #[test]
+    fn transfer_issuer_hands_over_authority_and_keeps_the_ref() {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let successor = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let gold = AssetRef::derive(&issuer, "gold").unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
+        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false)).unwrap();
+
+        let act = |sender: &Address, payload| ChainAction { sender: sender.clone(), nonce: 0, signature: None, payload };
+        let err = transfer_issuer(&view, &act(&successor, ActionPayload::TransferIssuer { asset: gold.clone(), new_issuer: successor.clone() }), &gold, &successor).unwrap_err();
+        assert!(err.to_string().contains("only the issuer"), "got: {err}");
+
+        let updates = transfer_issuer(&view, &act(&issuer, ActionPayload::TransferIssuer { asset: gold.clone(), new_issuer: successor.clone() }), &gold, &successor).unwrap();
+        let handed = updates.asset_registration.unwrap();
+        assert_eq!(handed.issuer, successor);
+        assert_eq!(handed.asset_ref, gold, "ref is identity — it must not follow the issuer");
+        view.put(&AssetKey(&gold), &handed).unwrap();
+
+        let err = set_metadata_uri(&view, &act(&issuer, ActionPayload::SetAssetMetadataUri { asset: gold.clone(), metadata_uri: None }), &gold, Some("x".into())).unwrap_err();
+        assert!(err.to_string().contains("only the issuer"), "old issuer must be locked out: {err}");
+        let updates = set_metadata_uri(&view, &act(&successor, ActionPayload::SetAssetMetadataUri { asset: gold.clone(), metadata_uri: None }), &gold, Some("ipfs://terms".into())).unwrap();
+        assert_eq!(updates.asset_registration.unwrap().metadata_uri.as_deref(), Some("ipfs://terms"));
     }
 
     #[test]

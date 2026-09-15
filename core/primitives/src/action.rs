@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::Address;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -119,7 +119,10 @@ impl<P: Serialize> Action<P> {
     }
 
     /// Verifies `signature` was produced by the private key behind `sender`,
-    /// over this action's (sender, nonce, payload).
+    /// over this action's (sender, nonce, payload). `verify_strict`, not
+    /// `verify`: addresses are raw pubkeys, and the small-order points
+    /// (`arx1qqq…` among them) pass cofactored verification for any
+    /// message — a funded one would be everyone's to spend.
     pub fn verify_signature(&self) -> Result<(), SignatureError> {
         let sig_hex = self.signature.as_deref().ok_or(SignatureError::Missing)?;
         let sig_bytes = hex::decode(sig_hex).map_err(|_| SignatureError::InvalidHex)?;
@@ -138,7 +141,7 @@ impl<P: Serialize> Action<P> {
             VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| SignatureError::Invalid)?;
 
         verifying_key
-            .verify(&self.signing_bytes(), &signature)
+            .verify_strict(&self.signing_bytes(), &signature)
             .map_err(|_| SignatureError::Invalid)
     }
 }
@@ -163,6 +166,36 @@ mod tests {
     /// decoded `Action<P>` re-encodes to different bytes than arrived on the
     /// wire, breaking `xc_poe::tx_root` and fault adjudication for any peer
     /// that pads a payload by even one byte.
+    /// The all-zero pubkey is a small-order point: under cofactored
+    /// verification a (R, s) pair exists that verifies for *every* message.
+    /// `verify_strict` must refuse it before anyone funds `arx1qqq…`.
+    #[test]
+    fn small_order_sender_never_verifies() {
+        let mut action = test_action();
+        action.sender = Address::from_pubkey_bytes(&[0u8; 32]).unwrap();
+        // Forgery: s = 0, so verification reduces to R == -[h]A. A has
+        // order 4, so -[h]A is one of four points; try all four encodings.
+        let mut two_a = [0xffu8; 32];
+        two_a[0] = 0xec;
+        two_a[31] = 0x7f;
+        let mut three_a = [0u8; 32];
+        three_a[31] = 0x80;
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        // Which point works depends on h mod 4, i.e. on the message, so
+        // sweep a few nonces: under plain `verify` one lands within a
+        // handful; under `verify_strict` none ever does.
+        for nonce in 0..16 {
+            action.nonce = nonce;
+            for r in [identity, [0u8; 32], two_a, three_a] {
+                let mut sig = [0u8; 64];
+                sig[..32].copy_from_slice(&r);
+                action.signature = Some(hex::encode(sig));
+                assert!(action.verify_signature().is_err(), "nonce {nonce} R={} must not verify", hex::encode(r));
+            }
+        }
+    }
+
     #[test]
     fn trailing_bytes_inside_payload_blob_are_rejected() {
         let action = test_action();
