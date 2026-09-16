@@ -1028,7 +1028,9 @@ async fn get_account_bls_key<P: Payload>(
 /// scale. `symbol`/`name` are what the wallet shows next to the truncated
 /// `ref`; they identify nothing. The rest of the record (claims,
 /// jurisdictions, supply) is only needed on an asset's own screen, which can
-/// fetch `GET /assets/{ref}`.
+/// fetch `GET /assets/{ref}`. `transfer_eligible` means this holder can send
+/// at least one base unit to an otherwise eligible recipient; recipient and
+/// nonce checks necessarily happen when the transfer is submitted.
 #[derive(serde::Serialize)]
 struct AccountAssetBalance {
     #[serde(rename = "ref")]
@@ -1040,13 +1042,19 @@ struct AccountAssetBalance {
     issuer_attested: bool,
     compliance_required: bool,
     frozen: bool,
+    holder_frozen: bool,
+    frozen_amount: u128,
+    transfer_eligible: bool,
+    eligibility_reason: &'static str,
     decimals: u8,
     balance: u128,
 }
 
 impl AccountAssetBalance {
-    fn new(db: &ArxiumDb, asset: Asset, balance: u128) -> Result<Self, StorageError> {
+    fn new(db: &ArxiumDb, address: &Address, asset: Asset, balance: u128) -> Result<Self, StorageError> {
         let issuer_attested = issuer_attested(db, &asset.issuer)?;
+        let holder_state = db.get_holder_state(&asset.asset_ref, address)?;
+        let eligibility = circuit_rwa_asset::transfer_eligibility(db, &asset, address, balance)?;
         Ok(Self {
             asset_ref: asset.asset_ref,
             asset_id: asset.asset_id,
@@ -1056,6 +1064,10 @@ impl AccountAssetBalance {
             issuer_attested,
             compliance_required: asset.compliance_required,
             frozen: asset.frozen,
+            holder_frozen: holder_state.frozen,
+            frozen_amount: holder_state.frozen_amount,
+            transfer_eligible: eligibility.is_eligible(),
+            eligibility_reason: eligibility.reason(),
             decimals: asset.decimals,
             balance,
         })
@@ -1150,7 +1162,7 @@ async fn get_account_assets<P: Payload>(
         let row = state
             .db
             .get_asset_balance(&asset_ref, &address)
-            .and_then(|balance| AccountAssetBalance::new(&state.db, asset, balance));
+            .and_then(|balance| AccountAssetBalance::new(&state.db, &address, asset, balance));
         match row {
             Ok(row) => balances.push(row),
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1185,7 +1197,7 @@ async fn get_account_asset_balance<P: Payload>(
     let row = state
         .db
         .get_asset_balance(&asset_ref, &address)
-        .and_then(|balance| AccountAssetBalance::new(&state.db, asset, balance));
+        .and_then(|balance| AccountAssetBalance::new(&state.db, &address, asset, balance));
     match row {
         Ok(row) => Json(row).into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1930,7 +1942,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde::Deserialize;
     use std::collections::BTreeMap;
-    use xc_primitives::{AccountEntry, Snapshot};
+    use xc_primitives::{AccountEntry, HolderState, Snapshot};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
@@ -2328,6 +2340,45 @@ mod tests {
                 // ... and not against any other root.
                 assert!(xc_artifact::verify_state_proof([0xAA; 32], &proof).is_err());
             }
+        });
+    }
+
+    #[test]
+    fn account_assets_reports_exact_holder_eligibility_and_u128_lock() {
+        use xc_storage::{AssetBalanceUpdates, HolderStateUpdates};
+
+        #[derive(Deserialize)]
+        struct EligibilityFields {
+            holder_frozen: bool,
+            frozen_amount: u128,
+            transfer_eligible: bool,
+            eligibility_reason: String,
+        }
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+            let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+            let asset = Asset::new("locked", issuer, false);
+            let balances = AssetBalanceUpdates(BTreeMap::from([((asset.asset_ref.clone(), holder.clone()), u128::MAX)]));
+            let holder_states = HolderStateUpdates(BTreeMap::from([(
+                (asset.asset_ref.clone(), holder.clone()),
+                HolderState { frozen: false, frozen_amount: u128::MAX },
+            )]));
+            let index = state.db.asset_index_updates(std::slice::from_ref(&asset), &balances).unwrap();
+            state.db.write_batches(&[&asset, &balances, &holder_states, &index]).unwrap();
+
+            let resp = get_account_assets(State(state), Path(holder.to_string())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let text = std::str::from_utf8(&body).unwrap();
+            assert!(text.contains(&format!("\"frozen_amount\":{}", u128::MAX)), "exact u128 JSON: {text}");
+            let rows: Vec<EligibilityFields> = serde_json::from_slice(&body).unwrap();
+            assert!(!rows[0].holder_frozen);
+            assert_eq!(rows[0].frozen_amount, u128::MAX);
+            assert!(!rows[0].transfer_eligible);
+            assert_eq!(rows[0].eligibility_reason, "no_transferable_balance");
         });
     }
 

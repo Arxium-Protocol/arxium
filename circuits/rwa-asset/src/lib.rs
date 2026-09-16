@@ -97,6 +97,38 @@ pub enum RwaError {
     },
 }
 
+/// Sender-side result used by wallets before a recipient and amount have
+/// been selected. The string values are part of the account-assets RPC
+/// contract; add new reasons rather than renaming existing ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferEligibility {
+    Eligible,
+    AssetFrozen,
+    HolderFrozen,
+    MissingAttestation,
+    MissingRequiredClaim,
+    JurisdictionNotAllowed,
+    NoTransferableBalance,
+}
+
+impl TransferEligibility {
+    pub fn is_eligible(self) -> bool {
+        self == Self::Eligible
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Eligible => "eligible",
+            Self::AssetFrozen => "asset_frozen",
+            Self::HolderFrozen => "holder_frozen",
+            Self::MissingAttestation => "missing_attestation",
+            Self::MissingRequiredClaim => "missing_required_claim",
+            Self::JurisdictionNotAllowed => "jurisdiction_not_allowed",
+            Self::NoTransferableBalance => "no_transferable_balance",
+        }
+    }
+}
+
 /// Whether one party may hold `asset`, checked identically for sender and
 /// recipient — a transfer is only compliant if both ends are.
 ///
@@ -140,7 +172,7 @@ fn check_party<V: KvRead<Error = StorageError>>(
     if !asset.required_claims.is_empty() {
         // An attested account is still the baseline: topics qualify an
         // attestation, they don't substitute for having one.
-        if entry.as_ref().is_none_or(|e| e.identity_hash.is_none()) {
+        if !is_attested(view, party)? {
             return Err(RwaError::NotCompliant { address: party.clone() });
         }
         let held = entry.as_ref().map(|e| e.claims.as_slice()).unwrap_or_default();
@@ -151,9 +183,7 @@ fn check_party<V: KvRead<Error = StorageError>>(
                 topic: missing.clone(),
             });
         }
-    } else if asset.compliance_required
-        && entry.as_ref().is_none_or(|e| e.identity_hash.is_none())
-    {
+    } else if asset.compliance_required && !is_attested(view, party)? {
         return Err(RwaError::NotCompliant { address: party.clone() });
     }
 
@@ -171,6 +201,43 @@ fn check_party<V: KvRead<Error = StorageError>>(
         }
     }
     Ok(())
+}
+
+/// Whether `sender` can make a positive compliant transfer to an otherwise
+/// eligible recipient. This intentionally excludes recipient-specific and
+/// nonce checks, which cannot be answered by an account-assets listing.
+/// Gate ordering matches `apply_compliant_transfer`.
+pub fn transfer_eligibility<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    sender: &Address,
+    balance: u128,
+) -> Result<TransferEligibility, StorageError> {
+    if asset.frozen {
+        return Ok(TransferEligibility::AssetFrozen);
+    }
+
+    match check_party(view, asset, sender) {
+        Ok(()) => {}
+        Err(RwaError::Storage(err)) => return Err(err),
+        Err(RwaError::HolderFrozen { .. }) => return Ok(TransferEligibility::HolderFrozen),
+        Err(RwaError::NotCompliant { .. }) => return Ok(TransferEligibility::MissingAttestation),
+        Err(RwaError::MissingClaim { .. }) => return Ok(TransferEligibility::MissingRequiredClaim),
+        Err(RwaError::JurisdictionNotAllowed { .. }) => return Ok(TransferEligibility::JurisdictionNotAllowed),
+        Err(_) => unreachable!("check_party returned an unrelated transfer error"),
+    }
+
+    let locked = holder_state(view, asset, sender)
+        .map_err(|err| match err {
+            RwaError::Storage(err) => err,
+            _ => unreachable!("holder_state returned a non-storage error"),
+        })?
+        .frozen_amount;
+    if balance.saturating_sub(locked) == 0 {
+        return Ok(TransferEligibility::NoTransferableBalance);
+    }
+
+    Ok(TransferEligibility::Eligible)
 }
 
 /// Mints `amount` of `asset` into the issuer's own balance. `sender` must
@@ -518,7 +585,7 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xc_storage::ArxiumDb;
+    use xc_storage::{ArxiumDb, HolderStateUpdates};
 
     fn temp_db() -> ArxiumDb {
         let path = std::env::temp_dir().join(format!("arxium-test-rwa-{}", uuid_like()));
@@ -547,6 +614,86 @@ mod tests {
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
         asset
+    }
+
+    #[test]
+    fn sender_eligibility_matches_transfer_policy() {
+        let db = temp_db();
+        let holder = addr(2);
+        let mut asset = Asset::new("bond", addr(1), false);
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+
+        asset.frozen = true;
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::AssetFrozen);
+        asset.frozen = false;
+        db.write_batch(&HolderStateUpdates(BTreeMap::from([(
+            (asset.asset_ref.clone(), holder.clone()),
+            HolderState { frozen: true, frozen_amount: 10 },
+        )])))
+        .unwrap();
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::HolderFrozen);
+        db.write_batch(&HolderStateUpdates(BTreeMap::from([(
+            (asset.asset_ref.clone(), holder.clone()),
+            HolderState { frozen: false, frozen_amount: 10 },
+        )])))
+        .unwrap();
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::NoTransferableBalance);
+
+        db.write_batch(&HolderStateUpdates(BTreeMap::from([(
+            (asset.asset_ref.clone(), holder.clone()),
+            HolderState::default(),
+        )])))
+        .unwrap();
+        asset.compliance_required = true;
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingAttestation);
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            holder.clone(),
+            AccountEntry {
+                identity_hash: Some("kyc".into()),
+                attested_by: Some(addr(9)),
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingAttestation);
+
+        attest(&db, &holder, &[], None);
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+        asset.required_claims = vec![ClaimTopic::Kyc];
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingRequiredClaim);
+        attest(&db, &holder, &[ClaimTopic::Kyc], None);
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+
+        asset.allowed_jurisdictions = Some(Vec::new());
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::JurisdictionNotAllowed);
+        asset.allowed_jurisdictions = None;
+        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+    }
+
+    #[test]
+    fn compliant_transfer_rejects_an_attestation_from_an_inactive_attestor() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let recipient = addr(2);
+        let mut asset = Asset::new("bond", issuer.clone(), true);
+        let (accounts, balances) = apply_issue(&db, &mut asset, &issuer, 0, 10).unwrap();
+        db.write_batch(&accounts).unwrap();
+        db.write_batch(&balances).unwrap();
+        for address in [&issuer, &recipient] {
+            db.write_batch(&AccountUpdates(BTreeMap::from([(
+                address.clone(),
+                AccountEntry {
+                    identity_hash: Some("kyc".into()),
+                    attested_by: Some(addr(9)),
+                    nonce: u64::from(address == &issuer),
+                    ..Default::default()
+                },
+            )])))
+            .unwrap();
+        }
+
+        let err = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 1).unwrap_err();
+        assert!(matches!(&err, RwaError::NotCompliant { address } if address == &issuer), "got: {err}");
     }
 
     #[test]
