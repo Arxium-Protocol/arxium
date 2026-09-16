@@ -5,6 +5,15 @@ The standard installer binds RPC to `127.0.0.1:30333`, keeping metrics private
 to the node host. If you change `ARXD_RPC_BIND`, the metrics endpoint follows
 that bind address and must be protected like every other RPC route.
 
+On a host that also runs `retracerd` (Retracer, a separate indexer — see its
+own repo), uncomment the `retracer` scrape job in `prometheus.yml` (its
+`GET /metrics`, `127.0.0.1:8080` by default). It's commented out by default
+because this file is shared by every node deployment and most don't run
+Retracer — leaving it active with nothing listening would make Prometheus
+report the target permanently down. `alerts.yml`'s matching `retracer` rule
+group needs no such care: it only fires for a job that's actually
+configured, so it's harmless to leave in place either way.
+
 Choose one of these paths. Docker is optional.
 
 | Path | Installs on the node | Best for |
