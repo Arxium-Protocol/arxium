@@ -21,7 +21,6 @@ core-adjudicate = [
     "dep:xc-storage",
     "dep:xc-circuit",
     "dep:xc-primitives",
-    "dep:xc-poe",
     "dep:xc-executor",
     "dep:xc-bls",
     "dep:bincode",
@@ -30,13 +29,16 @@ core-adjudicate = [
 
 [dependencies]
 xc-artifact = { workspace = true }
+# For `state-proof`: the EP hash that binds a state root to a finality
+# certificate. Pure hashing, no storage.
+xc-poe = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 arxd-runtime = { workspace = true, optional = true }
 xc-storage = { workspace = true, optional = true }
 xc-circuit = { workspace = true, optional = true }
 xc-primitives = { workspace = true, optional = true }
-xc-poe = { workspace = true, optional = true }
 xc-executor = { workspace = true, optional = true }
 xc-bls = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }

@@ -17,10 +17,14 @@ tower-http = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 rand = { workspace = true }
+bincode = { workspace = true }
 
 xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-mempool = { workspace = true }
+xc-circuit = { workspace = true }
+xc-poe = { workspace = true }
+xc-artifact = { workspace = true }
 circuit-rwa-asset = { workspace = true }
 
 [dev-dependencies]
