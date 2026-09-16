@@ -128,6 +128,41 @@ impl<'a> BlockView<'a> {
         Ok(())
     }
 
+    /// Folds an `AuthorizeOperator`/`RevokeOperator` write into the view —
+    /// both the forward record and the reverse index, so a same-block
+    /// re-authorization sees the first one's effect.
+    pub fn apply_operator(&mut self, updates: &OperatorUpdates) -> Result<(), StorageError> {
+        for (validator, operator) in &updates.authorization {
+            match operator {
+                Some(operator) => self.put(&OperatorKey(validator), operator)?,
+                None => self.delete(&OperatorKey(validator)),
+            }
+        }
+        for (operator, validators) in &updates.operator_index {
+            if validators.is_empty() {
+                self.delete(&OperatorIndexKey(operator));
+            } else {
+                self.put(&OperatorIndexKey(operator), validators)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Folds a `RegisterBlsKey`/`JoinValidator` key registration into the
+    /// view: current key, reverse owner index, and the old key's owner row
+    /// going away on rotation. The `CF_META` history row is not a view
+    /// concern (range-scanned, never `get`).
+    pub fn apply_bls_key(&mut self, registration: &BlsKeyRegistration) -> Result<(), StorageError> {
+        self.put(&BlsKeyKey(&registration.address), &registration.pubkey)?;
+        self.put(&BlsPubkeyOwnerKey(&registration.pubkey), &registration.address)?;
+        if let Some(previous) = &registration.previous_pubkey
+            && previous != &registration.pubkey
+        {
+            self.delete(&BlsPubkeyOwnerKey(previous));
+        }
+        Ok(())
+    }
+
     /// The database under this overlay, for range scans the overlay can't
     /// answer (there is no prefix iteration over an in-memory diff). Read
     /// single keys back through the view afterwards so in-block changes to

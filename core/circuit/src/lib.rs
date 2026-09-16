@@ -97,16 +97,42 @@ impl KeySpec for BlsPubkeyOwnerKey<'_> {
 /// The address currently authorized to submit `JoinValidator`/
 /// `LeaveValidator`/`RegisterBlsKey` on `validator`'s behalf, if any. Lives in
 /// `CF_GOVERNANCE` (included in `is_state_key`) so the delegated paths of
-/// those three actions are provable to the adjudicator. The reverse index
-/// (`meta:operator_index:{operator}`, used only by `AuthorizeOperator`/
-/// `RevokeOperator` to maintain the full per-operator validator list) stays
-/// in `CF_META` — same split `AssetIndexKey` already uses against `AssetKey`.
+/// those three actions are provable to the adjudicator.
 pub struct OperatorKey<'a>(pub &'a Address);
 impl KeySpec for OperatorKey<'_> {
     const CF: &'static str = CF_GOVERNANCE;
     type Value = Address;
     fn encode(&self) -> Vec<u8> {
         format!("operator:{}", self.0).into_bytes()
+    }
+}
+
+/// The reverse of `OperatorKey`: every validator currently authorizing
+/// `operator`. Read by `AuthorizeOperator`/`RevokeOperator` to maintain the
+/// list, so — unlike `AssetIndexKey`, which nothing dispatches on — it is
+/// `CF_GOVERNANCE` and in the root: the adjudicator has to be able to replay
+/// those two actions, and it can't from a `CF_META` row.
+pub struct OperatorIndexKey<'a>(pub &'a Address);
+impl KeySpec for OperatorIndexKey<'_> {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = Vec<Address>;
+    fn encode(&self) -> Vec<u8> {
+        format!("operator_index:{}", self.0).into_bytes()
+    }
+}
+
+/// The stake-weighted validator set effective from `height` — the row
+/// `xc_storage::ValidatorSetSnapshot` writes. `CF_VALIDATORS`, merkleized.
+/// The boundary hook writes one at *every* boundary, so the set in force at
+/// any height `H` is at exactly `validator_set_effective_height(H)` and an
+/// adjudicator can prove it as a single key instead of needing the
+/// reverse-seek `get_validator_set_at` does.
+pub struct ValidatorSetKey(pub u64);
+impl KeySpec for ValidatorSetKey {
+    const CF: &'static str = CF_VALIDATORS;
+    type Value = std::collections::BTreeMap<Address, xc_primitives::VotingPower>;
+    fn encode(&self) -> Vec<u8> {
+        format!("validator_set:{:020}", self.0).into_bytes()
     }
 }
 

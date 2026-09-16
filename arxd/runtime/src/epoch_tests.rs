@@ -195,8 +195,10 @@ fn too_few_eligible_keeps_the_previous_set() {
     let db = chain(&[1, 2, 3], MIN_VALIDATOR_STAKE);
     set_status(&db, &addr(2), Some(ValidatorStatus::Tombstoned));
     set_status(&db, &addr(3), Some(ValidatorStatus::Jailed { until_epoch: 9 }));
-    // Only 1 qualifies, minimum is 2: no new snapshot, old set stands.
-    assert!(seal(&db, boundary_of(0, EPOCH)).is_none());
+    // Only 1 qualifies, minimum is 2: the old set is re-written unchanged
+    // (a row at every boundary, so the set is provable as one key).
+    let kept = seal(&db, boundary_of(0, EPOCH)).expect("every boundary writes a set");
+    assert_eq!(kept, db.get_validator_set_at(0).unwrap());
     assert_eq!(db.validator_addresses_at(boundary_of(0, EPOCH) + 1).unwrap().len(), 3);
 }
 

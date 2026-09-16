@@ -12,7 +12,7 @@ use xc_primitives::{
     eligible_proposer, round_timeout_signing_bytes, signed_power,
 };
 use xc_primitives::Asset;
-use xc_circuit::{ChainParamsKey, KvRead};
+use xc_circuit::{ChainParamsKey, KvRead, OperatorIndexKey, OperatorKey};
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
     BatchWritable, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates,
@@ -631,6 +631,15 @@ where
         for marker in &evidence_markers {
             overlay.push(marker);
         }
+        // `CF_GOVERNANCE` rows: always in the committed trie, but until
+        // schema 12 missing from this preview — so a block carrying a
+        // `RegisterBlsKey`/`AuthorizeOperator` signed a root the trie never
+        // had. `BlsKeyRegistration` also writes a `CF_META` history row,
+        // which `compute_state_root` filters out.
+        for registration in &bls_keys {
+            overlay.push(registration);
+        }
+        overlay.push(&operator_updates);
         overlay
     };
     let expected_state_root = db.compute_state_root(&state_root_overlay)?;
@@ -805,15 +814,14 @@ where
             break;
         }
 
-        let operator_lookup = |validator: &Address| match operator_overlay.get(validator) {
-            Some(operator) => Ok(Clone::clone(operator)),
-            None => db.get_operator(validator),
+        // Through the view, not `db`: the view overlays this block's earlier
+        // operator writes (`apply_operator` below) and, in recording mode,
+        // logs the keys — a fraud proof for an `AuthorizeOperator` block
+        // needs exactly these.
+        let operator_lookup = |validator: &Address| KvRead::get(&view, &OperatorKey(validator));
+        let operator_validators_lookup = |operator: &Address| {
+            KvRead::get(&view, &OperatorIndexKey(operator)).map(Option::unwrap_or_default)
         };
-        let operator_validators_lookup =
-            |operator: &Address| match operator_index_overlay.get(operator) {
-                Some(validators) => Ok(Clone::clone(validators)),
-                None => db.get_validators_for_operator(operator),
-            };
 
         match dispatch(&action, &view, &operator_lookup, &operator_validators_lookup, validators) {
             Ok(updates) => {
@@ -825,7 +833,11 @@ where
                 validator_index_overlay.extend(updates.stakes.validator_index.clone());
                 view.apply_stakes(&updates.stakes)?;
                 evidence_markers.extend(updates.evidence);
+                if let Some(registration) = &updates.bls_key {
+                    view.apply_bls_key(registration)?;
+                }
                 bls_keys.extend(updates.bls_key);
+                view.apply_operator(&updates.operator)?;
                 operator_overlay.extend(updates.operator.authorization);
                 operator_index_overlay.extend(updates.operator.operator_index);
                 asset_overlay.extend(updates.assets.0.clone());
@@ -862,10 +874,23 @@ where
             };
             let asset_snapshot = AssetBalanceUpdates(asset_overlay.clone());
             let holder_snapshot = HolderStateUpdates(holder_overlay.clone());
-            let mut snapshot_overlay: Vec<&dyn BatchWritable> =
-                vec![&account_snapshot, &stake_snapshot, &asset_snapshot, &holder_snapshot, &status_overlay];
+            let operator_snapshot = OperatorUpdates {
+                authorization: operator_overlay.clone(),
+                operator_index: operator_index_overlay.clone(),
+            };
+            let mut snapshot_overlay: Vec<&dyn BatchWritable> = vec![
+                &account_snapshot,
+                &stake_snapshot,
+                &asset_snapshot,
+                &holder_snapshot,
+                &status_overlay,
+                &operator_snapshot,
+            ];
             snapshot_overlay.extend(attestor_registrations.iter().map(|r| r as &dyn BatchWritable));
             snapshot_overlay.extend(attestor_deregistrations.iter().map(|d| d as &dyn BatchWritable));
+            snapshot_overlay.extend(asset_registrations.iter().map(|a| a as &dyn BatchWritable));
+            snapshot_overlay.extend(evidence_markers.iter().map(|m| m as &dyn BatchWritable));
+            snapshot_overlay.extend(bls_keys.iter().map(|k| k as &dyn BatchWritable));
             roots.push(db.compute_state_root(&snapshot_overlay)?);
         }
     }

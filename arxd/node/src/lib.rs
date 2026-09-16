@@ -7,6 +7,7 @@ mod validator;
 
 use crate::components::new_partial;
 use anyhow::{Context, Result};
+use xc_circuit::KeySpec as _;
 use clap::Parser;
 use ed25519_dalek::Signer;
 use metrics::{counter, gauge};
@@ -970,6 +971,25 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         // Proving can fail (key pruned, db error) — that
                                         // just means no fraud proof this time, not a
                                         // reason to skip the dissent already sent above.
+                                        // Plus the two rows the adjudicator reads that
+                                        // `dispatch` never touches through the view —
+                                        // the validator set is a parameter, and it is
+                                        // located via `chain_params` — so a block with a
+                                        // `LeaveValidator` can still be replayed.
+                                        let mut touched_keys = touched_keys;
+                                        let epoch_length = db
+                                            .chain_params()
+                                            .map(|p| p.epoch_length)
+                                            .unwrap_or_default();
+                                        touched_keys.push(xc_circuit::ChainParamsKey.encode());
+                                        touched_keys.push(
+                                            xc_circuit::ValidatorSetKey(
+                                                xc_primitives::validator_set_effective_height(height, epoch_length),
+                                            )
+                                            .encode(),
+                                        );
+                                        touched_keys.sort();
+                                        touched_keys.dedup();
                                         let proofs: Result<
                                             Vec<xc_artifact::StateProof>,
                                             xc_storage::StorageError,

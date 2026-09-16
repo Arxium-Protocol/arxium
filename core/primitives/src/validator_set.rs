@@ -60,6 +60,14 @@ pub fn boundary_of(epoch: u64, epoch_length: u64) -> u64 {
     (epoch + 1) * epoch_length.max(1) - 1
 }
 
+/// The height whose `validator_set:` row is in force at `height`: genesis
+/// (`0`) throughout epoch 0, otherwise the first height of `height`'s epoch
+/// — the row the previous epoch's boundary hook wrote. Holds because the
+/// hook writes at every boundary (see `arxd_runtime::epoch`).
+pub fn validator_set_effective_height(height: u64, epoch_length: u64) -> u64 {
+    epoch_of(height, epoch_length) * epoch_length.max(1)
+}
+
 /// Whether `height` is the last block of its epoch.
 pub fn is_boundary(height: u64, epoch_length: u64) -> bool {
     (height + 1) % epoch_length.max(1) == 0

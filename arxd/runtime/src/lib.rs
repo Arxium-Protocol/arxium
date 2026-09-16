@@ -77,7 +77,8 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             ctx.operator_validators_lookup,
             ctx.validators,
             ctx.height,
-            &|pk: &BlsPublicKey| ctx.db.bls_pubkey_owner(pk),
+            // Through the view (overlay + touched-key recording), not `db`.
+            &|pk: &BlsPublicKey| ctx.view.get(&xc_circuit::BlsPubkeyOwnerKey(pk)),
         )
     }
 

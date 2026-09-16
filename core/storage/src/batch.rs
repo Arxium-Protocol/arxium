@@ -150,7 +150,7 @@ impl BatchWritable for ValidatorSetSnapshot {
         // BTreeMap encodes in key order, so the bytes are a pure function
         // of the set — the same property the old sorted Vec had.
         Ok(vec![(
-            format!("validator_set:{:020}", self.effective_height).into_bytes(),
+            ValidatorSetKey(self.effective_height).encode(),
             bincode::serde::encode_to_vec(&self.validators, config)?,
         )])
     }
@@ -312,9 +312,8 @@ impl BatchWritable for OperatorUpdates {
         }
         for (operator, validators) in &self.operator_index {
             if !validators.is_empty() {
-                let key = format!("meta:operator_index:{operator}").into_bytes();
                 let value = bincode::serde::encode_to_vec(validators, config)?;
-                entries.push((key, value));
+                entries.push((OperatorIndexKey(operator).encode(), value));
             }
         }
         Ok(entries)
@@ -329,7 +328,7 @@ impl BatchWritable for OperatorUpdates {
         }
         for (operator, validators) in &self.operator_index {
             if validators.is_empty() {
-                deletes.push(format!("meta:operator_index:{operator}").into_bytes());
+                deletes.push(OperatorIndexKey(operator).encode());
             }
         }
         Ok(deletes)

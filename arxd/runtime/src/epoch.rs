@@ -18,9 +18,10 @@ use xc_storage::{BlockView, StorageError};
 use crate::staking::MIN_VALIDATOR_STAKE;
 
 /// Runs inside `on_block_sealed`. Off a boundary it does nothing. On one it
-/// returns the next set (and the status rows it changed) or, when fewer
-/// than `min_validator_set` qualify, keeps the previous set and warns —
-/// never a set that cannot reach quorum.
+/// always returns a set (and the status rows it changed): the next one, or,
+/// when fewer than `min_validator_set` qualify, the previous one re-written
+/// with a warning — never a set that cannot reach quorum, and never a
+/// boundary without a row (see `xc_circuit::ValidatorSetKey`).
 pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result<BlockUpdates> {
     let params = view.get(&ChainParamsKey)?.unwrap_or_default();
     let mut updates = BlockUpdates::default();
@@ -65,6 +66,11 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
             minimum = params.min_validator_set,
             "epoch boundary: too few eligible validators, keeping the previous set"
         );
+        // Kept, but still written at this boundary's height: the row's
+        // location is what makes the set provable as one key
+        // (`ValidatorSetKey(validator_set_effective_height(H))`), so every
+        // boundary writes one whether or not the membership moved.
+        updates.validator_set = Some(view.db().get_validator_set_at(height)?);
         return Ok(updates);
     }
 

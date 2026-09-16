@@ -168,6 +168,11 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         for marker in &evidence_markers {
             overlay.push(marker);
         }
+        // Same `CF_GOVERNANCE` rows `accept_block` previews — see its comment.
+        for registration in &bls_keys {
+            overlay.push(registration);
+        }
+        overlay.push(&operator_updates);
         overlay
     };
     // The denominator against which PoE cost must be judged: this rescans

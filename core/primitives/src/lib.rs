@@ -22,7 +22,7 @@ pub use consensus::{
 };
 pub use validator_set::{
     ChainParams, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
-    is_boundary, power_cap, quorum_reached, signed_power,
+    is_boundary, power_cap, quorum_reached, signed_power, validator_set_effective_height,
 };
 pub use state::{
     HolderState,

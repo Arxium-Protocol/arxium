@@ -13,7 +13,8 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, AssetIndexKey, AssetKey,
     AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec,
-    KvRead, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorStatusKey, ChainParamsKey,
+    KvRead, OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorSetKey, ValidatorStatusKey,
+    ChainParamsKey,
 };
 use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
@@ -221,7 +222,22 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// Bumped 10 -> 11: `Asset` gained `issuance_locked` (`LockIssuance`,
 /// variant 28). Positional bincode again, and `asset_record:` is
 /// merkleized, so no in-place migration — devnet reset.
-pub const SCHEMA_VERSION: u32 = 11;
+///
+/// Bumped 11 -> 12 (closing the external review's gaps, see
+/// `docs/Review_Gaps_Plan_2026-09-16.md`): the reverse operator index moved
+/// into the trie (`meta:operator_index:` -> `operator_index:`,
+/// `OperatorIndexKey`, `CF_GOVERNANCE`); the boundary hook writes a
+/// `validator_set:` row at every boundary; `ChainParams` gained
+/// `max_block_weight`; `bls_key`/`operator` writes now count in the block's
+/// signed `state_root` preview (they were always in the committed trie, so
+/// the two disagreed for any block carrying one); and `meta:block_weight:`
+/// rows exist. Also `chain_params` finally routes to `CF_GOVERNANCE` as its
+/// `KeySpec` always claimed — `cf_for_key` had no arm for it, so it sat in
+/// `CF_META` outside the root and every `dispatch` path that reads it
+/// (`JoinValidator`/`Stake`/`Unstake`/`LeaveValidator`/evidence) was
+/// silently unprovable to the adjudicator. Every one of those moves
+/// certified roots — devnet reset.
+pub const SCHEMA_VERSION: u32 = 12;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -336,6 +352,8 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_EVIDENCE
     } else if key.starts_with(b"governor")
         || key.starts_with(b"operator:")
+        || key.starts_with(b"operator_index:")
+        || key == b"chain_params"
         || key.starts_with(b"blskey:")
         || key.starts_with(b"blskey_owner:")
     {
@@ -754,15 +772,7 @@ impl ArxiumDb {
     /// Every validator address currently authorizing `operator` to act for
     /// them — drives a "your validators" listing for a delegated client.
     pub fn get_validators_for_operator(&self, operator: &Address) -> Result<Vec<Address>, StorageError> {
-        let key = format!("meta:operator_index:{operator}");
-        match self.get(key.as_bytes())? {
-            Some(bytes) => {
-                let config = bincode::config::standard();
-                let (validators, _) = bincode::serde::decode_from_slice(&bytes, config)?;
-                Ok(validators)
-            }
-            None => Ok(Vec::new()),
-        }
+        Ok(KvRead::get(self, &OperatorIndexKey(operator))?.unwrap_or_default())
     }
 
     /// The finality certificate for `height`, if 2/3+ of that height's
@@ -1105,10 +1115,10 @@ impl ArxiumDb {
     /// contiguous finalized watermark — `revert_to` can never target below
     /// the watermark (`RevertBelowWatermark`), so nothing at or above it is
     /// ever eligible for pruning, and this makes that a hard floor rather
-    /// than a caller convention. Superseded `validator_set:` snapshots below
-    /// the cutoff are dropped too, except the newest one at or before it,
-    /// which `get_validator_set_at`'s reverse-seek still needs to answer for
-    /// every retained height.
+    /// than a caller convention. `validator_set:` rows are *not* pruned: they
+    /// are merkleized, and deleting the raw row while the trie keeps the leaf
+    /// is exactly what makes a raw-state export (snapshot sync) disagree with
+    /// the certified root. They are one small map per epoch.
     ///
     /// `CF_MERKLE` is untouched — `revert_to`'s root self-check documents it
     /// as immutable and never pruned, and this function doesn't get to
@@ -1125,26 +1135,6 @@ impl ArxiumDb {
     pub fn prune<P: DeserializeOwned + Serialize>(&self, cutoff: u64) -> Result<(), StorageError> {
         let cutoff = cutoff.min(self.get_final_watermark()?);
         let mut batch = WriteBatch::default();
-
-        let prefix = b"validator_set:";
-        let seek_key = format!("validator_set:{cutoff:020}");
-        let newest_kept = self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(seek_key.as_bytes(), Direction::Reverse))
-            .filter_map(|item| item.ok())
-            .take_while(|(key, _)| key.starts_with(prefix))
-            .map(|(key, _)| key.to_vec())
-            .next();
-        for (key, _) in self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward))
-            .filter_map(|item| item.ok())
-            .take_while(|(key, _)| key.starts_with(prefix))
-        {
-            if key.as_ref() < seek_key.as_bytes() && Some(key.to_vec()) != newest_kept {
-                batch.delete_cf(self.cf(CF_VALIDATORS), &key);
-            }
-        }
 
         for height in 0..cutoff {
             if let Some(block) = self.get_block::<P>(height)? {
