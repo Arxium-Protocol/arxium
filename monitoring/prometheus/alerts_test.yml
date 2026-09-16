@@ -1,0 +1,175 @@
+# Unit tests for alerts.yml, run by `promtool test rules`.
+#
+# These pin firing behaviour, not just YAML validity: `promtool check config`
+# accepts a rule whose expression never matches anything. Each case drives
+# synthetic series through a rule and asserts what fires and what stays
+# silent.
+#
+# Rules using increase() are deliberately absent: its extrapolation yields
+# values like 10.000000000000002, so asserting a templated "{{ $value }}"
+# summary against them is brittle rather than useful.
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  # --- retracer -----------------------------------------------------------
+
+  # The case this suite exists for: retracerd keeps answering scrapes
+  # (up == 1) while its database is unreachable. RetracerDown must stay
+  # silent, because /metrics still returns 200 in that state, and only
+  # RetracerDatabaseDown covers it.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="retracer"}'
+        values: '1x10'
+      - series: 'retracer_database_up'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RetracerDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: RetracerDatabaseDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Retracer cannot reach its database"
+              description: "retracerd is answering scrapes but its database check has been failing for two minutes. Check Postgres and retracerd's logs.\n"
+
+  # A healthy database must not fire it, and the 2m `for:` must hold.
+  - interval: 1m
+    input_series:
+      - series: 'retracer_database_up'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RetracerDatabaseDown
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'retracer_database_up'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RetracerDatabaseDown
+        exp_alerts: []
+
+  # The process being down is still RetracerDown's job.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="retracer"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RetracerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: retracer
+            exp_annotations:
+              summary: "Retracer metrics are unavailable"
+              description: "Prometheus has been unable to scrape retracerd for two minutes. Check systemctl status retracerd and curl http://127.0.0.1:8080/health.\n"
+
+  # Lag fires per chain, and a stalled tip is caught even while lag reads 0.
+  - interval: 1m
+    input_series:
+      - series: 'retracer_blocks_behind{chain_id="corechain-devnet"}'
+        values: '45x10'
+      - series: 'retracer_tip_age_seconds{chain_id="corechain-devnet"}'
+        values: '5x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RetracerLagging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              chain_id: corechain-devnet
+            exp_annotations:
+              summary: "Retracer chain corechain-devnet is 45 blocks behind"
+              description: "The indexed height has trailed the network tip by more than 30 blocks for five minutes.\n"
+      - eval_time: 6m
+        alertname: RetracerChainStalled
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'retracer_blocks_behind{chain_id="corechain-devnet"}'
+        values: '0x10'
+      - series: 'retracer_tip_age_seconds{chain_id="corechain-devnet"}'
+        values: '300x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: RetracerLagging
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RetracerChainStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              chain_id: corechain-devnet
+            exp_annotations:
+              summary: "Retracer chain corechain-devnet tip is stale (5m 0s old)"
+              description: "The indexed tip's own on-chain timestamp has been more than 120 seconds behind wall-clock time for five minutes, even though retracer_blocks_behind may still read zero.\n"
+
+  # --- arxium-node --------------------------------------------------------
+
+  - interval: 1m
+    input_series:
+      - series: 'up{job="arxium-node"}'
+        values: '0x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumMetricsUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: arxium-node
+            exp_annotations:
+              summary: "Arxium node metrics are unavailable"
+              description: "Prometheus has been unable to scrape arxd for one minute. Check systemctl status arxd and curl http://127.0.0.1:30333/metrics.\n"
+
+  # Quorum is unreachable when fewer validators hold BLS keys than required.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_validators_with_bls_key'
+        values: '2x5'
+      - series: 'arxium_finality_quorum'
+        values: '3x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumFinalityUnreachable
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Finality quorum is unreachable"
+              description: "Fewer validators hold BLS keys than the current finality quorum requires. Register the missing validator keys.\n"
+
+  # Enough keys for quorum must not fire.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_validators_with_bls_key'
+        values: '4x5'
+      - series: 'arxium_finality_quorum'
+        values: '3x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumFinalityUnreachable
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'arxium_mempool_pending_actions'
+        values: '1500x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: ArxiumMempoolBacklog
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "1500 actions have been pending for at least 5 minutes"
