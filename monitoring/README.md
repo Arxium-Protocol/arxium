@@ -10,7 +10,12 @@ own repo), uncomment the `retracer` scrape job in `prometheus.yml` (its
 `GET /metrics`, `127.0.0.1:8080` by default). It's commented out by default
 because this file is shared by every node deployment and most don't run
 Retracer — leaving it active with nothing listening would make Prometheus
-report the target permanently down. `alerts.yml`'s matching `retracer` rule
+report the target permanently down. The job sends a bearer token from
+`/etc/arxium-monitoring/retracer-scrape-token`, because `/metrics` sits
+behind `retracerd --auth-token` whenever one is set; that file must hold only
+the token and be readable by the `prometheus` account. Remove the
+`authorization` block if that retracerd runs without a token.
+`alerts.yml`'s matching `retracer` rule
 group needs no such care: it only fires for a job that's actually
 configured, so it's harmless to leave in place either way.
 
