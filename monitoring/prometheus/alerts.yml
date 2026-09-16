@@ -61,9 +61,8 @@ groups:
           summary: "{{ $value }} actions have been pending for at least 5 minutes"
 
   # Only fires on a host that also scrapes the `retracer` job in
-  # prometheus.yml, i.e. one also running retracerd (Retracer T8/T10, see
-  # Retracer_Tasks.md in the retracer repo). Harmless if that job isn't
-  # configured: these rules simply never match any series.
+  # prometheus.yml, i.e. one also running retracerd. Harmless if that job
+  # isn't configured: these rules simply never match any series.
   - name: retracer
     rules:
       - alert: RetracerDown
@@ -77,6 +76,20 @@ groups:
             Prometheus has been unable to scrape retracerd for two minutes.
             Check systemctl status retracerd and curl
             http://127.0.0.1:8080/health.
+
+      # up==1 alone misses this: /metrics still returns 200 with
+      # retracer_database_up 0 when only the database is unreachable, so
+      # RetracerDown above never fires for a database-only outage.
+      - alert: RetracerDatabaseDown
+        expr: retracer_database_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retracer cannot reach its database"
+          description: >
+            retracerd is answering scrapes but its database check has been
+            failing for two minutes. Check Postgres and retracerd's logs.
 
       - alert: RetracerLagging
         expr: retracer_blocks_behind > 30

@@ -11,9 +11,9 @@ scrape_configs:
       - targets: ['127.0.0.1:30333']
 
   # Commented out by default: this file is shared by every node deployment,
-  # and most don't run retracerd. Uncomment only on a host that also runs
-  # Retracer (Retracer T8, see Retracer_Tasks.md) — leaving it active on an
-  # arxd-only host makes the target permanently unreachable, which is a
+  # and most don't run retracerd (Retracer, a separate indexer — see its own
+  # repo). Uncomment only on a host that also runs it — leaving it active on
+  # an arxd-only host makes the target permanently unreachable, which is a
   # real "down" for Prometheus and fires RetracerDown (alerts.yml) forever.
   #
   # retracerd binds /metrics to loopback by default (--rest-bind,
@@ -23,5 +23,8 @@ scrape_configs:
   # at a root-only file containing just the token (Prometheus's config
   # format, not a KEY=VALUE .env line).
   # - job_name: retracer
+  #   # Each scrape re-runs Retracer's database/table-size queries; don't
+  #   # inherit this file's 5s global interval meant for arxd's own metrics.
+  #   scrape_interval: 30s
   #   static_configs:
   #     - targets: ['127.0.0.1:8080']
