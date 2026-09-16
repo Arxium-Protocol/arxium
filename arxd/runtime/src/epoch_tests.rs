@@ -24,7 +24,7 @@ fn addr(n: u8) -> Address {
 }
 
 fn params() -> ChainParams {
-    ChainParams { epoch_length: EPOCH, validator_attestation_required: false, min_validator_set: 2, max_validator_set: 100 }
+    ChainParams { epoch_length: EPOCH, min_validator_set: 2, ..ChainParams::default() }
 }
 
 /// Genesis-shaped db: `members` active with equal power, each self-staked

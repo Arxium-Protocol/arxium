@@ -83,7 +83,7 @@ pub(crate) fn revoke_operator(
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::{ACTION_FEE, ActionPayload};
+    use crate::ActionPayload;
     use std::collections::HashMap;
     use xc_primitives::Action;
 
@@ -94,7 +94,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(2 * ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(2 * FEE_BUDGET))]),
             HashMap::new(),
         );
         let authorize = Action {

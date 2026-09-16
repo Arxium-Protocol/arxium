@@ -12,10 +12,11 @@ use xc_primitives::{
     eligible_proposer, round_timeout_signing_bytes, signed_power,
 };
 use xc_primitives::Asset;
+use xc_circuit::{ChainParamsKey, KvRead};
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
-    BatchWritable, BlockView, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates, OperatorUpdates,
-    StakeUpdates, StorageError, ValidatorSetSnapshot, ValidatorStatusUpdates,
+    BatchWritable, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates,
+    OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot, ValidatorStatusUpdates,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -50,6 +51,16 @@ pub struct ExecutionOutcome<P> {
     /// so a producer can tell a polling client *why* — the block itself
     /// only lists what landed.
     pub dropped: Vec<(String, String)>,
+    /// Sum of `meter` weights over `applied` — PoE's `resources_used`.
+    pub weight_used: u64,
+    /// Sum of `meter` fees over `applied` — what `on_block_sealed` pays out.
+    pub fees_collected: u128,
+    /// The input tail that did not fit under `max_weight`, in order: the
+    /// first action that would have gone over and everything after it,
+    /// untouched (a later small action is not pulled ahead of it, so a
+    /// sender's nonce order is preserved). A producer requeues these; an
+    /// acceptor treats any as `BlockOverWeight`.
+    pub deferred: Vec<Action<P>>,
 }
 
 /// What a single dispatched action hands back: account changes, an optional
@@ -210,6 +221,8 @@ pub enum AcceptBlockError {
     Storage(#[from] StorageError),
     #[error("failed to execute block actions: {0}")]
     Execution(#[from] ExecutorError),
+    #[error("block {height} exceeds max_block_weight {max_block_weight} — {over} action(s) do not fit")]
+    BlockOverWeight { height: u64, max_block_weight: u64, over: usize },
     #[error(
         "block {block_height} claimed {claimed} action(s) but only {executed} executed successfully — proposer included an invalid action"
     )]
@@ -348,11 +361,12 @@ fn verify_round_certificate(
 /// per block; the caller must call `ArxiumDb::flush_wal` once after the
 /// whole page lands.
 ///
-/// `fee_per_action`: the chain's flat per-action fee (e.g. arxd/node's
-/// `ACTION_FEE`, 0 for a chain with none) — this crate doesn't know the fee
-/// amount itself (that's chain-specific, charged inside `dispatch`), only
-/// how many actions applied. `applied.len() * fee_per_action` is handed to
-/// `on_block_sealed` as `fees_collected`.
+/// `meter`: `(weight, fee)` of one action — `ChainRuntime::action_weight`/
+/// `action_fee_for` — this crate doesn't know either (both are chain-
+/// specific, the fee charged inside `dispatch`), only how to sum them. The
+/// weight sum is capped at `ChainParams.max_block_weight` and becomes PoE's
+/// `resources_used`; the fee sum is handed to `on_block_sealed` as
+/// `fees_collected`.
 ///
 /// `on_block_sealed` runs once, after every action in the block has
 /// dispatched — this is where whole-block economics (reward split, downtime
@@ -363,7 +377,7 @@ pub fn accept_block<P>(
     db: &ArxiumDb,
     block: Block<P>,
     sync: bool,
-    fee_per_action: u128,
+    meter: &dyn Fn(&Action<P>) -> (u64, u128),
     dispatch: impl Fn(
         &Action<P>,
         &BlockView<'_>,
@@ -542,7 +556,18 @@ where
         attestor_deregistrations,
         touched_keys,
         dropped: _,
-    } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, None, true)?;
+        weight_used,
+        fees_collected,
+        deferred,
+    } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, meter, None, true)?;
+    if !deferred.is_empty() {
+        let max_block_weight = max_block_weight(db)?;
+        return Err(AcceptBlockError::BlockOverWeight {
+            height: block.height,
+            max_block_weight,
+            over: deferred.len(),
+        });
+    }
     if applied.len() != claimed {
         let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
@@ -558,7 +583,6 @@ where
     // `verify_proposer_signature` above already guarantees `Some` — an
     // unsigned block never reaches this point.
     let proposer = block.proposer.as_ref().expect("signed block always has a proposer");
-    let fees_collected = applied.len() as u128 * fee_per_action;
     let mut view = BlockView::new(db);
     view.apply_accounts(&account_updates)?;
     view.apply_stakes(&stake_updates)?;
@@ -649,11 +673,19 @@ where
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
+    let block_weight = BlockWeight { height: block.height, weight_used };
+    writables.push(&block_weight);
     writables.push(&block);
     // One batch, and the undo record for it: the block, its state changes, and
     // the ability to roll all of it back have to land together or not at all.
     db.write_block_batches(block.height, &writables, !sync)?;
     Ok(block)
+}
+
+/// `ChainParams.max_block_weight` as of current state — read here (not
+/// passed in) so producer and acceptor cannot be handed different caps.
+pub fn max_block_weight(db: &ArxiumDb) -> Result<u64, StorageError> {
+    Ok(KvRead::get(db, &ChainParamsKey)?.unwrap_or_default().max_block_weight)
 }
 
 /// Applies each action to current state, in order, buffering every success
@@ -702,6 +734,11 @@ pub fn execute_actions<P>(
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
+    // `(weight, fee)` per action — see `accept_block`. Weights are summed
+    // over applied actions against `ChainParams.max_block_weight`; the
+    // first action that would cross it, and everything after, come back in
+    // `ExecutionOutcome::deferred` unexecuted.
+    meter: &dyn Fn(&Action<P>) -> (u64, u128),
     mut inter_action_roots: Option<&mut Vec<String>>,
     // When true, `view` logs every Merkleized key it reads or writes (see
     // `BlockView::new_recording`) — the returned key list is exactly what
@@ -715,6 +752,10 @@ where
 {
     let mut applied = Vec::with_capacity(actions.len());
     let mut dropped = Vec::new();
+    let mut deferred = Vec::new();
+    let mut weight_used = 0u64;
+    let mut fees_collected = 0u128;
+    let max_weight = max_block_weight(db)?;
     // Seeded from e.g. matured-unbonding resolution, run by the caller
     // before this loop — so a same-block `Stake` action sees a just-cleared
     // `unbonding` slot instead of hitting "already unbonding".
@@ -750,11 +791,18 @@ where
         view.apply_attestor_deregistration(deregistration);
     }
 
-    for action in actions {
+    let mut actions = actions.into_iter();
+    while let Some(action) = actions.next() {
         if let Err(err) = action.verify_signature() {
             warn!("dropping action from {}: {err}", action.sender);
             dropped.push((action.signature.clone().unwrap_or_default(), err.to_string()));
             continue;
+        }
+        let (weight, fee) = meter(&action);
+        if weight_used.saturating_add(weight) > max_weight {
+            deferred.push(action);
+            deferred.extend(actions);
+            break;
         }
 
         let operator_lookup = |validator: &Address| match operator_overlay.get(validator) {
@@ -796,6 +844,8 @@ where
                     view.apply_attestor_deregistration(deregistration);
                 }
                 attestor_deregistrations.extend(updates.attestor_deregistration);
+                weight_used += weight;
+                fees_collected = fees_collected.saturating_add(fee);
                 applied.push(action);
             }
             Err(err) => {
@@ -841,6 +891,9 @@ where
         attestor_registrations,
         attestor_deregistrations,
         touched_keys: view.touched_keys(),
+        weight_used,
+        fees_collected,
+        deferred,
     })
 }
 
@@ -851,7 +904,7 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
-    use xc_circuit::{AssetKey, KvRead};
+    use xc_circuit::AssetKey;
     use xc_primitives::{AccountEntry, StakeAllocation, expected_proposer};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -861,6 +914,11 @@ mod tests {
         Stake { validator: Address, amount: u128 },
         RegisterAsset { id: String, compliance_required: bool },
         IssueAsset { id: String },
+    }
+
+    /// Unmetered: every action weighs 1 and pays nothing.
+    fn flat(_: &Action<TestPayload>) -> (u64, u128) {
+        (1, 0)
     }
 
     fn dispatch(
@@ -1023,12 +1081,12 @@ mod tests {
         block.tx_root = xc_poe::tx_root(&block.actions).unwrap();
         block.sign(proposer.clone(), key);
         if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
-            accept_block(db, block.clone(), false, 0, dispatch, seal)
+            accept_block(db, block.clone(), false, &flat, dispatch, seal)
         {
             block.state_root = expected;
             block.sign(proposer.clone(), key);
         }
-        accept_block(db, block, false, 0, dispatch, seal)
+        accept_block(db, block, false, &flat, dispatch, seal)
     }
 
     fn signed_join(key: &SigningKey, sender: &Address, nonce: u64) -> Action<TestPayload> {
@@ -1122,7 +1180,7 @@ mod tests {
         ];
 
         let ExecutionOutcome { applied, accounts: updates, validator_statuses, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
         assert!(validator_statuses.0.is_empty());
         assert_eq!(
             applied.len(),
@@ -1167,7 +1225,7 @@ mod tests {
         ];
 
         let ExecutionOutcome { applied, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
         assert_eq!(applied.len(), 2, "IssueAsset must see the same-block registration");
     }
 
@@ -1193,7 +1251,7 @@ mod tests {
         ];
 
         let ExecutionOutcome { applied, asset_registrations, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
         assert_eq!(applied.len(), 2, "the same-issuer duplicate must be dropped, the other issuer's kept");
         assert_eq!(asset_registrations.len(), 2);
         assert_eq!(asset_registrations[0].issuer, alice, "first registration's issuer must survive");
@@ -1231,7 +1289,7 @@ mod tests {
 
         let mut roots = Vec::new();
         let ExecutionOutcome { applied, accounts: updates, .. } =
-            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, Some(&mut roots), false).unwrap();
+            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, &flat, Some(&mut roots), false).unwrap();
         assert_eq!(applied.len(), 3);
         assert_eq!(roots.len(), 3, "one root per input action, in order");
         db.write_batch(&updates).unwrap();
@@ -1249,7 +1307,7 @@ mod tests {
             .unwrap();
         for (i, action) in actions.into_iter().enumerate() {
             let ExecutionOutcome { accounts: prefix_updates, .. } =
-                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, None, false).unwrap();
+                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
             reference_db.write_batch(&prefix_updates).unwrap();
             assert_eq!(
                 roots[i],
@@ -1455,7 +1513,7 @@ mod tests {
             round_certificate: None,
         };
         block1.sign(addr.clone(), &key);
-        let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
+        let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
         (db, key, addr, block1)
     }
 
@@ -1494,6 +1552,43 @@ mod tests {
         block
     }
 
+    /// Metering: the producer stops at `max_block_weight` and hands the tail
+    /// back untouched; a block that carries more than the cap is invalid.
+    #[test]
+    fn actions_past_the_block_weight_cap_are_deferred_and_such_a_block_is_rejected() {
+        let base = now_secs() - 10;
+        let (db, key, addr, block1) = chain_at_height_one(base);
+        let alice_key = SigningKey::from_bytes(&[3u8; 32]);
+        let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
+        let bob = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            alice.clone(),
+            AccountEntry { balance: 100, ..Default::default() },
+        )])))
+        .unwrap();
+        let cap = max_block_weight(&db).unwrap();
+        // Two actions of 60% each: the second does not fit.
+        let heavy = move |_: &Action<TestPayload>| (cap / 10 * 6, 0u128);
+        let actions = vec![
+            signed_transfer(&alice_key, &alice, 0, &bob, 40),
+            signed_transfer(&alice_key, &alice, 1, &bob, 10),
+        ];
+
+        let outcome =
+            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, &heavy, None, false).unwrap();
+        assert_eq!(outcome.applied.len(), 1);
+        assert_eq!(outcome.deferred.len(), 1);
+        assert_eq!(outcome.deferred[0].nonce, 1, "the tail comes back in order, unexecuted");
+        assert_eq!(outcome.weight_used, cap / 10 * 6);
+
+        let mut block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
+        block2.actions = actions;
+        block2.tx_root = xc_poe::tx_root(&block2.actions).unwrap();
+        block2.sign(addr.clone(), &key);
+        let err = accept_block(&db, block2, false, &heavy, dispatch, seal).unwrap_err();
+        assert!(matches!(err, AcceptBlockError::BlockOverWeight { over: 1, .. }), "{err}");
+    }
+
     /// A proposer must not be able to stamp a block at or before its parent.
     /// `elapsed` is computed with `saturating_sub`, so a backwards timestamp
     /// silently reads as `elapsed == 0` — the primary's own window — which is
@@ -1505,7 +1600,7 @@ mod tests {
 
         for stamp in [base, base - 1, 0] {
             let block2 = signed_block_at(&db, &key, &addr, &block1, stamp);
-            let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+            let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NonMonotonicTimestamp { .. }),
                 "timestamp {stamp} against parent {base} should be rejected, got {err:?}",
@@ -1514,7 +1609,7 @@ mod tests {
 
         // One second later is the minimum acceptable step, and it works.
         let block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
-        assert!(accept_block(&db, block2, false, 0, dispatch, seal).is_ok());
+        assert!(accept_block(&db, block2, false, &flat, dispatch, seal).is_ok());
     }
 
     /// Proposer eligibility is derived from block timestamps, so an unbounded
@@ -1527,7 +1622,7 @@ mod tests {
 
         // A year ahead: the shape that used to stall the rotation indefinitely.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 31_536_000);
-        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::TimestampTooFarAhead { .. }),
             "got {err:?}",
@@ -1536,14 +1631,14 @@ mod tests {
         // Just past the bound is still rejected.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
         assert!(matches!(
-            accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err(),
+            accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err(),
             AcceptBlockError::TimestampTooFarAhead { .. }
         ));
 
         // Modest skew inside the bound is accepted — an honest node with a
         // slightly fast clock must not have its blocks refused.
         let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + 2);
-        assert!(accept_block(&db, block2, false, 0, dispatch, seal).is_ok());
+        assert!(accept_block(&db, block2, false, &flat, dispatch, seal).is_ok());
     }
 
     /// Only *future* drift is bounded. Blocks replayed during sync are old by
@@ -1556,7 +1651,7 @@ mod tests {
 
         let block2 = signed_block_at(&db, &key, &addr, &block1, long_ago + 4);
         assert!(
-            accept_block(&db, block2, true, 0, dispatch, seal).is_ok(),
+            accept_block(&db, block2, true, &flat, dispatch, seal).is_ok(),
             "a year-old block must still replay during sync",
         );
     }
@@ -1611,7 +1706,7 @@ mod tests {
             round_certificate: None,
         };
         block1.sign(addr1, &key1);
-        let block1 = accept_block(&db, block1, false, 0, dispatch, seal).unwrap();
+        let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
         (db, sorted, block1)
     }
 
@@ -1630,7 +1725,7 @@ mod tests {
         // One second later: nowhere near a full slot (4s), so the primary
         // (sorted[0]) is still the only eligible proposer.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 1);
-        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::WrongProposer { .. }),
             "non-primary signing during the primary's window should be rejected, got {err:?}",
@@ -1659,7 +1754,7 @@ mod tests {
         // 5s claimed elapsed against a 4s slot — within MAX_FUTURE_DRIFT_SECS
         // (30s) of "now", so this fails on eligibility, not drift-rejection.
         let block2 = signed_block_at(&db, &key1, &addr1, &block1, block1.timestamp + 5);
-        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::WrongProposer { .. }),
             "non-primary must stay ineligible once rotation is pinned to round 0, got {err:?}",
@@ -1687,7 +1782,7 @@ mod tests {
             round_certificate: None,
         };
         block2.sign(addr, &key);
-        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ParentMismatch { .. }),
             "got {err:?}",
@@ -1716,7 +1811,7 @@ mod tests {
                 round_certificate: None,
             };
             block2.sign(addr.clone(), &key);
-            let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+            let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NotNextHeight { .. }),
                 "height {bad_height} against tip 1 should be rejected, got {err:?}",
@@ -1758,7 +1853,7 @@ mod tests {
         })
         .unwrap();
 
-        let err = accept_block(&db, block2.clone(), false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2.clone(), false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ContradictsCertificate { .. }),
             "got {err:?}",
@@ -1776,7 +1871,7 @@ mod tests {
             ep: [0u8; 32],
         })
         .unwrap();
-        let err = accept_block(&db, block2, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::StateRootMismatch { .. }),
             "the gate must be past, got {err:?}",
@@ -1834,7 +1929,7 @@ mod tests {
         };
         block1.sign(alice, &alice_key);
 
-        let err = accept_block(&db, block1, false, 0, dispatch, seal).unwrap_err();
+        let err = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
             "got {err:?}",

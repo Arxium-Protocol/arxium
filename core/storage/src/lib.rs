@@ -476,6 +476,18 @@ impl KvRead for ArxiumDb {
 }
 
 impl ArxiumDb {
+    /// `weight_used` recorded for block `height` — 0 if none was (a block
+    /// accepted before metering existed, or genesis).
+    pub fn get_block_weight(&self, height: u64) -> Result<u64, StorageError> {
+        match self.get(&block_weight_key(height))? {
+            Some(bytes) => {
+                let arr: [u8; 8] = bytes.try_into().map_err(|_| StorageError::CorruptedMeta)?;
+                Ok(u64::from_le_bytes(arr))
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Get the current tip height from the DB.
     pub fn get_tip_height(&self) -> Result<Option<u64>, StorageError> {
         match self.get(b"meta:tip_height")? {

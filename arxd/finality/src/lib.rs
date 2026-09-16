@@ -629,8 +629,11 @@ where
                             String::new()
                         }
                     };
-                    let ep =
-                        xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root);
+                    let weight_used = db.get_block_weight(block.height).unwrap_or_else(|err| {
+                        warn!("finality: failed to read block weight at height {}: {err}", block.height);
+                        0
+                    });
+                    let ep = xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root, weight_used);
                     let msg = precommit_signing_bytes(&genesis, block.height, &hash, &ep);
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {

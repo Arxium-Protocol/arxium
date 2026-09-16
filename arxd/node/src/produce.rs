@@ -40,18 +40,19 @@ pub fn produce_block<R: ChainRuntime>(
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
 ) -> Result<Block<R::Payload>> {
-    produce_block_reporting::<R>(db, actions, timestamp, proposer).map(|(block, _)| block)
+    produce_block_reporting::<R>(db, actions, timestamp, proposer).map(|(block, _, _)| block)
 }
 
 /// `produce_block` plus the `(signature, reason)` of every action that was
 /// drained but not applied — what `produce_loop` hands the mempool so a
-/// status poll can name the rejection.
+/// status poll can name the rejection — and the tail that did not fit under
+/// `max_block_weight`, which `produce_loop` requeues.
 pub fn produce_block_reporting<R: ChainRuntime>(
     db: &ArxiumDb,
     actions: Vec<Action<R::Payload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
-) -> Result<(Block<R::Payload>, Vec<(String, String)>)> {
+) -> Result<(Block<R::Payload>, Vec<(String, String)>, Vec<Action<R::Payload>>)> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let next_height = tip_height + 1;
     let parent: Block<R::Payload> = db
@@ -91,6 +92,9 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         attestor_deregistrations,
         touched_keys: _,
         dropped,
+        weight_used,
+        fees_collected,
+        deferred,
     } = execute_actions(
         db,
         actions,
@@ -109,6 +113,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
                 },
             )
         },
+        &meter::<R>,
         None,
         false,
     )?;
@@ -118,7 +123,6 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     // validator would never see its own reward pool debited/credited.
     let mut snapshot = None;
     if let Some((address, _)) = proposer {
-        let fees_collected = applied.len() as u128 * R::action_fee();
         let mut view = xc_storage::BlockView::new(db);
         view.apply_accounts(&account_updates)?;
         view.apply_stakes(&stake_updates)?;
@@ -210,7 +214,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     // format yet — purely to measure EP compute cost against real block
     // production time before it's wired into consensus.
     let poe_start = Instant::now();
-    let ep = xc_poe::block_ep(&parent.state_root, &tx_root, &state_root);
+    let ep = xc_poe::block_ep(&parent.state_root, &tx_root, &state_root, weight_used);
     histogram!("arxium_poe_ep_compute_nanos").record(poe_start.elapsed().as_nanos() as f64);
     info!(height = next_height, ep = %hex::encode(ep), "computed proof-of-execution hash");
 
@@ -279,12 +283,20 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
+    let block_weight = xc_storage::BlockWeight { height: next_height, weight_used };
+    writables.push(&block_weight);
     writables.push(&new_block);
     // Undo-logged like the accept path — a proposer diverges from the network
     // exactly as easily as a follower does, so it needs the same rollback.
     db.write_block_batches(new_block.height, &writables, true)?;
 
-    Ok((new_block, dropped))
+    Ok((new_block, dropped, deferred))
+}
+
+/// `(weight, fee)` of one action, as `xc_executor` wants it.
+pub fn meter<R: ChainRuntime>(action: &Action<R::Payload>) -> (u64, u128) {
+    let weight = R::action_weight(action);
+    (weight, R::action_fee_for(weight))
 }
 
 /// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
@@ -477,9 +489,11 @@ pub fn produce_loop<R: ChainRuntime>(
         // and never reaches here; an Err means block-level bookkeeping itself failed
         // (e.g. storage), which is unexpected and logged rather than propagated.
         match produce_block_reporting::<R>(db, pending, now, proposer) {
-            std::result::Result::Ok((block, dropped)) => {
-                if !dropped.is_empty() {
-                    mempool.lock().unwrap_or_else(|e| e.into_inner()).note_dropped(dropped);
+            std::result::Result::Ok((block, dropped, deferred)) => {
+                if !dropped.is_empty() || !deferred.is_empty() {
+                    let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                    mempool.note_dropped(dropped);
+                    mempool.requeue_front(deferred);
                 }
                 info!(
                     "produced block {} with {} action(s), hash={}",
@@ -524,7 +538,7 @@ fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Dura
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arxd_runtime::{ACTION_FEE, ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
+    use arxd_runtime::{ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
     use ed25519_dalek::{Signer, SigningKey};
     use std::collections::BTreeMap;
     use xc_executor::BlockUpdates;
@@ -586,6 +600,7 @@ mod tests {
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                 )
             },
+            &meter::<CoreChainRuntime>,
             None,
             false,
         )
@@ -600,7 +615,7 @@ mod tests {
         accounts.insert(
             alice.clone(),
             AccountEntry {
-                balance: 2_000_000,
+                balance: 20_000_000,
                 ..Default::default()
             },
         );
@@ -631,7 +646,8 @@ mod tests {
         // Same nonce twice: the replay is dropped, and the drop is reported
         // by signature so a status poll can say why.
         let replay = transfer.clone();
-        let (block, dropped) =
+        let (weight, fee) = meter::<CoreChainRuntime>(&transfer);
+        let (block, dropped, _) =
             produce_block_reporting::<CoreChainRuntime>(&db, vec![transfer, replay.clone()], 1, None).unwrap();
         assert_eq!(block.actions.len(), 1);
         assert_eq!(dropped.len(), 1);
@@ -641,9 +657,10 @@ mod tests {
         assert_eq!(block.height, 1);
         assert_eq!(
             db.get_account(&alice).unwrap().unwrap().balance,
-            2_000_000 - 400 - arxd_runtime::ACTION_FEE
+            20_000_000 - 400 - fee
         );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
+        assert_eq!(db.get_block_weight(1).unwrap(), weight, "metered weight is persisted beside the block");
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -724,7 +741,7 @@ mod tests {
                     &peer,
                     block,
                     false,
-                    ACTION_FEE,
+                    &meter::<CoreChainRuntime>,
                     |action, view, operator_lookup, operator_validators_lookup, vals| {
                         dispatch(
                             action,

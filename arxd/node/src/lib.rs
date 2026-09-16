@@ -748,6 +748,7 @@ fn spawn_subsystems<R: ChainRuntime>(
         payload_precheck: Some(payload_precheck.clone()),
         min_stake: R::min_validator_stake(),
         action_fee: Some(R::action_fee()),
+        weight_fee: R::action_fee_for(1).saturating_sub(R::action_fee_for(0)),
         evidence_dir: config.base_path.join(chain_name).join("evidence"),
         limits: config.limits.clone(),
     })?;
@@ -774,7 +775,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                 &db,
                 block,
                 sync,
-                R::action_fee(),
+                &crate::produce::meter::<R>,
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
                     R::dispatch(
                         action,
@@ -896,10 +897,16 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         }
                                     };
                                     let block_hash = candidate.hash();
+                                    // Weight is a pure function of the action list, so
+                                    // this is what the block *would* have used had it
+                                    // executed as claimed — the same sum the proposer
+                                    // hashed into its EP.
+                                    let weight_used = candidate.actions.iter().map(R::action_weight).sum();
                                     let ep = xc_poe::block_ep(
                                         &parent_state_root,
                                         &candidate.tx_root,
                                         &state_root,
+                                        weight_used,
                                     );
                                     let proposer = candidate
                                         .proposer

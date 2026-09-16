@@ -252,7 +252,7 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::{ACTION_FEE, ActionPayload};
+    use crate::ActionPayload;
     use std::collections::HashMap;
     use xc_primitives::{Action, StakeAllocation};
 
@@ -292,7 +292,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::from([(
                 (alice.clone(), alice.clone()),
                 self_allocation(&alice, 2_000),
@@ -326,7 +326,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
             HashMap::new(),
         );
         let action = Action {
@@ -357,7 +357,7 @@ mod tests {
         );
         assert_eq!(
             updates.accounts.0.get(&alice).unwrap().balance,
-            2_000_000 - ACTION_FEE
+            2_000_000 + FEE_BUDGET - fee_of(&action)
         );
         let sub = circuit_staking::stake_subaccount(&alice);
         assert_eq!(
@@ -380,7 +380,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(2_000_000))]),
+            HashMap::from([(alice.clone(), funded(2_000_000 + FEE_BUDGET))]),
             HashMap::from([(
                 (alice.clone(), alice.clone()),
                 self_allocation(&alice, MIN_VALIDATOR_STAKE),
@@ -501,7 +501,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::from([(
                 (alice.clone(), alice.clone()),
                 self_allocation(&alice, MIN_VALIDATOR_STAKE),
@@ -549,7 +549,8 @@ mod tests {
             unbonding.unlock_at_height,
             5 + circuit_staking::unbonding_blocks(xc_primitives::ChainParams::default().epoch_length)
         );
-        // No balance credited back yet — still sitting in the sub-account, slashable.
+        // No balance credited back yet — still sitting in the sub-account,
+        // slashable: only the fee left the account.
         assert_eq!(
             updates
                 .accounts
@@ -557,7 +558,7 @@ mod tests {
                 .get(&alice)
                 .map(|a| a.balance)
                 .unwrap_or(0),
-            0
+            FEE_BUDGET - fee_of(&action)
         );
     }
 
@@ -643,7 +644,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
             HashMap::new(),
         );
         let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
@@ -677,7 +678,7 @@ mod tests {
         // third-party `Stake` action would.
         assert_eq!(
             updates.accounts.0.get(&bob).unwrap().balance,
-            2_000_000 - ACTION_FEE
+            2_000_000 + FEE_BUDGET - fee_of(&action)
         );
         let allocation = updates
             .stakes
@@ -705,7 +706,7 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(charlie.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(charlie.clone(), funded(FEE_BUDGET))]),
             HashMap::from([(
                 (bob.clone(), alice.clone()),
                 StakeAllocation {
@@ -810,7 +811,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
             HashMap::new(),
         );
 
@@ -855,7 +856,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000))]),
+            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
             HashMap::new(),
         );
         let pubkey = test_bls_pubkey(42);

@@ -84,6 +84,7 @@ struct AppState<P: Payload> {
     // Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so
     // a client can show it before submitting. `None` for chains with no fee.
     action_fee: Option<u128>,
+    weight_fee: u128,
     // Where `xc_evidence` writes fault artifacts (see `write_equivocation_artifact`
     // / `write_disagreement_artifact`). `GET /evidence*` just lists/serves this
     // directory's contents — no separate storage of its own.
@@ -381,6 +382,8 @@ pub struct IngestConfig<P: Payload> {
     pub payload_precheck: Option<PayloadPrecheck<P>>,
     pub min_stake: Option<u128>,
     pub action_fee: Option<u128>,
+    /// Fee per weight unit on top of `action_fee` — 0 for an unmetered chain.
+    pub weight_fee: u128,
     pub evidence_dir: PathBuf,
     pub limits: Limits,
 }
@@ -397,6 +400,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         payload_precheck,
         min_stake,
         action_fee,
+        weight_fee,
         evidence_dir,
         limits,
     } = config;
@@ -415,6 +419,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         pairing: Arc::new(PairingStore::new()),
         min_stake,
         action_fee,
+        weight_fee,
         evidence_dir,
     };
 
@@ -752,11 +757,26 @@ async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response
 
 /// Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so a
 /// client can show it before submitting. `404` for a chain with no fee.
+/// `action_fee` is the base; a client estimates a real fee as
+/// `action_fee + weight × weight_fee` (see `arxd_runtime::metering`), and
+/// `max_block_weight` is the cap any single action must fit under.
 async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    match state.action_fee {
-        Some(action_fee) => Json(serde_json::json!({ "action_fee": action_fee })).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    let Some(action_fee) = state.action_fee else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let max_block_weight = match state.db.chain_params() {
+        Ok(params) => params.max_block_weight,
+        Err(err) => {
+            warn!("failed to read chain params: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    Json(serde_json::json!({
+        "action_fee": action_fee,
+        "weight_fee": state.weight_fee,
+        "max_block_weight": max_block_weight,
+    }))
+    .into_response()
 }
 
 async fn get_account<P: Payload>(
@@ -1506,9 +1526,12 @@ fn block_with_finality<P: Payload>(
     block: &Block<P>,
 ) -> Result<serde_json::Value, StorageError> {
     let finalized = db.get_finality_record(block.height)?.is_some();
+    let weight_used = db.get_block_weight(block.height)?;
     let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
     if let Some(object) = value.as_object_mut() {
         object.insert("finalized".into(), serde_json::Value::Bool(finalized));
+        // PoE `resources_used`: the metered weight this block carried.
+        object.insert("weight_used".into(), serde_json::Value::from(weight_used));
     }
     Ok(value)
 }
@@ -1816,6 +1839,7 @@ mod tests {
             pairing: Arc::new(PairingStore::new()),
             min_stake: None,
             action_fee: None,
+            weight_fee: 0,
             evidence_dir: dir.join("evidence"),
         }
     }

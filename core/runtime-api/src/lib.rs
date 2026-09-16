@@ -66,8 +66,23 @@ pub trait ChainRuntime: Send + Sync + 'static {
     /// hands it, never a hardcoded registry.
     fn presets() -> &'static PresetRegistry;
 
-    /// Flat fee charged per action, in base units.
+    /// Base fee charged per action, in base units. The full fee is
+    /// `action_fee_for(action_weight(action))`.
     fn action_fee() -> u128;
+
+    /// Execution cost of `action` in this chain's weight units — what the
+    /// block cap (`ChainParams.max_block_weight`) and the PoE
+    /// `resources_used` are summed over. Must be a pure function of the
+    /// action so producer and attester agree. Default: every action weighs 1
+    /// (a chain with no metering).
+    fn action_weight(_action: &Action<Self::Payload>) -> u64 {
+        1
+    }
+
+    /// Fee for an action of `weight`. Default: the flat `action_fee`.
+    fn action_fee_for(_weight: u64) -> u128 {
+        Self::action_fee()
+    }
 
     /// Minimum self-stake for a validator, if this chain has validator
     /// staking at all. `None` disables the RPC's stake hint.

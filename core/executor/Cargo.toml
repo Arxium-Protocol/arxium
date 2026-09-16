@@ -9,6 +9,7 @@ xc-primitives = { workspace = true }
 xc-storage = { workspace = true }
 xc-poe = { workspace = true }
 xc-bls = { workspace = true }
+xc-circuit = { workspace = true }
 circuit-staking = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -19,7 +20,6 @@ hex = { workspace = true }
 [dev-dependencies]
 circuit-account = { workspace = true }
 ed25519-dalek = { workspace = true }
-xc-circuit = { workspace = true }
 
 [lints]
 workspace = true

@@ -339,7 +339,7 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::{ACTION_FEE, ActionPayload};
+    use crate::ActionPayload;
     use std::collections::HashMap;
     use xc_primitives::Action;
 
@@ -368,7 +368,7 @@ mod tests {
             &db,
             HashMap::from([
                 (sub_account, funded(10_000)),
-                (equivocator.clone(), funded(ACTION_FEE)),
+                (equivocator.clone(), funded(FEE_BUDGET)),
             ]),
             HashMap::from([(
                 (equivocator.clone(), equivocator.clone()),
@@ -466,7 +466,7 @@ mod tests {
             &db,
             HashMap::from([
                 (sub_account, funded(10_000)),
-                (reporter.clone(), funded(ACTION_FEE)),
+                (reporter.clone(), funded(FEE_BUDGET)),
             ]),
             HashMap::from([(
                 (voter.clone(), voter.clone()),
@@ -568,7 +568,7 @@ mod tests {
         let sub_account = circuit_staking::stake_subaccount(&equivocator);
         let mut view = seeded_view(
             &db,
-            HashMap::from([(sub_account.clone(), funded(10_000)), (reporter.clone(), funded(10 * ACTION_FEE))]),
+            HashMap::from([(sub_account.clone(), funded(10_000)), (reporter.clone(), funded(10 * FEE_BUDGET))]),
             HashMap::from([((equivocator.clone(), equivocator.clone()), self_allocation(&equivocator, 10_000))]),
         );
         view.put(&StakeByValidatorKey(&equivocator), &vec![equivocator.clone()]).unwrap();
@@ -610,7 +610,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::new(),
         );
         let action = Action {
@@ -647,7 +647,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::new(),
         );
         let action = Action {
@@ -682,7 +682,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::new(),
         );
         let action = Action {
@@ -757,7 +757,7 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
             HashMap::new(),
         );
         let (_, unowned) = xc_bls::keygen_from_seed(&[21u8; 32]).unwrap();

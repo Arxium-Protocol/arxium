@@ -222,6 +222,26 @@ impl<P: Serialize> Mempool<P> {
         Ok(())
     }
 
+    /// Puts actions a producer drained but could not fit under the block
+    /// weight cap back at the *front*, in their original order, so they lead
+    /// the next block instead of queueing behind everything that arrived
+    /// meanwhile. Bookkeeping mirrors `push` minus the admission caps: these
+    /// were already admitted once and the caps are what let them in.
+    pub fn requeue_front(&mut self, actions: Vec<Action<P>>) {
+        for action in actions.into_iter().rev() {
+            if !self.seen.insert((action.sender.clone(), action.nonce)) {
+                // Resubmitted while it was out of the queue — that copy wins.
+                continue;
+            }
+            if let Some(signature) = &action.signature {
+                self.signatures.insert(signature.clone());
+            }
+            self.total_bytes += Self::encoded_size(&action);
+            *self.per_sender.entry(action.sender.clone()).or_insert(0) += 1;
+            self.pending.push_front(action);
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

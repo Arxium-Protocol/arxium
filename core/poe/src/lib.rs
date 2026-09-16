@@ -19,9 +19,9 @@ fn hash_field(hasher: &mut Sha256, bytes: &[u8]) {
 /// each field length-prefixed so concatenation is unambiguous (same scheme
 /// as `xc_storage::ArxiumDb::compute_state_root`).
 ///
-/// `resources_used` has no real metering yet (`PoE_v5_design.md` names it in
-/// the formula but never defines a unit) — pass `0` until gas/compute
-/// accounting exists rather than a stand-in that could be misread as real.
+/// `resources_used` is the block's summed action weight
+/// (`xc_executor::ExecutionOutcome::weight_used`, units per
+/// `ChainRuntime::action_weight`).
 pub fn execution_proof(
     pre_state_root: &str,
     tx_root: &[u8; 32],
@@ -38,12 +38,17 @@ pub fn execution_proof(
 
 /// EP for a block, given its parent's post-state root. The single place
 /// this is derived: producer (`arxd/node/src/produce.rs`) and attester
-/// (`arxd/finality`) must not compute it two ways.
-///
-/// `resources_used` is hardcoded 0 until real metering exists — see
-/// `execution_proof`'s doc comment.
-pub fn block_ep(parent_state_root: &str, block_tx_root: &[u8; 32], block_state_root: &str) -> [u8; 32] {
-    execution_proof(parent_state_root, block_tx_root, block_state_root, 0)
+/// (`arxd/finality`) must not compute it two ways. `weight_used` is what the
+/// producer metered and persisted beside the block
+/// (`xc_storage::BlockWeight`); an attester re-executing the block gets the
+/// same sum, so a mismatch here is an execution disagreement.
+pub fn block_ep(
+    parent_state_root: &str,
+    block_tx_root: &[u8; 32],
+    block_state_root: &str,
+    weight_used: u64,
+) -> [u8; 32] {
+    execution_proof(parent_state_root, block_tx_root, block_state_root, weight_used)
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -177,6 +177,13 @@ pub struct ChainParams {
     /// by total stake among the eligible.
     #[serde(default = "default_max_validator_set")]
     pub max_validator_set: usize,
+    /// Total `ChainRuntime::action_weight` a block may carry. A block over it
+    /// is invalid (`xc_executor::AcceptBlockError::BlockOverWeight`); the
+    /// producer defers what does not fit to the next block. Units are the
+    /// runtime's (CoreChain: nominal microseconds on the devnet reference
+    /// host — see `arxd_runtime::metering`).
+    #[serde(default = "default_max_block_weight")]
+    pub max_block_weight: u64,
 }
 
 fn default_epoch_length() -> u64 {
@@ -188,6 +195,11 @@ fn default_min_validator_set() -> usize {
 fn default_max_validator_set() -> usize {
     100
 }
+/// ~1s of reference execution per block at CoreChain's table, well under a
+/// 2s devnet slot.
+fn default_max_block_weight() -> u64 {
+    1_000_000
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -196,6 +208,7 @@ impl Default for ChainParams {
             validator_attestation_required: false,
             min_validator_set: default_min_validator_set(),
             max_validator_set: default_max_validator_set(),
+            max_block_weight: default_max_block_weight(),
         }
     }
 }

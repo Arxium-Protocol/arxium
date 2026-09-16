@@ -210,7 +210,7 @@ pub(crate) fn verify_identity_credential<V: KvRead<Error = StorageError>>(
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::{ACTION_FEE, ActionPayload};
+    use crate::ActionPayload;
     use ark_serialize::CanonicalSerialize;
     use std::collections::HashMap;
     use xc_primitives::{Action, Address};
@@ -228,7 +228,7 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(attestor.clone(), funded(ACTION_FEE * 4))]),
+            HashMap::from([(attestor.clone(), funded(FEE_BUDGET * 4))]),
             HashMap::new(),
         );
         view.put(
@@ -300,7 +300,7 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(attestor.clone(), funded(ACTION_FEE))]),
+            HashMap::from([(attestor.clone(), funded(FEE_BUDGET))]),
             HashMap::new(),
         );
         view.put(
@@ -352,8 +352,8 @@ mod tests {
         let mut view = seeded_view(
             &db,
             HashMap::from([
-                (alice.clone(), funded(ACTION_FEE * 2)),
-                (attestor.clone(), funded(ACTION_FEE)),
+                (alice.clone(), funded(FEE_BUDGET * 2)),
+                (attestor.clone(), funded(FEE_BUDGET)),
             ]),
             HashMap::new(),
         );
@@ -434,7 +434,7 @@ mod tests {
         let mut proof_bytes = Vec::new();
         proof.serialize_compressed(&mut proof_bytes).unwrap();
 
-        let mut account = funded(ACTION_FEE);
+        let mut account = funded(FEE_BUDGET);
         account.identity_hash = Some(hex::encode(hash_bytes));
         let db = temp_db();
         let view = seeded_view(
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn verify_identity_credential_rejects_malformed_proof_bytes() {
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let mut account = funded(ACTION_FEE);
+        let mut account = funded(FEE_BUDGET);
         account.identity_hash = Some(hex::encode([0u8; 32]));
         let db = temp_db();
         let view = seeded_view(

@@ -19,6 +19,7 @@ mod epoch;
 #[cfg(test)]
 mod epoch_tests;
 mod identity;
+pub mod metering;
 mod pair;
 mod specs;
 mod staking;
@@ -47,6 +48,14 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
 
     fn action_fee() -> u128 {
         ACTION_FEE
+    }
+
+    fn action_weight(action: &ChainAction) -> u64 {
+        metering::action_weight(action)
+    }
+
+    fn action_fee_for(weight: u64) -> u128 {
+        metering::action_fee_for(weight)
     }
 
     fn min_validator_stake() -> Option<u128> {
@@ -206,8 +215,14 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
         .get_account(&action.sender)?
         .map(|e| e.balance)
         .unwrap_or(0);
-    if balance < ACTION_FEE {
-        anyhow::bail!("insufficient balance for the action fee ({ACTION_FEE} IUM)");
+    let weight = metering::action_weight(action);
+    let max_block_weight = db.chain_params()?.max_block_weight;
+    if weight > max_block_weight {
+        anyhow::bail!("action weight {weight} exceeds max_block_weight {max_block_weight} and can never be included");
+    }
+    let fee = metering::action_fee_for(weight);
+    if balance < fee {
+        anyhow::bail!("insufficient balance for the action fee ({fee} IUM)");
     }
     let operator_lookup = |validator: &Address| db.get_operator(validator);
     match &action.payload {
@@ -270,11 +285,10 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
     Ok(())
 }
 
-/// 0.001 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM) flat
-/// per-action fee, burned (no recipient), not a fee market. Devnet stub
-/// like `MIN_VALIDATOR_STAKE`; swapping it for a per-action-type fee or a
-/// validator/treasury payout only means changing `charge_action_fee` below,
-/// not any call site.
+/// 0.001 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM) base
+/// per-action fee. The full fee is `metering::action_fee_for(weight)` —
+/// this plus a per-weight term — charged in `charge_action_fee` below and
+/// paid out through `on_block_sealed`'s `fees_collected`.
 pub const ACTION_FEE: u128 = 1_000_000;
 
 pub fn dispatch<V: KvRead<Error = StorageError>>(
@@ -342,7 +356,7 @@ fn consume_nonce<V: KvRead<Error = StorageError>>(
     Ok(())
 }
 
-/// Debits `ACTION_FEE` from `action.sender`'s balance on top of whatever
+/// Debits the metered fee from `action.sender`'s balance on top of whatever
 /// `dispatch_inner` already did. Reuses the sender's entry from `updates` if
 /// the action already produced one (preserving whatever nonce/balance
 /// change it made), otherwise fetches a fresh one via `view` so an action
@@ -362,8 +376,9 @@ fn charge_action_fee<V: KvRead<Error = StorageError>>(
             )
         })?,
     };
-    entry.balance = entry.balance.checked_sub(ACTION_FEE).ok_or_else(|| {
-        anyhow::anyhow!("insufficient balance for the action fee ({ACTION_FEE} IUM)")
+    let fee = metering::action_fee_for(metering::action_weight(action));
+    entry.balance = entry.balance.checked_sub(fee).ok_or_else(|| {
+        anyhow::anyhow!("insufficient balance for the action fee ({fee} IUM)")
     })?;
     updates.accounts.0.insert(action.sender.clone(), entry);
     Ok(())
@@ -590,6 +605,16 @@ pub(crate) mod test_support {
         move |validator| Ok(authorizations.get(validator).cloned())
     }
 
+    /// Enough to pay any single action's metered fee — what tests fund
+    /// "one action's worth" with, since the real fee depends on the variant
+    /// and size. Exact post-fee balances use `fee_of`.
+    pub(crate) const FEE_BUDGET: u128 =
+        crate::ACTION_FEE + 1_000_000 * crate::metering::WEIGHT_FEE;
+
+    pub(crate) fn fee_of(action: &crate::ChainAction) -> u128 {
+        crate::metering::action_fee_for(crate::metering::action_weight(action))
+    }
+
     pub(crate) fn funded(balance: u128) -> AccountEntry {
         AccountEntry {
             balance,
@@ -658,7 +683,7 @@ mod tests {
         let db = precheck_test_db(&[]);
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             bob.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {
@@ -683,7 +708,7 @@ mod tests {
         let db = precheck_test_db(&[]);
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {
@@ -711,7 +736,7 @@ mod tests {
         let db = precheck_test_db(std::slice::from_ref(&alice));
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {
@@ -731,7 +756,7 @@ mod tests {
         let db = precheck_test_db(&[]);
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {
@@ -764,7 +789,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {
@@ -795,7 +820,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             bob.clone(),
-            funded(ACTION_FEE),
+            funded(FEE_BUDGET),
         )]))])
         .unwrap();
         let action = Action {

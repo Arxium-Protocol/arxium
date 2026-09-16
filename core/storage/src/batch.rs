@@ -336,6 +336,27 @@ impl BatchWritable for OperatorUpdates {
     }
 }
 
+/// `weight_used` of block `height` (`xc_executor::ExecutionOutcome`), kept
+/// beside the block so an attester can hash the same PoE `resources_used`
+/// the producer did (`xc_poe::block_ep`) without re-executing. `CF_META`:
+/// it is implied by the state root already (fees are a function of weight),
+/// so it must not move the root a second time.
+#[derive(Debug, Clone, Copy)]
+pub struct BlockWeight {
+    pub height: u64,
+    pub weight_used: u64,
+}
+
+pub(crate) fn block_weight_key(height: u64) -> Vec<u8> {
+    format!("meta:block_weight:{height:020}").into_bytes()
+}
+
+impl BatchWritable for BlockWeight {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        Ok(vec![(block_weight_key(self.height), self.weight_used.to_le_bytes().to_vec())])
+    }
+}
+
 /// A block finality certificate: proof 2/3+ of `height`'s validator set
 /// independently BLS-signed `block_hash`. Stored as its own record rather
 /// than a `Block<P>` field — it's produced in a second round after the

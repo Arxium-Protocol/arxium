@@ -444,7 +444,7 @@ pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
 mod tests {
     use super::*;
     use crate::test_support::*;
-    use crate::{ACTION_FEE, ActionPayload};
+    use crate::ActionPayload;
     use std::collections::HashMap;
     use xc_primitives::Action;
     use xc_storage::BlockView;
@@ -466,7 +466,7 @@ mod tests {
         let recipient = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let db = temp_db();
 
-        let mut issuer_account = funded(ACTION_FEE * 4);
+        let mut issuer_account = funded(FEE_BUDGET * 4);
         issuer_account.identity_hash = Some("kyc-issuer".into());
         let mut view = seeded_view(
             &db,
@@ -633,7 +633,7 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(ACTION_FEE * 8)), (bob.clone(), funded(ACTION_FEE * 8))]),
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET * 8)), (bob.clone(), funded(FEE_BUDGET * 8))]),
             HashMap::new(),
         );
         let register = |sender: &Address| ChainAction {
@@ -840,7 +840,7 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(stranger.clone(), funded(ACTION_FEE * 2))]),
+            HashMap::from([(stranger.clone(), funded(FEE_BUDGET * 2))]),
             HashMap::new(),
         );
         view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
@@ -902,8 +902,8 @@ mod tests {
         let mut view = seeded_view(
             &db,
             HashMap::from([
-                (issuer.clone(), funded(ACTION_FEE * 8)),
-                (stranger.clone(), funded(ACTION_FEE * 8)),
+                (issuer.clone(), funded(FEE_BUDGET * 8)),
+                (stranger.clone(), funded(FEE_BUDGET * 8)),
             ]),
             HashMap::new(),
         );
@@ -944,7 +944,7 @@ mod tests {
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let gold = gold_of(&issuer);
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(issuer.clone(), funded(ACTION_FEE * 8))]), HashMap::new());
+        let view = seeded_view(&db, HashMap::from([(issuer.clone(), funded(FEE_BUDGET * 8))]), HashMap::new());
         let register = |nonce: u64, id: &str| ChainAction {
             sender: issuer.clone(),
             nonce,
@@ -963,7 +963,7 @@ mod tests {
         assert!(err.to_string().contains("invalid nonce"), "{err}");
         let updates = dispatch_at(&register(0, "b"), &view, after).unwrap();
         assert_eq!(updates.accounts.0[&issuer].nonce, 1);
-        assert_eq!(updates.accounts.0[&issuer].balance, ACTION_FEE * 7, "fee still charged once");
+        assert_eq!(updates.accounts.0[&issuer].balance, FEE_BUDGET * 8 - fee_of(&register(0, "b")), "fee still charged once");
 
         // An action whose circuit already bumps the nonce is not bumped twice.
         let issue = ChainAction { sender: issuer.clone(), nonce: 0, signature: None, payload: ActionPayload::IssueAsset { asset: gold.clone(), amount: 5 } };
@@ -984,8 +984,8 @@ mod tests {
         let mut view = seeded_view(
             &db,
             HashMap::from([
-                (governor.clone(), funded(ACTION_FEE * 4)),
-                (issuer.clone(), funded(ACTION_FEE * 4)),
+                (governor.clone(), funded(FEE_BUDGET * 4)),
+                (issuer.clone(), funded(FEE_BUDGET * 4)),
             ]),
             HashMap::new(),
         );
