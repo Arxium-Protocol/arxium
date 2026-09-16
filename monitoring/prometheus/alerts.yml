@@ -59,3 +59,60 @@ groups:
           severity: warning
         annotations:
           summary: "{{ $value }} actions have been pending for at least 5 minutes"
+
+  # Only fires on a host that also scrapes the `retracer` job in
+  # prometheus.yml, i.e. one also running retracerd (Retracer T8/T10, see
+  # Retracer_Tasks.md in the retracer repo). Harmless if that job isn't
+  # configured: these rules simply never match any series.
+  - name: retracer
+    rules:
+      - alert: RetracerDown
+        expr: up{job="retracer"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retracer metrics are unavailable"
+          description: >
+            Prometheus has been unable to scrape retracerd for two minutes.
+            Check systemctl status retracerd and curl
+            http://127.0.0.1:8080/health.
+
+      - alert: RetracerLagging
+        expr: retracer_blocks_behind > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retracer chain {{ $labels.chain_id }} is {{ $value }} blocks behind"
+          description: >
+            The indexed height has trailed the network tip by more than 30
+            blocks for five minutes.
+
+      # Alert on the tip timestamp, not the lag figure — mirrors
+      # ArxiumChainStalled above. A halted node can leave retracer_blocks_behind
+      # at zero while nothing new is being indexed.
+      - alert: RetracerChainStalled
+        expr: retracer_tip_age_seconds > 120
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retracer chain {{ $labels.chain_id }} tip is stale ({{ $value | humanizeDuration }} old)"
+          description: >
+            The indexed tip's own on-chain timestamp has been more than 120
+            seconds behind wall-clock time for five minutes, even though
+            retracer_blocks_behind may still read zero.
+
+      # The 20 GB budget is a placeholder — set it to this host's actual
+      # disk allowance for the Postgres volume before trusting this alert.
+      - alert: RetracerDiskGrowth
+        expr: predict_linear(retracer_database_size_bytes[6h], 7 * 24 * 3600) > 20e9
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Retracer's database is projected to exceed its disk budget within a week"
+          description: >
+            Linear projection of retracer_database_size_bytes over the last
+            6 hours crosses the configured budget within the next 7 days.

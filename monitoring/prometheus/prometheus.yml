@@ -9,3 +9,19 @@ scrape_configs:
   - job_name: arxium-node
     static_configs:
       - targets: ['127.0.0.1:30333']
+
+  # Commented out by default: this file is shared by every node deployment,
+  # and most don't run retracerd. Uncomment only on a host that also runs
+  # Retracer (Retracer T8, see Retracer_Tasks.md) — leaving it active on an
+  # arxd-only host makes the target permanently unreachable, which is a
+  # real "down" for Prometheus and fires RetracerDown (alerts.yml) forever.
+  #
+  # retracerd binds /metrics to loopback by default (--rest-bind,
+  # RETRACER_REST_BIND), matching arxd's own bind-to-loopback posture above,
+  # so no bearer token is configured here either. If retracerd is started
+  # with --auth-token, add an authorization block and point credentials_file
+  # at a root-only file containing just the token (Prometheus's config
+  # format, not a KEY=VALUE .env line).
+  # - job_name: retracer
+  #   static_configs:
+  #     - targets: ['127.0.0.1:8080']
