@@ -17,14 +17,21 @@ scrape_configs:
   # real "down" for Prometheus and fires RetracerDown (alerts.yml) forever.
   #
   # retracerd binds /metrics to loopback by default (--rest-bind,
-  # RETRACER_REST_BIND), matching arxd's own bind-to-loopback posture above,
-  # so no bearer token is configured here either. If retracerd is started
-  # with --auth-token, add an authorization block and point credentials_file
-  # at a root-only file containing just the token (Prometheus's config
-  # format, not a KEY=VALUE .env line).
+  # RETRACER_REST_BIND), matching arxd's own bind-to-loopback posture above.
+  #
+  # Unlike /health and /ready, /metrics is NOT exempt from retracerd's
+  # bearer auth, so wherever RETRACER_AUTH_TOKEN is set the scrape must send
+  # it or every request returns 401 — which reads as a down target and fires
+  # RetracerDown forever. credentials_file wants a file holding just the
+  # token (Prometheus config format, not a KEY=VALUE .env line), readable by
+  # the unprivileged prometheus account. Arxium-Ops provisions exactly that
+  # on a managed host; drop the authorization block if the retracerd you are
+  # scraping runs without a token.
   # - job_name: retracer
   #   # Each scrape re-runs Retracer's database/table-size queries; don't
   #   # inherit this file's 5s global interval meant for arxd's own metrics.
   #   scrape_interval: 30s
+  #   authorization:
+  #     credentials_file: /etc/arxium-monitoring/retracer-scrape-token
   #   static_configs:
   #     - targets: ['127.0.0.1:8080']
