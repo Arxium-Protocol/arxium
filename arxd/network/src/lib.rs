@@ -5,8 +5,11 @@ mod discovery;
 mod gossip;
 pub mod identity;
 mod recovery;
+mod snapshot_sync;
 mod sync;
 mod transport;
+
+pub use snapshot_sync::SnapshotTrust;
 
 pub use gossip::Payload;
 pub use libp2p::PeerId;
@@ -94,6 +97,9 @@ pub struct P2pConfig<'a, P: Payload> {
     pub payload_precheck: Option<PayloadPrecheck<P>>,
     /// Operator-set resource limits; this crate reads `max_peers_incoming`.
     pub limits: xc_primitives::Limits,
+    /// Snapshot sync anchor (`--snapshot-trust-height`/`-hash`). Only acted
+    /// on while this node is still at genesis; see `snapshot_sync`.
+    pub snapshot_trust: Option<SnapshotTrust>,
 }
 
 pub type OnBlock<P> = Box<dyn Fn(Block<P>, bool) -> bool + Send>;
@@ -202,6 +208,7 @@ pub fn spawn_p2p_node<P: Payload>(config: P2pConfig<'_, P>) -> Result<PeerId> {
         on_round_timeout_vote,
         payload_precheck,
         limits,
+        snapshot_trust,
     } = config;
 
     let keypair = if is_bootnode {
@@ -255,6 +262,7 @@ pub fn spawn_p2p_node<P: Payload>(config: P2pConfig<'_, P>) -> Result<PeerId> {
                 on_round_timeout_vote,
                 payload_precheck,
                 limits,
+                snapshot_trust,
             },
             ready_tx,
         ));
@@ -287,6 +295,7 @@ struct SwarmParams<'a, P: Payload> {
     on_round_timeout_vote: OnRoundTimeoutVote,
     payload_precheck: Option<PayloadPrecheck<P>>,
     limits: xc_primitives::Limits,
+    snapshot_trust: Option<SnapshotTrust>,
 }
 
 async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::Sender<Result<()>>) {
@@ -308,6 +317,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
         on_round_timeout_vote,
         payload_precheck,
         limits,
+        snapshot_trust,
     } = params;
     let mut swarm = match build_swarm(keypair, chain_id, limits.max_peers_incoming) {
         Ok(swarm) => swarm,
@@ -395,6 +405,19 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
     // ignored — a peer must not be able to start a rollback conversation this
     // node didn't open.
     let mut recovering: HashMap<PeerId, RecoveryStep> = HashMap::new();
+    // Snapshot sync runs only on a node that has nothing but genesis; a
+    // restarted node with history ignores the anchor and syncs blocks.
+    let mut snapshot: Option<snapshot_sync::SnapshotSync<P>> = match snapshot_trust {
+        Some(trust) if local_tip_height(&db) == 0 => {
+            info!("snapshot sync: will fetch state at height {} ({}) from the first peer that can serve it", trust.height, trust.block_hash);
+            Some(snapshot_sync::SnapshotSync::new(trust))
+        }
+        Some(trust) => {
+            info!("snapshot sync: anchor at height {} ignored, this node already has history", trust.height);
+            None
+        }
+        None => None,
+    };
     // When the last automatic revert happened — see `recovery::REVERT_COOLDOWN`.
     let mut last_revert: Option<Instant> = None;
     // Latched once this node learns, from a certificate it verified itself,
@@ -800,14 +823,42 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             SyncResponse::NodeInfo(_) => "node_info",
                             SyncResponse::Hashes(_) => "hashes",
                             SyncResponse::Certificate { .. } => "certificate",
+                            SyncResponse::SnapshotManifest(_) => "snapshot_manifest",
+                            SyncResponse::SnapshotChunk { .. } => "snapshot_chunk",
                         };
                         counter!("arxium_sync_responses_total", "kind" => kind).increment(1);
+                        // While a snapshot is being fetched, every step of it
+                        // goes through the state machine and nothing else
+                        // (no block sync from height 1 underneath it).
+                        if let Some(sync) = snapshot.as_mut() {
+                            let step = match &sync_response {
+                                SyncResponse::Status { tip_height } => sync.on_peer_tip(peer, *tip_height),
+                                SyncResponse::SnapshotManifest(manifest) => sync.on_manifest(peer, manifest.clone()),
+                                SyncResponse::SnapshotChunk { height, index, entries } => {
+                                    sync.on_chunk(peer, &db, *height, *index, entries.clone())
+                                }
+                                _ => snapshot_sync::Step::Idle,
+                            };
+                            match step {
+                                snapshot_sync::Step::Request(request) => send_sync_request(&mut swarm, &peer, &request),
+                                snapshot_sync::Step::Done => {
+                                    let from = sync.height() + 1;
+                                    snapshot = None;
+                                    catching_up_since.get_or_insert_with(Instant::now);
+                                    send_sync_request(&mut swarm, &peer, &SyncRequest::Blocks { from });
+                                }
+                                snapshot_sync::Step::Retry | snapshot_sync::Step::Idle => {}
+                            }
+                            continue;
+                        }
                         match sync_response {
                             // The node never asks for these — they exist for
                             // followers. Receiving one means a peer answered a
                             // question we didn't ask, so note it and move on
                             // rather than treating it as protocol breakage.
-                            SyncResponse::NodeInfo(_) => {
+                            SyncResponse::NodeInfo(_)
+                            | SyncResponse::SnapshotManifest(_)
+                            | SyncResponse::SnapshotChunk { .. } => {
                                 warn!("unsolicited {kind} response from {peer}, ignoring");
                             }
                             // Step one of divergence recovery: locate the
@@ -1150,6 +1201,7 @@ mod tests {
             on_round_timeout_vote: Box::new(|_| {}),
             payload_precheck: None,
             limits: xc_primitives::Limits::default(),
+            snapshot_trust: None,
         })
         .expect("node should start on OS-assigned port");
         assert!(!peer_id.to_string().is_empty());

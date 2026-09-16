@@ -189,6 +189,7 @@ mod tests {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
             limits: xc_primitives::Limits::default(),
+            snapshot_trust: None,
         }
     }
 
@@ -277,6 +278,7 @@ mod tests {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
             limits: xc_primitives::Limits::default(),
+            snapshot_trust: None,
         };
 
         assert!(

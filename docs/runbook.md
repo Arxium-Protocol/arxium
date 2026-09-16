@@ -415,6 +415,33 @@ having one.
    so losing the data directory without a data backup means losing chain
    history, not just re-deriving it from the key.
 
+### Snapshot sync (join without replaying from genesis)
+
+A fresh node can fetch state at a finalized height from a peer instead of
+replaying every block. Trust comes from you, not the peer: pick a recent
+finalized block from the explorer (or a node you run) and pass its height
+and hash —
+
+```bash
+arxd run --snapshot-trust-height 120000 --snapshot-trust-hash 0x…
+```
+
+(`ARXD_SNAPSHOT_TRUST_HEIGHT` / `ARXD_SNAPSHOT_TRUST_HASH` in the env file.)
+The node asks the first peer whose tip covers that height for a manifest,
+refuses it unless the block hashes to your anchor, downloads the state in
+chunks, checks the finality certificate against the validator set the
+snapshot carries, recomputes the state root of everything it downloaded and
+requires it to equal the block's `state_root` — and only then writes it and
+continues with ordinary block sync from the next height. Anything that
+fails is logged as `snapshot sync: …` and the next peer is tried.
+
+Constraints: only a node still at genesis acts on the anchor (a node with
+history ignores it); the serving peer must not have pruned blocks below the
+anchor and must still hold the undo window for it — 5,000 blocks below its
+watermark (`xc_storage::UNDO_RETAIN`), so pick an anchor from the last
+couple of hours. A snapshot-synced node holds no blocks below the anchor;
+it serves `Blocks` only from there.
+
 ## Incident playbooks
 
 **Node up, tip stuck.**

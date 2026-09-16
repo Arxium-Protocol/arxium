@@ -166,6 +166,11 @@ pub struct NodeConfig {
     /// deployments should sit behind a TLS-terminating reverse proxy.
     pub rpc_bind: String,
     pub limits: Limits,
+    /// Snapshot-sync anchor `(height, block hash)` of a finalized block the
+    /// operator trusts (from an explorer or a node they run). A node still
+    /// at genesis fetches state at that height instead of replaying from
+    /// genesis; a node with history ignores it. `None`: replay.
+    pub snapshot_trust: Option<(u64, String)>,
 }
 
 // --- 2. The Key Types ---

@@ -206,6 +206,40 @@ pub mod state_trie {
         Ok((siblings, node))
     }
 
+    /// The root a trie holding exactly `leaves` (`key_hash -> value`) would
+    /// have, computed in memory with no storage at all — what a snapshot
+    /// importer checks a whole downloaded state against before writing a
+    /// byte of it (`xc_storage::ArxiumDb::import_snapshot`). Same hashing as
+    /// the incremental `descend`/`apply` path, so it equals what
+    /// `compute_state_root` reports for the same contents.
+    ///
+    /// ponytail: O(n × 256) hashes in the worst case — every leaf owns a
+    /// full path — which is seconds for a devnet-sized state. Good enough
+    /// until a state has millions of keys; the upgrade is to hash shared
+    /// prefixes once (a radix walk over the sorted hashes), not a new trie.
+    pub fn root_of(leaves: &std::collections::BTreeMap<[u8; 32], Vec<u8>>) -> [u8; 32] {
+        let hashed: Vec<([u8; 32], [u8; 32])> =
+            leaves.iter().map(|(key_hash, value)| (*key_hash, leaf_hash(key_hash, value))).collect();
+        subtree_root(&hashed, 0)
+    }
+
+    /// Root of the subtree at `level` (0 = whole trie) holding `sorted`,
+    /// which is sorted by key hash and lies entirely under this subtree.
+    fn subtree_root(sorted: &[([u8; 32], [u8; 32])], level: usize) -> [u8; 32] {
+        let defaults = default_hashes();
+        match sorted {
+            [] => defaults[256 - level],
+            [(_, leaf)] if level == 256 => *leaf,
+            _ => {
+                // Sorted by hash, so everything with bit `level` clear comes
+                // first: a single partition point splits left from right.
+                let split = sorted.partition_point(|(key_hash, _)| bit_at(key_hash, level) == 0);
+                let (left, right) = sorted.split_at(split);
+                internal_hash(&subtree_root(left, level + 1), &subtree_root(right, level + 1))
+            }
+        }
+    }
+
     /// A key's membership (`value: Some`) or non-membership (`value: None`)
     /// under a given root: the leaf's value plus the sibling at each of the
     /// 256 levels from the root down to the leaf, in that order. Bisection

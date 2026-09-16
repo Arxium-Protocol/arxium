@@ -37,8 +37,8 @@ pub fn sync_protocol(chain_id: &str) -> String {
 /// apart within one `SYNC_PROTOCOL` generation.
 ///
 /// 1 = `Status` + `Blocks`. 2 = adds `NodeInfo` and `Hashes`. 3 = adds
-/// `Certificate`.
-pub const WIRE_VERSION: u32 = 3;
+/// `Certificate`. 4 = adds `SnapshotManifest` and `SnapshotChunk`.
+pub const WIRE_VERSION: u32 = 4;
 
 /// `Blocks` returns at most the responder's page size (see
 /// [`NodeInfo::max_page_size`]) starting at `from`, capped at its local tip —
@@ -73,6 +73,42 @@ pub enum SyncRequest {
     Certificate {
         height: u64,
     },
+    /// Snapshot sync: describe the responder's state as of `height`, so a
+    /// joining node can skip replaying history. The asker names the height
+    /// (its operator's trust anchor); the responder can only answer for a
+    /// height it can still reconstruct — see `xc_storage::UNDO_RETAIN`.
+    SnapshotManifest {
+        height: u64,
+    },
+    /// One chunk of the snapshot a `SnapshotManifest` described.
+    SnapshotChunk {
+        height: u64,
+        index: u32,
+    },
+}
+
+/// One raw `(column family, key, value)` row of a node's state, exactly as
+/// `xc_storage` stores it. Opaque here: the importer verifies the whole set
+/// against a certified state root, never one row.
+pub type SnapshotEntry = (String, Vec<u8>, Vec<u8>);
+
+/// Answer to [`SyncRequest::SnapshotManifest`]. The block and its finality
+/// certificate ride along bincode-encoded (opaque here, as `Certificate` is)
+/// so the asker can tie `state_root` to the block its trust anchor names and
+/// to a quorum of the validator set the snapshot itself carries.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub height: u64,
+    pub block_hash: String,
+    pub state_root: String,
+    pub entries: u64,
+    pub chunks: u32,
+    /// SHA-256 of each chunk's bincode-encoded entry list — an IO checksum
+    /// against a corrupt or truncated chunk, *not* a trust anchor (the
+    /// responder chose them). Trust comes from the root check on import.
+    pub chunk_hashes: Vec<[u8; 32]>,
+    pub block: Vec<u8>,
+    pub certificate: Vec<u8>,
 }
 
 /// Generic over the *block* type, not the payload inside it. The protocol only
@@ -96,6 +132,16 @@ pub enum SyncResponse<B> {
     Certificate {
         height: u64,
         record: Option<Vec<u8>>,
+    },
+    /// `None`: the responder cannot serve that height (above its tip, not
+    /// certified, or its undo window has passed it) — not an error, ask
+    /// another peer or pick a newer anchor.
+    SnapshotManifest(Option<SnapshotManifest>),
+    /// `None` entries: same as above, or an index past `chunks`.
+    SnapshotChunk {
+        height: u64,
+        index: u32,
+        entries: Option<Vec<SnapshotEntry>>,
     },
 }
 

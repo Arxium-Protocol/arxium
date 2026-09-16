@@ -159,6 +159,14 @@ pub(crate) fn build_sync_response<P: Payload>(
                 });
             SyncResponse::<Block<P>>::Certificate { height, record }
         }
+        SyncRequest::SnapshotManifest { height } => {
+            SyncResponse::<Block<P>>::SnapshotManifest(crate::snapshot_sync::manifest::<P>(db, height))
+        }
+        SyncRequest::SnapshotChunk { height, index } => SyncResponse::<Block<P>>::SnapshotChunk {
+            height,
+            index,
+            entries: crate::snapshot_sync::chunk(db, height, index),
+        },
     }
 }
 
@@ -200,6 +208,8 @@ pub(crate) fn send_sync_request(
         SyncRequest::NodeInfo => "node_info",
         SyncRequest::Hashes { .. } => "hashes",
         SyncRequest::Certificate { .. } => "certificate",
+        SyncRequest::SnapshotManifest { .. } => "snapshot_manifest",
+        SyncRequest::SnapshotChunk { .. } => "snapshot_chunk",
     };
     match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
         Ok(bytes) => {

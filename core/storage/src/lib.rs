@@ -61,6 +61,10 @@ pub enum StorageError {
     #[error("RocksDB underlying error: {0}")]
     Rocks(#[from] rocksdb::Error),
 
+    /// `import_snapshot` refused its input — nothing was written.
+    #[error("snapshot rejected: {0}")]
+    SnapshotRejected(String),
+
     #[error("encode error: {0}")]
     Encode(#[from] bincode::error::EncodeError),
 
@@ -371,9 +375,11 @@ pub struct ArxiumDb {
 }
 
 mod batch;
+mod snapshot;
 mod view;
 
 pub use batch::*;
+pub use snapshot::{SNAPSHOT_CHUNK_BYTES, UNDO_RETAIN, snapshot_chunks};
 pub use view::BlockView;
 
 /// One batch's worth of raw key-value pairs, exactly as they go to RocksDB.
@@ -957,9 +963,10 @@ impl ArxiumDb {
     /// certificates simply don't move it; they get absorbed later when the gap
     /// they left ahead of the watermark fills in.
     ///
-    /// Undo records at or below the new watermark are dropped in the same
-    /// batch — the watermark is the revert floor, so they can never be needed
-    /// again, and this is what stops the log growing without bound.
+    /// Undo records more than `UNDO_RETAIN` below the new watermark are
+    /// dropped in the same batch — the watermark is the revert floor, so
+    /// those can never be needed for a revert; the window above that floor
+    /// is kept so `state_at` can still serve a snapshot at a recent height.
     fn stage_watermark_advance(
         &self,
         incoming: &BTreeMap<u64, String>,
@@ -993,7 +1000,8 @@ impl ArxiumDb {
             return Ok(());
         }
         batch.put_cf(self.cf(CF_META), FINAL_WATERMARK_KEY, watermark.to_be_bytes());
-        for height in start + 1..=watermark {
+        let was_pruned_to = start.saturating_sub(UNDO_RETAIN);
+        for height in was_pruned_to + 1..=watermark.saturating_sub(UNDO_RETAIN) {
             batch.delete_cf(self.cf(CF_META), undo_key(height));
         }
         Ok(())
@@ -2984,24 +2992,35 @@ mod divergence_recovery_tests {
         assert!(db.get_account_assets(&addr(1)).unwrap().is_empty());
     }
 
-    /// Undo records below the watermark can never be needed — the watermark is
-    /// the revert floor — so they must not accumulate forever.
+    /// Undo records below the watermark can never be needed for a revert —
+    /// the watermark is the revert floor — so they must not accumulate
+    /// forever; but the `UNDO_RETAIN` window under it is kept for snapshot
+    /// sync, so a short chain prunes nothing.
     #[test]
     fn undo_records_are_pruned_once_the_watermark_passes_them() {
         let db = ArxiumDb::open(&temp_path()).unwrap();
         for height in 0..=5 {
             commit(&db, height, 1, height as u128);
         }
-        assert!(db.get(&undo_key(3)).unwrap().is_some());
-
         for height in 1..=4 {
             certify(&db, height);
         }
         assert_eq!(db.get_final_watermark().unwrap(), 4);
-        for height in 1..=4 {
-            assert!(db.get(&undo_key(height)).unwrap().is_none(), "undo {height} should be pruned");
+        for height in 1..=5 {
+            assert!(db.get(&undo_key(height)).unwrap().is_some(), "undo {height} inside the retain window");
         }
-        assert!(db.get(&undo_key(5)).unwrap().is_some(), "above the watermark, still needed");
+        // Fake a watermark far past the window and advance once more: only
+        // heights more than `UNDO_RETAIN` below it go.
+        let mut batch = WriteBatch::default();
+        batch.put_cf(db.cf(CF_META), FINAL_WATERMARK_KEY, (UNDO_RETAIN + 2).to_be_bytes());
+        db.db.write(batch).unwrap();
+        for height in 6..=UNDO_RETAIN + 3 {
+            commit(&db, height, 1, height as u128);
+        }
+        certify(&db, UNDO_RETAIN + 3);
+        assert_eq!(db.get_final_watermark().unwrap(), UNDO_RETAIN + 3);
+        assert!(db.get(&undo_key(3)).unwrap().is_none(), "undo 3 is past the window");
+        assert!(db.get(&undo_key(4)).unwrap().is_some(), "undo 4 is exactly UNDO_RETAIN below");
     }
 
     /// The case that makes the watermark a floor on *this node's* history

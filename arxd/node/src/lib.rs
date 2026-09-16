@@ -1301,6 +1301,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
             limits: xc_primitives::Limits::default(),
+            snapshot_trust: None,
         };
         let components = new_partial::<R>(&config)?;
         components.db.export_checkpoint(output).with_context(|| {
@@ -1334,6 +1335,7 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             rpc_token: None,
             rpc_bind: "127.0.0.1".to_string(),
             limits: xc_primitives::Limits::default(),
+            snapshot_trust: None,
         };
         let components = new_partial::<R>(&config)?;
         let tip = components.db.get_tip_height()?.unwrap_or(0);
@@ -1536,6 +1538,10 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         on_round_timeout_vote: Box::new(on_round_timeout_vote),
         payload_precheck: Some(payload_precheck.clone()),
         limits: config.limits.clone(),
+        snapshot_trust: config
+            .snapshot_trust
+            .clone()
+            .map(|(height, block_hash)| arxd_network::SnapshotTrust { height, block_hash }),
     })?;
 
     produce::produce_loop::<R>(

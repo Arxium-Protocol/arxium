@@ -227,6 +227,20 @@ pub struct RunArgs {
     #[command(flatten)]
     pub limits: LimitArgs,
 
+    /// Snapshot sync: height of a finalized block you trust (read it off an
+    /// explorer or a node you run). With `--snapshot-trust-hash`, a fresh
+    /// node downloads the state at that height from a peer and verifies it
+    /// against the block instead of replaying from genesis. Ignored once
+    /// the node has history. The peer must still hold that height's undo
+    /// window (`xc_storage::UNDO_RETAIN` blocks below its watermark), so
+    /// pick a recent one.
+    #[arg(long, env = "ARXD_SNAPSHOT_TRUST_HEIGHT", requires = "snapshot_trust_hash")]
+    pub snapshot_trust_height: Option<u64>,
+
+    /// The `0x…` hash of the block at `--snapshot-trust-height`.
+    #[arg(long, env = "ARXD_SNAPSHOT_TRUST_HASH", requires = "snapshot_trust_height")]
+    pub snapshot_trust_hash: Option<String>,
+
     /// Harness-only, and only compiled in at all with `--features
     /// fault-injection` (never present in a normal build): corrupt this
     /// node's own computed state_root by one bit the next time it produces
@@ -337,6 +351,7 @@ impl RunArgs {
                 .into_iter()
                 .filter(|addr| !addr.trim().is_empty())
                 .collect(),
+            snapshot_trust: self.snapshot_trust_height.zip(self.snapshot_trust_hash),
             is_bootnode: self.bootnode,
             is_validator: self.validator,
             rpc_token: self.rpc_token,
