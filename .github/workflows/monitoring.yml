@@ -1,0 +1,74 @@
+name: Monitoring bundle
+
+# The `monitoring` job in ci.yml validates this bundle too, but that whole
+# workflow is the release pipeline: it triggers only on a version tag and
+# its later jobs publish a GitHub release and dispatch a deployment to
+# Arxium-Ops. It cannot be given a pull_request trigger without those jobs
+# becoming reachable from a PR, so the config checks live here as well and
+# run on every change to the bundle.
+#
+# This workflow deliberately stops at the static checks. The container and
+# native-installer smoke tests stay tag-only in ci.yml: they need sudo,
+# nftables and systemd, take minutes, and exercise the installer rather
+# than the files edited in a typical monitoring change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'monitoring/**'
+      - '.github/workflows/monitoring.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'monitoring/**'
+      - '.github/workflows/monitoring.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: monitoring-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate monitoring bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out Arxium
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Check shell syntax
+        shell: bash
+        run: bash -n scripts/install.sh monitoring/native/*.sh
+
+      - name: Check Prometheus configuration and rules
+        shell: bash
+        run: |
+          docker run --rm --entrypoint promtool \
+            --volume "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.7.2 \
+            check config /etc/prometheus/prometheus.yml
+
+      # `check config` only proves the rules parse. This asserts what they
+      # actually fire on, which is how a rule that never matches anything
+      # gets caught.
+      - name: Unit-test the alert rules
+        shell: bash
+        run: |
+          docker run --rm --entrypoint promtool \
+            --volume "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.7.2 \
+            test rules /etc/prometheus/alerts_test.yml
+
+      - name: Check Compose and dashboard files
+        shell: bash
+        env:
+          GRAFANA_ADMIN_PASSWORD: ci-placeholder-not-a-secret
+        run: |
+          docker compose -f monitoring/docker-compose.monitoring.yml config --quiet
+          jq empty monitoring/grafana/dashboards/arxium-node.json

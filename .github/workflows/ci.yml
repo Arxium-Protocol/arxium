@@ -162,6 +162,17 @@ jobs:
             prom/prometheus:v3.7.2 \
             check config /etc/prometheus/prometheus.yml
 
+      # `check config` only proves the rules parse. This asserts what they
+      # actually fire on, which is how a rule that never matches anything
+      # gets caught.
+      - name: Unit-test the alert rules
+        shell: bash
+        run: |
+          docker run --rm --entrypoint promtool \
+            --volume "$PWD/monitoring/prometheus:/etc/prometheus:ro" \
+            prom/prometheus:v3.7.2 \
+            test rules /etc/prometheus/alerts_test.yml
+
       - name: Check Compose and dashboard files
         shell: bash
         env:
@@ -342,7 +353,12 @@ jobs:
           cp target/release/arxd "dist/${out}/"
           tar -C dist -czf "dist/${out}.tar.gz" "${out}"
           rm -rf "dist/${out}"
-          tar -czf "dist/arxium-monitoring-${tag}.tar.gz" monitoring
+          # alerts_test.yml is CI-only fixture data for `promtool test rules`;
+          # Prometheus never loads it (prometheus.yml's rule_files lists just
+          # alerts.yml), so keep it out of what gets installed on a node.
+          tar -czf "dist/arxium-monitoring-${tag}.tar.gz" \
+            --exclude='monitoring/prometheus/alerts_test.yml' \
+            monitoring
 
       # scripts/install.sh verifies the node and monitoring archives against this file.
       # The same three checksums are exported so Arxium-Ops can pin the exact
