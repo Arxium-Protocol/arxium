@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use xc_circuit::{AssetKey, KvRead};
+use xc_circuit::{AdminRole, AssetKey, KvRead};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, Asset, AssetMetadata, AssetRef};
 use xc_storage::StorageError;
@@ -34,6 +34,19 @@ const MAX_DECIMALS: u8 = 18;
 /// generously, since this is a legal justification a human writes, but capped,
 /// because `MAX_WIRE_MESSAGE_SIZE` alone would permit most of a megabyte of it.
 const MAX_REASON_LEN: usize = 512;
+
+/// Every admin-gated action (`ForcedTransfer`, `IssuerForcedTransfer`,
+/// freeze/unfreeze, attestor register/deregister) carries a `reason` that
+/// must be non-blank and under `MAX_REASON_LEN`.
+pub(crate) fn check_reason(reason: &str, what: &str) -> anyhow::Result<()> {
+    if reason.trim().is_empty() {
+        anyhow::bail!("{what} needs a non-empty reason");
+    }
+    if reason.len() > MAX_REASON_LEN {
+        anyhow::bail!("reason is {} bytes, over the {MAX_REASON_LEN}-byte limit", reason.len());
+    }
+    Ok(())
+}
 
 /// Charset is restricted rather than case-folded, for two reasons.
 ///
@@ -199,9 +212,12 @@ pub(crate) fn transfer_asset<V: KvRead<Error = StorageError>>(
 }
 
 /// Sets or clears `Asset.frozen` (`FreezeAsset`/`UnfreezeAsset`). Authorized
-/// for the asset's own issuer or the chain governor: the issuer is the party
-/// that answers for the instrument, and the governor is the regulatory
+/// for the asset's own issuer or the freeze admin: the issuer is the party
+/// that answers for the instrument, and the freeze admin is the regulatory
 /// backstop for when the issuer is the problem.
+///
+/// `reason` is required and length-capped, same as `forced_transfer`; the
+/// block carrying the action is the audit record.
 ///
 /// Idempotent in both directions — freezing an already-frozen asset is a
 /// successful no-op write, so a caller never needs to read the current flag
@@ -213,12 +229,14 @@ pub(crate) fn set_frozen<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     asset: &AssetRef,
     frozen: bool,
+    reason: &str,
 ) -> anyhow::Result<BlockUpdates> {
+    check_reason(reason, if frozen { "a freeze" } else { "an unfreeze" })?;
     let mut asset = resolve_asset(view, asset)?;
     if action.sender != asset.issuer {
-        crate::identity::require_governor(view, action).map_err(|_| {
+        crate::identity::require_admin(view, action, AdminRole::Freeze).map_err(|_| {
             anyhow::anyhow!(
-                "{} is neither the issuer of {} nor the chain governor",
+                "{} is neither the issuer of {} nor the freeze admin",
                 action.sender, asset.asset_ref
             )
         })?;
@@ -230,7 +248,7 @@ pub(crate) fn set_frozen<V: KvRead<Error = StorageError>>(
     })
 }
 
-/// Moves an asset balance on the governor's authority alone
+/// Moves an asset balance on the recovery admin's authority alone
 /// (`ForcedTransfer`) — no signature from `from`, and none of the compliance,
 /// claim, jurisdiction or freeze gates, which is the entire point: the cases
 /// this exists for (court order, sanctions, a lost key) are ones ordinary
@@ -248,17 +266,9 @@ pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
     amount: u128,
     reason: &str,
 ) -> anyhow::Result<BlockUpdates> {
-    if reason.trim().is_empty() {
-        anyhow::bail!("a forced transfer needs a non-empty reason");
-    }
-    if reason.len() > MAX_REASON_LEN {
-        anyhow::bail!(
-            "reason is {} bytes, over the {MAX_REASON_LEN}-byte limit",
-            reason.len()
-        );
-    }
-    crate::identity::require_governor(view, action)
-        .map_err(|_| anyhow::anyhow!("only the chain governor may force a transfer"))?;
+    check_reason(reason, "a forced transfer")?;
+    crate::identity::require_admin(view, action, AdminRole::Recovery)
+        .map_err(|_| anyhow::anyhow!("only the recovery admin may force a transfer"))?;
 
     let asset = resolve_asset(view, asset)?;
     let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
@@ -329,7 +339,7 @@ pub(crate) fn lock_holder_amount<V: KvRead<Error = StorageError>>(
 }
 
 /// The issuer's forced transfer: same semantics and audit `reason` as the
-/// governor's, restricted to the issuer's own assets.
+/// freeze admin's, restricted to the issuer's own assets.
 pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -339,12 +349,7 @@ pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
     amount: u128,
     reason: &str,
 ) -> anyhow::Result<BlockUpdates> {
-    if reason.trim().is_empty() {
-        anyhow::bail!("a forced transfer needs a non-empty reason");
-    }
-    if reason.len() > MAX_REASON_LEN {
-        anyhow::bail!("reason is {} bytes, over the {MAX_REASON_LEN}-byte limit", reason.len());
-    }
+    check_reason(reason, "a forced transfer")?;
     let asset = require_issuer(view, action, asset)?;
     let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
     Ok(BlockUpdates {
@@ -578,6 +583,7 @@ mod tests {
             signature: None,
             payload: ActionPayload::FreezeAsset {
                 asset: gold.clone(),
+                reason: "test".into(),
             },
         };
         let updates = dispatch(&freeze, &view).unwrap();
@@ -611,6 +617,7 @@ mod tests {
             signature: None,
             payload: ActionPayload::UnfreezeAsset {
                 asset: gold.clone(),
+                reason: "test".into(),
             },
         };
         let updates = dispatch(&unfreeze, &view).unwrap();
@@ -830,10 +837,10 @@ mod tests {
         );
     }
 
-    /// Freeze is issuer-or-governor. This chain has no governor configured,
+    /// Freeze is issuer-or-freeze-admin. This chain has no freeze admin configured,
     /// so a third party has no route to it at all.
     #[test]
-    fn freeze_rejects_a_sender_who_is_neither_issuer_nor_governor() {
+    fn freeze_rejects_a_sender_who_is_neither_issuer_nor_freeze_admin() {
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let gold = gold_of(&issuer);
         let stranger = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
@@ -852,13 +859,61 @@ mod tests {
             signature: None,
             payload: ActionPayload::FreezeAsset {
                 asset: gold.clone(),
+                reason: "test".into(),
             },
         };
-        let err = set_frozen(&view, &action, &gold, true).unwrap_err();
+        let err = set_frozen(&view, &action, &gold, true, "test").unwrap_err();
         assert!(err.to_string().contains("neither the issuer"), "got: {err}");
     }
 
-    /// A forced transfer is governor-only and must carry a reason. The issuer
+    /// The roles are independent: holding the recovery (or attestor) key
+    /// does not grant freeze, and holding freeze does not grant forced
+    /// transfer. Same setup as above, but the stranger holds every role
+    /// except the one being checked.
+    #[test]
+    fn admin_roles_do_not_leak_into_each_other() {
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let gold = gold_of(&issuer);
+        let stranger = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(stranger.clone(), funded(FEE_BUDGET * 2))]),
+            HashMap::new(),
+        );
+        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
+            .unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Attestor), &stranger).unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &stranger).unwrap();
+
+        let action = ChainAction {
+            sender: stranger.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::FreezeAsset {
+                asset: gold.clone(),
+                reason: "test".into(),
+            },
+        };
+        let err = set_frozen(&view, &action, &gold, true, "test").unwrap_err();
+        assert!(err.to_string().contains("neither the issuer"), "got: {err}");
+
+        view.put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger).unwrap();
+        set_frozen(&view, &action, &gold, true, "test").unwrap();
+
+        // Freeze admin alone cannot force a transfer.
+        let mut freeze_only = seeded_view(
+            &db,
+            HashMap::from([(stranger.clone(), funded(FEE_BUDGET * 2))]),
+            HashMap::new(),
+        );
+        freeze_only.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true)).unwrap();
+        freeze_only.put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger).unwrap();
+        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why").unwrap_err();
+        assert!(err.to_string().contains("only the recovery admin"), "got: {err}");
+    }
+
+    /// A forced transfer is recovery-admin-only and must carry a reason. The issuer
     /// is deliberately *not* enough here, unlike freeze: moving someone
     /// else's holding without their signature is a regulatory power, not an
     /// issuer's housekeeping.
@@ -974,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn forced_transfer_requires_the_governor_and_a_non_empty_reason() {
+    fn forced_transfer_requires_the_recovery_admin_and_a_non_empty_reason() {
         let governor = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let gold = gold_of(&issuer);
@@ -989,7 +1044,7 @@ mod tests {
             ]),
             HashMap::new(),
         );
-        view.put(&xc_circuit::GovernorKey, &governor).unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &governor).unwrap();
         view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
             .unwrap();
         view.put(
@@ -1025,7 +1080,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            err.to_string().contains("only the chain governor"),
+            err.to_string().contains("only the recovery admin"),
             "got: {err}"
         );
 

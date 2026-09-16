@@ -12,7 +12,7 @@ use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, AssetIndexKey, AssetKey,
-    AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, GovernorKey, KeySpec,
+    AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, AdminKey, AdminRole, KeySpec,
     KvRead, OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorSetKey, ValidatorStatusKey,
     ChainParamsKey,
 };
@@ -185,8 +185,8 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// same "wipe and resync" policy as the prior bumps.
 ///
 /// Bumped 6 -> 7: three more `CF_META` rows joined the state trie, in a new
-/// `CF_GOVERNANCE` column family — the governor address (`meta:governor` ->
-/// `governor`, `GovernorKey`), the forward operator-authorization record
+/// `CF_GOVERNANCE` column family — the admin addresses (`meta:governor` ->
+/// `governor` -> `admin:*`, `AdminKey`), the forward operator-authorization record
 /// (`meta:operator:{validator}` -> `operator:{validator}`, `OperatorKey`;
 /// the reverse `meta:operator_index:` stays in `CF_META`, unprovable, same
 /// as `AssetIndexKey`), and the current BLS key row plus its new reverse
@@ -241,7 +241,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// (`JoinValidator`/`Stake`/`Unstake`/`LeaveValidator`/evidence) was
 /// silently unprovable to the adjudicator. Every one of those moves
 /// certified roots — devnet reset.
-pub const SCHEMA_VERSION: u32 = 12;
+///
+/// Bumped 12 -> 13: the single `governor` address split into three
+/// independently-checked roles (`admin:attestor`/`admin:freeze`/
+/// `admin:recovery`, `AdminKey`, `Snapshot.{attestor,freeze,recovery}_admin`).
+/// Certified-root change — devnet reset.
+pub const SCHEMA_VERSION: u32 = 13;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -354,7 +359,7 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         CF_ATTESTORS
     } else if key.starts_with(b"evidence:") {
         CF_EVIDENCE
-    } else if key.starts_with(b"governor")
+    } else if key.starts_with(b"admin:")
         || key.starts_with(b"operator:")
         || key.starts_with(b"operator_index:")
         || key == b"chain_params"
@@ -1930,7 +1935,9 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
-            governor: None,
+            attestor_admin: None,
+            freeze_admin: None,
+            recovery_admin: None,
         })
         .unwrap();
 
@@ -1967,7 +1974,9 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
-            governor: None,
+            attestor_admin: None,
+            freeze_admin: None,
+            recovery_admin: None,
         })
         .unwrap();
 
@@ -1997,7 +2006,9 @@ mod explorer_index_tests {
             validators,
             boot_nodes: vec![],
             attestor: None,
-            governor: None,
+            attestor_admin: None,
+            freeze_admin: None,
+            recovery_admin: None,
         })
         .unwrap();
 

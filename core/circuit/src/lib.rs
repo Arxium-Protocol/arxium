@@ -273,7 +273,7 @@ impl KeySpec for EvidenceMarkerKey<'_> {
 /// chosen: the value is the genesis state root itself, so storing it in a
 /// key `is_state_key` covers would change the very root it records. This is
 /// the one CF_META row of its kind left that structurally can never move —
-/// unlike `GovernorKey`, which was in the same "genesis-seeded, CF_META,
+/// unlike the old `GovernorKey` (now `AdminKey`), which was in the same "genesis-seeded, CF_META,
 /// read through `KvRead` at dispatch time" shape but had no such obstacle and
 /// has since moved to `CF_GOVERNANCE`.
 pub struct GenesisHashKey;
@@ -309,16 +309,44 @@ impl KeySpec for ChainParamsKey {
     }
 }
 
-/// Address allowed to `RegisterAttestor`/`DeregisterAttestor` — see
-/// `Snapshot::governor`. Lives in `CF_GOVERNANCE` (included in
-/// `is_state_key`) so both actions are provable to the proof-only
-/// adjudicator instead of failing closed.
-pub struct GovernorKey;
-impl KeySpec for GovernorKey {
+/// The three privileged roles that used to be one `governor` address —
+/// split so the party that decides who may act as a KYC provider, the
+/// party that can halt an instrument, and the party that can move a
+/// balance without its owner's signature are independently checkable
+/// keys. See `Snapshot::attestor_admin`/`freeze_admin`/`recovery_admin`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminRole {
+    /// `RegisterAttestor`/`DeregisterAttestor`.
+    Attestor,
+    /// `FreezeAsset`/`UnfreezeAsset` (alongside the asset's own issuer).
+    Freeze,
+    /// `ForcedTransfer`.
+    Recovery,
+}
+
+impl AdminRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            AdminRole::Attestor => "attestor admin",
+            AdminRole::Freeze => "freeze admin",
+            AdminRole::Recovery => "recovery admin",
+        }
+    }
+}
+
+/// Address holding `AdminRole`, seeded at genesis. Lives in
+/// `CF_GOVERNANCE` (included in `is_state_key`) so the gated actions are
+/// provable to the proof-only adjudicator instead of failing closed.
+pub struct AdminKey(pub AdminRole);
+impl KeySpec for AdminKey {
     const CF: &'static str = CF_GOVERNANCE;
     type Value = Address;
     fn encode(&self) -> Vec<u8> {
-        b"governor".to_vec()
+        match self.0 {
+            AdminRole::Attestor => b"admin:attestor".to_vec(),
+            AdminRole::Freeze => b"admin:freeze".to_vec(),
+            AdminRole::Recovery => b"admin:recovery".to_vec(),
+        }
     }
 }
 

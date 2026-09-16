@@ -477,7 +477,7 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
 /// claims may well be the reason the transfer is being forced. Freeze is
 /// likewise not a gate here: freezing an instrument is exactly when a
 /// regulator most needs to be able to move it. Authorization is the caller's
-/// job (the runtime restricts `ForcedTransfer` to the chain governor); this
+/// job (the runtime restricts `ForcedTransfer` to the recovery admin); this
 /// function assumes it has already been established.
 pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     view: &V,

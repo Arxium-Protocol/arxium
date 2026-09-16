@@ -632,7 +632,9 @@ mod tests {
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
             attestor: None,
-            governor: None,
+            attestor_admin: None,
+            freeze_admin: None,
+            recovery_admin: None,
         })
         .unwrap();
 

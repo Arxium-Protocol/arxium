@@ -208,20 +208,22 @@ pub enum ActionPayload {
         to: Address,
         amount: u128,
     },
-    /// Adds `attestor` to the trusted-attestor set (`identity::GovernorKey`
-    /// only, see `Snapshot.governor`) — the Trust Spectrum's multi-attestor
+    /// Adds `attestor` to the trusted-attestor set (the attestor admin
+    /// only, see `Snapshot.attestor_admin`) — the Trust Spectrum's multi-attestor
     /// model: more than one regulated KYC provider can hold
     /// `GrantAttestation`/`RevokeAttestation` rights at once. Rejected if
     /// `attestor` is already registered.
     RegisterAttestor {
         attestor: Address,
         name: String,
+        reason: String,
     },
-    /// Removes `attestor` from the trusted-attestor set (`GovernorKey`
+    /// Removes `attestor` from the trusted-attestor set (attestor admin
     /// only). Any registered attestor may still revoke attestations that
     /// `attestor` previously granted — see `identity::require_attestor`.
     DeregisterAttestor {
         attestor: Address,
+        reason: String,
     },
     /// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
     /// artifact (JSON-serialized `xc_artifact::EvidenceArtifact`) for
@@ -247,24 +249,29 @@ pub enum ActionPayload {
     /// than fail on them.
     FreezeAsset {
         asset: AssetRef,
+        reason: String,
     },
     /// Lifts a `FreezeAsset`. Idempotent — unfreezing an asset that isn't
-    /// frozen succeeds rather than erroring, so a governor never has to know
+    /// frozen succeeds rather than erroring, so an admin never has to know
     /// the current flag to reach the state they want.
     UnfreezeAsset {
         asset: AssetRef,
+        reason: String,
     },
     /// Moves `amount` of `asset` from `from` to `to` without `from`'s
     /// signature and without any compliance, claim, jurisdiction or freeze
-    /// check — the chain governor only. This is the recovery and enforcement
+    /// check — the recovery admin only. This is the recovery and enforcement
     /// path for what compliance cannot express: a court-ordered
     /// reassignment, a sanctioned holder, a holder who has lost their key.
     /// It still cannot mint: `from` must actually hold the balance.
     ///
-    /// `reason` is mandatory and non-empty. It is not stored in state — it
-    /// lives in the block that carried the action, which is the durable,
-    /// replicated audit record a regulator would be shown, and keeping it out
-    /// of state avoids growing the trie with free-text an issuer controls.
+    /// `reason` is mandatory and non-empty — as on every other admin-gated
+    /// action (`RegisterAttestor`/`DeregisterAttestor`/`FreezeAsset`/
+    /// `UnfreezeAsset`), so each privileged act is attributable *and*
+    /// justified. It is not stored in state — it lives in the block that
+    /// carried the action, which is the durable, replicated audit record a
+    /// regulator would be shown, and keeping it out of state avoids growing
+    /// the trie with free-text an issuer controls.
     ///
     /// Appended, like `FreezeAsset`/`UnfreezeAsset` above; the same note
     /// about Retracer's mirrored enum applies.
@@ -303,7 +310,7 @@ pub enum ActionPayload {
         amount: u128,
     },
     /// The issuer's own forced transfer, scoped to assets it issued, same audited `reason` as the
-    /// governor's `ForcedTransfer`. Variant 25.
+    /// recovery admin's `ForcedTransfer`. Variant 25.
     IssuerForcedTransfer {
         asset: AssetRef,
         from: Address,

@@ -4,7 +4,7 @@
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use std::sync::OnceLock;
-use xc_circuit::{AccountKey, AttestorRecordKey, GovernorKey, KvRead};
+use xc_circuit::{AccountKey, AdminKey, AdminRole, AttestorRecordKey, KvRead};
 use xc_executor::BlockUpdates;
 use xc_primitives::{AccountEntry, Address, AttestorRecord, ClaimTopic};
 use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
@@ -14,7 +14,7 @@ use crate::ChainAction;
 /// Shared authorization check for `GrantAttestation`/`RevokeAttestation` —
 /// both require `action.sender` to be a currently-registered attestor
 /// (`CF_ATTESTORS`, membership managed by `register_attestor`/
-/// `deregister_attestor`, both `GovernorKey`-gated). This is the Trust
+/// `deregister_attestor`, both `AdminRole::Attestor`-gated). This is the Trust
 /// Spectrum's multi-attestor model: more than one regulated KYC provider
 /// can hold this authority at once, rather than one chain-spec-fixed
 /// address for the whole chain's lifetime.
@@ -28,21 +28,21 @@ fn require_attestor<V: KvRead<Error = StorageError>>(
     Ok(())
 }
 
-/// Authorization check for `RegisterAttestor`/`DeregisterAttestor` —
-/// `action.sender` must be the chain-spec-designated governor
-/// (`identity::GovernorKey`, seeded at genesis; see `Snapshot.governor`).
-/// Deliberately a single fixed address for now, same walking-skeleton
-/// stage `require_attestor` used to be: a Compliance Committee
-/// (multi-sig/voting) is the deferred upgrade for this role.
-pub(crate) fn require_governor<V: KvRead<Error = StorageError>>(
+/// Authorization check for the privileged roles — `action.sender` must be
+/// the genesis-seeded holder of `role` (`AdminKey`, see
+/// `Snapshot.{attestor,freeze,recovery}_admin`). One address per role on
+/// chain; M-of-N approval is the custody behind that key, not a protocol
+/// feature.
+pub(crate) fn require_admin<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
+    role: AdminRole,
 ) -> anyhow::Result<()> {
-    let governor = view
-        .get(&GovernorKey)?
-        .ok_or_else(|| anyhow::anyhow!("chain has no governor configured"))?;
-    if action.sender != governor {
-        anyhow::bail!("{} is not the chain governor", action.sender);
+    let admin = view
+        .get(&AdminKey(role))?
+        .ok_or_else(|| anyhow::anyhow!("chain has no {} configured", role.name()))?;
+    if action.sender != admin {
+        anyhow::bail!("{} is not the {}", action.sender, role.name());
     }
     Ok(())
 }
@@ -54,9 +54,11 @@ pub(crate) fn register_attestor<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     attestor: &Address,
     name: &str,
+    reason: &str,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    require_governor(view, action)?;
+    crate::asset::check_reason(reason, "registering an attestor")?;
+    require_admin(view, action, AdminRole::Attestor)?;
     if view.get(&AttestorRecordKey(attestor))?.is_some() {
         anyhow::bail!("{attestor} is already a registered attestor");
     }
@@ -79,8 +81,10 @@ pub(crate) fn deregister_attestor<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     attestor: &Address,
+    reason: &str,
 ) -> anyhow::Result<BlockUpdates> {
-    require_governor(view, action)?;
+    crate::asset::check_reason(reason, "deregistering an attestor")?;
+    require_admin(view, action, AdminRole::Attestor)?;
     if view.get(&AttestorRecordKey(attestor))?.is_none() {
         anyhow::bail!("{attestor} is not a registered attestor");
     }

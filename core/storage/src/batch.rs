@@ -116,8 +116,14 @@ impl BatchWritable for Snapshot {
                 bincode::serde::encode_to_vec(&record, config)?,
             ));
         }
-        if let Some(governor) = &self.governor {
-            entries.push((GovernorKey.encode(), bincode::serde::encode_to_vec(governor, config)?));
+        for (role, admin) in [
+            (AdminRole::Attestor, &self.attestor_admin),
+            (AdminRole::Freeze, &self.freeze_admin),
+            (AdminRole::Recovery, &self.recovery_admin),
+        ] {
+            if let Some(admin) = admin {
+                entries.push((AdminKey(role).encode(), bincode::serde::encode_to_vec(admin, config)?));
+            }
         }
         Ok(entries)
     }

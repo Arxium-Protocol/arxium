@@ -976,21 +976,21 @@ mod tests {
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
-    /// Seeds `GovernorKey` directly, the same way `arxd/genesis` would via
-    /// `Snapshot.governor` — mirrors `xc_storage::GenesisHash`'s pattern for
+    /// Seeds the attestor-admin `AdminKey` directly, the same way `arxd/genesis`
+    /// would via `Snapshot.attestor_admin` — mirrors `xc_storage::GenesisHash`'s pattern for
     /// a single-key write outside a full genesis batch.
     struct GovernorSeed(Address);
     impl xc_storage::BatchWritable for GovernorSeed {
         fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
             Ok(vec![(
-                xc_circuit::GovernorKey.encode(),
+                xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor).encode(),
                 bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?,
             )])
         }
     }
 
     /// `RegisterAttestor` under `AuthorizeOperator`/`RevokeOperator`'s old
-    /// company: `GovernorKey` moved into `CF_GOVERNANCE` in the schema-v7
+    /// company: the governor key (now `AdminKey`) moved into `CF_GOVERNANCE` in the schema-v7
     /// migration specifically so governance actions like this one stop
     /// being fail-closed-by-construction and become real `Culpable`
     /// candidates, same as `Transfer`. A dissenter who claims the wrong
@@ -1015,6 +1015,7 @@ mod tests {
             payload: crate::ActionPayload::RegisterAttestor {
                 attestor: carol.clone(),
                 name: "kyc-provider".to_string(),
+                reason: "licensed".to_string(),
             },
         };
         let action_bytes =
@@ -1063,6 +1064,7 @@ mod tests {
             payload: crate::ActionPayload::RegisterAttestor {
                 attestor: carol.clone(),
                 name: "wrong-name".to_string(),
+                reason: "licensed".to_string(),
             },
         };
         let dissent_view = xc_storage::BlockView::new(&dissent_db);
@@ -1082,7 +1084,7 @@ mod tests {
             .unwrap();
         let dissent_post_root = dissent_db.compute_state_root(&[]).unwrap();
 
-        let governor_key = xc_circuit::GovernorKey.encode();
+        let governor_key = xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor).encode();
         let governor_account_key = AccountKey(&governor).encode();
         let attestor_key = AttestorRecordKey(&carol).encode();
         let proofs = vec![
