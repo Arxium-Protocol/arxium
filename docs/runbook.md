@@ -531,6 +531,25 @@ recovery is DB-specific troubleshooting, not covered here.
    post-restart `produced block N ...` / `accepted gossiped block N ...`
    line before considering the restart done.
 
+### Schema bumps: migration or reset?
+
+Every release says which of the two it is; the rule behind the call is fixed:
+
+- **A bump that changes anything inside the state trie** (accounts,
+  validators, assets, attestors, evidence, governance — key layout or
+  bincode shape) ships as **`reset-required`**. There is no in-place
+  migration that preserves the certified `state_root`s, so the store has to
+  be rebuilt from genesis or from a snapshot (`--snapshot-sync`, above).
+- **A bump that touches only `CF_META`** (chain params, cursors, key
+  registries — nothing the state root covers) ships with an in-place
+  `migrate_N_to_M` and a plain restart applies it.
+
+On a mismatch in either direction the node refuses to start rather than
+guess (`migrate_schema` fails closed on older *and* newer stores), so
+swapping the binary on the wrong store never corrupts anything — it just
+won't come up. Release notes name the kind; if they don't, treat it as
+reset-required.
+
 ## Rotating the RPC bearer token
 
 Update `ARXD_RPC_TOKEN` in `.env`, `docker compose -f
