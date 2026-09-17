@@ -34,7 +34,7 @@ struct Args {
     #[arg(long)]
     amount: Option<u128>,
 
-    /// Stake to bond, bookkeeping-only for now. Required for "join-validator".
+    /// Stake to bond (IUM). Debited from the sender and bonded on-chain; must meet `MIN_VALIDATOR_STAKE`. Required for "join-validator".
     #[arg(long)]
     stake: Option<u128>,
 
