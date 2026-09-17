@@ -268,8 +268,8 @@ pub fn apply_unstake<V: KvRead<Error = StorageError>>(
     Ok((AccountUpdates(account_updates), stake_updates))
 }
 
-/// Burns `amount` (capped at what's staked) from `validator`'s sub-account,
-/// hitting `active_amount` first and spilling into an in-flight
+/// Moves `amount` (capped at what's staked) from `validator`'s sub-account
+/// into `reward_pool_account`, hitting `active_amount` first and spilling into an in-flight
 /// `unbonding.amount` — this is the whole point of the unbonding delay,
 /// funds must stay slashable while unbonding. Not wired to any
 /// `ActionPayload` variant: unreachable from RPC/mempool by construction,
@@ -313,16 +313,25 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
     // `Snapshot::batch_entries` in xc_storage) without ever crediting a
     // matching sub-account balance, so slashing one for real would otherwise
     // underflow a u128 and panic. Clamping to 0 is the safe direction to
-    // fail in for a money-boundary bug: worst case a slash burns less than
+    // fail in for a money-boundary bug: worst case a slash moves less than
     // the ledger says, never the reverse.
-    sub_entry.balance = sub_entry.balance.saturating_sub(slash_amount);
-    // Burned, not credited anywhere — all of it, every reason. A treasury
-    // that profits from punishing validators has an incentive problem and an
-    // ownership question nobody pre-incorporation can answer; burning is
-    // accretive to every other holder and reversible by governance later.
+    let debited = sub_entry.balance.min(slash_amount);
+    sub_entry.balance -= debited;
+    // Credited to the reward pool — all of it, every reason. Not burned: the
+    // supply is fixed and the pool is the validators' entire future income,
+    // so a burn would make every honest validator pay for the one who
+    // misbehaved. Not the treasury: an account somebody controls profiting
+    // from punishing validators is the wrong incentive to bake in. The pool
+    // is keyless, and the slashed stake simply becomes future block rewards
+    // for the validators who stayed honest. Exactly what left the
+    // sub-account is what arrives (`debited`), so supply is conserved.
+    let pool_account = reward_pool_account();
+    let mut pool_entry = view.get(&AccountKey(&pool_account))?.unwrap_or_else(default_account);
+    pool_entry.balance += debited;
 
     let mut account_updates = BTreeMap::new();
     account_updates.insert(sub_account, sub_entry);
+    account_updates.insert(pool_account, pool_entry);
 
     let mut stake_updates = StakeUpdates::default();
     if existing.active_amount == 0 && existing.unbonding.is_none() {
@@ -337,7 +346,7 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
 
 /// Once per accepted/produced block: if `primary` (the height's no-timeout
 /// round-robin proposer, i.e. `xc_primitives::expected_proposer`) isn't who
-/// actually produced the block, burns a small downtime slash from their
+/// actually produced the block, takes a small downtime slash from their
 /// stake. No evidence submission needed — every node computes `primary` and
 /// `actual_proposer` from the same stored block, so both sides agree without
 /// proof. No-ops (rather than erroring) if the primary has nothing staked
@@ -640,14 +649,15 @@ mod tests {
         assert_eq!(allocation.active_amount, 0, "active portion slashed first, fully consumed");
         assert_eq!(allocation.unbonding.unwrap().amount, 150, "remainder spills into unbonding");
         let sub = stake_subaccount(&validator);
-        assert_eq!(db.get_account(&sub).unwrap().unwrap().balance, 150, "burned, no credit anywhere");
+        assert_eq!(db.get_account(&sub).unwrap().unwrap().balance, 150);
+        assert_eq!(db.get_account(&reward_pool_account()).unwrap().unwrap().balance, 350, "slash lands in the pool");
     }
 
-    /// D3: every slashed unit leaves circulation. Total supply (the sum of
-    /// every touched balance) drops by exactly the slash, and no account —
-    /// treasury included — is credited.
+    /// D3: a slash moves funds, it doesn't destroy them. Total supply (the
+    /// sum of every touched balance) is unchanged, the reward pool grows by
+    /// exactly the slash, and the treasury gets nothing.
     #[test]
-    fn slash_burns_the_full_amount_and_credits_nobody() {
+    fn slash_moves_the_full_amount_to_the_reward_pool() {
         let db = temp_db();
         let master = addr(1);
         let validator = addr(2);
@@ -660,18 +670,17 @@ mod tests {
             .sum();
 
         let (accounts, stakes) = apply_slash(&db, &validator, 120, SlashReason::ExecutionFault, 3).unwrap();
-        // Only the sub-account row changes, and only downward.
-        assert_eq!(accounts.0.len(), 1);
-        let (touched, entry) = accounts.0.iter().next().unwrap();
-        assert_eq!(*touched, stake_subaccount(&validator));
-        assert_eq!(entry.balance, 380);
+        // Exactly two rows: sub-account down, pool up by the same amount.
+        assert_eq!(accounts.0.len(), 2);
+        assert_eq!(accounts.0[&stake_subaccount(&validator)].balance, 380);
+        assert_eq!(accounts.0[&reward_pool_account()].balance, 120);
         commit(&db, accounts, stakes);
 
         let after: u128 = [master.clone(), stake_subaccount(&validator), treasury_account(), reward_pool_account()]
             .iter()
             .map(|a| db.get_account(a).unwrap().map(|e| e.balance).unwrap_or(0))
             .sum();
-        assert_eq!(before - after, 120);
+        assert_eq!(before, after, "slash conserves supply");
         assert_eq!(db.get_account(&treasury_account()).unwrap().map(|e| e.balance).unwrap_or(0), 0);
     }
 
@@ -717,6 +726,7 @@ mod tests {
         let supply = |db: &ArxiumDb| {
             db.get_account(&master).unwrap().unwrap().balance
                 + db.get_account(&stake_subaccount(&validator)).unwrap().map(|a| a.balance).unwrap_or(0)
+                + db.get_account(&reward_pool_account()).unwrap().map(|a| a.balance).unwrap_or(0)
         };
         assert_eq!(supply(&db), 1000);
 
@@ -754,12 +764,12 @@ mod tests {
         )
         .unwrap();
         commit(&db, accounts, stakes);
-        assert_eq!(supply(&db), 850, "slash burns — supply must drop by exactly the slashed amount");
+        assert_eq!(supply(&db), 1000, "slash moves stake to the pool — supply must not change");
 
         let due = db.get_allocations_with_unbonding_due(2 + UNBONDING_BLOCKS).unwrap();
         let (accounts, stakes) = resolve_due_unbonding(&db, due).unwrap();
         commit(&db, accounts, stakes);
-        assert_eq!(supply(&db), 850, "unbonding resolution moves funds within the same supply");
+        assert_eq!(supply(&db), 1000, "unbonding resolution moves funds within the same supply");
         assert_eq!(db.get_account(&master).unwrap().unwrap().balance, 400 + 200);
     }
 
@@ -912,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn downtime_slash_burns_a_small_share_when_primary_missed_its_slot() {
+    fn downtime_slash_takes_a_small_share_when_primary_missed_its_slot() {
         let db = temp_db();
         let master = addr(1);
         let primary = addr(2);
@@ -941,7 +951,7 @@ mod tests {
         let allocation = db.get_stake_allocation(&master, &primary).unwrap().unwrap();
         assert_eq!(
             allocation.active_amount, 999_900_000,
-            "0.01% of 1_000_000_000 == 100_000 burned"
+            "0.01% of 1_000_000_000 == 100_000 slashed"
         );
     }
 

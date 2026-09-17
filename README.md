@@ -219,6 +219,9 @@ total emission is bounded by what the pool holds. The devnet spec seeds it with
 (`arx1sj34f2pjncszzj7txnjlqcw5gt2p92q9vwskutt3j8ujza2fj4gs35dl8y`, which
 receives its fee share) or anyone else can extend the runway with a plain
 `Transfer` to it. Once it is empty validators earn fees only.
+Slashed stake (equivocation, downtime) is not burned either — it is credited
+to the same pool, so a misbehaving validator's stake becomes future rewards
+for the ones that stayed honest.
 
 ## Architecture
 
