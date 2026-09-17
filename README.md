@@ -194,7 +194,7 @@ an indexer reading the chain, not to the node's hot path.
 | Slot duration | 4s |
 | Action fee | 0.001 ARX |
 | Minimum validator stake | 100,000 ARX |
-| Unbonding period | 100 blocks |
+| Unbonding period | 14 days (`unbonding_blocks` in the chain spec's `params`, 604,800 at 2s; devnet uses 1,800 = 1h) |
 | Finality | BLS aggregate precommits, 2/3+1 of the validator set |
 | Block reward | 4.3 ARX/block (`reward_per_block` in the chain spec's `params`) |
 | Fee split | 30% proposer, 20% treasury, 50% burned |
@@ -206,8 +206,8 @@ not it can vote, so one without a key would raise the threshold while
 contributing nothing to meeting it. `GET /finality` reports how much of the
 current set can actually vote, and whether that clears quorum.
 
-These are compile-time constants, except `reward_per_block`, which is read from
-the chain spec. Changing a constant is a coordinated release, not a runtime
+These are compile-time constants, except `reward_per_block` and
+`unbonding_blocks`, which are read from the chain spec. Changing a constant is a coordinated release, not a runtime
 setting.
 
 Block rewards are never minted. Each block pays the proposer

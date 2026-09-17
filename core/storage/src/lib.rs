@@ -247,8 +247,10 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `admin:recovery`, `AdminKey`, `Snapshot.{attestor,freeze,recovery}_admin`).
 /// Certified-root change — devnet reset.
 ///
-/// Bumped 13 -> 14: `ChainParams` gained `reward_per_block`. Same trap as
-/// 8 -> 9: positional bincode, so a version-13 `chain_params` row decodes as
+/// Bumped 13 -> 14: `ChainParams` gained `reward_per_block` (block reward
+/// became a chain param) and `unbonding_blocks` (unbonding is an absolute
+/// block count, no longer `21 * epoch_length`). Same trap as 8 -> 9:
+/// positional bincode, so a version-13 `chain_params` row decodes as
 /// `UnexpectedEnd` and every block fails. The row is in `CF_GOVERNANCE`
 /// (merkleized since 12), so re-encoding it would move certified roots —
 /// devnet reset, which also seeds the new reward pool from the spec.

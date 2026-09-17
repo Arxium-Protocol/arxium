@@ -59,7 +59,7 @@ pub enum ActionPayload {
     /// `circuit_staking::apply_unstake` for `validator`'s full self-stake
     /// and a `Leaving` status. The validator keeps proposing and voting
     /// until the epoch boundary, then drops; the stake sits in `Unbonding`
-    /// for `circuit_staking::UNBONDING_EPOCHS` — and stays
+    /// for `ChainParams::unbonding_blocks` — and stays
     /// slashable that whole time (`circuit_staking::apply_slash` treats
     /// unbonding funds as fair game). Rejected if `validator` isn't
     /// currently a validator, or if they're the last one — an empty
@@ -83,7 +83,7 @@ pub enum ActionPayload {
         amount: u128,
     },
     /// MW-signature-only partial or full unstake, subject to
-    /// `circuit_staking::UNBONDING_EPOCHS`. See `circuit_staking::apply_unstake`.
+    /// `ChainParams::unbonding_blocks`. See `circuit_staking::apply_unstake`.
     /// There is deliberately no `Slash` variant here — slashing is never
     /// user-submitted, so it's unreachable from RPC/mempool by construction
     /// (see `circuit_staking::apply_slash`).

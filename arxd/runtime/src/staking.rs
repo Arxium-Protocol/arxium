@@ -122,10 +122,10 @@ fn status_after_join<V: KvRead<Error = StorageError>>(view: &V, validator: &Addr
     })
 }
 
-/// Blocks an unbonding batch started at `height` stays locked for — see
-/// `circuit_staking::UNBONDING_EPOCHS`.
+/// Blocks an unbonding batch started at `height` stays locked for —
+/// `ChainParams::unbonding_blocks`.
 fn unbonding_blocks<V: KvRead<Error = StorageError>>(view: &V) -> Result<u64, StorageError> {
-    Ok(circuit_staking::unbonding_blocks(view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length))
+    Ok(view.get(&ChainParamsKey)?.unwrap_or_default().unbonding_blocks)
 }
 
 pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
@@ -221,7 +221,7 @@ pub(crate) fn stake<V: KvRead<Error = StorageError>>(
 }
 
 /// MW-signature-only partial or full unstake, subject to
-/// `circuit_staking::UNBONDING_EPOCHS`. See `circuit_staking::apply_unstake`.
+/// `ChainParams::unbonding_blocks`. See `circuit_staking::apply_unstake`.
 /// There is deliberately no `Slash` variant — slashing is never
 /// user-submitted, so it's unreachable from RPC/mempool by construction
 /// (see `circuit_staking::apply_slash`).
@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(unbonding.amount, MIN_VALIDATOR_STAKE);
         assert_eq!(
             unbonding.unlock_at_height,
-            5 + circuit_staking::unbonding_blocks(xc_primitives::ChainParams::default().epoch_length)
+            5 + xc_primitives::ChainParams::default().unbonding_blocks
         );
         // No balance credited back yet — still sitting in the sub-account,
         // slashable: only the fee left the account.

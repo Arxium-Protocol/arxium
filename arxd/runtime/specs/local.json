@@ -2,7 +2,7 @@
   "genesis_format": "plain",
   "height": 0,
   "chain_name": "localchain",
-  "params": {"epoch_length": 20, "validator_attestation_required": false, "min_validator_set": 1, "max_validator_set": 20, "reward_per_block": 4300000000},
+  "params": {"epoch_length": 20, "validator_attestation_required": false, "min_validator_set": 1, "max_validator_set": 20, "reward_per_block": 4300000000, "unbonding_blocks": 20},
   "accounts": {
     "arx1kdcsvwkafvn8nxcrvkcsfjp9ywdxmrn6l9sxg5s2llkgh4thszgsfg8lw5": {
       "balance": 750000000000000000,

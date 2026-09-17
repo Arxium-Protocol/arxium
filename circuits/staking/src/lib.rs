@@ -15,17 +15,6 @@ use xc_storage::{AccountUpdates, StakeUpdates, StorageError};
 /// the doc comments on the originals in `xc_primitives::state` for why.
 pub use xc_primitives::{reward_pool_account, stake_subaccount, treasury_account};
 
-/// How long unstaked coins stay locked — and slashable — before they return
-/// to the master. In epochs, so it scales with the chain's own epoch length
-/// (`ChainParams::epoch_length`); see `unbonding_blocks`.
-pub const UNBONDING_EPOCHS: u64 = 21;
-
-/// `UNBONDING_EPOCHS` in blocks for a chain with `epoch_length`-block
-/// epochs — what `apply_unstake` adds to the current height.
-pub fn unbonding_blocks(epoch_length: u64) -> u64 {
-    UNBONDING_EPOCHS * epoch_length.max(1)
-}
-
 /// Default per-block reward; the live value is `ChainParams::reward_per_block`,
 /// which callers pass to `apply_block_reward`.
 pub const REWARD_PER_BLOCK: u128 = xc_primitives::DEFAULT_REWARD_PER_BLOCK;

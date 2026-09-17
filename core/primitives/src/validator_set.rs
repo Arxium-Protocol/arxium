@@ -200,6 +200,14 @@ pub struct ChainParams {
     /// governance change instead of a hard fork.
     #[serde(default = "default_reward_per_block")]
     pub reward_per_block: u128,
+    /// How long unstaked coins stay locked — and slashable — before they
+    /// return to the master, in blocks. Absolute rather than a multiple of
+    /// `epoch_length` so retuning epochs can't silently shrink the security
+    /// window. The window has to cover weak-subjectivity: a node syncing
+    /// from a checkpoint older than this could be shown a chain signed by
+    /// validators who have since withdrawn with nothing left to slash.
+    #[serde(default = "default_unbonding_blocks")]
+    pub unbonding_blocks: u64,
 }
 
 fn default_epoch_length() -> u64 {
@@ -222,6 +230,15 @@ pub const DEFAULT_REWARD_PER_BLOCK: u128 = 4_300_000_000;
 fn default_reward_per_block() -> u128 {
     DEFAULT_REWARD_PER_BLOCK
 }
+/// 14 days at 2s slots — whitepaper §5.6. Between the sub-3-day chains that
+/// don't slash (Solana, Near) and the 21/28-day ones (Cosmos, Polkadot)
+/// whose length is partly there to fit a human evidence-submission window
+/// and a governance voting period; Arxium detects equivocation in-process
+/// and has neither, so the weak-subjectivity margin is what's left to cover.
+pub const DEFAULT_UNBONDING_BLOCKS: u64 = 14 * 24 * 60 * 60 / 2;
+fn default_unbonding_blocks() -> u64 {
+    DEFAULT_UNBONDING_BLOCKS
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -232,6 +249,7 @@ impl Default for ChainParams {
             max_validator_set: default_max_validator_set(),
             max_block_weight: default_max_block_weight(),
             reward_per_block: default_reward_per_block(),
+            unbonding_blocks: default_unbonding_blocks(),
         }
     }
 }
