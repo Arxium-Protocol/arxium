@@ -246,7 +246,13 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// independently-checked roles (`admin:attestor`/`admin:freeze`/
 /// `admin:recovery`, `AdminKey`, `Snapshot.{attestor,freeze,recovery}_admin`).
 /// Certified-root change — devnet reset.
-pub const SCHEMA_VERSION: u32 = 13;
+///
+/// Bumped 13 -> 14: `ChainParams` gained `reward_per_block`. Same trap as
+/// 8 -> 9: positional bincode, so a version-13 `chain_params` row decodes as
+/// `UnexpectedEnd` and every block fails. The row is in `CF_GOVERNANCE`
+/// (merkleized since 12), so re-encoding it would move certified roots —
+/// devnet reset, which also seeds the new reward pool from the spec.
+pub const SCHEMA_VERSION: u32 = 14;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
