@@ -62,6 +62,7 @@ struct AppState<P: Payload> {
     mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
     rpc_token: Option<Arc<String>>,
+    admin_token: Option<Arc<String>>,
     rate_limiter: Arc<RateLimiter>,
     // Number of trusted proxies in front of this RPC — see `client_ip`.
     trusted_proxy_hops: usize,
@@ -330,6 +331,101 @@ async fn guard<P: Payload>(
     response
 }
 
+/// Bearer check for `/admin/*` against `admin_token`. Only ever mounted
+/// when the token is set, so a missing token here is a wiring bug, not an
+/// open door — it still fails closed.
+async fn admin_guard<P: Payload>(
+    State(state): State<AppState<P>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| UNMATCHED_PATH.to_string(), |matched| matched.as_str().to_string());
+    let authorized = state.admin_token.as_ref().is_some_and(|token| {
+        let expected = format!("Bearer {token}");
+        req.headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.len() == expected.len() && value.as_bytes().ct_eq(expected.as_bytes()).into()
+            })
+    });
+    if !authorized {
+        record_request(&path, StatusCode::UNAUTHORIZED);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let response = next.run(req).await;
+    record_request(&path, response.status());
+    response
+}
+
+#[derive(serde::Deserialize)]
+struct CheckpointRequest {
+    /// Server-local directory to write into. Must not already exist —
+    /// RocksDB refuses to checkpoint into an existing path rather than merge.
+    output: PathBuf,
+}
+
+#[derive(Serialize)]
+struct CheckpointResponse {
+    /// Tip at the time of the request. The checkpoint is of the live DB and
+    /// may include blocks past `finalized_height`; a restore from it plus a
+    /// resync reconciles anything provisional.
+    height: u64,
+    finalized_height: Option<u64>,
+    path: PathBuf,
+}
+
+/// `POST /admin/checkpoint {"output": "<path>"}` — a consistent RocksDB
+/// checkpoint of the running node, without stopping it. Same primitive as
+/// `arxd snapshot`, which needs the node stopped only because it opens a
+/// second DB handle; from inside the process that constraint doesn't apply.
+async fn admin_checkpoint<P: Payload>(
+    State(state): State<AppState<P>>,
+    body: Result<Json<CheckpointRequest>, JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(json) => json,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+    if !body.output.is_absolute() {
+        return (StatusCode::BAD_REQUEST, "output must be an absolute path").into_response();
+    }
+    if body.output.exists() {
+        return (StatusCode::CONFLICT, "output path already exists").into_response();
+    }
+    let height = match state.db.get_tip_height() {
+        Ok(Some(height)) => height,
+        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            warn!("failed to read tip height: {err}");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let finalized_height = state.db.get_finalized_height().unwrap_or_default();
+    let db = state.db.clone();
+    let output = body.output.clone();
+    // Hard-links the SSTs and copies the live WAL — file I/O proportional
+    // to the WAL, so off the async runtime.
+    let result = tokio::task::spawn_blocking(move || db.export_checkpoint(&output)).await;
+    match result {
+        Ok(Ok(())) => {
+            info!("wrote checkpoint at height {height} to {}", body.output.display());
+            Json(CheckpointResponse { height, finalized_height, path: body.output }).into_response()
+        }
+        Ok(Err(err)) => {
+            warn!("checkpoint to {} failed: {err}", body.output.display());
+            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+        Err(err) => {
+            warn!("checkpoint task panicked: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 fn record_request(path: &str, status: StatusCode) {
     metrics::counter!(
         "arxium_rpc_requests_total",
@@ -377,6 +473,8 @@ pub struct IngestConfig<P: Payload> {
     pub bind_addr: String,
     pub port: u16,
     pub rpc_token: Option<String>,
+    /// See `NodeConfig::admin_token`. `None` leaves `/admin/*` unmounted.
+    pub admin_token: Option<String>,
     pub gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
     pub metrics_handle: PrometheusHandle,
     pub payload_precheck: Option<PayloadPrecheck<P>>,
@@ -395,6 +493,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         bind_addr,
         port,
         rpc_token,
+        admin_token,
         gossip_tx,
         metrics_handle,
         payload_precheck,
@@ -410,6 +509,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         mempool,
         db,
         rpc_token: rpc_token.map(Arc::new),
+        admin_token: admin_token.map(Arc::new),
         rate_limiter: Arc::new(RateLimiter::new(&limits)),
         trusted_proxy_hops: limits.rpc_trusted_proxy_hops,
         max_nonce_gap: limits.mempool_max_nonce_gap,
@@ -495,10 +595,26 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .with_state(state.clone())
                 .layer(middleware::from_fn_with_state(state.clone(), guard::<P>));
 
+            // Operator-only routes, gated on their own token and mounted only
+            // when one is configured. Not in `guarded`: that shares
+            // `rpc_token` with every client that submits actions, and a
+            // route that writes a full DB copy to the node's disk shouldn't
+            // be reachable with it. The public gateway 404s `/admin/*`
+            // (`nginx-gateway.conf`), same as `/metrics`.
+            let admin = if state.admin_token.is_some() {
+                Router::new()
+                    .route("/admin/checkpoint", post(admin_checkpoint::<P>))
+                    .with_state(state.clone())
+                    .layer(middleware::from_fn_with_state(state.clone(), admin_guard::<P>))
+            } else {
+                Router::new()
+            };
+
             let app = Router::new()
                 .route("/metrics", get(get_metrics::<P>))
                 .with_state(state)
                 .merge(guarded)
+                .merge(admin)
                 // All reads are public and writes are gated by the bearer
                 // token above (never a cookie), so there's no session to
                 // leak cross-origin — open to any origin, same as any public
@@ -1970,6 +2086,7 @@ mod tests {
             mempool: Arc::new(Mutex::new(Mempool::new())),
             db: ArxiumDb::open(&dir).unwrap(),
             rpc_token: None,
+            admin_token: None,
             rate_limiter: Arc::new(RateLimiter::new(&Limits::default())),
             trusted_proxy_hops: 0,
             max_nonce_gap: Limits::default().mempool_max_nonce_gap,
@@ -2051,6 +2168,81 @@ mod tests {
     /// JSON consumers (Explorer, Retracer) read `pubkey` as a `0x…` hex
     /// string; the serde default for `BlsPublicKey` is a byte array, which
     /// the Explorer rejected as a 502.
+    /// `/admin/checkpoint` answers only to `admin_token` — not to
+    /// `rpc_token`, not to nothing — and writes a checkpoint that reopens
+    /// at the same tip.
+    #[tokio::test]
+    async fn admin_checkpoint_needs_the_admin_token_and_writes_a_reopenable_db() {
+        use tower::ServiceExt;
+
+        let mut state = test_state();
+        state.rpc_token = Some(Arc::new("rpc".into()));
+        state.admin_token = Some(Arc::new("admin".into()));
+        state
+            .db
+            .write_batch(&Block::<TestPayload> {
+                height: 0,
+                parent_hash: "0xparent".into(),
+                timestamp: 0,
+                actions: vec![],
+                tx_root: [0u8; 32],
+                proposer: None,
+                signature: None,
+                state_root: String::new(),
+                round: 0,
+                round_certificate: None,
+            })
+            .unwrap();
+        let app = Router::new()
+            .route("/admin/checkpoint", post(admin_checkpoint::<TestPayload>))
+            .with_state(state.clone())
+            .layer(middleware::from_fn_with_state(state.clone(), admin_guard::<TestPayload>));
+        let output = std::env::temp_dir().join(format!(
+            "arxium-test-admin-checkpoint-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let request = |auth: Option<&str>| {
+            let mut builder = axum::http::Request::builder()
+                .method("POST")
+                .uri("/admin/checkpoint")
+                .header("content-type", "application/json");
+            if let Some(auth) = auth {
+                builder = builder.header("authorization", auth);
+            }
+            builder
+                .body(axum::body::Body::from(format!("{{\"output\": {:?}}}", output.display().to_string())))
+                .unwrap()
+        };
+
+        assert_eq!(app.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            app.clone().oneshot(request(Some("Bearer rpc"))).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "the shared rpc token must not open admin routes"
+        );
+
+        let response = app.clone().oneshot(request(Some("Bearer admin"))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["height"], 0);
+        assert!(json["finalized_height"].is_null());
+
+        let reopened = ArxiumDb::open(&output).unwrap();
+        assert_eq!(reopened.get_tip_height().unwrap(), Some(0));
+        drop(reopened);
+
+        assert_eq!(
+            app.oneshot(request(Some("Bearer admin"))).await.unwrap().status(),
+            StatusCode::CONFLICT,
+            "never overwrite an existing path"
+        );
+        std::fs::remove_dir_all(&output).ok();
+    }
+
     #[tokio::test]
     async fn bls_key_is_returned_as_hex_not_a_byte_array() {
         let state = test_state();

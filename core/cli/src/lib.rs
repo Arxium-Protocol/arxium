@@ -215,6 +215,12 @@ pub struct RunArgs {
     #[arg(long, env = "ARXD_RPC_TOKEN")]
     pub rpc_token: Option<String>,
 
+    /// Enables `/admin/*` (e.g. `POST /admin/checkpoint`) behind this bearer
+    /// token. Keep it separate from `--rpc-token`: that one is shared with
+    /// every client that submits actions. Unset: no admin routes.
+    #[arg(long, env = "ARXD_ADMIN_TOKEN")]
+    pub admin_token: Option<String>,
+
     /// Address the RPC server binds to. Defaults to loopback-only; put a TLS-
     /// terminating reverse proxy in front for production, or pass 0.0.0.0 to
     /// accept connections directly (devnet/LAN convenience).
@@ -354,7 +360,12 @@ impl RunArgs {
             snapshot_trust: self.snapshot_trust_height.zip(self.snapshot_trust_hash),
             is_bootnode: self.bootnode,
             is_validator: self.validator,
-            rpc_token: self.rpc_token,
+            // Blank is "unset", not "the empty string is the password":
+            // clap already drops an empty env var, this covers `--admin-token ""`
+            // from a script — an admin router keyed on `Bearer ` would
+            // otherwise be open to anyone who sends that literal.
+            rpc_token: self.rpc_token.filter(|t| !t.trim().is_empty()),
+            admin_token: self.admin_token.filter(|t| !t.trim().is_empty()),
             rpc_bind: self.rpc_bind,
             limits: self.limits.into(),
         }
@@ -377,6 +388,16 @@ mod tests {
     /// what's configurable. That blank has to mean "no explicit bootnodes" —
     /// otherwise `arxd/node` sees a non-empty list, skips the chain spec's
     /// `boot_nodes` fallback, and the node joins nothing at all.
+    #[test]
+    fn blank_tokens_are_unset() {
+        let cfg = Cli::try_parse_from(["arxd", "--rpc-token", "", "--admin-token", " "])
+            .unwrap()
+            .run
+            .into_config();
+        assert!(cfg.rpc_token.is_none());
+        assert!(cfg.admin_token.is_none(), "a blank admin token must not mount /admin");
+    }
+
     #[test]
     fn blank_bootnodes_env_is_no_bootnodes() {
         let cfg = Cli::try_parse_from(["arxd", "--bootnodes", ""])

@@ -70,6 +70,7 @@ systemd (`EnvironmentFile=`) and `arxd` read directly.
 | `--validator` | `ARXD_VALIDATOR` | `false` | Produce blocks on this node's turn |
 | `--rpc-bind` | `ARXD_RPC_BIND` | `127.0.0.1` | RPC bind address |
 | `--rpc-token` | `ARXD_RPC_TOKEN` | none | Require `Authorization: Bearer <token>` |
+| `--admin-token` | `ARXD_ADMIN_TOKEN` | none | Mount `/admin/*` (operator routes) behind a separate bearer token |
 | `--bootnodes` | `ARXD_BOOTNODES` | chain spec | Comma-separated peer multiaddrs |
 | `--bootnode` | `ARXD_BOOTNODE` | `false` | Use the well-known seeded network identity |
 

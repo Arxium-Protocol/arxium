@@ -163,6 +163,11 @@ pub struct NodeConfig {
     pub is_validator: bool,
     /// If set, the RPC server requires `Authorization: Bearer <token>` on every request.
     pub rpc_token: Option<String>,
+    /// If set, mounts `/admin/*` (operator-only routes such as
+    /// `POST /admin/checkpoint`) behind this bearer token — deliberately not
+    /// `rpc_token`, which the Console, Arx-Plus API and explorer all hold.
+    /// Unset: the routes don't exist.
+    pub admin_token: Option<String>,
     /// Address the RPC server binds to. Loopback by default — production
     /// deployments should sit behind a TLS-terminating reverse proxy.
     pub rpc_bind: String,

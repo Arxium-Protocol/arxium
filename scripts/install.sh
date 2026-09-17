@@ -282,6 +282,10 @@ ARXD_RPC_BIND=$rpc_bind
 # Blank means no auth. Generate one with: openssl rand -hex 32
 ARXD_RPC_TOKEN=$rpc_token
 
+# Operator-only routes (POST /admin/checkpoint). Blank leaves them
+# unmounted. Keep it separate from the RPC token clients hold.
+ARXD_ADMIN_TOKEN=
+
 # Comma-separated peer multiaddrs. Blank falls back to the chain spec's
 # own boot_nodes list, which is the right answer for devnet.
 ARXD_BOOTNODES=

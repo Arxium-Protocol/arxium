@@ -389,6 +389,31 @@ if you need to raise verbosity, and set `RUST_LOG` in `.env` /the compose
 
 ## Backups
 
+### Live checkpoint (no downtime)
+
+With `ARXD_ADMIN_TOKEN` set, the running node writes a consistent RocksDB
+checkpoint on request — hard-linked SSTs plus a WAL copy, safe on a live DB:
+
+```bash
+curl -sS -X POST http://127.0.0.1:30333/admin/checkpoint \
+  -H "Authorization: Bearer $ARXD_ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"output": "/data/checkpoints/'"$(date +%F-%H%M)"'"}'
+# {"height":61913,"finalized_height":61910,"path":"/data/checkpoints/2026-09-17-1400"}
+```
+
+`output` is a server-local absolute path that must not exist yet (409 if it
+does). The path is inside the container, so point it at the data volume.
+`height` is the tip at the time of the call; the checkpoint may hold blocks
+past `finalized_height` — fine for a pre-upgrade backup, a restore plus
+resync reconciles anything provisional. The admin token is separate from
+`ARXD_RPC_TOKEN` on purpose (that one is held by every client that submits
+actions) and the public gateway returns 404 for `/admin/`, so call it from
+the docker network or over SSH. Then copy the directory off-box like any
+other backup.
+
+### Full backup (stopped node)
+
 `scripts/backup-node.sh <data-dir> <backup-dir> [keep-count]` tars up the
 node's whole data directory (RocksDB `data/`, `snapshots/`, `validator.key`,
 `validator.bls.key`, `network.key`) and prunes old backups beyond
