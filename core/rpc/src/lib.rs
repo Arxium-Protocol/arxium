@@ -503,6 +503,9 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         evidence_dir,
         limits,
     } = config;
+    if rpc_token.is_none() && bind_addr.parse::<IpAddr>().is_ok_and(|ip| !ip.is_loopback()) {
+        warn!("RPC bound to {bind_addr} with no --rpc-token: anyone who can reach it can submit actions");
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
     let state = AppState {

@@ -18,7 +18,7 @@
 //! certificate.
 
 #[cfg(feature = "core-adjudicate")]
-mod core_adjudicate;
+use arxd_runtime::adjudicate as core_adjudicate;
 
 use std::env;
 use std::fs;

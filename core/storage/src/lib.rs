@@ -1720,31 +1720,6 @@ impl ArxiumDb {
         Ok(KvRead::get(self, &StakeByValidatorKey(validator))?.unwrap_or_default())
     }
 
-    /// All of `master`'s stake allocations, one per validator staked to.
-    pub fn get_stakes_by_master(
-        &self,
-        master: &Address,
-    ) -> Result<Vec<(Address, StakeAllocation)>, StorageError> {
-        let prefix = format!("stake:{}:", master);
-        let mut results = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            let validator_str = std::str::from_utf8(&key[prefix.len()..])
-                .map_err(|_| StorageError::CorruptedMeta)?;
-            let validator = Address::parse(validator_str).map_err(|_| StorageError::CorruptedMeta)?;
-            let config = bincode::config::standard();
-            let (allocation, _len) = bincode::serde::decode_from_slice(&value, config)?;
-            results.push((validator, allocation));
-        }
-        Ok(results)
-    }
-
     /// Every allocation with an `Unbonding` batch matured as of `height`.
     /// Full `stake:` prefix scan — every allocation on the chain, once per
     /// block. Fine at the current scale (matches the doc's "walking skeleton"

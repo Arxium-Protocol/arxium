@@ -4,7 +4,7 @@ services:
   arxd:
     build: .
     ports:
-      - "30333:30333" # RPC — fine to publish for local testing
+      - "127.0.0.1:30333:30333" # RPC — token-less and write-capable, so loopback only
       - "30334:30334/tcp" # P2P
       - "30334:30334/udp" # P2P (QUIC)
     volumes:

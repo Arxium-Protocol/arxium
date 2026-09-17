@@ -175,11 +175,10 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         overlay.push(&operator_updates);
         overlay
     };
-    // The denominator against which PoE cost must be judged: this rescans
-    // the entire accounts/validators column families (O(total state), not
-    // O(delta)) on every block, so it's the number that decides whether
-    // tx_root/block_ep are actually cheap or just cheap next to something
-    // already pathological.
+    // Incremental since the B3 schema bump: walks only the overlay delta
+    // into the persisted Merkle trie (O(delta), not O(total state)), so it
+    // is now in the same cost class as tx_root/block_ep rather than the
+    // denominator they used to hide behind.
     let sr_start = Instant::now();
     let state_root = db.compute_state_root(&state_root_overlay)?;
     histogram!("arxium_state_root_nanos").record(sr_start.elapsed().as_nanos() as f64);

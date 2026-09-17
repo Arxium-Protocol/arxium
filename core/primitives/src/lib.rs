@@ -1,7 +1,6 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use std::path::PathBuf;
 
 mod action;
@@ -177,19 +176,6 @@ pub struct NodeConfig {
     /// at genesis fetches state at that height instead of replaying from
     /// genesis; a node with history ignores it. `None`: replay.
     pub snapshot_trust: Option<(u64, String)>,
-}
-
-// --- 2. The Key Types ---
-// These types are used by core/consensus and core/network.
-pub struct ArxiumKeypair {
-    pub node_key: SigningKey,
-    pub validator_key: Option<SigningKey>,
-}
-
-impl ArxiumKeypair {
-    pub fn node_public_key(&self) -> VerifyingKey {
-        self.node_key.verifying_key()
-    }
 }
 
 #[cfg(test)]
