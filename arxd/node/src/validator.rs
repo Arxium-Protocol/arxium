@@ -8,6 +8,7 @@ use std::path::Path;
 use tracing::info;
 use xc_bls::{BlsPublicKey, BlsSecretKey};
 use xc_primitives::Address;
+use zeroize::Zeroizing;
 
 const KEY_FILE: &str = "validator.key";
 const BLS_KEY_FILE: &str = "validator.bls.key";
@@ -16,20 +17,30 @@ const BLS_KEY_FILE: &str = "validator.bls.key";
 /// new random one if absent, and locking the file down to owner-only
 /// permissions either way (a key file created before that check existed, or
 /// by any other means, still gets restricted on next load).
-fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<[u8; 32]> {
-    let seed: [u8; 32] = if path.exists() {
-        let hex_seed =
-            std::fs::read_to_string(path).with_context(|| format!("failed to read {what} file"))?;
-        let seed_bytes = hex::decode(hex_seed.trim())
-            .with_context(|| format!("{what} file is not valid hex"))?;
-        seed_bytes
-            .as_slice()
-            .try_into()
-            .with_context(|| format!("{what} file must contain a 32-byte seed"))?
+///
+/// Every buffer that holds the seed (the hex text, its decoded bytes, the
+/// returned array) is `Zeroizing`, so no copy of it outlives its use on the
+/// heap or stack. `SigningKey` and blst's `SecretKey` already zeroize
+/// themselves on drop; this covers the plaintext before it reaches them.
+fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<Zeroizing<[u8; 32]>> {
+    let seed: Zeroizing<[u8; 32]> = if path.exists() {
+        let hex_seed = Zeroizing::new(
+            std::fs::read_to_string(path).with_context(|| format!("failed to read {what} file"))?,
+        );
+        let seed_bytes = Zeroizing::new(
+            hex::decode(hex_seed.trim()).with_context(|| format!("{what} file is not valid hex"))?,
+        );
+        Zeroizing::new(
+            seed_bytes
+                .as_slice()
+                .try_into()
+                .with_context(|| format!("{what} file must contain a 32-byte seed"))?,
+        )
     } else {
-        let mut seed = [0u8; 32];
-        rand::rng().fill_bytes(&mut seed);
-        xc_primitives::keyfile::write_new_key_file(path, hex::encode(seed).as_bytes())
+        let mut seed = Zeroizing::new([0u8; 32]);
+        rand::rng().fill_bytes(seed.as_mut());
+        let hex_seed = Zeroizing::new(hex::encode(*seed));
+        xc_primitives::keyfile::write_new_key_file(path, hex_seed.as_bytes())
             .with_context(|| format!("failed to persist generated {what}"))?;
         seed
     };

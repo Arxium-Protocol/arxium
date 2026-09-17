@@ -103,6 +103,7 @@ rand = "0.9"
 dirs = "5.0"
 thiserror = "2.0.19"
 blst = "0.3.17"
+zeroize = "1"
 ark-bls12-381 = "0.6.0"
 ark-groth16 = { version = "0.6.0", default-features = false }
 ark-relations = { version = "0.6.0", default-features = false }

@@ -4,6 +4,7 @@
 use anyhow::{Context, Result};
 use libp2p::identity::Keypair;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 const KEY_FILE: &str = "network.key";
 
@@ -41,19 +42,26 @@ fn load_or_generate_keypair_inner(
     let key_path = base_path.join(KEY_FILE);
 
     let keypair = if key_path.exists() {
-        let bytes = std::fs::read(&key_path).context("failed to read network key file")?;
+        let bytes = Zeroizing::new(
+            std::fs::read(&key_path).context("failed to read network key file")?,
+        );
         Keypair::from_protobuf_encoding(&bytes)
             .context("network key file is not valid protobuf-encoded keypair")?
     } else {
         let keypair = match fixed_seed {
-            Some(mut seed) => {
-                Keypair::ed25519_from_bytes(&mut seed).context("invalid devnet bootnode seed")?
+            Some(seed) => {
+                let mut seed = Zeroizing::new(seed);
+                Keypair::ed25519_from_bytes(seed.as_mut()).context("invalid devnet bootnode seed")?
             }
             None => Keypair::generate_ed25519(),
         };
-        let bytes = keypair
-            .to_protobuf_encoding()
-            .context("failed to encode generated network key")?;
+        // Protobuf encoding carries the private half — zeroized like the
+        // seed buffers in `arxd/node/src/validator.rs`.
+        let bytes = Zeroizing::new(
+            keypair
+                .to_protobuf_encoding()
+                .context("failed to encode generated network key")?,
+        );
         xc_primitives::keyfile::write_new_key_file(&key_path, &bytes)
             .context("failed to persist generated network key")?;
         keypair

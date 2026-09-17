@@ -444,7 +444,6 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
             // network.
             let guarded = Router::new()
                 .route("/actions", post(submit_action::<P>))
-                .layer(DefaultBodyLimit::max(limits.rpc_max_body_bytes))
                 .route("/accounts/{address}", get(get_account::<P>))
                 .route("/accounts/{address}/proof", get(get_account_proof::<P>))
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
@@ -490,6 +489,9 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                     "/pairing/{nonce}",
                     post(submit_pairing::<P>).get(poll_pairing::<P>),
                 )
+                // After every route so it covers `/pairing*` too — a `.layer`
+                // only wraps the routes added before it.
+                .layer(DefaultBodyLimit::max(limits.rpc_max_body_bytes))
                 .with_state(state.clone())
                 .layer(middleware::from_fn_with_state(state.clone(), guard::<P>));
 

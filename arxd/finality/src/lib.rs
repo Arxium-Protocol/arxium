@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -185,6 +186,15 @@ pub struct Dissent {
 /// far behind the highest height seen is never going to gain another vote.
 const TALLY_RETENTION_HEIGHTS: u64 = 500;
 
+/// Upper bound on peer-sourced events queued for the finality thread. The
+/// `events` channel is unbounded because `BlockObserved` is sent while the
+/// producer holds `chain_lock`, which `enforce_certificate` also takes — a
+/// blocking bounded channel would deadlock the two. Peer traffic is bounded
+/// separately: anything past this cap is dropped at the gossip callback.
+/// Sized for a full set (`ChainParams::max_validator_set`) voting on every retained
+/// height at once; honest traffic never gets near it.
+pub const PEER_EVENT_BACKLOG_CAP: usize = 50_000;
+
 /// A vote is gossiped once, when this node signs it. If that one gossip
 /// message never reaches enough peers, quorum can never be reached even
 /// though the voter is alive and its vote is sitting right here — so
@@ -352,6 +362,10 @@ pub fn spawn_finality<P>(
     // turn into an evidence artifact and an on-chain slash report.
     equivocation_tx: Sender<PrecommitEquivocation>,
     chain_lock: Arc<Mutex<()>>,
+    // Count of peer-sourced events (votes, dissents, round-timeouts) sitting
+    // in `events` — see `PEER_EVENT_BACKLOG_CAP`. Decremented here as each
+    // one is dequeued; `arxd/node` increments on enqueue and drops past the cap.
+    peer_backlog: Arc<AtomicUsize>,
 ) -> thread::JoinHandle<()>
 where
     P: Serialize + DeserializeOwned + Send + 'static,
@@ -459,7 +473,12 @@ where
 
         loop {
             let event = match events.recv_timeout(VOTE_REBROADCAST_INTERVAL) {
-                Ok(event) => event,
+                Ok(event) => {
+                    if !matches!(event, FinalityEvent::BlockObserved(_)) {
+                        peer_backlog.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    event
+                }
                 Err(RecvTimeoutError::Timeout) => {
                     for vote in my_votes.values() {
                         if vote_tx.send(vote.clone()).is_err() {
@@ -1694,6 +1713,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let dissent_height = 5;
@@ -1747,6 +1767,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1795,6 +1816,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         event_tx
@@ -1844,6 +1866,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -1892,6 +1915,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let block = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100);
@@ -2239,6 +2263,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let vote = round_timeout_rx
@@ -2284,6 +2309,7 @@ mod tests {
             dissent_tx,
             equivocation_tx_for_test(),
             Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
         );
 
         let vote = round_timeout_rx

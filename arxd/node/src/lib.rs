@@ -13,6 +13,7 @@ use ed25519_dalek::Signer;
 use metrics::{counter, gauge};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,8 +23,7 @@ use xc_runtime_api::ChainRuntime;
 
 use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PrecommitEquivocation, PrecommitVote, RoundTimeoutVote,
-    dissent_signing_bytes,
-    spawn_finality,
+    PEER_EVENT_BACKLOG_CAP, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault, PrecommitAttestation};
@@ -599,6 +599,24 @@ fn spawn_subsystems<R: ChainRuntime>(
     // lock first wins, and the others observe the moved tip and back off.
     let chain_lock = Arc::new(Mutex::new(()));
 
+    // Peer-sourced finality events are admitted through this counter — see
+    // `PEER_EVENT_BACKLOG_CAP` for why the channel itself stays unbounded.
+    let peer_backlog = Arc::new(AtomicUsize::new(0));
+    let send_peer_event = {
+        let finality_event_tx = finality_event_tx.clone();
+        let peer_backlog = peer_backlog.clone();
+        move |event: FinalityEvent<R::Payload>| {
+            if peer_backlog.fetch_add(1, Ordering::Relaxed) >= PEER_EVENT_BACKLOG_CAP {
+                peer_backlog.fetch_sub(1, Ordering::Relaxed);
+                counter!("arxium_finality_peer_events_dropped_total").increment(1);
+                return;
+            }
+            if finality_event_tx.send(event).is_err() {
+                peer_backlog.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    };
+
     spawn_supervised(
         "finality",
         spawn_finality(
@@ -610,6 +628,7 @@ fn spawn_subsystems<R: ChainRuntime>(
             dissent_recorded_tx,
             equivocation_tx,
             chain_lock.clone(),
+            peer_backlog,
         ),
     );
 
@@ -709,24 +728,18 @@ fn spawn_subsystems<R: ChainRuntime>(
     );
 
     let on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send> = {
-        let finality_event_tx = finality_event_tx.clone();
-        Box::new(move |vote: PrecommitVote| {
-            let _ = finality_event_tx.send(FinalityEvent::VoteObserved(vote));
-        })
+        let send = send_peer_event.clone();
+        Box::new(move |vote: PrecommitVote| send(FinalityEvent::VoteObserved(vote)))
     };
 
     let on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send> = {
-        let finality_event_tx = finality_event_tx.clone();
-        Box::new(move |vote: RoundTimeoutVote| {
-            let _ = finality_event_tx.send(FinalityEvent::RoundTimeoutObserved(vote));
-        })
+        let send = send_peer_event.clone();
+        Box::new(move |vote: RoundTimeoutVote| send(FinalityEvent::RoundTimeoutObserved(vote)))
     };
 
     let on_dissent: Box<dyn Fn(Dissent) + Send> = {
-        let finality_event_tx = finality_event_tx.clone();
-        Box::new(move |dissent: Dissent| {
-            let _ = finality_event_tx.send(FinalityEvent::DissentObserved(dissent));
-        })
+        let send = send_peer_event.clone();
+        Box::new(move |dissent: Dissent| send(FinalityEvent::DissentObserved(dissent)))
     };
 
     let (dissent_tx, dissent_rx) = tokio::sync::mpsc::unbounded_channel::<Dissent>();
@@ -765,6 +778,9 @@ fn spawn_subsystems<R: ChainRuntime>(
         let chain_lock = chain_lock.clone();
         let evidence_tx = evidence_tx.clone();
         let finality_event_tx = finality_event_tx.clone();
+        // Own dissents go through the same gate as peer events so the
+        // backlog counter's increments and decrements stay paired.
+        let send_peer_event = send_peer_event.clone();
         let mempool = mempool.clone();
         let bls_identity = bls_identity_for_dissent.clone();
         let dissent_tx = dissent_tx.clone();
@@ -935,8 +951,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                         voter: address.clone(),
                                         signature,
                                     };
-                                    let _ = finality_event_tx
-                                        .send(FinalityEvent::DissentObserved(dissent.clone()));
+                                    send_peer_event(FinalityEvent::DissentObserved(dissent.clone()));
                                     let _ = dissent_tx.send(dissent.clone());
                                     if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
                                         let attestation = DissentAttestation {

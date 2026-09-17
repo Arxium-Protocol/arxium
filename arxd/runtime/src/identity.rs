@@ -178,6 +178,11 @@ pub(crate) fn identity_zk_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls
 /// verifying key — see `circuits/identity-zk`'s module docs for why the
 /// key isn't from a real trusted-setup ceremony. On success, marks
 /// `zk_identity_verified` on the sender's account.
+///
+/// The proof's second public input is derived here from `action.sender`,
+/// not read from the action, so a proof lifted from another account's
+/// on-chain `VerifyIdentityCredential` fails verification instead of
+/// re-verifying whoever replays it.
 pub(crate) fn verify_identity_credential<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -196,7 +201,12 @@ pub(crate) fn verify_identity_credential<V: KvRead<Error = StorageError>>(
         .map_err(|_| anyhow::anyhow!("identity_hash is not a valid field element"))?;
     let parsed_proof = circuit_identity_zk::Proof::<Bls12_381>::deserialize_compressed(proof)
         .map_err(|_| anyhow::anyhow!("malformed zk proof bytes"))?;
-    if !circuit_identity_zk::verify(&credential_hash, &parsed_proof, identity_zk_vk()) {
+    let sender_pubkey = action
+        .sender
+        .pubkey_bytes()
+        .map_err(|_| anyhow::anyhow!("sender address is not a valid public key"))?;
+    let sender = circuit_identity_zk::sender_binding(&sender_pubkey);
+    if !circuit_identity_zk::verify(&credential_hash, &sender, &parsed_proof, identity_zk_vk()) {
         anyhow::bail!("zk credential proof failed verification");
     }
     let mut verified_entry = entry;
@@ -395,7 +405,7 @@ mod tests {
         view.apply_accounts(&grant_updates.accounts).unwrap();
 
         let mut rng = StdRng::seed_from_u64(7);
-        let proof = circuit_identity_zk::prove(preimage, &pk, &mut rng);
+        let proof = circuit_identity_zk::prove(preimage, &[1u8; 32], &pk, &mut rng);
         let mut proof_bytes = Vec::new();
         proof.serialize_compressed(&mut proof_bytes).unwrap();
 
@@ -434,7 +444,7 @@ mod tests {
         hash.serialize_compressed(&mut hash_bytes).unwrap();
 
         let mut rng = StdRng::seed_from_u64(7);
-        let proof = circuit_identity_zk::prove(preimage, &pk, &mut rng);
+        let proof = circuit_identity_zk::prove(preimage, &[1u8; 32], &pk, &mut rng);
         let mut proof_bytes = Vec::new();
         proof.serialize_compressed(&mut proof_bytes).unwrap();
 
@@ -472,6 +482,54 @@ mod tests {
                 .expect("sender account must be updated")
                 .zk_identity_verified
         );
+    }
+
+    /// The replay case: Bob is attested to the same hash as Alice and
+    /// resubmits the proof Alice published. The runtime binds the proof to
+    /// `action.sender`, so it fails for him.
+    #[test]
+    fn verify_identity_credential_rejects_a_proof_replayed_by_another_account() {
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
+
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let pk_bytes: &[u8] = include_bytes!("../../../circuits/identity-zk/pk.bin");
+        let pk =
+            circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(pk_bytes).unwrap();
+
+        let preimage = b"alice's secret preimage";
+        let params = circuit_identity_zk::poseidon_params();
+        let hash = circuit_identity_zk::credential_hash(&params, preimage);
+        let mut hash_bytes = Vec::new();
+        hash.serialize_compressed(&mut hash_bytes).unwrap();
+
+        // Alice's proof, bound to her key.
+        let mut rng = StdRng::seed_from_u64(7);
+        let proof = circuit_identity_zk::prove(preimage, &[1u8; 32], &pk, &mut rng);
+        let mut proof_bytes = Vec::new();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+
+        let mut account = funded(FEE_BUDGET);
+        account.identity_hash = Some(hex::encode(hash_bytes));
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::from([(bob.clone(), account)]), HashMap::new());
+
+        let action = Action {
+            sender: bob,
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::VerifyIdentityCredential { proof: proof_bytes },
+        };
+        let err = crate::dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            0,
+            &no_bls_owner,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("failed verification"), "got: {err}");
     }
 
     #[test]
@@ -519,7 +577,7 @@ mod tests {
 
         let preimage = b"alice's secret preimage";
         let mut rng = StdRng::seed_from_u64(7);
-        let proof = circuit_identity_zk::prove(preimage, &pk, &mut rng);
+        let proof = circuit_identity_zk::prove(preimage, &[1u8; 32], &pk, &mut rng);
         let mut proof_bytes = Vec::new();
         proof.serialize_compressed(&mut proof_bytes).unwrap();
 

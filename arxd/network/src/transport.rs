@@ -141,7 +141,14 @@ pub(crate) fn build_swarm(
                 gossipsub_config,
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-            let sync = cbor::Behaviour::new(
+            // Pinned to the same cap as gossip and every `decode_wire`: the
+            // codec's defaults (1 MiB request / 10 MiB response) would let a
+            // peer make us buffer a response that `decode_wire` is going to
+            // reject on size anyway.
+            let sync = cbor::Behaviour::with_codec(
+                cbor::codec::Codec::default()
+                    .set_request_size_maximum(MAX_GOSSIP_TRANSMIT_SIZE as u64)
+                    .set_response_size_maximum(MAX_GOSSIP_TRANSMIT_SIZE as u64),
                 [(sync_protocol, ProtocolSupport::Full)],
                 request_response::Config::default(),
             );
