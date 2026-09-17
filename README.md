@@ -196,6 +196,8 @@ an indexer reading the chain, not to the node's hot path.
 | Minimum validator stake | 100,000 ARX |
 | Unbonding period | 100 blocks |
 | Finality | BLS aggregate precommits, 2/3+1 of the validator set |
+| Block reward | 4.3 ARX/block (`reward_per_block` in the chain spec's `params`) |
+| Fee split | 30% proposer, 20% treasury, 50% burned |
 
 A validator's BLS finality key is bound to its registration: `JoinValidator`
 carries it and registers it atomically, and genesis validators declare one via
@@ -204,8 +206,19 @@ not it can vote, so one without a key would raise the threshold while
 contributing nothing to meeting it. `GET /finality` reports how much of the
 current set can actually vote, and whether that clears quorum.
 
-These are compile-time constants. Changing one is a coordinated release, not a
-runtime setting.
+These are compile-time constants, except `reward_per_block`, which is read from
+the chain spec. Changing a constant is a coordinated release, not a runtime
+setting.
+
+Block rewards are never minted. Each block pays the proposer
+`min(reward_per_block, pool balance)` out of the reward pool account
+`arx1kdcsvwkafvn8nxcrvkcsfjp9ywdxmrn6l9sxg5s2llkgh4thszgsfg8lw5` (derived
+from `sha256("xc-reward-pool")`, see `xc_primitives::reward_pool_account`), so
+total emission is bounded by what the pool holds. The devnet spec seeds it with
+750M ARX — about 11 years at 2s blocks. It is an ordinary account: the treasury
+(`arx1sj34f2pjncszzj7txnjlqcw5gt2p92q9vwskutt3j8ujza2fj4gs35dl8y`, which
+receives its fee share) or anyone else can extend the runway with a plain
+`Transfer` to it. Once it is empty validators earn fees only.
 
 ## Architecture
 

@@ -2,8 +2,13 @@
   "genesis_format": "plain",
   "height": 0,
   "chain_name": "localchain",
-  "params": {"epoch_length": 20, "validator_attestation_required": false, "min_validator_set": 1, "max_validator_set": 20},
+  "params": {"epoch_length": 20, "validator_attestation_required": false, "min_validator_set": 1, "max_validator_set": 20, "reward_per_block": 4300000000},
   "accounts": {
+    "arx1kdcsvwkafvn8nxcrvkcsfjp9ywdxmrn6l9sxg5s2llkgh4thszgsfg8lw5": {
+      "balance": 750000000000000000,
+      "nonce": 0,
+      "identity_hash": null
+    },
     "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5": {
       "balance": 1000000000000000000,
       "nonce": 0,

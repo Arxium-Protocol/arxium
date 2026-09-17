@@ -1019,7 +1019,9 @@ mod tests {
         validators: &[Address],
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
-        let reward_updates = circuit_staking::apply_block_reward(view, proposer, fees_collected)?;
+        let reward_per_block = view.get(&ChainParamsKey)?.unwrap_or_default().reward_per_block;
+        let reward_updates =
+            circuit_staking::apply_block_reward(view, proposer, fees_collected, reward_per_block)?;
         let mut updates = BlockUpdates {
             accounts: reward_updates,
             ..Default::default()
@@ -1524,7 +1526,7 @@ mod tests {
         // No actions, but the block reward still touches state (see
         // `signed_block_at`'s comment) — the root must account for it.
         let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr, 0).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),
@@ -1560,7 +1562,7 @@ mod tests {
         // `addr` regardless — the root must include that overlay too, or a
         // block that should be accepted fails its own StateRootMismatch check.
         let reward_updates =
-            circuit_staking::apply_block_reward(db, addr, 0).unwrap();
+            circuit_staking::apply_block_reward(db, addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block = Block {
             height: parent.height + 1,
             parent_hash: parent.hash(),
@@ -1717,7 +1719,7 @@ mod tests {
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
         let (key1, addr1) = sorted[1].clone();
         let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr1, 0).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr1, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash(),

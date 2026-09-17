@@ -192,6 +192,14 @@ pub struct ChainParams {
     /// host — see `arxd_runtime::metering`).
     #[serde(default = "default_max_block_weight")]
     pub max_block_weight: u64,
+    /// Flat per-block reward in IUM, paid to the proposer from
+    /// `reward_pool_account()` (never minted — capped at what the pool holds,
+    /// so total emission is bounded by the pool's genesis balance plus
+    /// whatever treasury or anyone else transfers into it later). A chain
+    /// param rather than a constant so it can be tapered by a genesis or
+    /// governance change instead of a hard fork.
+    #[serde(default = "default_reward_per_block")]
+    pub reward_per_block: u128,
 }
 
 fn default_epoch_length() -> u64 {
@@ -208,6 +216,12 @@ fn default_max_validator_set() -> usize {
 fn default_max_block_weight() -> u64 {
     1_000_000
 }
+/// 4.3 ARX/block in IUM — whitepaper §9.1/9.3 Y1 target. With 2s slots a
+/// 750M-ARX pool lasts ~11 years at this rate.
+pub const DEFAULT_REWARD_PER_BLOCK: u128 = 4_300_000_000;
+fn default_reward_per_block() -> u128 {
+    DEFAULT_REWARD_PER_BLOCK
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -217,6 +231,7 @@ impl Default for ChainParams {
             min_validator_set: default_min_validator_set(),
             max_validator_set: default_max_validator_set(),
             max_block_weight: default_max_block_weight(),
+            reward_per_block: default_reward_per_block(),
         }
     }
 }

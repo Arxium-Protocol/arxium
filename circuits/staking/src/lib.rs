@@ -26,11 +26,9 @@ pub fn unbonding_blocks(epoch_length: u64) -> u64 {
     UNBONDING_EPOCHS * epoch_length.max(1)
 }
 
-/// 4.3 ARX/block in IUM — whitepaper §9.1/9.3 Y1 target (750M-ARX pool,
-/// 15% of the 5B fixed non-mintable supply, emitted to validators).
-/// Flat devnet-stub rate, no 8%/yr decay curve — tune once real economics
-/// are decided.
-pub const REWARD_PER_BLOCK: u128 = 4_300_000_000;
+/// Default per-block reward; the live value is `ChainParams::reward_per_block`,
+/// which callers pass to `apply_block_reward`.
+pub const REWARD_PER_BLOCK: u128 = xc_primitives::DEFAULT_REWARD_PER_BLOCK;
 
 /// Fee split, whitepaper §9.4: 30% to the block proposer, 20% to treasury,
 /// remaining 50% stays burned (the sender already paid the full fee in
@@ -102,7 +100,7 @@ fn default_account() -> AccountEntry {
     AccountEntry { balance: 0, ..Default::default() }
 }
 
-/// Once per block: pays the proposer the flat block reward (capped at
+/// Once per block: pays the proposer `reward_per_block` (capped at
 /// whatever's left in `reward_pool_account` — never exceeds it, so total
 /// emission is bounded by the pool's genesis balance) plus the proposer's
 /// cut of `fees_collected`, and credits treasury its cut. `fees_collected`
@@ -115,12 +113,13 @@ pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
     view: &V,
     proposer: &Address,
     fees_collected: u128,
+    reward_per_block: u128,
 ) -> Result<AccountUpdates, StorageError> {
     let pool_account = reward_pool_account();
     let treasury = treasury_account();
 
     let mut pool_entry = view.get(&AccountKey(&pool_account))?.unwrap_or_else(default_account);
-    let block_reward = REWARD_PER_BLOCK.min(pool_entry.balance);
+    let block_reward = reward_per_block.min(pool_entry.balance);
     pool_entry.balance -= block_reward;
 
     let proposer_fee_share = fees_collected * FEE_PROPOSER_BPS / 10_000;
@@ -778,7 +777,7 @@ mod tests {
         let pool_before = supply(&db);
 
         // 10 actions at 1_000_000 IUM fee each == 10_000_000 collected.
-        let updates = apply_block_reward(&db, &proposer, 10_000_000).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 10_000_000, REWARD_PER_BLOCK).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -811,7 +810,7 @@ mod tests {
         let proposer = addr(9);
         write_balance(&db, &reward_pool_account(), 1_000_000); // far less than REWARD_PER_BLOCK
 
-        let updates = apply_block_reward(&db, &proposer, 0).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -822,7 +821,7 @@ mod tests {
         assert_eq!(db.get_account(&reward_pool_account()).unwrap().unwrap().balance, 0);
 
         // Pool empty: further blocks mint nothing further, forever.
-        let updates = apply_block_reward(&db, &proposer, 0).unwrap();
+        let updates = apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK).unwrap();
         db.write_batch(&updates).unwrap();
         assert_eq!(db.get_account(&proposer).unwrap().unwrap().balance, 1_000_000);
     }

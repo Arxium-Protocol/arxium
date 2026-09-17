@@ -21,6 +21,7 @@ pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, round_timeout_signing_bytes,
 };
 pub use validator_set::{
+    DEFAULT_REWARD_PER_BLOCK,
     ChainParams, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
     is_boundary, power_cap, quorum_reached, signed_power, validator_set_effective_height,
 };

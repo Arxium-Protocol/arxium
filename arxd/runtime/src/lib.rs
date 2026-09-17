@@ -94,7 +94,9 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         validators: &[Address],
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
-        let reward_updates = circuit_staking::apply_block_reward(view, proposer, fees_collected)?;
+        let params = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default();
+        let reward_updates =
+            circuit_staking::apply_block_reward(view, proposer, fees_collected, params.reward_per_block)?;
         let mut updates = BlockUpdates {
             accounts: reward_updates,
             ..Default::default()
@@ -106,7 +108,7 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             // set from the next boundary, back the epoch after. Tombstoned
             // stays tombstoned; a jail already running is left alone.
             if !downtime_stakes.allocations.is_empty() {
-                let epoch_length = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default().epoch_length;
+                let epoch_length = params.epoch_length;
                 let jailed = xc_primitives::ValidatorStatus::Jailed {
                     until_epoch: xc_primitives::epoch_of(height, epoch_length) + 2,
                 };
