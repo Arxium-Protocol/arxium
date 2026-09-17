@@ -1010,7 +1010,11 @@ async fn get_account_bls_key<P: Payload>(
     // Reading the current key after rotation would incorrectly reject an old
     // valid certificate or accept a forged historical one.
     match state.db.get_bls_pubkey_at(&address, height) {
-        Ok(Some(pubkey)) => Json(serde_json::json!({ "pubkey": pubkey })).into_response(),
+        // Hex, not the serde byte array: every JSON consumer (Explorer, Retracer)
+        // expects the same `0x…` form as `voter_pubkey` in the fault report.
+        Ok(Some(pubkey)) => {
+            Json(serde_json::json!({ "pubkey": format!("0x{}", hex::encode(pubkey.0)) })).into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -2042,6 +2046,50 @@ mod tests {
         assert!(rendered.contains(&format!("path=\"{UNMATCHED_PATH}\"")), "{rendered}");
         assert!(!rendered.contains("arx1aaaaaaaa"), "{rendered}");
         assert!(!rendered.contains("arx1cccccccc"), "{rendered}");
+    }
+
+    /// JSON consumers (Explorer, Retracer) read `pubkey` as a `0x…` hex
+    /// string; the serde default for `BlsPublicKey` is a byte array, which
+    /// the Explorer rejected as a 502.
+    #[tokio::test]
+    async fn bls_key_is_returned_as_hex_not_a_byte_array() {
+        let state = test_state();
+        let validator = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let pubkey = xc_bls::BlsPublicKey([0xAB; 48]);
+        state
+            .db
+            .write_batches(&[
+                &Block::<TestPayload> {
+                    height: 0,
+                    parent_hash: "0xparent".into(),
+                    timestamp: 0,
+                    actions: vec![],
+                    tx_root: [0u8; 32],
+                    proposer: None,
+                    signature: None,
+                    state_root: String::new(),
+                    round: 0,
+                    round_certificate: None,
+                },
+                &xc_storage::BlsKeyRegistration {
+                    address: validator.clone(),
+                    pubkey,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                },
+            ])
+            .unwrap();
+
+        let response = get_account_bls_key::<TestPayload>(
+            State(state),
+            Path(validator.to_string()),
+            Query(ValidatorSetQuery { height: None }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["pubkey"], format!("0x{}", "ab".repeat(48)));
     }
 
     #[test]
