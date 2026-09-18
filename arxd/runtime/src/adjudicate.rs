@@ -637,16 +637,7 @@ mod tests {
     }
 
     fn hex_proof(proof: xc_poe::state_trie::InclusionProof) -> StateProof {
-        let (bitmap, non_default) = proof.compress();
-        StateProof {
-            key_hash: format!("0x{}", hex::encode(proof.key_hash)),
-            value: proof.value.map(|v| format!("0x{}", hex::encode(v))),
-            siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
-            siblings: non_default
-                .iter()
-                .map(|s| format!("0x{}", hex::encode(s)))
-                .collect(),
-        }
+        proof.into_state_proof()
     }
 
     /// The bitmap convention (`255 - level`, `7 - level % 8`) is duplicated

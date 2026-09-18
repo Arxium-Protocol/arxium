@@ -277,6 +277,21 @@ pub mod state_trie {
             }
             (bitmap, non_default)
         }
+
+        /// `compress()`'s output, hex-encoded into the wire shape every
+        /// caller building an `xc_artifact::StateProof` from a raw proof
+        /// wants — was copy-pasted identically in `xc_rpc::state_proof`,
+        /// `arxd_node`'s divergence-evidence path, and a test helper in
+        /// `arxd_runtime::adjudicate`.
+        pub fn into_state_proof(&self) -> xc_artifact::StateProof {
+            let (bitmap, siblings) = self.compress();
+            xc_artifact::StateProof {
+                key_hash: format!("0x{}", hex::encode(self.key_hash)),
+                value: self.value.as_ref().map(|v| format!("0x{}", hex::encode(v))),
+                siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
+                siblings: siblings.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
+            }
+        }
     }
 
     /// Recomputes the root `proof` implies and checks it equals `root`. A

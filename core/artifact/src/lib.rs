@@ -612,6 +612,25 @@ fn decode_hex_32(field: &'static str, s: &str) -> Result<[u8; 32], VerifyError> 
     bytes.as_slice().try_into().map_err(|_| VerifyError::BadFixedLength { field, len: bytes.len(), expected: 32 })
 }
 
+/// Decodes a hex-encoded Ed25519 public key. Every `Fault` variant repeated
+/// this decode -> `[u8; 32]` -> `VerifyingKey` dance for `proposer_pubkey`.
+fn verifying_key(field: &'static str, hex: &str) -> Result<VerifyingKey, VerifyError> {
+    let bytes = decode_hex(field, hex)?;
+    let bytes: [u8; 32] =
+        bytes.as_slice().try_into().map_err(|_| VerifyError::BadPubkeyLength(bytes.len()))?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| VerifyError::BadPubkey)
+}
+
+/// Decodes a hex-encoded Ed25519 signature and checks it against `message`
+/// under `key`, using `invalid` for a verification failure — the other half
+/// of the pattern every `Fault` variant repeated alongside `verifying_key`.
+fn check_sig(key: &VerifyingKey, sig_hex: &str, message: &[u8], invalid: VerifyError) -> Result<(), VerifyError> {
+    let sig_bytes = decode_hex("signature", sig_hex)?;
+    let sig_bytes: [u8; 64] =
+        sig_bytes.as_slice().try_into().map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
+    key.verify_strict(message, &Signature::from_bytes(&sig_bytes)).map_err(|_| invalid)
+}
+
 /// Sparse-Merkle-trie hash functions — must stay byte-for-byte identical to
 /// `xc_poe::state_trie`'s `leaf_hash`/`internal_hash`. See [`StateProof`]'s
 /// doc comment for why this crate carries its own copy instead of a
@@ -714,187 +733,13 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
 
     match &artifact.fault {
         Fault::Equivocation { proposer_pubkey, height, blocks } => {
-            let pubkey_bytes = decode_hex("proposer_pubkey", proposer_pubkey)?;
-            let pubkey_bytes: [u8; 32] = pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadPubkeyLength(pubkey_bytes.len()))?;
-            let verifying_key =
-                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
-
-            if blocks[0].header.height != blocks[1].header.height {
-                return Err(VerifyError::HeightMismatch(
-                    blocks[0].header.height,
-                    blocks[1].header.height,
-                ));
-            }
-            if blocks[0].header.height != *height {
-                return Err(VerifyError::FaultHeightMismatch {
-                    claimed: *height,
-                    actual: blocks[0].header.height,
-                });
-            }
-
-            let mut signed = Vec::with_capacity(2);
-            for (i, block) in blocks.iter().enumerate() {
-                let bytes = signing_bytes_for(&block.header)?;
-                let sig_bytes = decode_hex("signature", &block.signature)?;
-                let sig_bytes: [u8; 64] = sig_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
-                let signature = Signature::from_bytes(&sig_bytes);
-                verifying_key
-                    .verify_strict(&bytes, &signature)
-                    .map_err(|_| VerifyError::SignatureInvalid(i))?;
-                signed.push(bytes);
-            }
-
-            if signed[0] == signed[1] {
-                return Err(VerifyError::SameBlock);
-            }
-
-            Ok(Verdict::Culpable { fault: "equivocation", culpable_pubkey: proposer_pubkey.clone() })
+            verify_equivocation(proposer_pubkey, *height, blocks)
         }
         Fault::ExecutionDisagreement { proposer_pubkey, height, proposed, dissent } => {
-            let pubkey_bytes = decode_hex("proposer_pubkey", proposer_pubkey)?;
-            let pubkey_bytes: [u8; 32] = pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadPubkeyLength(pubkey_bytes.len()))?;
-            let verifying_key =
-                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
-
-            if proposed.header.height != *height {
-                return Err(VerifyError::FaultHeightMismatch {
-                    claimed: *height,
-                    actual: proposed.header.height,
-                });
-            }
-            if dissent.height != *height {
-                return Err(VerifyError::DisagreementHeightMismatch {
-                    dissent_height: dissent.height,
-                    fault_height: *height,
-                });
-            }
-
-            let bytes = signing_bytes_for(&proposed.header)?;
-            let sig_bytes = decode_hex("signature", &proposed.signature)?;
-            let sig_bytes: [u8; 64] = sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
-            let signature = Signature::from_bytes(&sig_bytes);
-            verifying_key.verify_strict(&bytes, &signature).map_err(|_| VerifyError::ProposedSignatureInvalid)?;
-
-            let header_commitment_bytes = decode_hex("header_commitment", &dissent.header_commitment)?;
-            let header_commitment_bytes: [u8; 32] = header_commitment_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadHeaderCommitmentLength(header_commitment_bytes.len()))?;
-            if Sha256::digest(&bytes).as_slice() != header_commitment_bytes.as_slice() {
-                return Err(VerifyError::DissentTargetsDifferentBlock);
-            }
-
-            // Decoded to bytes before comparing, not compared as strings: a
-            // proposer and a dissenter formatting the same root with
-            // different case/prefix must never be read as a disagreement
-            // (see `arxd_runtime::consensus::genesis_hash_matches`, the same
-            // class of bug for `genesis_hash`).
-            if decode_hex_32("state_root", &proposed.header.state_root)?
-                == decode_hex_32("state_root", &dissent.state_root)?
-            {
-                return Err(VerifyError::NoDisagreement);
-            }
-
-            let voter_pubkey_bytes = decode_hex("voter_pubkey", &dissent.voter_pubkey)?;
-            let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
-            let voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
-
-            let dissent_sig_bytes = decode_hex("signature", &dissent.signature)?;
-            let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
-            let dissent_signature = BlsSignature(dissent_sig_bytes);
-
-            let ep_bytes = decode_hex("ep", &dissent.ep)?;
-            let ep_bytes: [u8; 32] =
-                ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
-
-            let dissent_msg = dissent_signing_bytes(
-                &genesis,
-                dissent.height,
-                &dissent.block_hash,
-                &dissent.state_root,
-                &header_commitment_bytes,
-                &ep_bytes,
-                &dissent.reason,
-            );
-            xc_bls::verify(&dissent_msg, &voter_pubkey, &dissent_signature)
-                .map_err(|_| VerifyError::DissentSignatureInvalid)?;
-
-            Ok(Verdict::Disagreement {
-                fault: "execution_disagreement",
-                parties: vec![proposer_pubkey.clone(), dissent.voter_pubkey.clone()],
-            })
+            verify_execution_disagreement(&genesis, proposer_pubkey, *height, proposed, dissent)
         }
         Fault::PrecommitEquivocation { voter_pubkey, height, precommits } => {
-            let pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
-            let pubkey_bytes: [u8; 48] = pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsPubkeyLength(pubkey_bytes.len()))?;
-            let voter = BlsPublicKey(pubkey_bytes);
-
-            if precommits[0].height != precommits[1].height {
-                return Err(VerifyError::HeightMismatch(
-                    precommits[0].height,
-                    precommits[1].height,
-                ));
-            }
-            if precommits[0].height != *height {
-                return Err(VerifyError::FaultHeightMismatch {
-                    claimed: *height,
-                    actual: precommits[0].height,
-                });
-            }
-
-            let mut signed = Vec::with_capacity(2);
-            for (i, precommit) in precommits.iter().enumerate() {
-                let ep_bytes = decode_hex("ep", &precommit.ep)?;
-                let ep_bytes: [u8; 32] = ep_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
-                let sig_bytes = decode_hex("signature", &precommit.signature)?;
-                let sig_bytes: [u8; 96] = sig_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
-
-                let bytes = precommit_signing_bytes(&genesis, precommit.height, &precommit.block_hash, &ep_bytes);
-                xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
-                    .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
-                signed.push(bytes);
-            }
-
-            // Signed bytes, not the raw signatures: BLS signing is
-            // deterministic here, so equal messages give equal signatures —
-            // but the property that actually makes this a fault is two
-            // *distinct messages* under one key, and that is what gets
-            // compared.
-            if signed[0] == signed[1] {
-                return Err(VerifyError::SamePrecommit);
-            }
-
-            Ok(Verdict::Culpable {
-                fault: "precommit_equivocation",
-                culpable_pubkey: voter_pubkey.clone(),
-            })
+            verify_precommit_equivocation(&genesis, voter_pubkey, *height, precommits)
         }
         Fault::ActionDivergence {
             proposer_pubkey,
@@ -904,74 +749,16 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             action_bytes,
             proposed_claim,
             dissent_claim,
-        } => {
-            let pubkey_bytes = decode_hex_32("proposer_pubkey", proposer_pubkey)?;
-            let verifying_key =
-                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
-            let voter_pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
-            let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
-            let bls_voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
-
-            let action_bytes_raw = decode_hex("action_bytes", action_bytes)?;
-            let action_bytes_hash: [u8; 32] = Sha256::digest(&action_bytes_raw).into();
-
-            if proposed_claim.pre_state_root != dissent_claim.pre_state_root {
-                return Err(VerifyError::ActionClaimsDisagreeOnPreState);
-            }
-            if proposed_claim.post_state_root == dissent_claim.post_state_root {
-                return Err(VerifyError::ActionClaimsAgreeOnPostState);
-            }
-
-            let proposed_msg = action_claim_signing_bytes(
-                &genesis,
-                *height,
-                *action_index,
-                &action_bytes_hash,
-                &proposed_claim.pre_state_root,
-                &proposed_claim.post_state_root,
-            );
-            let proposed_sig_bytes = decode_hex("proposed_claim signature", &proposed_claim.signature)?;
-            let proposed_sig_bytes: [u8; 64] = proposed_sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadSignatureLength(proposed_sig_bytes.len()))?;
-            verifying_key
-                .verify_strict(&proposed_msg, &Signature::from_bytes(&proposed_sig_bytes))
-                .map_err(|_| VerifyError::ProposedClaimSignatureInvalid)?;
-
-            let dissent_msg = action_claim_signing_bytes(
-                &genesis,
-                *height,
-                *action_index,
-                &action_bytes_hash,
-                &dissent_claim.pre_state_root,
-                &dissent_claim.post_state_root,
-            );
-            let dissent_sig_bytes = decode_hex("dissent_claim signature", &dissent_claim.signature)?;
-            let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
-            xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
-                .map_err(|_| VerifyError::DissentClaimSignatureInvalid)?;
-
-            let proposed_root = decode_hex_32("proposed_claim.pre_state_root", &proposed_claim.pre_state_root)?;
-            for proof in &proposed_claim.proofs {
-                verify_state_proof(proposed_root, proof)?;
-            }
-            let dissent_root = decode_hex_32("dissent_claim.pre_state_root", &dissent_claim.pre_state_root)?;
-            for proof in &dissent_claim.proofs {
-                verify_state_proof(dissent_root, proof)?;
-            }
-
-            Ok(Verdict::Disagreement {
-                fault: "action_divergence",
-                parties: vec![proposer_pubkey.clone(), voter_pubkey.clone()],
-            })
-        }
+        } => verify_action_divergence(
+            &genesis,
+            proposer_pubkey,
+            voter_pubkey,
+            *height,
+            *action_index,
+            action_bytes,
+            proposed_claim,
+            dissent_claim,
+        ),
         Fault::BlockDivergence {
             proposer_pubkey,
             voter_pubkey,
@@ -980,65 +767,308 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             block_attestation,
             actions: _,
             dissent_claim,
-        } => {
-            let pubkey_bytes = decode_hex_32("proposer_pubkey", proposer_pubkey)?;
-            let verifying_key =
-                VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| VerifyError::BadPubkey)?;
-            let voter_pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
-            let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
-            let bls_voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
-
-            if block_attestation.header.height != *height {
-                return Err(VerifyError::BlockDivergenceHeightMismatch {
-                    claimed: *height,
-                    actual: block_attestation.header.height,
-                });
-            }
-
-            let header_bytes = signing_bytes_for(&block_attestation.header)?;
-            let sig_bytes = decode_hex("block_attestation signature", &block_attestation.signature)?;
-            let sig_bytes: [u8; 64] = sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
-            verifying_key
-                .verify_strict(&header_bytes, &Signature::from_bytes(&sig_bytes))
-                .map_err(|_| VerifyError::BlockAttestationSignatureInvalid)?;
-            let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
-
-            if block_attestation.header.state_root == dissent_claim.computed_state_root {
-                return Err(VerifyError::BlockDivergenceNoDisagreement);
-            }
-
-            let dissent_msg = block_divergence_signing_bytes(
-                &genesis,
-                *height,
-                &header_commitment,
-                parent_state_root,
-                &dissent_claim.computed_state_root,
-            );
-            let dissent_sig_bytes = decode_hex("dissent_claim signature", &dissent_claim.signature)?;
-            let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
-                .as_slice()
-                .try_into()
-                .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
-            xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
-                .map_err(|_| VerifyError::BlockDissentSignatureInvalid)?;
-
-            let parent_root = decode_hex_32("parent_state_root", parent_state_root)?;
-            for proof in &dissent_claim.proofs {
-                verify_state_proof(parent_root, proof)?;
-            }
-
-            Ok(Verdict::Disagreement {
-                fault: "block_divergence",
-                parties: vec![proposer_pubkey.clone(), voter_pubkey.clone()],
-            })
-        }
+        } => verify_block_divergence(
+            &genesis,
+            proposer_pubkey,
+            voter_pubkey,
+            *height,
+            parent_state_root,
+            block_attestation,
+            dissent_claim,
+        ),
     }
+}
+
+fn verify_equivocation(
+    proposer_pubkey: &str,
+    height: u64,
+    blocks: &[BlockAttestation; 2],
+) -> Result<Verdict, VerifyError> {
+    let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
+
+    if blocks[0].header.height != blocks[1].header.height {
+        return Err(VerifyError::HeightMismatch(blocks[0].header.height, blocks[1].header.height));
+    }
+    if blocks[0].header.height != height {
+        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: blocks[0].header.height });
+    }
+
+    let mut signed = Vec::with_capacity(2);
+    for (i, block) in blocks.iter().enumerate() {
+        let bytes = signing_bytes_for(&block.header)?;
+        check_sig(&key, &block.signature, &bytes, VerifyError::SignatureInvalid(i))?;
+        signed.push(bytes);
+    }
+
+    if signed[0] == signed[1] {
+        return Err(VerifyError::SameBlock);
+    }
+
+    Ok(Verdict::Culpable { fault: "equivocation", culpable_pubkey: proposer_pubkey.to_string() })
+}
+
+fn verify_execution_disagreement(
+    genesis: &[u8; 32],
+    proposer_pubkey: &str,
+    height: u64,
+    proposed: &BlockAttestation,
+    dissent: &DissentAttestation,
+) -> Result<Verdict, VerifyError> {
+    let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
+
+    if proposed.header.height != height {
+        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: proposed.header.height });
+    }
+    if dissent.height != height {
+        return Err(VerifyError::DisagreementHeightMismatch {
+            dissent_height: dissent.height,
+            fault_height: height,
+        });
+    }
+
+    let bytes = signing_bytes_for(&proposed.header)?;
+    check_sig(&key, &proposed.signature, &bytes, VerifyError::ProposedSignatureInvalid)?;
+
+    let header_commitment_bytes = decode_hex("header_commitment", &dissent.header_commitment)?;
+    let header_commitment_bytes: [u8; 32] = header_commitment_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadHeaderCommitmentLength(header_commitment_bytes.len()))?;
+    if Sha256::digest(&bytes).as_slice() != header_commitment_bytes.as_slice() {
+        return Err(VerifyError::DissentTargetsDifferentBlock);
+    }
+
+    // Decoded to bytes before comparing, not compared as strings: a
+    // proposer and a dissenter formatting the same root with different
+    // case/prefix must never be read as a disagreement (see
+    // `arxd_runtime::consensus::genesis_hash_matches`, the same class of
+    // bug for `genesis_hash`).
+    if decode_hex_32("state_root", &proposed.header.state_root)?
+        == decode_hex_32("state_root", &dissent.state_root)?
+    {
+        return Err(VerifyError::NoDisagreement);
+    }
+
+    let voter_pubkey_bytes = decode_hex("voter_pubkey", &dissent.voter_pubkey)?;
+    let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
+    let voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
+
+    let dissent_sig_bytes = decode_hex("signature", &dissent.signature)?;
+    let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
+    let dissent_signature = BlsSignature(dissent_sig_bytes);
+
+    let ep_bytes = decode_hex("ep", &dissent.ep)?;
+    let ep_bytes: [u8; 32] =
+        ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+
+    let dissent_msg = dissent_signing_bytes(
+        genesis,
+        dissent.height,
+        &dissent.block_hash,
+        &dissent.state_root,
+        &header_commitment_bytes,
+        &ep_bytes,
+        &dissent.reason,
+    );
+    xc_bls::verify(&dissent_msg, &voter_pubkey, &dissent_signature)
+        .map_err(|_| VerifyError::DissentSignatureInvalid)?;
+
+    Ok(Verdict::Disagreement {
+        fault: "execution_disagreement",
+        parties: vec![proposer_pubkey.to_string(), dissent.voter_pubkey.clone()],
+    })
+}
+
+fn verify_precommit_equivocation(
+    genesis: &[u8; 32],
+    voter_pubkey: &str,
+    height: u64,
+    precommits: &[PrecommitAttestation; 2],
+) -> Result<Verdict, VerifyError> {
+    let pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
+    let pubkey_bytes: [u8; 48] = pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsPubkeyLength(pubkey_bytes.len()))?;
+    let voter = BlsPublicKey(pubkey_bytes);
+
+    if precommits[0].height != precommits[1].height {
+        return Err(VerifyError::HeightMismatch(precommits[0].height, precommits[1].height));
+    }
+    if precommits[0].height != height {
+        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: precommits[0].height });
+    }
+
+    let mut signed = Vec::with_capacity(2);
+    for (i, precommit) in precommits.iter().enumerate() {
+        let ep_bytes = decode_hex("ep", &precommit.ep)?;
+        let ep_bytes: [u8; 32] =
+            ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+        let sig_bytes = decode_hex("signature", &precommit.signature)?;
+        let sig_bytes: [u8; 96] = sig_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
+
+        let bytes = precommit_signing_bytes(genesis, precommit.height, &precommit.block_hash, &ep_bytes);
+        xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
+            .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
+        signed.push(bytes);
+    }
+
+    // Signed bytes, not the raw signatures: BLS signing is deterministic
+    // here, so equal messages give equal signatures — but the property that
+    // actually makes this a fault is two *distinct messages* under one key,
+    // and that is what gets compared.
+    if signed[0] == signed[1] {
+        return Err(VerifyError::SamePrecommit);
+    }
+
+    Ok(Verdict::Culpable { fault: "precommit_equivocation", culpable_pubkey: voter_pubkey.to_string() })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_action_divergence(
+    genesis: &[u8; 32],
+    proposer_pubkey: &str,
+    voter_pubkey: &str,
+    height: u64,
+    action_index: u64,
+    action_bytes: &str,
+    proposed_claim: &ActionClaim,
+    dissent_claim: &ActionClaim,
+) -> Result<Verdict, VerifyError> {
+    let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
+    let voter_pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
+    let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
+    let bls_voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
+
+    let action_bytes_raw = decode_hex("action_bytes", action_bytes)?;
+    let action_bytes_hash: [u8; 32] = Sha256::digest(&action_bytes_raw).into();
+
+    if proposed_claim.pre_state_root != dissent_claim.pre_state_root {
+        return Err(VerifyError::ActionClaimsDisagreeOnPreState);
+    }
+    if proposed_claim.post_state_root == dissent_claim.post_state_root {
+        return Err(VerifyError::ActionClaimsAgreeOnPostState);
+    }
+
+    let proposed_msg = action_claim_signing_bytes(
+        genesis,
+        height,
+        action_index,
+        &action_bytes_hash,
+        &proposed_claim.pre_state_root,
+        &proposed_claim.post_state_root,
+    );
+    check_sig(
+        &key,
+        &proposed_claim.signature,
+        &proposed_msg,
+        VerifyError::ProposedClaimSignatureInvalid,
+    )?;
+
+    let dissent_msg = action_claim_signing_bytes(
+        genesis,
+        height,
+        action_index,
+        &action_bytes_hash,
+        &dissent_claim.pre_state_root,
+        &dissent_claim.post_state_root,
+    );
+    let dissent_sig_bytes = decode_hex("dissent_claim signature", &dissent_claim.signature)?;
+    let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
+    xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
+        .map_err(|_| VerifyError::DissentClaimSignatureInvalid)?;
+
+    let proposed_root = decode_hex_32("proposed_claim.pre_state_root", &proposed_claim.pre_state_root)?;
+    for proof in &proposed_claim.proofs {
+        verify_state_proof(proposed_root, proof)?;
+    }
+    let dissent_root = decode_hex_32("dissent_claim.pre_state_root", &dissent_claim.pre_state_root)?;
+    for proof in &dissent_claim.proofs {
+        verify_state_proof(dissent_root, proof)?;
+    }
+
+    Ok(Verdict::Disagreement {
+        fault: "action_divergence",
+        parties: vec![proposer_pubkey.to_string(), voter_pubkey.to_string()],
+    })
+}
+
+fn verify_block_divergence(
+    genesis: &[u8; 32],
+    proposer_pubkey: &str,
+    voter_pubkey: &str,
+    height: u64,
+    parent_state_root: &str,
+    block_attestation: &BlockAttestation,
+    dissent_claim: &BlockDissentClaim,
+) -> Result<Verdict, VerifyError> {
+    let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
+    let voter_pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
+    let voter_pubkey_bytes: [u8; 48] = voter_pubkey_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsPubkeyLength(voter_pubkey_bytes.len()))?;
+    let bls_voter_pubkey = BlsPublicKey(voter_pubkey_bytes);
+
+    if block_attestation.header.height != height {
+        return Err(VerifyError::BlockDivergenceHeightMismatch {
+            claimed: height,
+            actual: block_attestation.header.height,
+        });
+    }
+
+    let header_bytes = signing_bytes_for(&block_attestation.header)?;
+    check_sig(
+        &key,
+        &block_attestation.signature,
+        &header_bytes,
+        VerifyError::BlockAttestationSignatureInvalid,
+    )?;
+    let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
+
+    if block_attestation.header.state_root == dissent_claim.computed_state_root {
+        return Err(VerifyError::BlockDivergenceNoDisagreement);
+    }
+
+    let dissent_msg = block_divergence_signing_bytes(
+        genesis,
+        height,
+        &header_commitment,
+        parent_state_root,
+        &dissent_claim.computed_state_root,
+    );
+    let dissent_sig_bytes = decode_hex("dissent_claim signature", &dissent_claim.signature)?;
+    let dissent_sig_bytes: [u8; 96] = dissent_sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
+    xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
+        .map_err(|_| VerifyError::BlockDissentSignatureInvalid)?;
+
+    let parent_root = decode_hex_32("parent_state_root", parent_state_root)?;
+    for proof in &dissent_claim.proofs {
+        verify_state_proof(parent_root, proof)?;
+    }
+
+    Ok(Verdict::Disagreement {
+        fault: "block_divergence",
+        parties: vec![proposer_pubkey.to_string(), voter_pubkey.to_string()],
+    })
 }
 
 #[cfg(test)]

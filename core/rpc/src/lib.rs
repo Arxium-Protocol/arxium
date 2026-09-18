@@ -976,13 +976,7 @@ fn state_proof<P: Payload, K: xc_circuit::KeySpec>(
         }
         None => serde_json::Value::Null,
     };
-    let (bitmap, siblings) = inclusion.compress();
-    let proof = xc_artifact::StateProof {
-        key_hash: format!("0x{}", hex::encode(inclusion.key_hash)),
-        value: inclusion.value.as_ref().map(|v| format!("0x{}", hex::encode(v))),
-        siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
-        siblings: siblings.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
-    };
+    let proof = inclusion.into_state_proof();
     Ok(StateProofResponse {
         key: String::from_utf8_lossy(&raw_key).into_owned(),
         value,

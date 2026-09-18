@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 xc-primitives = { workspace = true }
+xc-artifact = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 bincode = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

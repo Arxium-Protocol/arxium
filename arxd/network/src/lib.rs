@@ -331,32 +331,23 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
 
     let actions_topic = gossipsub::IdentTopic::new(actions_topic(chain_id));
     let blocks_topic = gossipsub::IdentTopic::new(blocks_topic(chain_id));
-    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&actions_topic) {
-        let _ = ready_tx.send(Err(err.into()));
-        return;
-    }
-    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&blocks_topic) {
-        let _ = ready_tx.send(Err(err.into()));
-        return;
-    }
     let precommits_topic = gossipsub::IdentTopic::new(precommits_topic(chain_id));
-    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&precommits_topic) {
-        let _ = ready_tx.send(Err(err.into()));
-        return;
-    }
     let dissents_topic = gossipsub::IdentTopic::new(dissents_topic(chain_id));
-    if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(&dissents_topic) {
-        let _ = ready_tx.send(Err(err.into()));
-        return;
-    }
     let round_timeouts_topic = gossipsub::IdentTopic::new(round_timeouts_topic(chain_id));
-    if let Err(err) = swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&round_timeouts_topic)
-    {
-        let _ = ready_tx.send(Err(err.into()));
-        return;
+    // Each topic is also used by name later (publish + message-matching in
+    // the select loop below), so the bindings stay individual — only the
+    // subscribe-or-bail boilerplate collapses.
+    for topic in [
+        &actions_topic,
+        &blocks_topic,
+        &precommits_topic,
+        &dissents_topic,
+        &round_timeouts_topic,
+    ] {
+        if let Err(err) = swarm.behaviour_mut().gossipsub.subscribe(topic) {
+            let _ = ready_tx.send(Err(err.into()));
+            return;
+        }
     }
 
     let listen_result = swarm
