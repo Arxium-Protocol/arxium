@@ -58,6 +58,16 @@ if [[ -z ${ALERTMANAGER+x} \
   ALERTMANAGER_CONFIG="$CONFIG_ROOT/alertmanager.yml"
 fi
 ALERTMANAGER="${ALERTMANAGER:-0}"
+# prometheus.yml is shared by every node deployment and most don't run
+# retracerd, so the retracer scrape job stays commented out in it and is
+# appended here instead, gated the same way ALERTMANAGER is: an explicit
+# WITH_RETRACER=1, or auto-detected on a reinstall from the scrape token
+# Arxium-Ops already provisions on a host that runs Retracer.
+WITH_RETRACER="${WITH_RETRACER:-}"
+if [[ -z ${WITH_RETRACER} && -f "$CONFIG_ROOT/retracer-scrape-token" ]]; then
+  WITH_RETRACER=1
+fi
+WITH_RETRACER="${WITH_RETRACER:-0}"
 [[ -f "$CONFIG_SRC/prometheus.yml" ]] || die "missing $CONFIG_SRC/prometheus.yml"
 [[ -f "$CONFIG_SRC/alerts.yml" ]] || die "missing $CONFIG_SRC/alerts.yml"
 [[ -f "$GRAFANA_SRC/provisioning/datasources/prometheus.yml" ]] || die "missing Grafana datasource provisioning"
@@ -306,6 +316,21 @@ ln -sfn "$INSTALL_ROOT/grafana-$GRAFANA_VERSION" "$INSTALL_ROOT/grafana"
 mkdir -p "$CONFIG_ROOT" "$STATE_ROOT/prometheus"
 install -m 0644 "$CONFIG_SRC/prometheus.yml" "$CONFIG_ROOT/prometheus.yml"
 install -m 0644 "$CONFIG_SRC/alerts.yml" "$CONFIG_ROOT/alerts.yml"
+if [[ $WITH_RETRACER == 1 ]]; then
+  [[ -f "$CONFIG_ROOT/retracer-scrape-token" ]] \
+    || die "WITH_RETRACER=1 requires $CONFIG_ROOT/retracer-scrape-token (provisioned by Arxium-Ops align_retracer_runtime.yml)"
+  cat >> "$CONFIG_ROOT/prometheus.yml" <<'YAML'
+
+  - job_name: retracer
+    # Each scrape re-runs Retracer's database/table-size queries; don't
+    # inherit this file's 5s global interval meant for arxd's own metrics.
+    scrape_interval: 30s
+    authorization:
+      credentials_file: /etc/arxium-monitoring/retracer-scrape-token
+    static_configs:
+      - targets: ['127.0.0.1:8080']
+YAML
+fi
 if [[ -f "$SCRIPT_DIR/alertmanager.yml.example" ]]; then
   install -m 0644 "$SCRIPT_DIR/alertmanager.yml.example" "$CONFIG_ROOT/alertmanager.yml.example"
 fi
