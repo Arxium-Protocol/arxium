@@ -355,3 +355,61 @@ pub enum ActionPayload {
 
 pub type ChainAction = Action<ActionPayload>;
 pub type ChainBlock = xc_primitives::Block<ActionPayload>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wire discriminants the out-of-process codecs (Arx-Plus Swift, Console
+    /// TS, Retracer) have hard-coded. Inserting a variant mid-enum shifts
+    /// every later index and fails here instead of on a phone.
+    #[test]
+    fn variant_discriminants_are_pinned() {
+        const EXPECTED: [&str; 31] = [
+            "Transfer",
+            "JoinValidator",
+            "LeaveValidator",
+            "Stake",
+            "Unstake",
+            "SubmitEquivocationEvidence",
+            "RegisterBlsKey",
+            "VerifyIdentityCredential",
+            "AuthorizeOperator",
+            "RevokeOperator",
+            "GrantAttestation",
+            "RevokeAttestation",
+            "RegisterAsset",
+            "IssueAsset",
+            "TransferAsset",
+            "RegisterAttestor",
+            "DeregisterAttestor",
+            "SubmitExecutionFault",
+            "FreezeAsset",
+            "UnfreezeAsset",
+            "ForcedTransfer",
+            "BurnAsset",
+            "SetHolderFrozen",
+            "LockHolderAmount",
+            "UnlockHolderAmount",
+            "IssuerForcedTransfer",
+            "RecoverHolder",
+            "IssueAssetTo",
+            "LockIssuance",
+            "TransferIssuer",
+            "SetAssetMetadataUri",
+        ];
+        let cfg = bincode::config::standard();
+        for (idx, name) in EXPECTED.iter().enumerate() {
+            // Discriminant byte, then zeros: every field decodes as empty/0/None.
+            let mut bytes = vec![idx as u8];
+            bytes.extend([0u8; 256]);
+            let (decoded, _): (ActionPayload, _) = bincode::serde::decode_from_slice(&bytes, cfg)
+                .unwrap_or_else(|e| panic!("variant {idx} ({name}) failed to decode: {e}"));
+            let debug = format!("{decoded:?}");
+            let got = debug.split([' ', '{']).next().unwrap();
+            assert_eq!(got, *name, "variant index {idx}");
+        }
+        let past_end = [EXPECTED.len() as u8, 0];
+        assert!(bincode::serde::decode_from_slice::<ActionPayload, _>(&past_end, cfg).is_err(), "new variant appended without updating EXPECTED");
+    }
+}

@@ -68,8 +68,9 @@ pub enum Command {
     BlsKey {
         #[arg(long, default_value_os_t = default_base_path())]
         base_path: PathBuf,
-        /// Also render the pubkey as a terminal QR code, for a client that
-        /// scans it instead of copying hex by hand.
+        /// Also render pubkey‖proof-of-possession (288 hex chars) as a
+        /// terminal QR code, for a client that scans it instead of copying
+        /// hex by hand.
         #[arg(long)]
         qr: bool,
         /// Print the key's proof of possession (hex) instead of the pubkey.
