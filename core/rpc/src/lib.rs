@@ -28,6 +28,27 @@ use xc_primitives::{
 };
 use xc_storage::{ArxiumDb, StorageError};
 
+mod error;
+use error::ApiError;
+
+/// `Address::parse`, mapped to the 400 every handler already gave it.
+fn parse_address(s: &str) -> Result<Address, ApiError> {
+    Address::parse(s).map_err(|err| ApiError::BadRequest(err.to_string()))
+}
+
+/// Resolves a `?height=` query param against the tip, rejecting one above it
+/// — answering with the tip's set would look like data rather than the
+/// caller mistake it is. `None` means "as of the tip".
+fn resolve_height(requested: Option<u64>, tip_height: u64) -> Result<u64, ApiError> {
+    match requested {
+        Some(h) if h > tip_height => {
+            Err(ApiError::BadRequest(format!("height {h} is above the chain tip {tip_height}")))
+        }
+        Some(h) => Ok(h),
+        None => Ok(tip_height),
+    }
+}
+
 /// Bound every chain's payload type must satisfy to be served over this RPC:
 /// JSON (de)serializable for the wire, `Clone` because `AppState` is cloned
 /// per request, `Send + Sync + 'static` to live inside the shared axum state.
@@ -387,25 +408,15 @@ struct CheckpointResponse {
 async fn admin_checkpoint<P: Payload>(
     State(state): State<AppState<P>>,
     body: Result<Json<CheckpointRequest>, JsonRejection>,
-) -> Response {
-    let Json(body) = match body {
-        Ok(json) => json,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
+) -> Result<Response, ApiError> {
+    let Json(body) = body.map_err(|err| ApiError::BadRequest(err.to_string()))?;
     if !body.output.is_absolute() {
-        return (StatusCode::BAD_REQUEST, "output must be an absolute path").into_response();
+        return Err(ApiError::BadRequest("output must be an absolute path".to_string()));
     }
     if body.output.exists() {
-        return (StatusCode::CONFLICT, "output path already exists").into_response();
+        return Err(ApiError::Conflict("output path already exists".to_string()));
     }
-    let height = match state.db.get_tip_height() {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(err) => {
-            warn!("failed to read tip height: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
     let finalized_height = state.db.get_finalized_height().unwrap_or_default();
     let db = state.db.clone();
     let output = body.output.clone();
@@ -415,16 +426,13 @@ async fn admin_checkpoint<P: Payload>(
     match result {
         Ok(Ok(())) => {
             info!("wrote checkpoint at height {height} to {}", body.output.display());
-            Json(CheckpointResponse { height, finalized_height, path: body.output }).into_response()
+            Ok(Json(CheckpointResponse { height, finalized_height, path: body.output }).into_response())
         }
         Ok(Err(err)) => {
             warn!("checkpoint to {} failed: {err}", body.output.display());
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+            Ok((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
         }
-        Err(err) => {
-            warn!("checkpoint task panicked: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(err) => Err(ApiError::internal(anyhow::anyhow!("checkpoint task panicked: {err}"))),
     }
 }
 
@@ -807,44 +815,15 @@ async fn poll_pairing<P: Payload>(
 /// Chain-wide health: name, tip height/hash. No per-account or per-action
 /// state, so unlike other routes it can't 404 — an initialized node always
 /// has at least the genesis block.
-async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    let chain_name = match state.db.get_chain_name() {
-        Ok(Some(name)) => name,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(err) => {
-            warn!("failed to read chain name: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let tip_height = match state.db.get_tip_height() {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(err) => {
-            warn!("failed to read tip height: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let tip_hash = match state.db.get_block::<P>(tip_height) {
-        Ok(Some(block)) => block.hash(),
-        Ok(None) => {
-            warn!("tip height {tip_height} recorded but block is missing");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(err) => {
-            warn!("failed to load tip block {tip_height}: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let genesis_hash = match state.db.genesis_hash() {
-        Ok(Some(hash)) => hash,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(err) => {
-            warn!("failed to read genesis hash: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+    let chain_name = state.db.get_chain_name()?.ok_or(ApiError::ServiceUnavailable)?;
+    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let tip_hash = state
+        .db
+        .get_block::<P>(tip_height)?
+        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("tip height {tip_height} recorded but block is missing")))?
+        .hash();
+    let genesis_hash = state.db.genesis_hash()?.ok_or(ApiError::ServiceUnavailable)?;
 
     // Additive: existing consumers keep reading the three fields they know.
     // A wallet showing confirmations needs finality from the same call it
@@ -863,7 +842,7 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
         0
     });
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "chain_name": chain_name,
         "genesis_hash": genesis_hash,
         "tip_height": tip_height,
@@ -871,7 +850,7 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Response {
         "finalized_height": finalized_height,
         "final_watermark": final_watermark,
     }))
-    .into_response()
+    .into_response())
 }
 
 /// Chain-specific minimum validator stake (e.g. arxd/node's
@@ -889,39 +868,23 @@ async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response
 /// `action_fee` is the base; a client estimates a real fee as
 /// `action_fee + weight × weight_fee` (see `arxd_runtime::metering`), and
 /// `max_block_weight` is the cap any single action must fit under.
-async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    let Some(action_fee) = state.action_fee else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let max_block_weight = match state.db.chain_params() {
-        Ok(params) => params.max_block_weight,
-        Err(err) => {
-            warn!("failed to read chain params: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    Json(serde_json::json!({
+async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+    let action_fee = state.action_fee.ok_or(ApiError::NotFound)?;
+    let max_block_weight = state.db.chain_params()?.max_block_weight;
+    Ok(Json(serde_json::json!({
         "action_fee": action_fee,
         "weight_fee": state.weight_fee,
         "max_block_weight": max_block_weight,
     }))
-    .into_response()
+    .into_response())
 }
 
 async fn get_account<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-
-    match state.db.get_account(&address) {
-        Ok(Some(account)) => Json(account).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<xc_primitives::AccountEntry>, ApiError> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.db.get_account(&address)?.ok_or(ApiError::NotFound)?))
 }
 
 /// EIP-1186-shaped state proof: one key's value (or proven absence) under a
@@ -991,78 +954,52 @@ fn state_proof<P: Payload, K: xc_circuit::KeySpec>(
     })
 }
 
-fn state_proof_response<P: Payload, K: xc_circuit::KeySpec>(db: &ArxiumDb, key: &K) -> Response {
-    match state_proof::<P, K>(db, key) {
-        Ok(response) => Json(response).into_response(),
-        Err(err) => {
-            warn!("failed to build state proof: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+fn state_proof_response<P: Payload, K: xc_circuit::KeySpec>(
+    db: &ArxiumDb,
+    key: &K,
+) -> Result<Json<StateProofResponse>, ApiError> {
+    Ok(Json(state_proof::<P, K>(db, key)?))
 }
 
 async fn get_account_proof<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
+) -> Result<Json<StateProofResponse>, ApiError> {
+    let address = parse_address(&address)?;
     state_proof_response::<P, _>(&state.db, &xc_circuit::AccountKey(&address))
 }
 
 async fn get_validator_proof<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
+) -> Result<Json<StateProofResponse>, ApiError> {
+    let address = parse_address(&address)?;
     state_proof_response::<P, _>(&state.db, &xc_circuit::ValidatorStatusKey(&address))
 }
 
 async fn get_account_asset_balance_proof<P: Payload>(
     State(state): State<AppState<P>>,
     Path((address, asset_ref)): Path<(String, String)>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let asset_ref = match parse_ref(&asset_ref) {
-        Ok(r) => r,
-        Err(bad) => return bad.into_response(),
-    };
+) -> Result<Json<StateProofResponse>, ApiError> {
+    let address = parse_address(&address)?;
+    let asset_ref = parse_ref(&asset_ref)?;
     state_proof_response::<P, _>(&state.db, &xc_circuit::AssetBalanceKey { asset: &asset_ref, owner: &address })
 }
 
 /// The genesis state root bound into every BLS finality signature. External
 /// verifiers must pin this value rather than infer network identity from a
 /// mutable chain-name label.
-async fn get_genesis_hash<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    match state.db.genesis_hash() {
-        Ok(Some(genesis_hash)) => Json(serde_json::json!({ "genesis_hash": genesis_hash })).into_response(),
-        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+async fn get_genesis_hash<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+    let genesis_hash = state.db.genesis_hash()?.ok_or(ApiError::ServiceUnavailable)?;
+    Ok(Json(serde_json::json!({ "genesis_hash": genesis_hash })).into_response())
 }
 
 async fn get_account_stake<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-
-    match state.db.get_stake_allocation(&address, &address) {
-        Ok(Some(allocation)) => Json(allocation).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<xc_primitives::StakeAllocation>, ApiError> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.db.get_stake_allocation(&address, &address)?.ok_or(ApiError::NotFound)?))
 }
 
 /// A delegated stake allocation: `master` need not equal `validator` (unlike
@@ -1071,21 +1008,10 @@ async fn get_account_stake<P: Payload>(
 async fn get_delegated_stake<P: Payload>(
     State(state): State<AppState<P>>,
     Path((master, validator)): Path<(String, String)>,
-) -> Response {
-    let master = match Address::parse(&master) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let validator = match Address::parse(&validator) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-
-    match state.db.get_stake_allocation(&master, &validator) {
-        Ok(Some(allocation)) => Json(allocation).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<xc_primitives::StakeAllocation>, ApiError> {
+    let master = parse_address(&master)?;
+    let validator = parse_address(&validator)?;
+    Ok(Json(state.db.get_stake_allocation(&master, &validator)?.ok_or(ApiError::NotFound)?))
 }
 
 /// Whether `address` has a BLS key registered for finality precommit voting
@@ -1095,44 +1021,19 @@ async fn get_account_bls_key<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
     Query(query): Query<ValidatorSetQuery>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
+) -> Result<Response, ApiError> {
+    let address = parse_address(&address)?;
 
-    let height = match query.height {
-        Some(requested) => match state.db.get_tip_height() {
-            Ok(Some(tip_height)) if requested <= tip_height => requested,
-            Ok(Some(tip_height)) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    format!("height {requested} is above the chain tip {tip_height}"),
-                )
-                    .into_response();
-            }
-            Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
-        None => match state.db.get_tip_height() {
-            Ok(Some(tip_height)) => tip_height,
-            Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
-    };
+    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let height = resolve_height(query.height, tip_height)?;
 
     // Certificates must be checked against the key registered at their height.
     // Reading the current key after rotation would incorrectly reject an old
     // valid certificate or accept a forged historical one.
-    match state.db.get_bls_pubkey_at(&address, height) {
-        // Hex, not the serde byte array: every JSON consumer (Explorer, Retracer)
-        // expects the same `0x…` form as `voter_pubkey` in the fault report.
-        Ok(Some(pubkey)) => {
-            Json(serde_json::json!({ "pubkey": format!("0x{}", hex::encode(pubkey.0)) })).into_response()
-        }
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    let pubkey = state.db.get_bls_pubkey_at(&address, height)?.ok_or(ApiError::NotFound)?;
+    // Hex, not the serde byte array: every JSON consumer (Explorer, Retracer)
+    // expects the same `0x…` form as `voter_pubkey` in the fault report.
+    Ok(Json(serde_json::json!({ "pubkey": format!("0x{}", hex::encode(pubkey.0)) })).into_response())
 }
 
 /// One row of `GET /accounts/{address}/assets`.
@@ -1203,8 +1104,8 @@ fn issuer_attested(db: &ArxiumDb, issuer: &Address) -> Result<bool, StorageError
     circuit_rwa_asset::is_attested(db, issuer)
 }
 
-fn parse_ref(s: &str) -> Result<AssetRef, (StatusCode, String)> {
-    AssetRef::parse(s).map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))
+fn parse_ref(s: &str) -> Result<AssetRef, ApiError> {
+    AssetRef::parse(s).map_err(|err| ApiError::BadRequest(err.to_string()))
 }
 
 /// One row of an asset's cap table: balance plus the issuer's freeze state.
@@ -1221,32 +1122,17 @@ struct AssetHolderRow {
 async fn get_asset_holders<P: Payload>(
     State(state): State<AppState<P>>,
     Path(asset_ref): Path<String>,
-) -> Response {
-    let asset_ref = match parse_ref(&asset_ref) {
-        Ok(r) => r,
-        Err(bad) => return bad.into_response(),
-    };
-    match state.db.get_asset(&asset_ref) {
-        Ok(Some(_)) => {}
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-    let holders = match state.db.get_asset_holders(&asset_ref) {
-        Ok(holders) => holders,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+) -> Result<Json<Vec<AssetHolderRow>>, ApiError> {
+    let asset_ref = parse_ref(&asset_ref)?;
+    state.db.get_asset(&asset_ref)?.ok_or(ApiError::NotFound)?;
+    let holders = state.db.get_asset_holders(&asset_ref)?;
     let mut rows = Vec::with_capacity(holders.len());
     for address in holders {
-        let (balance, holder_state) = match (
-            state.db.get_asset_balance(&asset_ref, &address),
-            state.db.get_holder_state(&asset_ref, &address),
-        ) {
-            (Ok(balance), Ok(holder_state)) => (balance, holder_state),
-            _ => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
+        let balance = state.db.get_asset_balance(&asset_ref, &address)?;
+        let holder_state = state.db.get_holder_state(&asset_ref, &address)?;
         rows.push(AssetHolderRow { address, balance, frozen: holder_state.frozen, frozen_amount: holder_state.frozen_amount });
     }
-    Json(rows).into_response()
+    Ok(Json(rows))
 }
 
 /// Every regulated asset `address` holds a balance row for.
@@ -1259,38 +1145,21 @@ async fn get_asset_holders<P: Payload>(
 async fn get_account_assets<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-
-    let refs = match state.db.get_account_assets(&address) {
-        Ok(refs) => refs,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+) -> Result<Json<Vec<AccountAssetBalance>>, ApiError> {
+    let address = parse_address(&address)?;
+    let refs = state.db.get_account_assets(&address)?;
 
     let mut balances = Vec::with_capacity(refs.len());
     for asset_ref in refs {
-        let asset = match state.db.get_asset(&asset_ref) {
-            Ok(Some(asset)) => asset,
-            // Indexed but unregistered is impossible through the normal write
-            // path (both rows land in one atomic batch), so skip rather than
-            // fail the whole listing.
-            Ok(None) => continue,
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        };
-        let row = state
-            .db
-            .get_asset_balance(&asset_ref, &address)
-            .and_then(|balance| AccountAssetBalance::new(&state.db, &address, asset, balance));
-        match row {
-            Ok(row) => balances.push(row),
-            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        }
+        // Indexed but unregistered is impossible through the normal write
+        // path (both rows land in one atomic batch), so skip rather than
+        // fail the whole listing.
+        let Some(asset) = state.db.get_asset(&asset_ref)? else { continue };
+        let balance = state.db.get_asset_balance(&asset_ref, &address)?;
+        balances.push(AccountAssetBalance::new(&state.db, &address, asset, balance)?);
     }
 
-    Json(balances).into_response()
+    Ok(Json(balances))
 }
 
 /// `address`'s balance of one asset. 404 when the asset was never registered,
@@ -1299,30 +1168,12 @@ async fn get_account_assets<P: Payload>(
 async fn get_account_asset_balance<P: Payload>(
     State(state): State<AppState<P>>,
     Path((address, asset_ref)): Path<(String, String)>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let asset_ref = match parse_ref(&asset_ref) {
-        Ok(r) => r,
-        Err(bad) => return bad.into_response(),
-    };
-
-    let asset = match state.db.get_asset(&asset_ref) {
-        Ok(Some(asset)) => asset,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    let row = state
-        .db
-        .get_asset_balance(&asset_ref, &address)
-        .and_then(|balance| AccountAssetBalance::new(&state.db, &address, asset, balance));
-    match row {
-        Ok(row) => Json(row).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<AccountAssetBalance>, ApiError> {
+    let address = parse_address(&address)?;
+    let asset_ref = parse_ref(&asset_ref)?;
+    let asset = state.db.get_asset(&asset_ref)?.ok_or(ApiError::NotFound)?;
+    let balance = state.db.get_asset_balance(&asset_ref, &address)?;
+    Ok(Json(AccountAssetBalance::new(&state.db, &address, asset, balance)?))
 }
 
 /// The registry record plus what a client needs to render it safely without
@@ -1355,43 +1206,30 @@ struct AssetsQuery {
 async fn get_assets<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<AssetsQuery>,
-) -> Response {
-    let issuer = match query.issuer.as_deref().map(Address::parse).transpose() {
-        Ok(issuer) => issuer,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let assets = match state.db.list_assets() {
-        Ok(assets) => assets,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
+) -> Result<Json<Vec<AssetResponse>>, ApiError> {
+    let issuer = query
+        .issuer
+        .as_deref()
+        .map(Address::parse)
+        .transpose()
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let assets = state.db.list_assets()?;
     let rows = assets
         .into_iter()
         .filter(|asset| issuer.as_ref().is_none_or(|issuer| &asset.issuer == issuer))
         .map(|asset| asset_response(&state.db, asset))
-        .collect::<Result<Vec<_>, _>>();
-    match rows {
-        Ok(rows) => Json(rows).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(rows))
 }
 
 /// One asset's registry record by ref — the canonical lookup.
 async fn get_asset<P: Payload>(
     State(state): State<AppState<P>>,
     Path(asset_ref): Path<String>,
-) -> Response {
-    let asset_ref = match parse_ref(&asset_ref) {
-        Ok(r) => r,
-        Err(bad) => return bad.into_response(),
-    };
-    match state.db.get_asset(&asset_ref) {
-        Ok(Some(asset)) => match asset_response(&state.db, asset) {
-            Ok(row) => Json(row).into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<AssetResponse>, ApiError> {
+    let asset_ref = parse_ref(&asset_ref)?;
+    let asset = state.db.get_asset(&asset_ref)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(asset_response(&state.db, asset)?))
 }
 
 /// Slug resolution — "is this name taken?" for a register form. The ref is
@@ -1401,22 +1239,13 @@ async fn get_asset<P: Payload>(
 async fn get_asset_alias<P: Payload>(
     State(state): State<AppState<P>>,
     Path((issuer, asset_id)): Path<(String, String)>,
-) -> Response {
-    let issuer = match Address::parse(&issuer) {
-        Ok(issuer) => issuer,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let asset_ref = match AssetRef::derive(&issuer, &asset_id) {
-        Ok(r) => r,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    match state.db.get_asset(&asset_ref) {
-        Ok(Some(asset)) => match asset_response(&state.db, asset) {
-            Ok(row) => Json(row).into_response(),
-            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-        },
-        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({ "ref": asset_ref }))).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+) -> Result<Response, ApiError> {
+    let issuer = parse_address(&issuer)?;
+    let asset_ref =
+        AssetRef::derive(&issuer, &asset_id).map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    match state.db.get_asset(&asset_ref)? {
+        Some(asset) => Ok(Json(asset_response(&state.db, asset)?).into_response()),
+        None => Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({ "ref": asset_ref }))).into_response()),
     }
 }
 
@@ -1429,42 +1258,35 @@ struct AttestorResponse {
 }
 
 /// Every attestor currently in the trust-spectrum registry.
-async fn get_attestors<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    match state.db.list_attestors() {
-        Ok(attestors) => Json(
-            attestors
-                .into_iter()
-                .map(|(attestor, record)| AttestorResponse {
-                    attestor: attestor.to_string(),
-                    name: record.name,
-                    registered_at: record.registered_at,
-                })
-                .collect::<Vec<_>>(),
-        )
-        .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+async fn get_attestors<P: Payload>(
+    State(state): State<AppState<P>>,
+) -> Result<Json<Vec<AttestorResponse>>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .list_attestors()?
+            .into_iter()
+            .map(|(attestor, record)| AttestorResponse {
+                attestor: attestor.to_string(),
+                name: record.name,
+                registered_at: record.registered_at,
+            })
+            .collect(),
+    ))
 }
 
 /// One address's attestor registry record, if currently registered.
 async fn get_attestor<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    match state.db.get_attestor_record(&address) {
-        Ok(Some(record)) => Json(AttestorResponse {
-            attestor: address.to_string(),
-            name: record.name,
-            registered_at: record.registered_at,
-        })
-        .into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<AttestorResponse>, ApiError> {
+    let address = parse_address(&address)?;
+    let record = state.db.get_attestor_record(&address)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(AttestorResponse {
+        attestor: address.to_string(),
+        name: record.name,
+        registered_at: record.registered_at,
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1494,71 +1316,30 @@ struct ValidatorSetQuery {
 /// symptom beyond a `warn!` per dropped vote. Reporting the set size, how many
 /// of them can actually vote, and the quorum those numbers imply makes that
 /// visible in one request.
-async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    let tip_height = match state.db.get_tip_height() {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(err) => {
-            warn!("failed to read tip height: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let validators = match state.db.get_validator_set_at(tip_height) {
-        Ok(validators) => validators,
-        Err(err) => {
-            warn!("failed to read validator set at {tip_height}: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let validators = state.db.get_validator_set_at(tip_height)?;
 
     let mut voters = 0usize;
     let mut keyed: Vec<&Address> = Vec::new();
     for validator in validators.keys() {
-        match state.db.get_bls_pubkey(validator) {
-            Ok(Some(_)) => {
-                voters += 1;
-                keyed.push(validator);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!("failed to read BLS key for {validator}: {err}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        if state.db.get_bls_pubkey(validator)?.is_some() {
+            voters += 1;
+            keyed.push(validator);
         }
     }
     // Quorum is by voting power, so what matters is how much of it can
     // actually sign — a keyless whale can block finality on its own.
     let voting_power_with_bls_key = signed_power(&validators, keyed);
 
-    let finalized_height = match state.db.get_finalized_height() {
-        Ok(height) => height,
-        Err(err) => {
-            warn!("failed to read finalized height: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
+    let finalized_height = state.db.get_finalized_height()?;
     let record = match finalized_height {
-        Some(height) => match state.db.get_finality_record(height) {
-            Ok(record) => record,
-            Err(err) => {
-                warn!("failed to read finality record at {height}: {err}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        },
+        Some(height) => state.db.get_finality_record(height)?,
         None => None,
     };
+    let final_watermark = state.db.get_final_watermark()?;
 
-    let final_watermark = match state.db.get_final_watermark() {
-        Ok(watermark) => watermark,
-        Err(err) => {
-            warn!("failed to read final watermark: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         // null rather than absent: a client must be able to tell "nothing has
         // finalized yet" from "this node is too old to have the field".
         "finalized_height": finalized_height,
@@ -1582,40 +1363,20 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         // anything, because not enough of the set's power can even vote.
         "quorum_reachable": voting_power_with_bls_key >= QUORUM_POWER,
     }))
-    .into_response()
+    .into_response())
 }
 
 async fn get_validators<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<ValidatorSetQuery>,
-) -> Response {
-    let tip_height = match state.db.get_tip_height() {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
-    // A height above the tip is a caller mistake worth naming: answering with
-    // the tip's set would look like data rather than a misunderstanding.
-    let height = match query.height {
-        Some(requested) if requested > tip_height => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("height {requested} is above the chain tip {tip_height}"),
-            )
-                .into_response();
-        }
-        Some(requested) => requested,
-        None => tip_height,
-    };
+) -> Result<Json<Vec<Address>>, ApiError> {
+    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let height = resolve_height(query.height, tip_height)?;
 
     // Membership only, sorted — the shape Retracer's uptime view and the
     // proposer formula (`sorted(set)[height % len]`) consume. Weights are
     // on `/validators/power`.
-    match state.db.validator_addresses_at(height) {
-        Ok(validators) => Json(validators).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    Ok(Json(state.db.validator_addresses_at(height)?))
 }
 
 /// `{address: voting_power}` for the set at `?height=` (default: tip) —
@@ -1623,25 +1384,12 @@ async fn get_validators<P: Payload>(
 async fn get_validator_power<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<ValidatorSetQuery>,
-) -> Response {
-    let tip_height = match state.db.get_tip_height() {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let height = match query.height {
-        Some(requested) if requested > tip_height => {
-            return (StatusCode::BAD_REQUEST, format!("height {requested} is above the chain tip {tip_height}"))
-                .into_response();
-        }
-        Some(requested) => requested,
-        None => tip_height,
-    };
-    match state.db.get_validator_set_at(height) {
-        Ok(validators) => Json(validators.into_iter().map(|(a, p)| (a.to_string(), p.0)).collect::<BTreeMap<_, _>>())
-            .into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<BTreeMap<String, u32>>, ApiError> {
+    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let height = resolve_height(query.height, tip_height)?;
+    Ok(Json(
+        state.db.get_validator_set_at(height)?.into_iter().map(|(a, p)| (a.to_string(), p.0)).collect(),
+    ))
 }
 
 /// One validator's standing: its `ValidatorStatus` (Active / Pending /
@@ -1652,32 +1400,22 @@ async fn get_validator_power<P: Payload>(
 async fn get_validator<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-    let status = match state.db.get_validator_status(&address) {
-        Ok(Some(status)) => status,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let tip = state.db.get_tip_height().ok().flatten().unwrap_or(0);
-    let voting_power = match state.db.get_validator_set_at(tip) {
-        Ok(set) => set.into_iter().find(|(a, _)| a == &address).map(|(_, p)| p.0).unwrap_or(0),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let (Ok(bls), Ok(operator)) = (state.db.get_bls_pubkey(&address), state.db.get_operator(&address)) else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
-    Json(serde_json::json!({
+) -> Result<Response, ApiError> {
+    let address = parse_address(&address)?;
+    let status = state.db.get_validator_status(&address)?.ok_or(ApiError::NotFound)?;
+    let tip = state.db.get_tip_height()?.unwrap_or(0);
+    let voting_power =
+        state.db.get_validator_set_at(tip)?.into_iter().find(|(a, _)| a == &address).map(|(_, p)| p.0).unwrap_or(0);
+    let bls = state.db.get_bls_pubkey(&address)?;
+    let operator = state.db.get_operator(&address)?;
+    Ok(Json(serde_json::json!({
         "address": address,
         "status": status,
         "voting_power": voting_power,
         "bls_registered": bls.is_some(),
         "operator": operator,
     }))
-    .into_response()
+    .into_response())
 }
 
 /// Every validator address currently authorizing `address` to submit
@@ -1687,16 +1425,9 @@ async fn get_validator<P: Payload>(
 async fn get_operator_validators<P: Payload>(
     State(state): State<AppState<P>>,
     Path(address): Path<String>,
-) -> Response {
-    let address = match Address::parse(&address) {
-        Ok(address) => address,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
-
-    match state.db.get_validators_for_operator(&address) {
-        Ok(validators) => Json(validators).into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+) -> Result<Json<Vec<Address>>, ApiError> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.db.get_validators_for_operator(&address)?))
 }
 
 /// Status of a submitted action: "pending" while it's still queued in the
@@ -1709,55 +1440,39 @@ async fn get_operator_validators<P: Payload>(
 async fn get_action_status<P: Payload>(
     State(state): State<AppState<P>>,
     Path(signature): Path<String>,
-) -> Response {
+) -> Result<Response, ApiError> {
     {
         let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if mempool.contains_signature(&signature) {
-            return Json(serde_json::json!({ "status": "pending" })).into_response();
+            return Ok(Json(serde_json::json!({ "status": "pending" })).into_response());
         }
         if let Some(reason) = mempool.dropped_reason(&signature) {
-            return Json(serde_json::json!({ "status": "dropped", "reason": reason })).into_response();
+            return Ok(Json(serde_json::json!({ "status": "dropped", "reason": reason })).into_response());
         }
     }
 
-    let height = match state.db.get_action_block_height(&signature) {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => {
-            warn!("failed to look up action {signature}: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let block = match state.db.get_block::<P>(height) {
-        Ok(Some(block)) => block,
-        Ok(None) => {
-            warn!("action index points at missing block {height} for {signature}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(err) => {
-            warn!("failed to load block {height} for {signature}: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    let Some(action) = block
+    let height = state.db.get_action_block_height(&signature)?.ok_or(ApiError::NotFound)?;
+    let block = state.db.get_block::<P>(height)?.ok_or_else(|| {
+        ApiError::internal(anyhow::anyhow!("action index points at missing block {height} for {signature}"))
+    })?;
+    let action = block
         .actions
         .iter()
         .find(|action| action.signature.as_deref() == Some(signature.as_str()))
-    else {
-        warn!("action index points at block {height} but action {signature} isn't in it");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    };
+        .ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!(
+                "action index points at block {height} but action {signature} isn't in it"
+            ))
+        })?;
 
-    Json(serde_json::json!({
+    Ok(Json(serde_json::json!({
         "status": "confirmed",
         "height": height,
         "block_hash": block.hash(),
         "sender": action.sender,
         "nonce": action.nonce,
     }))
-    .into_response()
+    .into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -1798,107 +1513,55 @@ fn block_with_finality<P: Payload>(
 async fn get_blocks<P: Payload>(
     State(state): State<AppState<P>>,
     Query(range): Query<BlockRangeQuery>,
-) -> Response {
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
     if range.from > range.to {
-        return (StatusCode::BAD_REQUEST, "from must be <= to").into_response();
+        return Err(ApiError::BadRequest("from must be <= to".to_string()));
     }
-    match state.db.get_block_range::<P>(range.from, range.to) {
-        // One finality lookup per block. The range is already capped, so this
-        // is bounded; a single watermark comparison would be cheaper but wrong
-        // for the reason `block_with_finality` documents.
-        Ok(blocks) => {
-            let annotated: Result<Vec<_>, _> = blocks
-                .iter()
-                .map(|block| block_with_finality(&state.db, block))
-                .collect();
-            match annotated {
-                Ok(values) => Json(values).into_response(),
-                Err(err) => {
-                    warn!("failed to read finality for block range: {err}");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
-            }
-        }
-        Err(err) => {
-            warn!("failed to load block range {}..={}: {err}", range.from, range.to);
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    // One finality lookup per block. The range is already capped, so this
+    // is bounded; a single watermark comparison would be cheaper but wrong
+    // for the reason `block_with_finality` documents.
+    let blocks = state.db.get_block_range::<P>(range.from, range.to)?;
+    let annotated =
+        blocks.iter().map(|block| block_with_finality(&state.db, block)).collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(annotated))
 }
 
 async fn get_block_by_height<P: Payload>(
     State(state): State<AppState<P>>,
     Path(height): Path<u64>,
-) -> Response {
-    match state.db.get_block::<P>(height) {
-        Ok(Some(block)) => match block_with_finality(&state.db, &block) {
-            Ok(value) => Json(value).into_response(),
-            Err(err) => {
-                warn!("failed to read finality for block {height}: {err}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(err) => {
-            warn!("failed to load block {height}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let block = state.db.get_block::<P>(height)?.ok_or(ApiError::NotFound)?;
+    Ok(Json(block_with_finality(&state.db, &block)?))
 }
 
 async fn get_block_by_hash<P: Payload>(
     State(state): State<AppState<P>>,
     Path(hash): Path<String>,
-) -> Response {
+) -> Result<Json<serde_json::Value>, ApiError> {
     // Case/prefix are normalized before the lookup, not compared as raw
     // strings, so `/blocks/AABBCC...` finds the same block as
     // `/blocks/aabbcc...`. A string that isn't even a valid 32-byte hash
     // can't name any block, same as one that doesn't match.
     let Ok(hash) = hash.parse::<Hash32>() else {
-        return StatusCode::NOT_FOUND.into_response();
+        return Err(ApiError::NotFound);
     };
-    let height = match state.db.get_block_height_by_hash(&hash) {
-        Ok(Some(height)) => height,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(err) => {
-            warn!("failed to look up block hash {hash}: {err}");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    match state.db.get_block::<P>(height) {
-        Ok(Some(block)) => match block_with_finality(&state.db, &block) {
-            Ok(value) => Json(value).into_response(),
-            Err(err) => {
-                warn!("failed to read finality for block {height}: {err}");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
-        },
-        Ok(None) => {
-            warn!("block_hash index points at missing block {height} for {hash}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-        Err(err) => {
-            warn!("failed to load block {height} for hash {hash}: {err}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
-    }
+    let height = state.db.get_block_height_by_hash(&hash)?.ok_or(ApiError::NotFound)?;
+    let block = state.db.get_block::<P>(height)?.ok_or_else(|| {
+        ApiError::internal(anyhow::anyhow!("block_hash index points at missing block {height} for {hash}"))
+    })?;
+    Ok(Json(block_with_finality(&state.db, &block)?))
 }
 
 /// Lists the filenames `xc_evidence::write_equivocation_artifact` /
 /// `write_disagreement_artifact` have written to `evidence_dir` — each one
 /// an `EvidenceArtifact` an outside party can fetch via `GET /evidence/{id}`
 /// and check with `arx-verify`, no shell access to the node required.
-async fn get_evidence_list<P: Payload>(State(state): State<AppState<P>>) -> Response {
+async fn get_evidence_list<P: Payload>(State(state): State<AppState<P>>) -> Result<Json<Vec<String>>, ApiError> {
     let entries = match std::fs::read_dir(&state.evidence_dir) {
         Ok(entries) => entries,
         // No evidence directory yet just means no faults observed so far.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Json(Vec::<String>::new()).into_response();
-        }
-        Err(err) => {
-            warn!("failed to read evidence dir {}: {err}", state.evidence_dir.display());
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Json(Vec::new())),
+        Err(err) => return Err(ApiError::internal(err)),
     };
 
     let mut ids: Vec<String> = entries
@@ -1907,7 +1570,7 @@ async fn get_evidence_list<P: Payload>(State(state): State<AppState<P>>) -> Resp
         .filter(|name| name.ends_with(".json"))
         .collect();
     ids.sort();
-    Json(ids).into_response()
+    Ok(Json(ids))
 }
 
 /// Serves one evidence artifact's raw JSON by filename, as listed by
@@ -1916,22 +1579,15 @@ async fn get_evidence_list<P: Payload>(State(state): State<AppState<P>>) -> Resp
 async fn get_evidence_by_id<P: Payload>(
     State(state): State<AppState<P>>,
     Path(id): Path<String>,
-) -> Response {
+) -> Result<Response, ApiError> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return StatusCode::BAD_REQUEST.into_response();
+        return Err(ApiError::BadRequest("invalid evidence id".to_string()));
     }
     let path = state.evidence_dir.join(&id);
     match std::fs::read(&path) {
-        Ok(bytes) => {
-            ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            StatusCode::NOT_FOUND.into_response()
-        }
-        Err(err) => {
-            warn!("failed to read evidence artifact {}: {err}", path.display());
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Ok(bytes) => Ok(([(header::CONTENT_TYPE, "application/json")], bytes).into_response()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(ApiError::NotFound),
+        Err(err) => Err(ApiError::internal(err)),
     }
 }
 
@@ -2284,7 +1940,7 @@ mod tests {
             Path(validator.to_string()),
             Query(ValidatorSetQuery { height: None }),
         )
-        .await;
+        .await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -2333,7 +1989,7 @@ mod tests {
             let state = test_state();
             let alice = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
 
-            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await;
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let allocation = xc_primitives::StakeAllocation {
@@ -2354,7 +2010,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await;
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
         });
     }
@@ -2371,7 +2027,7 @@ mod tests {
                 State(state.clone()),
                 Path((operator.to_string(), validator.to_string())),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let allocation = xc_primitives::StakeAllocation {
@@ -2398,14 +2054,14 @@ mod tests {
                 State(state.clone()),
                 Path((validator.to_string(), validator.to_string())),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let resp = get_delegated_stake(
                 State(state.clone()),
                 Path((operator.to_string(), validator.to_string())),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2426,7 +2082,7 @@ mod tests {
             // Tampering with the nonce after signing invalidates the signature.
             let mut tampered = signed_action(&key, 0);
             tampered.nonce = 1;
-            let resp = submit_action(State(state.clone()), Ok(Json(tampered))).await;
+            let resp = submit_action(State(state.clone()), Ok(Json(tampered))).await.into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             // Sender is already at on-chain nonce 5 — nonce 0 is a stale replay.
@@ -2453,25 +2109,25 @@ mod tests {
                 })
                 .unwrap();
             let stale = signed_action(&key, 0);
-            let resp = submit_action(State(state.clone()), Ok(Json(stale))).await;
+            let resp = submit_action(State(state.clone()), Ok(Json(stale))).await.into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             // Far-future nonce: can never execute until every nonce below it
             // does, and `purge_stale` never reclaims it — so it must not take
             // a mempool slot at all.
             let far_future = signed_action(&key, 5 + state.max_nonce_gap + 1);
-            let resp = submit_action(State(state.clone()), Ok(Json(far_future))).await;
+            let resp = submit_action(State(state.clone()), Ok(Json(far_future))).await.into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             assert_eq!(state.mempool.lock().unwrap().len(), 0);
 
             // The edge of the window is still admissible.
             let edge = signed_action(&key, 5 + state.max_nonce_gap);
-            let resp = submit_action(State(state.clone()), Ok(Json(edge))).await;
+            let resp = submit_action(State(state.clone()), Ok(Json(edge))).await.into_response();
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
             // Correctly signed, current nonce: must be accepted into the mempool.
             let valid = signed_action(&key, 5);
-            let resp = submit_action(State(state.clone()), Ok(Json(valid))).await;
+            let resp = submit_action(State(state.clone()), Ok(Json(valid))).await.into_response();
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
             assert_eq!(state.mempool.lock().unwrap().len(), 2);
         });
@@ -2504,7 +2160,7 @@ mod tests {
             let index = state.db.asset_index_updates(&[alice_gold.clone(), bob_gold.clone()], &balances).unwrap();
             state.db.write_batches(&[&alice_gold, &bob_gold, &balances, &index]).unwrap();
 
-            let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string())).await;
+            let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = json(resp).await;
             assert_eq!(body["ref"], alice_gold.asset_ref.to_string());
@@ -2515,28 +2171,28 @@ mod tests {
             assert_eq!(body["holders"], 1);
 
             // The slug is not a route: a non-ref path segment is a 400.
-            let resp = get_asset(State(state.clone()), Path("gold".into())).await;
+            let resp = get_asset(State(state.clone()), Path("gold".into())).await.into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: Some(bob.to_string()) })).await;
+            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: Some(bob.to_string()) })).await.into_response();
             let body = json(resp).await;
             assert_eq!(body.as_array().unwrap().len(), 1);
             assert_eq!(body[0]["ref"], bob_gold.asset_ref.to_string());
-            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: None })).await;
+            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: None })).await.into_response();
             assert_eq!(json(resp).await.as_array().unwrap().len(), 2);
 
-            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "gold".into()))).await;
+            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "gold".into()))).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(json(resp).await["ref"], bob_gold.asset_ref.to_string());
-            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "silver".into()))).await;
+            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "silver".into()))).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
             assert_eq!(json(resp).await["ref"], AssetRef::derive(&bob, "silver").unwrap().to_string());
 
-            let resp = get_account_asset_balance(State(state.clone()), Path((bob.to_string(), alice_gold.asset_ref.to_string()))).await;
+            let resp = get_account_asset_balance(State(state.clone()), Path((bob.to_string(), alice_gold.asset_ref.to_string()))).await.into_response();
             let body = json(resp).await;
             assert_eq!(body["balance"], 7);
             assert_eq!(body["issuer"], alice.to_string());
-            let resp = get_account_assets(State(state.clone()), Path(bob.to_string())).await;
+            let resp = get_account_assets(State(state.clone()), Path(bob.to_string())).await.into_response();
             let body = json(resp).await;
             let rows = body.as_array().unwrap();
             assert_eq!(rows.len(), 2);
@@ -2574,7 +2230,7 @@ mod tests {
             state.db.write_batch(&genesis).unwrap();
 
             for (who, expect_value) in [(&alice, Some(42u64)), (&nobody, None)] {
-                let resp = get_account_proof(State(state.clone()), Path(who.to_string())).await;
+                let resp = get_account_proof(State(state.clone()), Path(who.to_string())).await.into_response();
                 assert_eq!(resp.status(), StatusCode::OK);
                 let body = json(resp).await;
                 assert_eq!(body["height"], 0);
@@ -2618,7 +2274,7 @@ mod tests {
             let index = state.db.asset_index_updates(std::slice::from_ref(&asset), &balances).unwrap();
             state.db.write_batches(&[&asset, &balances, &holder_states, &index]).unwrap();
 
-            let resp = get_account_assets(State(state), Path(holder.to_string())).await;
+            let resp = get_account_assets(State(state), Path(holder.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let text = std::str::from_utf8(&body).unwrap();
@@ -2636,12 +2292,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = test_state();
-            let resp = get_min_stake(State(state.clone())).await;
+            let resp = get_min_stake(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let mut state = state;
             state.min_stake = Some(1_000);
-            let resp = get_min_stake(State(state)).await;
+            let resp = get_min_stake(State(state)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2656,12 +2312,12 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let state = test_state();
-            let resp = get_action_fee(State(state.clone())).await;
+            let resp = get_action_fee(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let mut state = state;
             state.action_fee = Some(10);
-            let resp = get_action_fee(State(state)).await;
+            let resp = get_action_fee(State(state)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2678,7 +2334,7 @@ mod tests {
             let state = test_state();
 
             // No genesis written yet: nothing to report.
-            let resp = get_status(State(state.clone())).await;
+            let resp = get_status(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
@@ -2703,7 +2359,7 @@ mod tests {
                 .write_batch(&xc_storage::GenesisHash(genesis.state_root.clone()))
                 .unwrap();
 
-            let resp = get_status(State(state.clone())).await;
+            let resp = get_status(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2738,7 +2394,7 @@ mod tests {
                 State(state.clone()),
                 Query(BlockRangeQuery { from: 0, to: 2 }),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2746,17 +2402,17 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json.as_array().unwrap().len(), 3);
 
-            let resp = get_block_by_height(State(state.clone()), Path(1)).await;
+            let resp = get_block_by_height(State(state.clone()), Path(1)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            let resp = get_block_by_height(State(state.clone()), Path(99)).await;
+            let resp = get_block_by_height(State(state.clone()), Path(99)).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let target_hash = state.db.get_block::<TestPayload>(1).unwrap().unwrap().hash();
-            let resp = get_block_by_hash(State(state.clone()), Path(target_hash.to_string())).await;
+            let resp = get_block_by_hash(State(state.clone()), Path(target_hash.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await;
+            let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });
     }
@@ -2768,7 +2424,7 @@ mod tests {
             let state = test_state();
 
             // No evidence directory yet just means no faults observed so far.
-            let resp = get_evidence_list(State(state.clone())).await;
+            let resp = get_evidence_list(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -2779,24 +2435,24 @@ mod tests {
             std::fs::create_dir_all(&state.evidence_dir).unwrap();
             std::fs::write(state.evidence_dir.join("fault-1.json"), b"{\"ok\":true}").unwrap();
 
-            let resp = get_evidence_list(State(state.clone())).await;
+            let resp = get_evidence_list(State(state.clone())).await.into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json.as_array().unwrap(), &["fault-1.json"]);
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("fault-1.json".into())).await;
+            let resp = get_evidence_by_id(State(state.clone()), Path("fault-1.json".into())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
             assert_eq!(&body[..], b"{\"ok\":true}");
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("no-such-file.json".into())).await;
+            let resp = get_evidence_by_id(State(state.clone()), Path("no-such-file.json".into())).await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("../secrets.json".into())).await;
+            let resp = get_evidence_by_id(State(state.clone()), Path("../secrets.json".into())).await.into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         });
     }
@@ -2817,7 +2473,7 @@ mod tests {
             }
 
             // search by height
-            let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() })).await;
+            let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() })).await.into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -2830,7 +2486,7 @@ mod tests {
                 State(state.clone()),
                 Query(SearchQuery { q: "99999".into() }),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             // search by address
@@ -2840,7 +2496,7 @@ mod tests {
                     q: sender.to_string(),
                 }),
             )
-            .await;
+            .await.into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -2852,7 +2508,7 @@ mod tests {
                 State(state.clone()),
                 Query(SearchQuery { q: last_sig }),
             )
-            .await;
+            .await.into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -2864,7 +2520,7 @@ mod tests {
                 State(state.clone()),
                 Query(SearchQuery { q: "nonsense".into() }),
             )
-            .await;
+            .await.into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });
     }
@@ -2904,7 +2560,7 @@ mod tests {
                 .write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(0, &[validator.clone()]))
                 .unwrap();
 
-            let resp = get_finality::<TestPayload>(State(state.clone())).await;
+            let resp = get_finality::<TestPayload>(State(state.clone())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2932,7 +2588,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_finality::<TestPayload>(State(state.clone())).await;
+            let resp = get_finality::<TestPayload>(State(state.clone())).await.into_response();
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["validators_with_bls_key"], 1);
@@ -2952,7 +2608,7 @@ mod tests {
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
             state.db.write_batch(&genesis).unwrap();
 
-            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await;
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -2974,7 +2630,7 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await;
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await.into_response();
             let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["finalized"], true);
