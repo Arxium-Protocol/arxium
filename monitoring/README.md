@@ -6,15 +6,20 @@ to the node host. If you change `ARXD_RPC_BIND`, the metrics endpoint follows
 that bind address and must be protected like every other RPC route.
 
 On a host that also runs `retracerd` (Retracer, a separate indexer — see its
-own repo), uncomment the `retracer` scrape job in `prometheus.yml` (its
-`GET /metrics`, `127.0.0.1:8080` by default). It's commented out by default
-because this file is shared by every node deployment and most don't run
-Retracer — leaving it active with nothing listening would make Prometheus
-report the target permanently down. The job sends a bearer token from
-`/etc/arxium-monitoring/retracer-scrape-token`, because `/metrics` sits
+own repo), enable the `retracer` scrape job (its `GET /metrics`,
+`127.0.0.1:8080` by default) by passing `WITH_RETRACER=1` to
+`install-monitoring.sh`, or just rerun it once
+`/etc/arxium-monitoring/retracer-scrape-token` exists — the installer
+auto-detects that file on reinstall and keeps the job enabled from then on.
+The job stays commented out in `prometheus.yml` itself and is appended by the
+installer instead, because this file is shared by every node deployment and
+most don't run Retracer — leaving it active with nothing listening would make
+Prometheus report the target permanently down. The job sends a bearer token
+from `/etc/arxium-monitoring/retracer-scrape-token`, because `/metrics` sits
 behind `retracerd --auth-token` whenever one is set; that file must hold only
-the token and be readable by the `prometheus` account. Remove the
-`authorization` block if that retracerd runs without a token.
+the token and be readable by the `prometheus` account, and
+`WITH_RETRACER=1` fails fast if it's missing. Remove the `authorization`
+block from the appended job if that retracerd runs without a token.
 `alerts.yml`'s matching `retracer` rule
 group needs no such care: it only fires for a job that's actually
 configured, so it's harmless to leave in place either way.
