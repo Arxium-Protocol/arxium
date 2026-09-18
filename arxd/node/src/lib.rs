@@ -449,6 +449,210 @@ fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
     })
 }
 
+/// Builds and sends the `Dissent` this node's BLS key can sign for an
+/// execution disagreement, plus (when every touched key can still be proven
+/// against the parent root) the stronger `BlockDivergence` fraud proof.
+/// Pulled out of `on_block`'s rejection path in `spawn_subsystems`, which
+/// nested this same logic 16 levels deep — same side effects, same early-
+/// outs, just no longer indented past the point of reading it.
+#[allow(clippy::too_many_arguments)]
+fn dissent_on_execution_disagreement<R: ChainRuntime>(
+    err: &AcceptBlockError,
+    height: u64,
+    candidate: &Block<R::Payload>,
+    db: &ArxiumDb,
+    genesis_hash: [u8; 32],
+    address: &Address,
+    bls_key: &xc_bls::BlsSecretKey,
+    send_peer_event: &impl Fn(FinalityEvent<R::Payload>),
+    dissent_tx: &tokio::sync::mpsc::UnboundedSender<Dissent>,
+    evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
+) {
+    // Only these two variants should reach here — see
+    // `AcceptBlockError::is_execution_disagreement`. That classifier lives in
+    // a different crate than this match, though, so a future variant added
+    // there without a matching arm here must not panic the block-handling
+    // path: skip the dissent instead.
+    let dissent_fields = match err {
+        AcceptBlockError::StateRootMismatch { expected, touched_keys, .. } => {
+            Some((expected.clone(), DissentReason::StateRootMismatch, touched_keys.clone()))
+        }
+        AcceptBlockError::ActionMismatch { local_state_root, touched_keys, .. } => {
+            Some((local_state_root.clone(), DissentReason::ActionMismatch, touched_keys.clone()))
+        }
+        _ => {
+            warn!(
+                "is_execution_disagreement() true for a variant this match doesn't handle ({err}) — \
+                 skipping dissent, not panicking"
+            );
+            None
+        }
+    };
+    let Some((state_root, reason, touched_keys)) = dissent_fields else { return };
+
+    // A node that can't read its own parent stays quiet instead of signing a
+    // dissent built on an EP it never actually read — same principle that
+    // excludes `Storage` errors from `is_execution_disagreement` in the first
+    // place. Ok(None) (genesis, no parent) is a legitimate empty EP, not a
+    // read failure.
+    let parent_state_root = match db.get_block::<R::Payload>(height.saturating_sub(1)) {
+        Ok(Some(parent)) => parent.state_root,
+        Ok(None) => String::new(),
+        Err(err) => {
+            warn!(
+                "failed to read parent block {} for dissent EP — staying quiet instead of dissenting on \
+                 unread data: {err}",
+                height.saturating_sub(1)
+            );
+            return;
+        }
+    };
+    let block_hash = candidate.hash();
+    // Weight is a pure function of the action list, so this is what the
+    // block *would* have used had it executed as claimed — the same sum the
+    // proposer hashed into its EP.
+    let weight_used = candidate.actions.iter().map(R::action_weight).sum();
+    let ep = xc_poe::block_ep(&parent_state_root, &candidate.tx_root, &state_root, weight_used);
+    let proposer = candidate.proposer.as_ref().expect("signature already verified, proposer present");
+    let header_commitment: [u8; 32] = Sha256::digest(candidate.signing_bytes(proposer)).into();
+    let msg = dissent_signing_bytes(
+        &genesis_hash,
+        height,
+        &block_hash.to_string(),
+        &state_root,
+        &header_commitment,
+        &ep,
+        reason.as_str(),
+    );
+    let signature = xc_bls::sign(bls_key, &msg);
+    let dissent = Dissent {
+        height,
+        block_hash,
+        state_root: state_root.clone(),
+        header_commitment,
+        ep,
+        reason,
+        voter: address.clone(),
+        signature,
+    };
+    send_peer_event(FinalityEvent::DissentObserved(dissent.clone()));
+    let _ = dissent_tx.send(dissent.clone());
+    let Ok(Some(pubkey)) = db.get_bls_pubkey(address) else { return };
+
+    let attestation = DissentAttestation {
+        height: dissent.height,
+        block_hash: dissent.block_hash.to_string(),
+        state_root: dissent.state_root.clone(),
+        header_commitment: format!("0x{}", hex::encode(dissent.header_commitment)),
+        ep: format!("0x{}", hex::encode(dissent.ep)),
+        reason: reason.as_str().to_string(),
+        voter: address.to_string(),
+        voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+        signature: format!("0x{}", hex::encode(dissent.signature.0)),
+    };
+    let _ = evidence_tx.send(EvidenceEvent::ExecutionDisagreement {
+        proposed: candidate.clone(),
+        dissent: attestation,
+    });
+
+    // Alongside the plain dissent, try to build the stronger BlockDivergence
+    // fraud proof: a proof per touched key against parent_state_root lets
+    // arx-verify replay the block and name a culpable party instead of just
+    // recording disagreement. Proving can fail (key pruned, db error) — that
+    // just means no fraud proof this time, not a reason to skip the dissent
+    // already sent above. Plus the two rows the adjudicator reads that
+    // `dispatch` never touches through the view — the validator set is a
+    // parameter, and it is located via `chain_params` — so a block with a
+    // `LeaveValidator` can still be replayed.
+    let mut touched_keys = touched_keys;
+    let epoch_length = db.chain_params().map(|p| p.epoch_length).unwrap_or_default();
+    touched_keys.push(xc_circuit::ChainParamsKey.encode());
+    touched_keys.push(
+        xc_circuit::ValidatorSetKey(xc_primitives::validator_set_effective_height(height, epoch_length)).encode(),
+    );
+    touched_keys.sort();
+    touched_keys.dedup();
+    let proofs: Result<Vec<xc_artifact::StateProof>, xc_storage::StorageError> = touched_keys
+        .iter()
+        .map(|key| db.prove(key, &parent_state_root).map(|proof| proof.into_state_proof()))
+        .collect();
+    match proofs {
+        Ok(proofs) => {
+            let claim_msg = xc_artifact::block_divergence_signing_bytes(
+                &genesis_hash,
+                height,
+                &header_commitment,
+                &parent_state_root,
+                &state_root,
+            );
+            let claim_signature = xc_bls::sign(bls_key, &claim_msg);
+            let dissent_claim = xc_artifact::BlockDissentClaim {
+                computed_state_root: state_root.clone(),
+                proofs,
+                signature: format!("0x{}", hex::encode(claim_signature.0)),
+            };
+            let _ = evidence_tx.send(EvidenceEvent::BlockDivergence {
+                proposed: candidate.clone(),
+                parent_state_root: parent_state_root.clone(),
+                voter: address.to_string(),
+                voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                dissent_claim,
+            });
+        }
+        Err(err) => {
+            warn!("failed to prove a touched key for block divergence artifact — sending plain dissent only: {err}");
+        }
+    }
+}
+
+/// The routine/not-routine, evidence-worthy classification `on_block`
+/// applies to a rejected block — pulled out for the same reason as
+/// `dissent_on_execution_disagreement` above.
+fn handle_rejected_block<R: ChainRuntime>(
+    err: &AcceptBlockError,
+    height: u64,
+    candidate: &Block<R::Payload>,
+    db: &ArxiumDb,
+    genesis_hash: [u8; 32],
+    bls_identity: &Option<(Address, xc_bls::BlsSecretKey)>,
+    send_peer_event: &impl Fn(FinalityEvent<R::Payload>),
+    dissent_tx: &tokio::sync::mpsc::UnboundedSender<Dissent>,
+    evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
+) {
+    // A block strictly behind our tip is an ordinary, expected race —
+    // already applied via the other delivery path (gossip vs. sync) while
+    // this one was in flight — not evidence of anything wrong, so it
+    // doesn't deserve warn. Competing block for the height we already
+    // committed (`block_height == tip_height`) is the one shape worth both
+    // a warn and handing to the evidence watcher subsystem to check for
+    // equivocation; anything else (ahead of tip, parent mismatch, bad
+    // signature, etc.) stays at warn too.
+    if is_routine_reject(err) {
+        debug!("rejected gossiped block: {err}");
+        return;
+    }
+    warn!("rejected gossiped block: {err}");
+    if err.is_execution_disagreement() {
+        if let Some((address, bls_key)) = bls_identity {
+            dissent_on_execution_disagreement::<R>(
+                err, height, candidate, db, genesis_hash, address, bls_key, send_peer_event, dissent_tx, evidence_tx,
+            );
+        }
+    } else if matches!(
+        err,
+        AcceptBlockError::NotNextHeight { block_height, tip_height } if block_height == tip_height
+    ) || matches!(err, AcceptBlockError::ContradictsCertificate { .. })
+    {
+        // Two shapes of the same sighting: a second block for a height
+        // already committed, and a block for a height a quorum has
+        // certified another block for (which is what reaches here once
+        // the finality unwind has rolled the height back). Both are
+        // equivocation-shaped and belong to the evidence watcher, not to
+        // this path.
+        let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate.clone()));
+    }
+}
+
 /// Spawns every subsystem thread (evidence watcher, finality, the
 /// precommit-vote bridge, RPC ingest, the ctrl-c watcher) and wires the
 /// channels/closures between them. Everything `spawn_p2p_node` and
@@ -846,241 +1050,17 @@ fn spawn_subsystems<R: ChainRuntime>(
                 }
                 Err(err) => {
                     counter!("arxium_blocks_rejected_total").increment(1);
-                    // A block strictly behind our tip is an ordinary,
-                    // expected race — already applied via the other delivery
-                    // path (gossip vs. sync) while this one was in flight —
-                    // not evidence of anything wrong, so it doesn't deserve
-                    // warn. Competing block for the height we already
-                    // committed (`block_height == tip_height`) is the one
-                    // shape worth both a warn and handing to the evidence watcher
-                    // subsystem to check for equivocation; anything else
-                    // (ahead of tip, parent mismatch, bad signature, etc.)
-                    // stays at warn too.
-                    if is_routine_reject(&err) {
-                        debug!("rejected gossiped block: {err}");
-                    } else {
-                        warn!("rejected gossiped block: {err}");
-                        if err.is_execution_disagreement() {
-                            if let Some((address, bls_key)) = &bls_identity {
-                                // Only these two variants should reach here — see
-                                // `AcceptBlockError::is_execution_disagreement`. That
-                                // classifier lives in a different crate than this
-                                // match, though, so a future variant added there
-                                // without a matching arm here must not panic the
-                                // block-handling path: skip the dissent instead.
-                                let dissent_fields = match &err {
-                                    AcceptBlockError::StateRootMismatch {
-                                        expected,
-                                        touched_keys,
-                                        ..
-                                    } => Some((
-                                        expected.clone(),
-                                        DissentReason::StateRootMismatch,
-                                        touched_keys.clone(),
-                                    )),
-                                    AcceptBlockError::ActionMismatch {
-                                        local_state_root,
-                                        touched_keys,
-                                        ..
-                                    } => Some((
-                                        local_state_root.clone(),
-                                        DissentReason::ActionMismatch,
-                                        touched_keys.clone(),
-                                    )),
-                                    _ => {
-                                        warn!(
-                                            "is_execution_disagreement() true for a variant this match doesn't \
-                                             handle ({err}) — skipping dissent, not panicking"
-                                        );
-                                        None
-                                    }
-                                };
-                                if let Some((state_root, reason, touched_keys)) = dissent_fields {
-                                    // A node that can't read its own parent stays quiet
-                                    // instead of signing a dissent built on an EP it
-                                    // never actually read — same principle that excludes
-                                    // `Storage` errors from `is_execution_disagreement`
-                                    // in the first place. Ok(None) (genesis, no parent)
-                                    // is a legitimate empty EP, not a read failure.
-                                    let parent_state_root = match db
-                                        .get_block::<R::Payload>(height.saturating_sub(1))
-                                    {
-                                        Ok(Some(parent)) => parent.state_root,
-                                        Ok(None) => String::new(),
-                                        Err(err) => {
-                                            warn!(
-                                                "failed to read parent block {} for dissent EP — \
-                                                 staying quiet instead of dissenting on unread data: {err}",
-                                                height.saturating_sub(1)
-                                            );
-                                            return false;
-                                        }
-                                    };
-                                    let block_hash = candidate.hash();
-                                    // Weight is a pure function of the action list, so
-                                    // this is what the block *would* have used had it
-                                    // executed as claimed — the same sum the proposer
-                                    // hashed into its EP.
-                                    let weight_used = candidate.actions.iter().map(R::action_weight).sum();
-                                    let ep = xc_poe::block_ep(
-                                        &parent_state_root,
-                                        &candidate.tx_root,
-                                        &state_root,
-                                        weight_used,
-                                    );
-                                    let proposer = candidate
-                                        .proposer
-                                        .as_ref()
-                                        .expect("signature already verified, proposer present");
-                                    let header_commitment: [u8; 32] =
-                                        Sha256::digest(candidate.signing_bytes(proposer)).into();
-                                    let msg = dissent_signing_bytes(
-                                        &genesis_hash,
-                                        height,
-                                        &block_hash.to_string(),
-                                        &state_root,
-                                        &header_commitment,
-                                        &ep,
-                                        reason.as_str(),
-                                    );
-                                    let signature = xc_bls::sign(bls_key, &msg);
-                                    let dissent = Dissent {
-                                        height,
-                                        block_hash,
-                                        state_root: state_root.clone(),
-                                        header_commitment,
-                                        ep,
-                                        reason,
-                                        voter: address.clone(),
-                                        signature,
-                                    };
-                                    send_peer_event(FinalityEvent::DissentObserved(dissent.clone()));
-                                    let _ = dissent_tx.send(dissent.clone());
-                                    if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
-                                        let attestation = DissentAttestation {
-                                            height: dissent.height,
-                                            block_hash: dissent.block_hash.to_string(),
-                                            state_root: dissent.state_root.clone(),
-                                            header_commitment: format!(
-                                                "0x{}",
-                                                hex::encode(dissent.header_commitment)
-                                            ),
-                                            ep: format!("0x{}", hex::encode(dissent.ep)),
-                                            reason: reason.as_str().to_string(),
-                                            voter: address.to_string(),
-                                            voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
-                                            signature: format!(
-                                                "0x{}",
-                                                hex::encode(dissent.signature.0)
-                                            ),
-                                        };
-                                        let _ = evidence_tx.send(
-                                            EvidenceEvent::ExecutionDisagreement {
-                                                proposed: candidate.clone(),
-                                                dissent: attestation,
-                                            },
-                                        );
-
-                                        // Alongside the plain dissent, try to build the
-                                        // stronger BlockDivergence fraud proof: a proof
-                                        // per touched key against parent_state_root lets
-                                        // arx-verify replay the block and name a culpable
-                                        // party instead of just recording disagreement.
-                                        // Proving can fail (key pruned, db error) — that
-                                        // just means no fraud proof this time, not a
-                                        // reason to skip the dissent already sent above.
-                                        // Plus the two rows the adjudicator reads that
-                                        // `dispatch` never touches through the view —
-                                        // the validator set is a parameter, and it is
-                                        // located via `chain_params` — so a block with a
-                                        // `LeaveValidator` can still be replayed.
-                                        let mut touched_keys = touched_keys;
-                                        let epoch_length = db
-                                            .chain_params()
-                                            .map(|p| p.epoch_length)
-                                            .unwrap_or_default();
-                                        touched_keys.push(xc_circuit::ChainParamsKey.encode());
-                                        touched_keys.push(
-                                            xc_circuit::ValidatorSetKey(
-                                                xc_primitives::validator_set_effective_height(height, epoch_length),
-                                            )
-                                            .encode(),
-                                        );
-                                        touched_keys.sort();
-                                        touched_keys.dedup();
-                                        let proofs: Result<
-                                            Vec<xc_artifact::StateProof>,
-                                            xc_storage::StorageError,
-                                        > = touched_keys
-                                            .iter()
-                                            .map(|key| {
-                                                db.prove(key, &parent_state_root)
-                                                    .map(|proof| proof.into_state_proof())
-                                            })
-                                            .collect();
-                                        match proofs {
-                                            Ok(proofs) => {
-                                                let claim_msg =
-                                                    xc_artifact::block_divergence_signing_bytes(
-                                                        &genesis_hash,
-                                                        height,
-                                                        &header_commitment,
-                                                        &parent_state_root,
-                                                        &state_root,
-                                                    );
-                                                let claim_signature =
-                                                    xc_bls::sign(bls_key, &claim_msg);
-                                                let dissent_claim =
-                                                    xc_artifact::BlockDissentClaim {
-                                                        computed_state_root: state_root.clone(),
-                                                        proofs,
-                                                        signature: format!(
-                                                            "0x{}",
-                                                            hex::encode(claim_signature.0)
-                                                        ),
-                                                    };
-                                                let _ = evidence_tx.send(
-                                                    EvidenceEvent::BlockDivergence {
-                                                        proposed: candidate.clone(),
-                                                        parent_state_root: parent_state_root
-                                                            .clone(),
-                                                        voter: address.to_string(),
-                                                        voter_pubkey: format!(
-                                                            "0x{}",
-                                                            hex::encode(pubkey.0)
-                                                        ),
-                                                        dissent_claim,
-                                                    },
-                                                );
-                                            }
-                                            Err(err) => {
-                                                warn!(
-                                                    "failed to prove a touched key for block divergence artifact — \
-                                                 sending plain dissent only: {err}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        } else if matches!(
-                            &err,
-                            xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height }
-                                if block_height == tip_height
-                        ) || matches!(
-                            &err,
-                            xc_executor::AcceptBlockError::ContradictsCertificate { .. }
-                        ) {
-                            // Two shapes of the same sighting: a second block
-                            // for a height already committed, and a block for
-                            // a height a quorum has certified another block
-                            // for (which is what reaches here once the
-                            // finality unwind has rolled the height back).
-                            // Both are equivocation-shaped and belong to the
-                            // evidence watcher, not to this path.
-                            let _ = evidence_tx.send(EvidenceEvent::BlockObserved(candidate));
-                        }
-                    }
+                    handle_rejected_block::<R>(
+                        &err,
+                        height,
+                        &candidate,
+                        &db,
+                        genesis_hash,
+                        &bls_identity,
+                        &send_peer_event,
+                        &dissent_tx,
+                        &evidence_tx,
+                    );
                     matches!(err, xc_executor::AcceptBlockError::Signature(_))
                 }
             }
