@@ -106,7 +106,10 @@ impl PairingStore {
 }
 
 pub(super) enum PollOutcome {
-    Fulfilled { validator: Address, operator: Address },
+    Fulfilled {
+        validator: Address,
+        operator: Address,
+    },
     Pending,
     NotFound,
 }
@@ -180,9 +183,14 @@ pub(super) async fn poll_pairing<P: Payload>(
     Path(nonce): Path<String>,
 ) -> Response {
     match state.pairing.poll(&nonce) {
-        PollOutcome::Fulfilled { validator, operator } => {
-            Json(PollPairingResponse { validator, operator }).into_response()
-        }
+        PollOutcome::Fulfilled {
+            validator,
+            operator,
+        } => Json(PollPairingResponse {
+            validator,
+            operator,
+        })
+        .into_response(),
         PollOutcome::Pending => StatusCode::ACCEPTED.into_response(),
         PollOutcome::NotFound => {
             (StatusCode::NOT_FOUND, "unknown or expired pairing session").into_response()

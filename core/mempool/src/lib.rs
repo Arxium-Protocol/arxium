@@ -43,7 +43,9 @@ pub enum MempoolError {
 pub enum AdmissionError {
     #[error("bad signature: {0}")]
     BadSignature(#[from] SignatureError),
-    #[error("stale nonce for {sender}: action has {action_nonce}, current on-chain nonce is {current_nonce}")]
+    #[error(
+        "stale nonce for {sender}: action has {action_nonce}, current on-chain nonce is {current_nonce}"
+    )]
     StaleNonce {
         sender: Address,
         action_nonce: u64,
@@ -112,7 +114,8 @@ pub fn validate_action<P: Serialize>(
 /// gossip receipt both run the exact same check, instead of a bad
 /// `JoinValidator`/`LeaveValidator`/`RegisterBlsKey` only being caught (and
 /// silently dropped) at block-production time.
-pub type PayloadPrecheck<P> = Arc<dyn Fn(&Action<P>, &ArxiumDb) -> anyhow::Result<()> + Send + Sync>;
+pub type PayloadPrecheck<P> =
+    Arc<dyn Fn(&Action<P>, &ArxiumDb) -> anyhow::Result<()> + Send + Sync>;
 
 pub struct Mempool<P> {
     pending: VecDeque<Action<P>>,
@@ -192,7 +195,10 @@ impl<P: Serialize> Mempool<P> {
         }
         let size = Self::encoded_size(&action);
         if size > xc_primitives::MAX_WIRE_MESSAGE_SIZE {
-            return Err(MempoolError::TooLarge { size, max: xc_primitives::MAX_WIRE_MESSAGE_SIZE });
+            return Err(MempoolError::TooLarge {
+                size,
+                max: xc_primitives::MAX_WIRE_MESSAGE_SIZE,
+            });
         }
         if self.total_bytes + size > self.max_pending_bytes {
             return Err(MempoolError::Full);
@@ -265,7 +271,11 @@ impl<P: Serialize> Mempool<P> {
     }
 
     pub fn dropped_reason(&self, signature: &str) -> Option<&str> {
-        self.dropped.iter().rev().find(|(sig, _)| sig == signature).map(|(_, reason)| reason.as_str())
+        self.dropped
+            .iter()
+            .rev()
+            .find(|(sig, _)| sig == signature)
+            .map(|(_, reason)| reason.as_str())
     }
 
     pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
@@ -362,7 +372,9 @@ mod tests {
                 signature: Some(format!("sig-{nonce}")),
                 payload: big_payload.clone(),
             };
-            mempool.push(action).expect("well under the byte cap so far");
+            mempool
+                .push(action)
+                .expect("well under the byte cap so far");
         }
 
         let overflow = Action {
@@ -372,7 +384,11 @@ mod tests {
             payload: big_payload,
         };
         assert!(matches!(mempool.push(overflow), Err(MempoolError::Full)));
-        assert_eq!(mempool.len(), 10, "the 11th action must not have been queued");
+        assert_eq!(
+            mempool.len(),
+            10,
+            "the 11th action must not have been queued"
+        );
     }
 
     /// One sender must not be able to hold the whole queue. Admission is
@@ -381,7 +397,10 @@ mod tests {
     /// action fee, since the fee is only charged when an action executes.
     #[test]
     fn one_sender_cannot_hold_more_than_its_share_of_the_queue() {
-        let limits = xc_primitives::Limits { mempool_max_per_sender: 3, ..Default::default() };
+        let limits = xc_primitives::Limits {
+            mempool_max_per_sender: 3,
+            ..Default::default()
+        };
         let mut mempool: Mempool<()> = Mempool::with_limits(&limits);
 
         for nonce in 0..3 {
@@ -420,18 +439,31 @@ mod tests {
             payload: vec![0u8; xc_primitives::MAX_WIRE_MESSAGE_SIZE + 1],
         };
 
-        assert!(matches!(mempool.push(oversized), Err(MempoolError::TooLarge { .. })));
-        assert!(mempool.is_empty(), "an oversized action must not have been queued");
+        assert!(matches!(
+            mempool.push(oversized),
+            Err(MempoolError::TooLarge { .. })
+        ));
+        assert!(
+            mempool.is_empty(),
+            "an oversized action must not have been queued"
+        );
     }
 
     #[test]
     fn dropped_ring_answers_newest_reason_and_forgets_past_capacity() {
         let mut mempool = Mempool::<u64>::new();
-        mempool.note_dropped([("a".to_string(), "first".to_string()), ("a".to_string(), "second".to_string())]);
+        mempool.note_dropped([
+            ("a".to_string(), "first".to_string()),
+            ("a".to_string(), "second".to_string()),
+        ]);
         assert_eq!(mempool.dropped_reason("a"), Some("second"));
         assert_eq!(mempool.dropped_reason("b"), None);
         mempool.note_dropped((0..DROPPED_RING).map(|i| (format!("s{i}"), "x".to_string())));
-        assert_eq!(mempool.dropped_reason("a"), None, "evicted once the ring wraps");
+        assert_eq!(
+            mempool.dropped_reason("a"),
+            None,
+            "evicted once the ring wraps"
+        );
         assert_eq!(mempool.dropped_reason("s0"), Some("x"));
     }
 
@@ -476,19 +508,31 @@ mod tests {
         assert!(mempool.contains_signature("sig-0"));
 
         mempool.drain_pending(1);
-        assert!(!mempool.contains_signature("sig-0"), "drained action must leave the index");
+        assert!(
+            !mempool.contains_signature("sig-0"),
+            "drained action must leave the index"
+        );
         assert!(mempool.contains_signature("sig-1"));
 
         mempool.purge_stale(&addr(1), 5);
-        assert!(!mempool.contains_signature("sig-1"), "purged action must leave the index");
+        assert!(
+            !mempool.contains_signature("sig-1"),
+            "purged action must leave the index"
+        );
     }
 
     #[test]
     fn a_configured_entry_cap_replaces_the_default() {
-        let limits = xc_primitives::Limits { mempool_max_pending: 2, ..Default::default() };
+        let limits = xc_primitives::Limits {
+            mempool_max_pending: 2,
+            ..Default::default()
+        };
         let mut mempool: Mempool<()> = Mempool::with_limits(&limits);
         mempool.push(action(addr(1), 0)).unwrap();
         mempool.push(action(addr(1), 1)).unwrap();
-        assert!(matches!(mempool.push(action(addr(1), 2)), Err(MempoolError::Full)));
+        assert!(matches!(
+            mempool.push(action(addr(1), 2)),
+            Err(MempoolError::Full)
+        ));
     }
 }

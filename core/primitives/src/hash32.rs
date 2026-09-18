@@ -32,9 +32,14 @@ impl Hash32 {
     }
 
     pub fn parse(s: &str) -> Result<Self, Hash32Error> {
-        let hex_part = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+        let hex_part = s
+            .strip_prefix("0x")
+            .or_else(|| s.strip_prefix("0X"))
+            .unwrap_or(s);
         let bytes = hex::decode(hex_part).map_err(|_| Hash32Error::InvalidHex)?;
-        let bytes: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| Hash32Error::WrongLength(v.len()))?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| Hash32Error::WrongLength(v.len()))?;
         Ok(Self(bytes))
     }
 
@@ -106,7 +111,8 @@ mod tests {
 
     const MIXED_UPPER: &str = "0xAABBCC0000000000000000000000000000000000000000000000000000000000";
     const BARE_LOWER: &str = "aabbcc0000000000000000000000000000000000000000000000000000000000";
-    const CAPITAL_X_PREFIX: &str = "0Xaabbcc0000000000000000000000000000000000000000000000000000000000";
+    const CAPITAL_X_PREFIX: &str =
+        "0Xaabbcc0000000000000000000000000000000000000000000000000000000000";
 
     #[test]
     fn parse_accepts_both_case_and_prefix_conventions() {
@@ -132,7 +138,10 @@ mod tests {
     fn round_trips_through_json_regardless_of_input_case() {
         let json = format!("\"{MIXED_UPPER}\"");
         let h: Hash32 = serde_json::from_str(&json).unwrap();
-        assert_eq!(serde_json::to_string(&h).unwrap(), format!("\"0x{}\"", BARE_LOWER));
+        assert_eq!(
+            serde_json::to_string(&h).unwrap(),
+            format!("\"0x{}\"", BARE_LOWER)
+        );
     }
 
     #[test]

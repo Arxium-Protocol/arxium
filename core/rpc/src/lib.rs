@@ -24,7 +24,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
 use xc_primitives::{
-    Action, Address, Asset, AssetRef, Block, Hash32, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power,
+    Action, Address, Asset, AssetRef, Block, Hash32, Limits, QUORUM_POWER, TOTAL_VOTING_POWER,
+    signed_power,
 };
 use xc_storage::{ArxiumDb, StorageError};
 
@@ -56,9 +57,9 @@ fn parse_address(s: &str) -> Result<Address, ApiError> {
 /// caller mistake it is. `None` means "as of the tip".
 fn resolve_height(requested: Option<u64>, tip_height: u64) -> Result<u64, ApiError> {
     match requested {
-        Some(h) if h > tip_height => {
-            Err(ApiError::BadRequest(format!("height {h} is above the chain tip {tip_height}")))
-        }
+        Some(h) if h > tip_height => Err(ApiError::BadRequest(format!(
+            "height {h} is above the chain tip {tip_height}"
+        ))),
         Some(h) => Ok(h),
         None => Ok(tip_height),
     }
@@ -168,7 +169,11 @@ impl RateLimiter {
             hits.retain(|_, (seen, _)| now.duration_since(*seen) <= self.window);
         }
 
-        let max = if is_write { self.max_writes } else { self.max_reads };
+        let max = if is_write {
+            self.max_writes
+        } else {
+            self.max_reads
+        };
         let entry = hits.entry((ip, is_write)).or_insert((now, 0));
         if now.duration_since(entry.0) > self.window {
             *entry = (now, 0);
@@ -231,10 +236,10 @@ async fn guard<P: Payload>(
     // runs on 404s and on rate-limited requests too). Captured before `req`
     // moves into `next.run`. Requests that matched no route have no template
     // and share one bucket.
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| UNMATCHED_PATH.to_string(), |matched| matched.as_str().to_string());
+    let path = req.extensions().get::<MatchedPath>().map_or_else(
+        || UNMATCHED_PATH.to_string(),
+        |matched| matched.as_str().to_string(),
+    );
     let is_write = req.method() != Method::GET;
 
     if let Some(token) = &state.rpc_token {
@@ -342,8 +347,14 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         evidence_dir,
         limits,
     } = config;
-    if rpc_token.is_none() && bind_addr.parse::<IpAddr>().is_ok_and(|ip| !ip.is_loopback()) {
-        warn!("RPC bound to {bind_addr} with no --rpc-token: anyone who can reach it can submit actions");
+    if rpc_token.is_none()
+        && bind_addr
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| !ip.is_loopback())
+    {
+        warn!(
+            "RPC bound to {bind_addr} with no --rpc-token: anyone who can reach it can submit actions"
+        );
     }
 
     let (ready_tx, ready_rx) = mpsc::channel::<std::io::Result<()>>();
@@ -526,10 +537,11 @@ async fn submit_action<P: Payload>(
     }
 
     if let Some(precheck) = &state.payload_precheck
-        && let Err(err) = precheck(&action, &state.db) {
-            warn!("rejected action from {sender}: {err}");
-            return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
-        }
+        && let Err(err) = precheck(&action, &state.db)
+    {
+        warn!("rejected action from {sender}: {err}");
+        return (StatusCode::BAD_REQUEST, err.to_string()).into_response();
+    }
 
     let gossip_action = state.gossip_tx.is_some().then(|| action.clone());
     match state
@@ -567,14 +579,27 @@ async fn submit_action<P: Payload>(
 /// state, so unlike other routes it can't 404 — an initialized node always
 /// has at least the genesis block.
 async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
-    let chain_name = state.db.get_chain_name()?.ok_or(ApiError::ServiceUnavailable)?;
-    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let chain_name = state
+        .db
+        .get_chain_name()?
+        .ok_or(ApiError::ServiceUnavailable)?;
+    let tip_height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let tip_hash = state
         .db
         .get_block::<P>(tip_height)?
-        .ok_or_else(|| ApiError::internal(anyhow::anyhow!("tip height {tip_height} recorded but block is missing")))?
+        .ok_or_else(|| {
+            ApiError::internal(anyhow::anyhow!(
+                "tip height {tip_height} recorded but block is missing"
+            ))
+        })?
         .hash();
-    let genesis_hash = state.db.genesis_hash()?.ok_or(ApiError::ServiceUnavailable)?;
+    let genesis_hash = state
+        .db
+        .genesis_hash()?
+        .ok_or(ApiError::ServiceUnavailable)?;
 
     // Additive: existing consumers keep reading the three fields they know.
     // A wallet showing confirmations needs finality from the same call it
@@ -619,7 +644,9 @@ async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response
 /// `action_fee` is the base; a client estimates a real fee as
 /// `action_fee + weight × weight_fee` (see `arxd_runtime::metering`), and
 /// `max_block_weight` is the cap any single action must fit under.
-async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+async fn get_action_fee<P: Payload>(
+    State(state): State<AppState<P>>,
+) -> Result<Response, ApiError> {
     let action_fee = state.action_fee.ok_or(ApiError::NotFound)?;
     let max_block_weight = state.db.chain_params()?.max_block_weight;
     Ok(Json(serde_json::json!({
@@ -633,8 +660,13 @@ async fn get_action_fee<P: Payload>(State(state): State<AppState<P>>) -> Result<
 /// The genesis state root bound into every BLS finality signature. External
 /// verifiers must pin this value rather than infer network identity from a
 /// mutable chain-name label.
-async fn get_genesis_hash<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
-    let genesis_hash = state.db.genesis_hash()?.ok_or(ApiError::ServiceUnavailable)?;
+async fn get_genesis_hash<P: Payload>(
+    State(state): State<AppState<P>>,
+) -> Result<Response, ApiError> {
+    let genesis_hash = state
+        .db
+        .genesis_hash()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     Ok(Json(serde_json::json!({ "genesis_hash": genesis_hash })).into_response())
 }
 
@@ -656,7 +688,10 @@ mod rate_limiter_tests {
         // Reads for the same IP draw from a separate, larger budget — this
         // is the fix for a client's own status-check polling getting
         // starved by a submission burst it just made.
-        assert!(limiter.allow(ip, false), "read budget must be independent of the write budget");
+        assert!(
+            limiter.allow(ip, false),
+            "read budget must be independent of the write budget"
+        );
     }
 
     #[test]
@@ -676,7 +711,10 @@ mod rate_limiter_tests {
     /// pointless if the limiter still reads the compiled-in default.
     #[test]
     fn a_configured_budget_replaces_the_default() {
-        let limits = Limits { rpc_rate_limit_writes: 2, ..Limits::default() };
+        let limits = Limits {
+            rpc_rate_limit_writes: 2,
+            ..Limits::default()
+        };
         let limiter = RateLimiter::new(&limits);
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
 
@@ -821,21 +859,36 @@ mod tests {
         let handle = recorder.handle();
         // `with_local_recorder` installs the recorder for *this* thread, so
         // the requests have to run on it — hence a current-thread runtime.
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 for address in ["arx1aaaaaaaa", "arx1bbbbbbbb"] {
-                    app.clone().oneshot(request(&format!("/accounts/{address}"))).await.unwrap();
+                    app.clone()
+                        .oneshot(request(&format!("/accounts/{address}")))
+                        .await
+                        .unwrap();
                 }
                 // A 404 must not mint a label of its own either — the guard
                 // wraps the fallback too.
-                app.clone().oneshot(request("/no/such/route/arx1cccccccc")).await.unwrap();
+                app.clone()
+                    .oneshot(request("/no/such/route/arx1cccccccc"))
+                    .await
+                    .unwrap();
             });
         });
 
         let rendered = handle.render();
-        assert!(rendered.contains("path=\"/accounts/{address}\""), "{rendered}");
-        assert!(rendered.contains(&format!("path=\"{UNMATCHED_PATH}\"")), "{rendered}");
+        assert!(
+            rendered.contains("path=\"/accounts/{address}\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("path=\"{UNMATCHED_PATH}\"")),
+            "{rendered}"
+        );
         assert!(!rendered.contains("arx1aaaaaaaa"), "{rendered}");
         assert!(!rendered.contains("arx1cccccccc"), "{rendered}");
     }
@@ -871,7 +924,10 @@ mod tests {
         let app = Router::new()
             .route("/admin/checkpoint", post(admin_checkpoint::<TestPayload>))
             .with_state(state.clone())
-            .layer(middleware::from_fn_with_state(state.clone(), admin_guard::<TestPayload>));
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                admin_guard::<TestPayload>,
+            ));
         let output = std::env::temp_dir().join(format!(
             "arxium-test-admin-checkpoint-{}",
             std::time::SystemTime::now()
@@ -888,20 +944,36 @@ mod tests {
                 builder = builder.header("authorization", auth);
             }
             builder
-                .body(axum::body::Body::from(format!("{{\"output\": {:?}}}", output.display().to_string())))
+                .body(axum::body::Body::from(format!(
+                    "{{\"output\": {:?}}}",
+                    output.display().to_string()
+                )))
                 .unwrap()
         };
 
-        assert_eq!(app.clone().oneshot(request(None)).await.unwrap().status(), StatusCode::UNAUTHORIZED);
         assert_eq!(
-            app.clone().oneshot(request(Some("Bearer rpc"))).await.unwrap().status(),
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Some("Bearer rpc")))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::UNAUTHORIZED,
             "the shared rpc token must not open admin routes"
         );
 
-        let response = app.clone().oneshot(request(Some("Bearer admin"))).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(request(Some("Bearer admin")))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["height"], 0);
         assert!(json["finalized_height"].is_null());
@@ -911,7 +983,10 @@ mod tests {
         drop(reopened);
 
         assert_eq!(
-            app.oneshot(request(Some("Bearer admin"))).await.unwrap().status(),
+            app.oneshot(request(Some("Bearer admin")))
+                .await
+                .unwrap()
+                .status(),
             StatusCode::CONFLICT,
             "never overwrite an existing path"
         );
@@ -952,9 +1027,12 @@ mod tests {
             Path(validator.to_string()),
             Query(ValidatorSetQuery { height: None }),
         )
-        .await.into_response();
+        .await
+        .into_response();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["pubkey"], format!("0x{}", "ab".repeat(48)));
     }
@@ -965,7 +1043,10 @@ mod tests {
         let validator = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let operator = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
 
-        assert!(matches!(store.submit("no-such-nonce", operator.clone()), SubmitOutcome::NotFound));
+        assert!(matches!(
+            store.submit("no-such-nonce", operator.clone()),
+            SubmitOutcome::NotFound
+        ));
         assert!(matches!(store.poll("no-such-nonce"), PollOutcome::NotFound));
 
         let nonce = store.start(validator.clone());
@@ -984,7 +1065,10 @@ mod tests {
         ));
 
         match store.poll(&nonce) {
-            PollOutcome::Fulfilled { validator: v, operator: o } => {
+            PollOutcome::Fulfilled {
+                validator: v,
+                operator: o,
+            } => {
                 assert_eq!(v, validator);
                 assert_eq!(o, operator);
             }
@@ -1001,7 +1085,9 @@ mod tests {
             let state = test_state();
             let alice = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
 
-            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await.into_response();
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let allocation = xc_primitives::StakeAllocation {
@@ -1022,7 +1108,9 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await.into_response();
+            let resp = get_account_stake(State(state.clone()), Path(alice.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
         });
     }
@@ -1037,51 +1125,81 @@ mod tests {
             let v1 = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
             let v2 = Address::from_pubkey_bytes(&[13u8; 32]).unwrap();
 
-            let resp = get_account_stakes(State(state.clone()), Path(master.to_string())).await.into_response();
+            let resp = get_account_stakes(State(state.clone()), Path(master.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!([]));
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                serde_json::json!([])
+            );
 
-            let alloc = |m: &Address, v: &Address, active: u128, unbonding| xc_primitives::StakeAllocation {
-                master: m.clone(),
-                validator: v.clone(),
-                active_amount: active,
-                unbonding,
-                created_at: 1,
-                updated_at: 1,
+            let alloc = |m: &Address, v: &Address, active: u128, unbonding| {
+                xc_primitives::StakeAllocation {
+                    master: m.clone(),
+                    validator: v.clone(),
+                    active_amount: active,
+                    unbonding,
+                    created_at: 1,
+                    updated_at: 1,
+                }
             };
             let mut allocations = BTreeMap::new();
-            allocations.insert((master.clone(), v1.clone()), Some(alloc(&master, &v1, 1_000, None)));
+            allocations.insert(
+                (master.clone(), v1.clone()),
+                Some(alloc(&master, &v1, 1_000, None)),
+            );
             allocations.insert(
                 (master.clone(), v2.clone()),
                 Some(alloc(
                     &master,
                     &v2,
                     0,
-                    Some(xc_primitives::Unbonding { amount: 300, unlock_at_height: 99 }),
+                    Some(xc_primitives::Unbonding {
+                        amount: 300,
+                        unlock_at_height: 99,
+                    }),
                 )),
             );
             // Another master's row must not leak into this master's list.
-            allocations.insert((other.clone(), v1.clone()), Some(alloc(&other, &v1, 7, None)));
+            allocations.insert(
+                (other.clone(), v1.clone()),
+                Some(alloc(&other, &v1, 7, None)),
+            );
             state
                 .db
-                .write_batch(&xc_storage::StakeUpdates { allocations, validator_index: BTreeMap::new() })
+                .write_batch(&xc_storage::StakeUpdates {
+                    allocations,
+                    validator_index: BTreeMap::new(),
+                })
                 .unwrap();
 
-            let resp = get_account_stakes(State(state.clone()), Path(master.to_string())).await.into_response();
+            let resp = get_account_stakes(State(state.clone()), Path(master.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             let rows = json.as_array().unwrap();
             assert_eq!(rows.len(), 2);
             for row in rows {
                 assert_eq!(row["master"], master.to_string());
             }
-            let by_validator: BTreeMap<String, &serde_json::Value> =
-                rows.iter().map(|r| (r["validator"].as_str().unwrap().to_string(), r)).collect();
+            let by_validator: BTreeMap<String, &serde_json::Value> = rows
+                .iter()
+                .map(|r| (r["validator"].as_str().unwrap().to_string(), r))
+                .collect();
             assert_eq!(by_validator[&v1.to_string()]["active_amount"], 1_000);
             assert!(by_validator[&v1.to_string()]["unbonding"].is_null());
-            assert_eq!(by_validator[&v2.to_string()]["unbonding"]["unlock_at_height"], 99);
+            assert_eq!(
+                by_validator[&v2.to_string()]["unbonding"]["unlock_at_height"],
+                99
+            );
             assert_eq!(by_validator[&v2.to_string()]["unbonding"]["amount"], 300);
         });
     }
@@ -1098,7 +1216,8 @@ mod tests {
                 State(state.clone()),
                 Path((operator.to_string(), validator.to_string())),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let allocation = xc_primitives::StakeAllocation {
@@ -1125,14 +1244,16 @@ mod tests {
                 State(state.clone()),
                 Path((validator.to_string(), validator.to_string())),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let resp = get_delegated_stake(
                 State(state.clone()),
                 Path((operator.to_string(), validator.to_string())),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -1153,7 +1274,9 @@ mod tests {
             // Tampering with the nonce after signing invalidates the signature.
             let mut tampered = signed_action(&key, 0);
             tampered.nonce = 1;
-            let resp = submit_action(State(state.clone()), Ok(Json(tampered))).await.into_response();
+            let resp = submit_action(State(state.clone()), Ok(Json(tampered)))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             // Sender is already at on-chain nonce 5 — nonce 0 is a stale replay.
@@ -1174,31 +1297,39 @@ mod tests {
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
-                attestor_admin: None,
-                freeze_admin: None,
-                recovery_admin: None,
+                    attestor_admin: None,
+                    freeze_admin: None,
+                    recovery_admin: None,
                 })
                 .unwrap();
             let stale = signed_action(&key, 0);
-            let resp = submit_action(State(state.clone()), Ok(Json(stale))).await.into_response();
+            let resp = submit_action(State(state.clone()), Ok(Json(stale)))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             // Far-future nonce: can never execute until every nonce below it
             // does, and `purge_stale` never reclaims it — so it must not take
             // a mempool slot at all.
             let far_future = signed_action(&key, 5 + state.max_nonce_gap + 1);
-            let resp = submit_action(State(state.clone()), Ok(Json(far_future))).await.into_response();
+            let resp = submit_action(State(state.clone()), Ok(Json(far_future)))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             assert_eq!(state.mempool.lock().unwrap().len(), 0);
 
             // The edge of the window is still admissible.
             let edge = signed_action(&key, 5 + state.max_nonce_gap);
-            let resp = submit_action(State(state.clone()), Ok(Json(edge))).await.into_response();
+            let resp = submit_action(State(state.clone()), Ok(Json(edge)))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
 
             // Correctly signed, current nonce: must be accepted into the mempool.
             let valid = signed_action(&key, 5);
-            let resp = submit_action(State(state.clone()), Ok(Json(valid))).await.into_response();
+            let resp = submit_action(State(state.clone()), Ok(Json(valid)))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::ACCEPTED);
             assert_eq!(state.mempool.lock().unwrap().len(), 2);
         });
@@ -1212,7 +1343,9 @@ mod tests {
         use xc_storage::AssetBalanceUpdates;
 
         async fn json(resp: Response) -> serde_json::Value {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             serde_json::from_slice(&body).unwrap()
         }
 
@@ -1228,10 +1361,18 @@ mod tests {
                 ((alice_gold.asset_ref.clone(), bob.clone()), 7u128),
                 ((bob_gold.asset_ref.clone(), bob.clone()), 3u128),
             ]));
-            let index = state.db.asset_index_updates(&[alice_gold.clone(), bob_gold.clone()], &balances).unwrap();
-            state.db.write_batches(&[&alice_gold, &bob_gold, &balances, &index]).unwrap();
+            let index = state
+                .db
+                .asset_index_updates(&[alice_gold.clone(), bob_gold.clone()], &balances)
+                .unwrap();
+            state
+                .db
+                .write_batches(&[&alice_gold, &bob_gold, &balances, &index])
+                .unwrap();
 
-            let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string())).await.into_response();
+            let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = json(resp).await;
             assert_eq!(body["ref"], alice_gold.asset_ref.to_string());
@@ -1242,32 +1383,64 @@ mod tests {
             assert_eq!(body["holders"], 1);
 
             // The slug is not a route: a non-ref path segment is a 400.
-            let resp = get_asset(State(state.clone()), Path("gold".into())).await.into_response();
+            let resp = get_asset(State(state.clone()), Path("gold".into()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: Some(bob.to_string()) })).await.into_response();
+            let resp = get_assets(
+                State(state.clone()),
+                Query(AssetsQuery {
+                    issuer: Some(bob.to_string()),
+                }),
+            )
+            .await
+            .into_response();
             let body = json(resp).await;
             assert_eq!(body.as_array().unwrap().len(), 1);
             assert_eq!(body[0]["ref"], bob_gold.asset_ref.to_string());
-            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: None })).await.into_response();
+            let resp = get_assets(State(state.clone()), Query(AssetsQuery { issuer: None }))
+                .await
+                .into_response();
             assert_eq!(json(resp).await.as_array().unwrap().len(), 2);
 
-            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "gold".into()))).await.into_response();
+            let resp =
+                get_asset_alias(State(state.clone()), Path((bob.to_string(), "gold".into())))
+                    .await
+                    .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(json(resp).await["ref"], bob_gold.asset_ref.to_string());
-            let resp = get_asset_alias(State(state.clone()), Path((bob.to_string(), "silver".into()))).await.into_response();
+            let resp = get_asset_alias(
+                State(state.clone()),
+                Path((bob.to_string(), "silver".into())),
+            )
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-            assert_eq!(json(resp).await["ref"], AssetRef::derive(&bob, "silver").unwrap().to_string());
+            assert_eq!(
+                json(resp).await["ref"],
+                AssetRef::derive(&bob, "silver").unwrap().to_string()
+            );
 
-            let resp = get_account_asset_balance(State(state.clone()), Path((bob.to_string(), alice_gold.asset_ref.to_string()))).await.into_response();
+            let resp = get_account_asset_balance(
+                State(state.clone()),
+                Path((bob.to_string(), alice_gold.asset_ref.to_string())),
+            )
+            .await
+            .into_response();
             let body = json(resp).await;
             assert_eq!(body["balance"], 7);
             assert_eq!(body["issuer"], alice.to_string());
-            let resp = get_account_assets(State(state.clone()), Path(bob.to_string())).await.into_response();
+            let resp = get_account_assets(State(state.clone()), Path(bob.to_string()))
+                .await
+                .into_response();
             let body = json(resp).await;
             let rows = body.as_array().unwrap();
             assert_eq!(rows.len(), 2);
-            let bobs = rows.iter().find(|r| r["ref"] == bob_gold.asset_ref.to_string()).unwrap();
+            let bobs = rows
+                .iter()
+                .find(|r| r["ref"] == bob_gold.asset_ref.to_string())
+                .unwrap();
             assert_eq!(bobs["balance"], 3);
         });
     }
@@ -1280,7 +1453,9 @@ mod tests {
         use xc_storage::AccountUpdates;
 
         async fn json(resp: Response) -> serde_json::Value {
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             serde_json::from_slice(&body).unwrap()
         }
 
@@ -1291,7 +1466,10 @@ mod tests {
             let nobody = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
             let accounts = AccountUpdates(BTreeMap::from([(
                 alice.clone(),
-                xc_primitives::AccountEntry { balance: 42, ..Default::default() },
+                xc_primitives::AccountEntry {
+                    balance: 42,
+                    ..Default::default()
+                },
             )]));
             state.db.write_batch(&accounts).unwrap();
             let genesis = Block::<TestPayload> {
@@ -1301,17 +1479,23 @@ mod tests {
             state.db.write_batch(&genesis).unwrap();
 
             for (who, expect_value) in [(&alice, Some(42u64)), (&nobody, None)] {
-                let resp = get_account_proof(State(state.clone()), Path(who.to_string())).await.into_response();
+                let resp = get_account_proof(State(state.clone()), Path(who.to_string()))
+                    .await
+                    .into_response();
                 assert_eq!(resp.status(), StatusCode::OK);
                 let body = json(resp).await;
                 assert_eq!(body["height"], 0);
                 assert_eq!(body["state_root"], genesis.state_root);
                 assert_eq!(body["block_hash"], genesis.hash().to_string());
                 assert_eq!(body["value"]["balance"].as_u64(), expect_value);
-                let proof: xc_artifact::StateProof = serde_json::from_value(body["proof"].clone()).unwrap();
-                let root: [u8; 32] =
-                    hex::decode(genesis.state_root.trim_start_matches("0x")).unwrap().try_into().unwrap();
-                xc_artifact::verify_state_proof(root, &proof).expect("proof verifies against the named root");
+                let proof: xc_artifact::StateProof =
+                    serde_json::from_value(body["proof"].clone()).unwrap();
+                let root: [u8; 32] = hex::decode(genesis.state_root.trim_start_matches("0x"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+                xc_artifact::verify_state_proof(root, &proof)
+                    .expect("proof verifies against the named root");
                 assert_eq!(proof.value.is_some(), expect_value.is_some());
                 // ... and not against any other root.
                 assert!(xc_artifact::verify_state_proof([0xAA; 32], &proof).is_err());
@@ -1337,19 +1521,38 @@ mod tests {
             let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
             let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
             let asset = Asset::new("locked", issuer, false);
-            let balances = AssetBalanceUpdates(BTreeMap::from([((asset.asset_ref.clone(), holder.clone()), u128::MAX)]));
+            let balances = AssetBalanceUpdates(BTreeMap::from([(
+                (asset.asset_ref.clone(), holder.clone()),
+                u128::MAX,
+            )]));
             let holder_states = HolderStateUpdates(BTreeMap::from([(
                 (asset.asset_ref.clone(), holder.clone()),
-                HolderState { frozen: false, frozen_amount: u128::MAX },
+                HolderState {
+                    frozen: false,
+                    frozen_amount: u128::MAX,
+                },
             )]));
-            let index = state.db.asset_index_updates(std::slice::from_ref(&asset), &balances).unwrap();
-            state.db.write_batches(&[&asset, &balances, &holder_states, &index]).unwrap();
+            let index = state
+                .db
+                .asset_index_updates(std::slice::from_ref(&asset), &balances)
+                .unwrap();
+            state
+                .db
+                .write_batches(&[&asset, &balances, &holder_states, &index])
+                .unwrap();
 
-            let resp = get_account_assets(State(state), Path(holder.to_string())).await.into_response();
+            let resp = get_account_assets(State(state), Path(holder.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let text = std::str::from_utf8(&body).unwrap();
-            assert!(text.contains(&format!("\"frozen_amount\":{}", u128::MAX)), "exact u128 JSON: {text}");
+            assert!(
+                text.contains(&format!("\"frozen_amount\":{}", u128::MAX)),
+                "exact u128 JSON: {text}"
+            );
             let rows: Vec<EligibilityFields> = serde_json::from_slice(&body).unwrap();
             assert!(!rows[0].holder_frozen);
             assert_eq!(rows[0].frozen_amount, u128::MAX);
@@ -1419,9 +1622,9 @@ mod tests {
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
-                attestor_admin: None,
-                freeze_admin: None,
-                recovery_admin: None,
+                    attestor_admin: None,
+                    freeze_admin: None,
+                    recovery_admin: None,
                 })
                 .unwrap();
             state.db.write_batch(&genesis).unwrap();
@@ -1443,7 +1646,10 @@ mod tests {
         });
     }
 
-    fn block_with_action(height: u64, action: Action<TestPayload>) -> xc_primitives::Block<TestPayload> {
+    fn block_with_action(
+        height: u64,
+        action: Action<TestPayload>,
+    ) -> xc_primitives::Block<TestPayload> {
         let mut block: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(height);
         block.height = height;
         block.actions = vec![action];
@@ -1465,7 +1671,8 @@ mod tests {
                 State(state.clone()),
                 Query(BlockRangeQuery { from: 0, to: 2 }),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -1473,17 +1680,30 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json.as_array().unwrap().len(), 3);
 
-            let resp = get_block_by_height(State(state.clone()), Path(1)).await.into_response();
+            let resp = get_block_by_height(State(state.clone()), Path(1))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            let resp = get_block_by_height(State(state.clone()), Path(99)).await.into_response();
+            let resp = get_block_by_height(State(state.clone()), Path(99))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-            let target_hash = state.db.get_block::<TestPayload>(1).unwrap().unwrap().hash();
-            let resp = get_block_by_hash(State(state.clone()), Path(target_hash.to_string())).await.into_response();
+            let target_hash = state
+                .db
+                .get_block::<TestPayload>(1)
+                .unwrap()
+                .unwrap()
+                .hash();
+            let resp = get_block_by_hash(State(state.clone()), Path(target_hash.to_string()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
 
-            let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await.into_response();
+            let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });
     }
@@ -1495,7 +1715,9 @@ mod tests {
             let state = test_state();
 
             // No evidence directory yet just means no faults observed so far.
-            let resp = get_evidence_list(State(state.clone())).await.into_response();
+            let resp = get_evidence_list(State(state.clone()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
@@ -1506,24 +1728,32 @@ mod tests {
             std::fs::create_dir_all(&state.evidence_dir).unwrap();
             std::fs::write(state.evidence_dir.join("fault-1.json"), b"{\"ok\":true}").unwrap();
 
-            let resp = get_evidence_list(State(state.clone())).await.into_response();
+            let resp = get_evidence_list(State(state.clone()))
+                .await
+                .into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json.as_array().unwrap(), &["fault-1.json"]);
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("fault-1.json".into())).await.into_response();
+            let resp = get_evidence_by_id(State(state.clone()), Path("fault-1.json".into()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
             assert_eq!(&body[..], b"{\"ok\":true}");
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("no-such-file.json".into())).await.into_response();
+            let resp = get_evidence_by_id(State(state.clone()), Path("no-such-file.json".into()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
-            let resp = get_evidence_by_id(State(state.clone()), Path("../secrets.json".into())).await.into_response();
+            let resp = get_evidence_by_id(State(state.clone()), Path("../secrets.json".into()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         });
     }
@@ -1544,7 +1774,9 @@ mod tests {
             }
 
             // search by height
-            let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() })).await.into_response();
+            let resp = search(State(state.clone()), Query(SearchQuery { q: "1".into() }))
+                .await
+                .into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -1557,7 +1789,8 @@ mod tests {
                 State(state.clone()),
                 Query(SearchQuery { q: "99999".into() }),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             // search by address
@@ -1567,7 +1800,8 @@ mod tests {
                     q: sender.to_string(),
                 }),
             )
-            .await.into_response();
+            .await
+            .into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -1575,11 +1809,9 @@ mod tests {
             assert_eq!(json["kind"], "account");
 
             // search by action signature
-            let resp = search(
-                State(state.clone()),
-                Query(SearchQuery { q: last_sig }),
-            )
-            .await.into_response();
+            let resp = search(State(state.clone()), Query(SearchQuery { q: last_sig }))
+                .await
+                .into_response();
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
                 .await
                 .unwrap();
@@ -1589,9 +1821,12 @@ mod tests {
             // search miss
             let resp = search(
                 State(state.clone()),
-                Query(SearchQuery { q: "nonsense".into() }),
+                Query(SearchQuery {
+                    q: "nonsense".into(),
+                }),
             )
-            .await.into_response();
+            .await
+            .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         });
     }
@@ -1619,21 +1854,28 @@ mod tests {
                     validators: BTreeMap::new(),
                     boot_nodes: Vec::new(),
                     attestor: None,
-                attestor_admin: None,
-                freeze_admin: None,
-                recovery_admin: None,
+                    attestor_admin: None,
+                    freeze_admin: None,
+                    recovery_admin: None,
                 })
                 .unwrap();
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
             state.db.write_batch(&genesis).unwrap();
             state
                 .db
-                .write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(0, &[validator.clone()]))
+                .write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(
+                    0,
+                    &[validator.clone()],
+                ))
                 .unwrap();
 
-            let resp = get_finality::<TestPayload>(State(state.clone())).await.into_response();
+            let resp = get_finality::<TestPayload>(State(state.clone()))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
             // Null, not absent — a client must tell "nothing final yet" from
@@ -1659,8 +1901,12 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_finality::<TestPayload>(State(state.clone())).await.into_response();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let resp = get_finality::<TestPayload>(State(state.clone()))
+                .await
+                .into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["validators_with_bls_key"], 1);
             assert_eq!(json["quorum_reachable"], true);
@@ -1679,9 +1925,13 @@ mod tests {
             let genesis: xc_primitives::Block<TestPayload> = xc_primitives::Block::genesis(0);
             state.db.write_batch(&genesis).unwrap();
 
-            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await.into_response();
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0))
+                .await
+                .into_response();
             assert_eq!(resp.status(), StatusCode::OK);
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
             assert_eq!(json["finalized"], false, "no certificate written yet");
@@ -1701,8 +1951,12 @@ mod tests {
                 })
                 .unwrap();
 
-            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0)).await.into_response();
-            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let resp = get_block_by_height::<TestPayload>(State(state.clone()), Path(0))
+                .await
+                .into_response();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["finalized"], true);
         });

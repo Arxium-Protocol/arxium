@@ -116,7 +116,12 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 /// it was signed against; binding `genesis` (v3) makes it meaningful only
 /// for the specific *chain* — a validator running one BLS key on two Arxium
 /// networks can't have a vote from one counted on the other.
-pub fn round_timeout_signing_bytes(genesis: &[u8; 32], height: u64, round: u32, parent_hash: &str) -> Vec<u8> {
+pub fn round_timeout_signing_bytes(
+    genesis: &[u8; 32],
+    height: u64,
+    round: u32,
+    parent_hash: &str,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_ROUND_TIMEOUT);
     push_field(&mut buf, genesis);

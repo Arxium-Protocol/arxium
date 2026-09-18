@@ -94,7 +94,12 @@ impl ArxiumDb {
     pub fn state_at(&self, height: u64) -> Result<Option<ExportedEntries>, StorageError> {
         let snapshot = self.db.snapshot();
         let tip = match snapshot.get_cf(self.cf(CF_META), b"meta:tip_height")? {
-            Some(bytes) => u64::from_be_bytes(bytes.as_slice().try_into().map_err(|_| StorageError::CorruptedMeta)?),
+            Some(bytes) => u64::from_be_bytes(
+                bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptedMeta)?,
+            ),
             None => return Ok(None),
         };
         if height > tip {
@@ -131,7 +136,12 @@ impl ArxiumDb {
                 };
             }
         }
-        Ok(Some(entries.into_iter().map(|((cf, key), value)| (cf, key, value)).collect()))
+        Ok(Some(
+            entries
+                .into_iter()
+                .map(|((cf, key), value)| (cf, key, value))
+                .collect(),
+        ))
     }
 
     /// Replaces this node's state with a downloaded snapshot at `block`'s
@@ -161,10 +171,14 @@ impl ArxiumDb {
     ) -> Result<(), StorageError> {
         let tip = self.get_tip_height()?.unwrap_or(0);
         if tip != 0 {
-            return Err(StorageError::SnapshotRejected(format!("node already at height {tip}, not fresh")));
+            return Err(StorageError::SnapshotRejected(format!(
+                "node already at height {tip}, not fresh"
+            )));
         }
         if finality.height != block.height || finality.block_hash != block.hash() {
-            return Err(StorageError::SnapshotRejected("certificate does not name the snapshot block".into()));
+            return Err(StorageError::SnapshotRejected(
+                "certificate does not name the snapshot block".into(),
+            ));
         }
         let leaves: BTreeMap<[u8; 32], Vec<u8>> = entries
             .iter()
@@ -186,12 +200,16 @@ impl ArxiumDb {
             .iter()
             .find(|(_, key, _)| *key == genesis_key)
             .map(|(_, _, value)| value.clone())
-            .ok_or_else(|| StorageError::SnapshotRejected("snapshot carries no genesis hash".into()))?;
-        let local_genesis = self
-            .get(&genesis_key)?
-            .ok_or_else(|| StorageError::SnapshotRejected("this node has no genesis hash to compare".into()))?;
+            .ok_or_else(|| {
+                StorageError::SnapshotRejected("snapshot carries no genesis hash".into())
+            })?;
+        let local_genesis = self.get(&genesis_key)?.ok_or_else(|| {
+            StorageError::SnapshotRejected("this node has no genesis hash to compare".into())
+        })?;
         if snapshot_genesis != local_genesis {
-            return Err(StorageError::SnapshotRejected("snapshot is for a different chain".into()));
+            return Err(StorageError::SnapshotRejected(
+                "snapshot is for a different chain".into(),
+            ));
         }
 
         // Wipe: every CF except blocks (genesis stays; it is this chain's),
@@ -217,7 +235,11 @@ impl ArxiumDb {
         for (key, value) in finality.batch_entries()? {
             all.push((CF_META.to_string(), key, value));
         }
-        all.push((CF_META.to_string(), FINAL_WATERMARK_KEY.to_vec(), block.height.to_be_bytes().to_vec()));
+        all.push((
+            CF_META.to_string(),
+            FINAL_WATERMARK_KEY.to_vec(),
+            block.height.to_be_bytes().to_vec(),
+        ));
         self.write_raw_entries(&all)?;
         debug_assert_eq!(self.merkle_root()?, claimed);
         Ok(())
@@ -244,7 +266,18 @@ mod tests {
 
     fn accounts(pairs: &[(u8, u128)]) -> AccountUpdates {
         AccountUpdates(
-            pairs.iter().map(|(n, balance)| (addr(*n), AccountEntry { balance: *balance, ..Default::default() })).collect(),
+            pairs
+                .iter()
+                .map(|(n, balance)| {
+                    (
+                        addr(*n),
+                        AccountEntry {
+                            balance: *balance,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
         )
     }
 
@@ -253,8 +286,11 @@ mod tests {
     fn commit(db: &ArxiumDb, height: u64, holder: u8, balance: u128) -> Block<()> {
         let updates = accounts(&[(holder, balance)]);
         let state_root = db.compute_state_root(&[&updates]).unwrap();
-        let parent_hash =
-            db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash().to_string()).unwrap_or_default();
+        let parent_hash = db
+            .get_block::<()>(height.saturating_sub(1))
+            .unwrap()
+            .map(|b| b.hash().to_string())
+            .unwrap_or_default();
         let block = Block::<()> {
             height,
             parent_hash,
@@ -267,14 +303,16 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        db.write_block_batches(height, &[&updates, &block], true).unwrap();
+        db.write_block_batches(height, &[&updates, &block], true)
+            .unwrap();
         block
     }
 
     #[test]
     fn chunks_are_consecutive_and_bounded() {
-        let entries: Vec<(String, Vec<u8>, Vec<u8>)> =
-            (0..1000u32).map(|i| ("cf".into(), i.to_be_bytes().to_vec(), vec![0u8; 2_000])).collect();
+        let entries: Vec<(String, Vec<u8>, Vec<u8>)> = (0..1000u32)
+            .map(|i| ("cf".into(), i.to_be_bytes().to_vec(), vec![0u8; 2_000]))
+            .collect();
         let ranges = snapshot_chunks(&entries);
         assert!(ranges.len() > 1);
         assert_eq!(ranges.first().unwrap().start, 0);
@@ -283,7 +321,10 @@ mod tests {
             assert_eq!(pair[0].end, pair[1].start);
         }
         for range in &ranges {
-            let bytes: usize = entries[range.clone()].iter().map(|(c, k, v)| c.len() + k.len() + v.len() + 27).sum();
+            let bytes: usize = entries[range.clone()]
+                .iter()
+                .map(|(c, k, v)| c.len() + k.len() + v.len() + 27)
+                .sum();
             assert!(bytes <= SNAPSHOT_CHUNK_BYTES);
         }
         assert!(snapshot_chunks(&[]).is_empty());
@@ -295,7 +336,8 @@ mod tests {
     #[test]
     fn root_of_matches_the_incremental_trie() {
         let db = ArxiumDb::open(&temp_path()).unwrap();
-        db.write_batch(&accounts(&[(1, 100), (2, 200), (3, 300)])).unwrap();
+        db.write_batch(&accounts(&[(1, 100), (2, 200), (3, 300)]))
+            .unwrap();
         let root = decode_root(&db.compute_state_root(&[]).unwrap()).unwrap();
         let leaves: BTreeMap<[u8; 32], Vec<u8>> = db
             .export_all_entries()
@@ -305,7 +347,10 @@ mod tests {
             .map(|(_, key, value)| (hash_key(&key), value))
             .collect();
         assert_eq!(xc_poe::state_trie::root_of(&leaves), root);
-        assert_eq!(xc_poe::state_trie::root_of(&BTreeMap::new()), default_hashes()[256]);
+        assert_eq!(
+            xc_poe::state_trie::root_of(&BTreeMap::new()),
+            default_hashes()[256]
+        );
     }
 
     /// `state_at(H)` is the state block `H` committed to, not the tip's.
@@ -322,8 +367,14 @@ mod tests {
             .map(|(_, key, value)| (hash_key(key), value.clone()))
             .collect();
         let block_2: Block<()> = db.get_block(2).unwrap().unwrap();
-        assert_eq!(xc_poe::state_trie::root_of(&leaves), decode_root(&block_2.state_root).unwrap());
-        assert!(at_2.iter().all(|(cf, key, _)| cf != CF_BLOCKS && is_snapshot_key(key)));
+        assert_eq!(
+            xc_poe::state_trie::root_of(&leaves),
+            decode_root(&block_2.state_root).unwrap()
+        );
+        assert!(
+            at_2.iter()
+                .all(|(cf, key, _)| cf != CF_BLOCKS && is_snapshot_key(key))
+        );
         assert!(db.state_at(9).unwrap().is_none(), "above the tip");
     }
 
@@ -353,22 +404,36 @@ mod tests {
         };
 
         let mut tampered = entries.clone();
-        let (_, _, value) = tampered.iter_mut().find(|(_, key, _)| key.starts_with(b"account:")).unwrap();
+        let (_, _, value) = tampered
+            .iter_mut()
+            .find(|(_, key, _)| key.starts_with(b"account:"))
+            .unwrap();
         value[0] ^= 1;
-        let err = fresh().import_snapshot(&tampered, &block, &finality).unwrap_err();
+        let err = fresh()
+            .import_snapshot(&tampered, &block, &finality)
+            .unwrap_err();
         assert!(matches!(err, StorageError::SnapshotRejected(_)), "{err}");
 
         let other_chain = ArxiumDb::open(&temp_path()).unwrap();
-        other_chain.write_batch(&GenesisHash("0x22".into())).unwrap();
+        other_chain
+            .write_batch(&GenesisHash("0x22".into()))
+            .unwrap();
         commit(&other_chain, 0, 1, 0);
-        assert!(other_chain.import_snapshot(&entries, &block, &finality).is_err());
+        assert!(
+            other_chain
+                .import_snapshot(&entries, &block, &finality)
+                .is_err()
+        );
 
         let db = fresh();
         db.import_snapshot(&entries, &block, &finality).unwrap();
         assert_eq!(db.get_tip_height().unwrap(), Some(3));
         assert_eq!(db.get_final_watermark().unwrap(), 3);
         assert_eq!(db.compute_state_root(&[]).unwrap(), block.state_root);
-        assert_eq!(db.get_account(&addr(1)).unwrap().map(|e| e.balance), Some(30));
+        assert_eq!(
+            db.get_account(&addr(1)).unwrap().map(|e| e.balance),
+            Some(30)
+        );
         assert!(db.get_finality_record(3).unwrap().is_some());
         // Not fresh any more: a second import is refused.
         assert!(db.import_snapshot(&entries, &block, &finality).is_err());

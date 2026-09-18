@@ -191,7 +191,11 @@ mod tests {
                 let mut sig = [0u8; 64];
                 sig[..32].copy_from_slice(&r);
                 action.signature = Some(hex::encode(sig));
-                assert!(action.verify_signature().is_err(), "nonce {nonce} R={} must not verify", hex::encode(r));
+                assert!(
+                    action.verify_signature().is_err(),
+                    "nonce {nonce} R={} must not verify",
+                    hex::encode(r)
+                );
             }
         }
     }

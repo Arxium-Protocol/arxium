@@ -102,7 +102,10 @@ mod tests {
     #[test]
     fn a_fixed_pair_derives_the_pinned_constant() {
         let alice = Address::parse(ALICE).unwrap();
-        assert_eq!(AssetRef::derive(&alice, "gold").unwrap().to_string(), ALICE_GOLD_REF);
+        assert_eq!(
+            AssetRef::derive(&alice, "gold").unwrap().to_string(),
+            ALICE_GOLD_REF
+        );
     }
 
     #[test]
@@ -112,7 +115,11 @@ mod tests {
         assert_eq!(r.to_string().parse::<AssetRef>().unwrap(), r);
         assert_eq!(AssetRef::from_bytes(&r.bytes()), r);
         let json = serde_json::to_string(&r).unwrap();
-        assert_eq!(json, format!("\"{r}\""), "serializes as a plain string, like Address");
+        assert_eq!(
+            json,
+            format!("\"{r}\""),
+            "serializes as a plain string, like Address"
+        );
         assert_eq!(serde_json::from_str::<AssetRef>(&json).unwrap(), r);
     }
 
@@ -120,7 +127,10 @@ mod tests {
     fn same_slug_under_two_issuers_is_two_refs() {
         let alice = Address::parse(ALICE).unwrap();
         let bob = Address::parse(BOB).unwrap();
-        assert_ne!(AssetRef::derive(&alice, "gold").unwrap(), AssetRef::derive(&bob, "gold").unwrap());
+        assert_ne!(
+            AssetRef::derive(&alice, "gold").unwrap(),
+            AssetRef::derive(&bob, "gold").unwrap()
+        );
     }
 
     /// Without the separator, `H(domain || pubkey || id)` would let a pubkey
@@ -140,9 +150,18 @@ mod tests {
 
     #[test]
     fn rejects_wrong_hrp_and_length() {
-        assert!(matches!(AssetRef::parse(ALICE), Err(AssetRefError::MissingPrefix)));
+        assert!(matches!(
+            AssetRef::parse(ALICE),
+            Err(AssetRefError::MissingPrefix)
+        ));
         let short = bech32::encode::<Bech32>(HRP, &[1u8; 20]).unwrap();
-        assert!(matches!(AssetRef::parse(&short), Err(AssetRefError::WrongLength(20))));
-        assert!(matches!(AssetRef::parse("nonsense"), Err(AssetRefError::InvalidEncoding)));
+        assert!(matches!(
+            AssetRef::parse(&short),
+            Err(AssetRefError::WrongLength(20))
+        ));
+        assert!(matches!(
+            AssetRef::parse("nonsense"),
+            Err(AssetRefError::InvalidEncoding)
+        ));
     }
 }

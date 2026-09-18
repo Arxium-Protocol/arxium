@@ -14,7 +14,9 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use xc_bls::BlsPublicKey;
-use xc_primitives::{AccountEntry, Address, Asset, AssetRef, AttestorRecord, HolderState, StakeAllocation};
+use xc_primitives::{
+    AccountEntry, Address, Asset, AssetRef, AttestorRecord, HolderState, StakeAllocation,
+};
 
 pub const CF_META: &str = "meta";
 pub const CF_BLOCKS: &str = "blocks";

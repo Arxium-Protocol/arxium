@@ -7,8 +7,8 @@
 // depends on this crate; it only ever loads whatever file this tool wrote,
 // through the same `--chain` loader it uses for a preset name.
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
 use arxd_genesis::ChainSpec;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use xc_chain_spec::presets::PresetRegistry;
 
@@ -71,7 +71,10 @@ fn main() -> Result<()> {
 
 fn run_build(chain: &str, raw: bool, output: &std::path::Path) -> Result<()> {
     if output.exists() {
-        bail!("{} already exists — refusing to overwrite", output.display());
+        bail!(
+            "{} already exists — refusing to overwrite",
+            output.display()
+        );
     }
     let spec_json = xc_chain_spec::resolve_chain_spec(chain, &CORECHAIN_PRESETS)?;
 
@@ -84,14 +87,20 @@ fn run_build(chain: &str, raw: bool, output: &std::path::Path) -> Result<()> {
         // here rather than at boot time.
         let spec = ChainSpec::parse(&spec_json)?;
         if !matches!(spec, ChainSpec::Plain(_)) {
-            bail!("`--chain {chain}` resolved to a raw spec — build from a plain spec, or drop --raw to pass it through");
+            bail!(
+                "`--chain {chain}` resolved to a raw spec — build from a plain spec, or drop --raw to pass it through"
+            );
         }
         serde_json::to_vec_pretty(&spec)?
     };
 
     std::fs::write(output, &out_json)
         .with_context(|| format!("failed to write chain spec to {}", output.display()))?;
-    println!("wrote {} chain spec to {}", if raw { "raw" } else { "plain" }, output.display());
+    println!(
+        "wrote {} chain spec to {}",
+        if raw { "raw" } else { "plain" },
+        output.display()
+    );
     Ok(())
 }
 
@@ -100,7 +109,9 @@ fn run_inspect(chain: &str) -> Result<()> {
     let spec = ChainSpec::parse(&spec_json)?;
     match spec {
         ChainSpec::Plain(snapshot) => {
-            snapshot.validate().context("chain spec failed validation")?;
+            snapshot
+                .validate()
+                .context("chain spec failed validation")?;
             println!("format:      plain");
             println!("chain name:  {}", snapshot.chain_name);
             println!("validators:  {}", snapshot.validators.len());

@@ -82,8 +82,8 @@ pub(crate) fn revoke_operator(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
     use crate::ActionPayload;
+    use crate::test_support::*;
     use std::collections::HashMap;
     use xc_primitives::Action;
 

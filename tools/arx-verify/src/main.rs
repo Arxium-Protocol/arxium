@@ -66,7 +66,8 @@ fn decode_root(root: &str) -> Result<[u8; 32], String> {
 
 fn check_state_proof(response: &StateProofResponse) -> Result<(), String> {
     let root = decode_root(&response.state_root)?;
-    xc_artifact::verify_state_proof(root, &response.proof).map_err(|e| format!("merkle path: {e}"))?;
+    xc_artifact::verify_state_proof(root, &response.proof)
+        .map_err(|e| format!("merkle path: {e}"))?;
     if response.block.state_root != response.state_root {
         return Err("state_root is not the named block's".into());
     }
@@ -92,9 +93,10 @@ fn check_state_proof(response: &StateProofResponse) -> Result<(), String> {
 }
 
 fn state_proof_main(path: &str) -> ExitCode {
-    let response: StateProofResponse = match fs::read(path).map_err(|e| e.to_string()).and_then(|b| {
-        serde_json::from_slice(&b).map_err(|e| e.to_string())
-    }) {
+    let response: StateProofResponse = match fs::read(path)
+        .map_err(|e| e.to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
+    {
         Ok(response) => response,
         Err(err) => {
             eprintln!("arx-verify: {path} is not a state-proof response: {err}");
@@ -110,7 +112,11 @@ fn state_proof_main(path: &str) -> ExitCode {
             println!("value: {}", response.value);
             println!(
                 "certified: {}",
-                if response.finality.is_some() { "yes" } else { "genesis root, no certificate" }
+                if response.finality.is_some() {
+                    "yes"
+                } else {
+                    "genesis root, no certificate"
+                }
             );
             ExitCode::SUCCESS
         }
@@ -152,7 +158,10 @@ fn main() -> ExitCode {
     };
 
     match xc_artifact::verify(&artifact) {
-        Ok(Verdict::Culpable { fault, culpable_pubkey }) => {
+        Ok(Verdict::Culpable {
+            fault,
+            culpable_pubkey,
+        }) => {
             println!("VALID");
             println!("fault: {fault}");
             println!("genesis_hash: {}", artifact.genesis_hash);
@@ -203,7 +212,9 @@ fn main() -> ExitCode {
             println!("fault: {fault}");
             println!("genesis_hash: {}", artifact.genesis_hash);
             println!("parties: {}", parties.join(", "));
-            println!("note: this artifact proves a proposer/validator execution disagreement, not who is at fault");
+            println!(
+                "note: this artifact proves a proposer/validator execution disagreement, not who is at fault"
+            );
             ExitCode::SUCCESS
         }
         Err(err) => {
@@ -227,7 +238,10 @@ mod state_proof_tests {
             key: "account:nobody".into(),
             value: serde_json::Value::Null,
             proof: xc_artifact::StateProof {
-                key_hash: format!("0x{}", hex::encode(xc_poe::state_trie::hash_key(b"account:nobody"))),
+                key_hash: format!(
+                    "0x{}",
+                    hex::encode(xc_poe::state_trie::hash_key(b"account:nobody"))
+                ),
                 value: None,
                 siblings_bitmap: format!("0x{}", hex::encode([0u8; 32])),
                 siblings: vec![],
@@ -237,20 +251,36 @@ mod state_proof_tests {
             block_hash: "0xabc".into(),
             parent_state_root: "0xparent".into(),
             weight_used: 123,
-            block: BlockHeader { tx_root: [9u8; 32], state_root },
-            finality: Some(Finality { height: 7, block_hash: "0xabc".into(), ep }),
+            block: BlockHeader {
+                tx_root: [9u8; 32],
+                state_root,
+            },
+            finality: Some(Finality {
+                height: 7,
+                block_hash: "0xabc".into(),
+                ep,
+            }),
         }
     }
 
     #[test]
     fn a_certificate_binds_the_root_through_the_ep() {
         let empty_root = xc_poe::state_trie::default_hashes()[256];
-        let good = xc_poe::block_ep("0xparent", &[9u8; 32], &format!("0x{}", hex::encode(empty_root)), 123);
+        let good = xc_poe::block_ep(
+            "0xparent",
+            &[9u8; 32],
+            &format!("0x{}", hex::encode(empty_root)),
+            123,
+        );
         assert!(check_state_proof(&response(good)).is_ok());
         let err = check_state_proof(&response([0u8; 32])).unwrap_err();
         assert!(err.contains("execution proof"), "{err}");
         let mut tampered = response(good);
         tampered.proof.value = Some("0x01".into());
-        assert!(check_state_proof(&tampered).unwrap_err().contains("merkle path"));
+        assert!(
+            check_state_proof(&tampered)
+                .unwrap_err()
+                .contains("merkle path")
+        );
     }
 }

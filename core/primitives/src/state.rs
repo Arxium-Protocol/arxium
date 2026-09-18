@@ -119,7 +119,11 @@ pub struct StakeAllocation {
 pub fn stake_subaccount(validator: &Address) -> Address {
     // ponytail: domain-separated hash; grep confirmed no other
     // from_pubkey_bytes-as-hash usage in xc-primitives to collide with.
-    let preimage = [b"xc-stake-subaccount:".as_slice(), validator.to_string().as_bytes()].concat();
+    let preimage = [
+        b"xc-stake-subaccount:".as_slice(),
+        validator.to_string().as_bytes(),
+    ]
+    .concat();
     let digest = Sha256::digest(preimage);
     Address::from_pubkey_bytes(&digest).expect("sha256 digest is always 32 bytes")
 }
@@ -412,7 +416,10 @@ impl Snapshot {
             );
         }
         if self.height != 0 {
-            anyhow::bail!("chain spec height must be 0 for a genesis spec, got {}", self.height);
+            anyhow::bail!(
+                "chain spec height must be 0 for a genesis spec, got {}",
+                self.height
+            );
         }
         for addr in self.boot_nodes.iter() {
             if addr.trim().is_empty() {
@@ -465,7 +472,11 @@ mod tests {
 
         let emitted = serde_json::to_string(&BTreeMap::from([(
             address.clone(),
-            ValidatorEntry { stake: 100_000 * 1_000_000_000, bls_pubkey: Some(bls.into()), bls_pop: None },
+            ValidatorEntry {
+                stake: 100_000 * 1_000_000_000,
+                bls_pubkey: Some(bls.into()),
+                bls_pop: None,
+            },
         )]))
         .unwrap();
 
@@ -474,7 +485,10 @@ mod tests {
         );
         let snapshot: Snapshot = serde_json::from_str(&spec).expect("spec must parse");
 
-        let entry = snapshot.validators.get(&address).expect("validator must survive");
+        let entry = snapshot
+            .validators
+            .get(&address)
+            .expect("validator must survive");
         assert_eq!(entry.stake, 100_000 * 1_000_000_000);
         assert_eq!(
             entry.bls_pubkey.as_deref(),

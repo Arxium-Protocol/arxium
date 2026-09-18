@@ -16,10 +16,10 @@ pub(super) async fn admin_guard<P: Payload>(
     req: Request,
     next: Next,
 ) -> Response {
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map_or_else(|| UNMATCHED_PATH.to_string(), |matched| matched.as_str().to_string());
+    let path = req.extensions().get::<MatchedPath>().map_or_else(
+        || UNMATCHED_PATH.to_string(),
+        |matched| matched.as_str().to_string(),
+    );
     let authorized = state.admin_token.as_ref().is_some_and(|token| {
         let expected = format!("Bearer {token}");
         req.headers()
@@ -65,12 +65,17 @@ pub(super) async fn admin_checkpoint<P: Payload>(
 ) -> Result<Response, ApiError> {
     let Json(body) = body.map_err(|err| ApiError::BadRequest(err.to_string()))?;
     if !body.output.is_absolute() {
-        return Err(ApiError::BadRequest("output must be an absolute path".to_string()));
+        return Err(ApiError::BadRequest(
+            "output must be an absolute path".to_string(),
+        ));
     }
     if body.output.exists() {
         return Err(ApiError::Conflict("output path already exists".to_string()));
     }
-    let height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let finalized_height = state.db.get_finalized_height().unwrap_or_default();
     let db = state.db.clone();
     let output = body.output.clone();
@@ -79,13 +84,23 @@ pub(super) async fn admin_checkpoint<P: Payload>(
     let result = tokio::task::spawn_blocking(move || db.export_checkpoint(&output)).await;
     match result {
         Ok(Ok(())) => {
-            info!("wrote checkpoint at height {height} to {}", body.output.display());
-            Ok(Json(CheckpointResponse { height, finalized_height, path: body.output }).into_response())
+            info!(
+                "wrote checkpoint at height {height} to {}",
+                body.output.display()
+            );
+            Ok(Json(CheckpointResponse {
+                height,
+                finalized_height,
+                path: body.output,
+            })
+            .into_response())
         }
         Ok(Err(err)) => {
             warn!("checkpoint to {} failed: {err}", body.output.display());
             Ok((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response())
         }
-        Err(err) => Err(ApiError::internal(anyhow::anyhow!("checkpoint task panicked: {err}"))),
+        Err(err) => Err(ApiError::internal(anyhow::anyhow!(
+            "checkpoint task panicked: {err}"
+        ))),
     }
 }

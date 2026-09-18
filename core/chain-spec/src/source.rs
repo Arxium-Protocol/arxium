@@ -19,7 +19,9 @@ pub fn resolve_chain_spec(raw: &str, registry: &PresetRegistry) -> Result<String
         } else {
             format!("known presets: {}", names.join(", "))
         };
-        format!("{raw:?} is not a known preset ({known}) and could not be read as a chain spec file")
+        format!(
+            "{raw:?} is not a known preset ({known}) and could not be read as a chain spec file"
+        )
     })
 }
 
@@ -29,8 +31,14 @@ mod tests {
     use std::io::Write;
 
     const REGISTRY: PresetRegistry = PresetRegistry::new(&[
-        ("alpha", r#"{"height":0,"chain_name":"alpha","accounts":{},"validators":{},"boot_nodes":[]}"#),
-        ("beta", r#"{"height":0,"chain_name":"beta","accounts":{},"validators":{},"boot_nodes":[]}"#),
+        (
+            "alpha",
+            r#"{"height":0,"chain_name":"alpha","accounts":{},"validators":{},"boot_nodes":[]}"#,
+        ),
+        (
+            "beta",
+            r#"{"height":0,"chain_name":"beta","accounts":{},"validators":{},"boot_nodes":[]}"#,
+        ),
     ]);
 
     #[test]
@@ -45,7 +53,10 @@ mod tests {
     fn empty_registry_error_says_no_presets_available() {
         let err = resolve_chain_spec("bogus", &PresetRegistry::EMPTY).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("no built-in presets"), "must say so plainly: {msg}");
+        assert!(
+            msg.contains("no built-in presets"),
+            "must say so plainly: {msg}"
+        );
     }
 
     #[test]
@@ -56,10 +67,13 @@ mod tests {
             std::thread::current().id()
         ));
         let spec = r#"{"height":0,"chain_name":"runtime-loaded","accounts":{},"validators":{},"boot_nodes":[]}"#;
-        std::fs::File::create(&path).unwrap().write_all(spec.as_bytes()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(spec.as_bytes())
+            .unwrap();
 
-        let loaded =
-            resolve_chain_spec(path.to_str().unwrap(), &PresetRegistry::EMPTY).expect("must read from disk");
+        let loaded = resolve_chain_spec(path.to_str().unwrap(), &PresetRegistry::EMPTY)
+            .expect("must read from disk");
         let snapshot: xc_primitives::Snapshot = serde_json::from_str(&loaded).unwrap();
         assert_eq!(snapshot.chain_name, "runtime-loaded");
 

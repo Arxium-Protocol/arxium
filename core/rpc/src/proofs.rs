@@ -48,7 +48,9 @@ fn state_proof<P: Payload, K: xc_circuit::KeySpec>(
     let parent_state_root = if height == 0 {
         String::new()
     } else {
-        db.get_block::<P>(height - 1)?.map(|b| b.state_root).unwrap_or_default()
+        db.get_block::<P>(height - 1)?
+            .map(|b| b.state_root)
+            .unwrap_or_default()
     };
     let raw_key = key.encode();
     let inclusion = db.prove(&raw_key, &block.state_root)?;
@@ -104,5 +106,11 @@ pub(super) async fn get_account_asset_balance_proof<P: Payload>(
 ) -> Result<Json<StateProofResponse>, ApiError> {
     let address = parse_address(&address)?;
     let asset_ref = parse_ref(&asset_ref)?;
-    state_proof_response::<P, _>(&state.db, &xc_circuit::AssetBalanceKey { asset: &asset_ref, owner: &address })
+    state_proof_response::<P, _>(
+        &state.db,
+        &xc_circuit::AssetBalanceKey {
+            asset: &asset_ref,
+            owner: &address,
+        },
+    )
 }

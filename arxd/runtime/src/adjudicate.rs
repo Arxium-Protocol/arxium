@@ -43,7 +43,10 @@
 //! `dispatch` never reads it — only certificate verification does.
 
 use xc_artifact::{ActionClaim, EvidenceArtifact, Fault, StateProof};
-use xc_circuit::{BlsPubkeyOwnerKey, ChainParamsKey, KeySpec, KvRead, OperatorIndexKey, OperatorKey, ValidatorSetKey};
+use xc_circuit::{
+    BlsPubkeyOwnerKey, ChainParamsKey, KeySpec, KvRead, OperatorIndexKey, OperatorKey,
+    ValidatorSetKey,
+};
 use xc_executor::BlockUpdates;
 use xc_poe::state_trie::{InclusionProof, ProofBackedTrie};
 use xc_primitives::Address;
@@ -528,19 +531,50 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
         &updates.assets,
         &updates.holder_states,
     ];
-    parts.extend(updates.evidence.iter().map(|m| m as &dyn xc_storage::BatchWritable));
-    parts.extend(updates.bls_key.iter().map(|k| k as &dyn xc_storage::BatchWritable));
-    parts.extend(updates.asset_registration.iter().map(|a| a as &dyn xc_storage::BatchWritable));
-    parts.extend(updates.attestor_registration.iter().map(|r| r as &dyn xc_storage::BatchWritable));
-    parts.extend(updates.attestor_deregistration.iter().map(|d| d as &dyn xc_storage::BatchWritable));
+    parts.extend(
+        updates
+            .evidence
+            .iter()
+            .map(|m| m as &dyn xc_storage::BatchWritable),
+    );
+    parts.extend(
+        updates
+            .bls_key
+            .iter()
+            .map(|k| k as &dyn xc_storage::BatchWritable),
+    );
+    parts.extend(
+        updates
+            .asset_registration
+            .iter()
+            .map(|a| a as &dyn xc_storage::BatchWritable),
+    );
+    parts.extend(
+        updates
+            .attestor_registration
+            .iter()
+            .map(|r| r as &dyn xc_storage::BatchWritable),
+    );
+    parts.extend(
+        updates
+            .attestor_deregistration
+            .iter()
+            .map(|d| d as &dyn xc_storage::BatchWritable),
+    );
     let mut entries = Vec::new();
     for part in parts {
-        for (key, value) in part.batch_entries().expect("in-memory updates always encode") {
+        for (key, value) in part
+            .batch_entries()
+            .expect("in-memory updates always encode")
+        {
             if xc_storage::is_state_key(&key) {
                 entries.push((key, Some(value)));
             }
         }
-        for key in part.batch_deletes().expect("in-memory updates always encode") {
+        for key in part
+            .batch_deletes()
+            .expect("in-memory updates always encode")
+        {
             if xc_storage::is_state_key(&key) {
                 entries.push((key, None));
             }
@@ -555,7 +589,9 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 /// `eligible_proposer`/`LeaveValidator` expect. `Err` carries the
 /// `Disagreement`/`Unprovable` reason.
 fn proven_validators(view: &ProofBackedView, height: u64) -> Result<Vec<Address>, String> {
-    let unproven = |what: &str| format!("the validator set at height {height} is not provable: {what} not in the proof set");
+    let unproven = |what: &str| {
+        format!("the validator set at height {height} is not provable: {what} not in the proof set")
+    };
     let params = view
         .get(&ChainParamsKey)
         .map_err(|_| unproven("chain_params"))?
@@ -1181,7 +1217,8 @@ mod tests {
         // the result back into the view.
         view.apply_accounts(&updates.accounts).unwrap();
         view.apply_stakes(&updates.stakes).unwrap();
-        view.apply_validator_statuses(&updates.validator_statuses).unwrap();
+        view.apply_validator_statuses(&updates.validator_statuses)
+            .unwrap();
         view.apply_operator(&updates.operator).unwrap();
         if let Some(registration) = &updates.bls_key {
             view.apply_bls_key(registration).unwrap();
@@ -1191,8 +1228,12 @@ mod tests {
             .iter()
             .map(|key| hex_proof(db.prove(key, &pre_root).unwrap()))
             .collect();
-        let mut writables: Vec<&dyn xc_storage::BatchWritable> =
-            vec![&updates.accounts, &updates.stakes, &updates.validator_statuses, &updates.operator];
+        let mut writables: Vec<&dyn xc_storage::BatchWritable> = vec![
+            &updates.accounts,
+            &updates.stakes,
+            &updates.validator_statuses,
+            &updates.operator,
+        ];
         if let Some(registration) = &updates.bls_key {
             writables.push(registration);
         }
@@ -1212,20 +1253,31 @@ mod tests {
         action: &crate::ChainAction,
         height: u64,
     ) -> (EvidenceArtifact, String) {
-        let action_bytes = bincode::serde::encode_to_vec(action, bincode::config::standard()).unwrap();
+        let action_bytes =
+            bincode::serde::encode_to_vec(action, bincode::config::standard()).unwrap();
         let action_bytes_hash: [u8; 32] = sha2::Sha256::digest(&action_bytes).into();
         let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
         let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let wrong_post = format!("0x{}", hex::encode([0xBBu8; 32]));
         let sign = |post: &str| {
-            xc_artifact::action_claim_signing_bytes(&GENESIS, height, 0, &action_bytes_hash, pre_root, post)
+            xc_artifact::action_claim_signing_bytes(
+                &GENESIS,
+                height,
+                0,
+                &action_bytes_hash,
+                pre_root,
+                post,
+            )
         };
         let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
             fault: Fault::ActionDivergence {
-                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                proposer_pubkey: format!(
+                    "0x{}",
+                    hex::encode(proposer_key.verifying_key().as_bytes())
+                ),
                 voter_pubkey: voter_pubkey.clone(),
                 height,
                 action_index: 0,
@@ -1234,13 +1286,19 @@ mod tests {
                     pre_state_root: pre_root.to_string(),
                     post_state_root: real_post_root.to_string(),
                     proofs: proofs.clone(),
-                    signature: format!("0x{}", hex::encode(proposer_key.sign(&sign(real_post_root)).to_bytes())),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(proposer_key.sign(&sign(real_post_root)).to_bytes())
+                    ),
                 },
                 dissent_claim: ActionClaim {
                     pre_state_root: pre_root.to_string(),
                     post_state_root: wrong_post.clone(),
                     proofs,
-                    signature: format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &sign(&wrong_post)).0)),
+                    signature: format!(
+                        "0x{}",
+                        hex::encode(xc_bls::sign(&voter_sk, &sign(&wrong_post)).0)
+                    ),
                 },
             },
             human_readable: serde_json::json!({}),
@@ -1256,8 +1314,11 @@ mod tests {
         let db = temp_db();
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(alice.clone(), entry(1_000_000_000))])))
-            .unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+            alice.clone(),
+            entry(1_000_000_000),
+        )])))
+        .unwrap();
         let pre_root = db.compute_state_root(&[]).unwrap();
         let action: crate::ChainAction = xc_primitives::Action {
             sender: alice,
@@ -1266,10 +1327,13 @@ mod tests {
             payload: crate::ActionPayload::AuthorizeOperator { operator: bob },
         };
         let (post_root, proofs) = dispatch_recording_proofs(&db, &action, 5);
-        let (artifact, voter) = artifact_with_wrong_dissent(&pre_root, &post_root, proofs, &action, 5);
+        let (artifact, voter) =
+            artifact_with_wrong_dissent(&pre_root, &post_root, proofs, &action, 5);
         assert_eq!(
             adjudicate_action_divergence(&artifact).unwrap(),
-            AdjudicationOutcome::Culpable { culpable_pubkey: voter }
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter
+            }
         );
     }
 
@@ -1282,21 +1346,39 @@ mod tests {
         let db = temp_db();
         let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let params = xc_primitives::ChainParams { epoch_length: 10, ..Default::default() };
+        let params = xc_primitives::ChainParams {
+            epoch_length: 10,
+            ..Default::default()
+        };
         db.write_batch(&xc_storage::ChainParamsRow(params)).unwrap();
         // Set in force at height 15 is the one written effective at 10.
-        db.write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(10, &[alice.clone(), bob.clone()])).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(alice.clone(), entry(1_000_000_000))])))
-            .unwrap();
+        db.write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(
+            10,
+            &[alice.clone(), bob.clone()],
+        ))
+        .unwrap();
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+            alice.clone(),
+            entry(1_000_000_000),
+        )])))
+        .unwrap();
         let mut statuses = xc_storage::ValidatorStatusUpdates::default();
-        statuses.0.insert(alice.clone(), Some(ValidatorStatus::Active));
+        statuses
+            .0
+            .insert(alice.clone(), Some(ValidatorStatus::Active));
         db.write_batch(&statuses).unwrap();
         db.write_batch(&xc_storage::StakeUpdates {
             allocations: std::collections::BTreeMap::from([(
                 (alice.clone(), alice.clone()),
-                Some(crate::test_support::self_allocation(&alice, crate::MIN_VALIDATOR_STAKE)),
+                Some(crate::test_support::self_allocation(
+                    &alice,
+                    crate::MIN_VALIDATOR_STAKE,
+                )),
             )]),
-            validator_index: std::collections::BTreeMap::from([(alice.clone(), vec![alice.clone()])]),
+            validator_index: std::collections::BTreeMap::from([(
+                alice.clone(),
+                vec![alice.clone()],
+            )]),
         })
         .unwrap();
         db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
@@ -1315,11 +1397,16 @@ mod tests {
         // The set is a `dispatch` *parameter*, so the recording view never
         // saw it read — a real dissenter adds it, exactly as the adjudicator
         // will look for it.
-        proofs.push(hex_proof(db.prove(&ValidatorSetKey(10).encode(), &pre_root).unwrap()));
-        let (artifact, voter) = artifact_with_wrong_dissent(&pre_root, &post_root, proofs, &action, 15);
+        proofs.push(hex_proof(
+            db.prove(&ValidatorSetKey(10).encode(), &pre_root).unwrap(),
+        ));
+        let (artifact, voter) =
+            artifact_with_wrong_dissent(&pre_root, &post_root, proofs, &action, 15);
         assert_eq!(
             adjudicate_action_divergence(&artifact).unwrap(),
-            AdjudicationOutcome::Culpable { culpable_pubkey: voter }
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter
+            }
         );
     }
 

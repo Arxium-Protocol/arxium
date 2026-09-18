@@ -39,7 +39,10 @@ pub(super) async fn get_attestor<P: Payload>(
     Path(address): Path<String>,
 ) -> Result<Json<AttestorResponse>, ApiError> {
     let address = parse_address(&address)?;
-    let record = state.db.get_attestor_record(&address)?.ok_or(ApiError::NotFound)?;
+    let record = state
+        .db
+        .get_attestor_record(&address)?
+        .ok_or(ApiError::NotFound)?;
     Ok(Json(AttestorResponse {
         attestor: address.to_string(),
         name: record.name,
@@ -74,8 +77,13 @@ pub(super) struct ValidatorSetQuery {
 /// symptom beyond a `warn!` per dropped vote. Reporting the set size, how many
 /// of them can actually vote, and the quorum those numbers imply makes that
 /// visible in one request.
-pub(super) async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
-    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+pub(super) async fn get_finality<P: Payload>(
+    State(state): State<AppState<P>>,
+) -> Result<Response, ApiError> {
+    let tip_height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let validators = state.db.get_validator_set_at(tip_height)?;
 
     let mut voters = 0usize;
@@ -128,7 +136,10 @@ pub(super) async fn get_validators<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<ValidatorSetQuery>,
 ) -> Result<Json<Vec<Address>>, ApiError> {
-    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let tip_height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let height = resolve_height(query.height, tip_height)?;
 
     // Membership only, sorted — the shape Retracer's uptime view and the
@@ -143,10 +154,18 @@ pub(super) async fn get_validator_power<P: Payload>(
     State(state): State<AppState<P>>,
     Query(query): Query<ValidatorSetQuery>,
 ) -> Result<Json<BTreeMap<String, u32>>, ApiError> {
-    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let tip_height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let height = resolve_height(query.height, tip_height)?;
     Ok(Json(
-        state.db.get_validator_set_at(height)?.into_iter().map(|(a, p)| (a.to_string(), p.0)).collect(),
+        state
+            .db
+            .get_validator_set_at(height)?
+            .into_iter()
+            .map(|(a, p)| (a.to_string(), p.0))
+            .collect(),
     ))
 }
 
@@ -160,10 +179,18 @@ pub(super) async fn get_validator<P: Payload>(
     Path(address): Path<String>,
 ) -> Result<Response, ApiError> {
     let address = parse_address(&address)?;
-    let status = state.db.get_validator_status(&address)?.ok_or(ApiError::NotFound)?;
+    let status = state
+        .db
+        .get_validator_status(&address)?
+        .ok_or(ApiError::NotFound)?;
     let tip = state.db.get_tip_height()?.unwrap_or(0);
-    let voting_power =
-        state.db.get_validator_set_at(tip)?.into_iter().find(|(a, _)| a == &address).map(|(_, p)| p.0).unwrap_or(0);
+    let voting_power = state
+        .db
+        .get_validator_set_at(tip)?
+        .into_iter()
+        .find(|(a, _)| a == &address)
+        .map(|(_, p)| p.0)
+        .unwrap_or(0);
     let bls = state.db.get_bls_pubkey(&address)?;
     let operator = state.db.get_operator(&address)?;
     Ok(Json(serde_json::json!({

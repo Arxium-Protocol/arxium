@@ -70,7 +70,8 @@ fn entries_at(db: &ArxiumDb, height: u64) -> Option<std::sync::Arc<Vec<SnapshotE
 }
 
 pub(crate) fn chunk_hash(entries: &[SnapshotEntry]) -> [u8; 32] {
-    let bytes = bincode::serde::encode_to_vec(entries, xc_primitives::wire_config()).unwrap_or_default();
+    let bytes =
+        bincode::serde::encode_to_vec(entries, xc_primitives::wire_config()).unwrap_or_default();
     Sha256::digest(bytes).into()
 }
 
@@ -87,9 +88,13 @@ pub(crate) fn manifest<P: Payload>(db: &ArxiumDb, height: u64) -> Option<Snapsho
         state_root: block.state_root.clone(),
         entries: entries.len() as u64,
         chunks: ranges.len() as u32,
-        chunk_hashes: ranges.iter().map(|r| chunk_hash(&entries[r.clone()])).collect(),
+        chunk_hashes: ranges
+            .iter()
+            .map(|r| chunk_hash(&entries[r.clone()]))
+            .collect(),
         block: bincode::serde::encode_to_vec(&block, xc_primitives::wire_config()).ok()?,
-        certificate: bincode::serde::encode_to_vec(&certificate, xc_primitives::wire_config()).ok()?,
+        certificate: bincode::serde::encode_to_vec(&certificate, xc_primitives::wire_config())
+            .ok()?,
     })
 }
 
@@ -154,16 +159,28 @@ impl<P: Payload> SnapshotSync<P> {
         }
         self.tried.insert(peer);
         self.peer = Some(peer);
-        info!("snapshot sync: asking {peer} for state at trusted height {}", self.trust.height);
-        Step::Request(SyncRequest::SnapshotManifest { height: self.trust.height })
+        info!(
+            "snapshot sync: asking {peer} for state at trusted height {}",
+            self.trust.height
+        );
+        Step::Request(SyncRequest::SnapshotManifest {
+            height: self.trust.height,
+        })
     }
 
-    pub(crate) fn on_manifest(&mut self, peer: libp2p::PeerId, manifest: Option<SnapshotManifest>) -> Step {
+    pub(crate) fn on_manifest(
+        &mut self,
+        peer: libp2p::PeerId,
+        manifest: Option<SnapshotManifest>,
+    ) -> Step {
         if self.peer != Some(peer) {
             return Step::Idle;
         }
         let Some(manifest) = manifest else {
-            warn!("snapshot sync: {peer} cannot serve height {}", self.trust.height);
+            warn!(
+                "snapshot sync: {peer} cannot serve height {}",
+                self.trust.height
+            );
             return self.retry();
         };
         if manifest.height != self.trust.height || manifest.block_hash != self.trust.block_hash {
@@ -199,7 +216,10 @@ impl<P: Payload> SnapshotSync<P> {
         self.manifest = Some(manifest);
         self.block = Some(block);
         self.certificate = Some(certificate);
-        Step::Request(SyncRequest::SnapshotChunk { height: self.trust.height, index: 0 })
+        Step::Request(SyncRequest::SnapshotChunk {
+            height: self.trust.height,
+            index: 0,
+        })
     }
 
     pub(crate) fn on_chunk(
@@ -229,7 +249,10 @@ impl<P: Payload> SnapshotSync<P> {
         }
         self.chunks[index as usize] = Some(entries);
         if let Some(next) = self.chunks.iter().position(Option::is_none) {
-            return Step::Request(SyncRequest::SnapshotChunk { height, index: next as u32 });
+            return Step::Request(SyncRequest::SnapshotChunk {
+                height,
+                index: next as u32,
+            });
         }
 
         let entries: Vec<SnapshotEntry> = self.chunks.drain(..).flatten().flatten().collect();
@@ -239,7 +262,9 @@ impl<P: Payload> SnapshotSync<P> {
         match verify_certificate_against(&entries, &certificate, &block) {
             Ok(()) => {}
             Err(reason) => {
-                warn!("snapshot sync: certificate from {peer} does not verify against the snapshot's own validator set: {reason}");
+                warn!(
+                    "snapshot sync: certificate from {peer} does not verify against the snapshot's own validator set: {reason}"
+                );
                 return self.retry();
             }
         }
@@ -295,9 +320,12 @@ fn verify_certificate_against<P: Payload>(
     if record.height != block.height || record.block_hash != block.hash() {
         return Err("certificate names another block".into());
     }
-    let epoch_length = entry(entries, &ChainParamsKey).unwrap_or_default().epoch_length;
+    let epoch_length = entry(entries, &ChainParamsKey)
+        .unwrap_or_default()
+        .epoch_length;
     let effective = validator_set_effective_height(block.height, epoch_length);
-    let validators = entry(entries, &ValidatorSetKey(effective)).ok_or("snapshot carries no validator set")?;
+    let validators =
+        entry(entries, &ValidatorSetKey(effective)).ok_or("snapshot carries no validator set")?;
     let unique: std::collections::BTreeSet<_> = record.signers.iter().collect();
     if unique.len() != record.signers.len() || !unique.iter().all(|s| validators.contains_key(s)) {
         return Err("signers are not distinct members of the set".into());
@@ -307,15 +335,24 @@ fn verify_certificate_against<P: Payload>(
     }
     let mut pubkeys = Vec::with_capacity(record.signers.len());
     for signer in &record.signers {
-        pubkeys.push(entry(entries, &BlsKeyKey(signer)).ok_or_else(|| format!("no BLS key for {signer}"))?);
+        pubkeys.push(
+            entry(entries, &BlsKeyKey(signer)).ok_or_else(|| format!("no BLS key for {signer}"))?,
+        );
     }
-    let genesis: String = entry(entries, &GenesisHashKey).ok_or("snapshot carries no genesis hash")?;
+    let genesis: String =
+        entry(entries, &GenesisHashKey).ok_or("snapshot carries no genesis hash")?;
     let genesis: [u8; 32] = hex::decode(genesis.strip_prefix("0x").unwrap_or(&genesis))
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or("malformed genesis hash")?;
-    let msg = arxd_finality::precommit_signing_bytes(&genesis, record.height, &record.block_hash.to_string(), &record.ep);
-    xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).map_err(|e| format!("aggregate: {e}"))
+    let msg = arxd_finality::precommit_signing_bytes(
+        &genesis,
+        record.height,
+        &record.block_hash.to_string(),
+        &record.ep,
+    );
+    xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature)
+        .map_err(|e| format!("aggregate: {e}"))
 }
 
 #[cfg(test)]
@@ -323,7 +360,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use xc_primitives::{AccountEntry, Address};
-    use xc_storage::{AccountUpdates, BlsKeyRegistration, ChainParamsRow, GenesisHash, ValidatorSetSnapshot};
+    use xc_storage::{
+        AccountUpdates, BlsKeyRegistration, ChainParamsRow, GenesisHash, ValidatorSetSnapshot,
+    };
 
     fn temp_db(tag: &str) -> ArxiumDb {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -340,11 +379,17 @@ mod tests {
     fn commit(db: &ArxiumDb, height: u64, balance: u128) -> Block<()> {
         let updates = AccountUpdates(BTreeMap::from([(
             Address::from_pubkey_bytes(&[1u8; 32]).unwrap(),
-            AccountEntry { balance, ..Default::default() },
+            AccountEntry {
+                balance,
+                ..Default::default()
+            },
         )]));
         let state_root = db.compute_state_root(&[&updates]).unwrap();
-        let parent_hash =
-            db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash().to_string()).unwrap_or_default();
+        let parent_hash = db
+            .get_block::<()>(height.saturating_sub(1))
+            .unwrap()
+            .map(|b| b.hash().to_string())
+            .unwrap_or_default();
         let block = Block::<()> {
             height,
             parent_hash,
@@ -357,7 +402,8 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        db.write_block_batches(height, &[&updates, &block], true).unwrap();
+        db.write_block_batches(height, &[&updates, &block], true)
+            .unwrap();
         block
     }
 
@@ -367,17 +413,25 @@ mod tests {
         let db = temp_db("source");
         let validator = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
         let (sk, pk) = xc_bls::keygen_from_seed(&[9u8; 32]).unwrap();
-        db.write_batch(&GenesisHash(format!("0x{}", hex::encode(GENESIS)))).unwrap();
-        db.write_batch(&ChainParamsRow(Default::default())).unwrap();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[validator.clone()])).unwrap();
-        db.write_batch(&BlsKeyRegistration { address: validator.clone(), pubkey: pk, effective_height: 0, previous_pubkey: None })
+        db.write_batch(&GenesisHash(format!("0x{}", hex::encode(GENESIS))))
             .unwrap();
+        db.write_batch(&ChainParamsRow(Default::default())).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[validator.clone()]))
+            .unwrap();
+        db.write_batch(&BlsKeyRegistration {
+            address: validator.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        })
+        .unwrap();
         let mut block = commit(&db, 0, 0);
         for height in 1..=3 {
             block = commit(&db, height, height as u128 * 10);
         }
         let ep = [0u8; 32];
-        let msg = arxd_finality::precommit_signing_bytes(&GENESIS, 3, &block.hash().to_string(), &ep);
+        let msg =
+            arxd_finality::precommit_signing_bytes(&GENESIS, 3, &block.hash().to_string(), &ep);
         let record = FinalityRecord {
             height: 3,
             block_hash: block.hash(),
@@ -391,7 +445,8 @@ mod tests {
 
     fn fresh_node() -> ArxiumDb {
         let db = temp_db("joiner");
-        db.write_batch(&GenesisHash(format!("0x{}", hex::encode(GENESIS)))).unwrap();
+        db.write_batch(&GenesisHash(format!("0x{}", hex::encode(GENESIS))))
+            .unwrap();
         commit(&db, 0, 0);
         db
     }
@@ -399,7 +454,8 @@ mod tests {
     fn drive(joiner: &ArxiumDb, source: &ArxiumDb, trust: SnapshotTrust) -> Step {
         let peer = libp2p::PeerId::random();
         let mut sync = SnapshotSync::<()>::new(trust);
-        let Step::Request(SyncRequest::SnapshotManifest { height }) = sync.on_peer_tip(peer, 3) else {
+        let Step::Request(SyncRequest::SnapshotManifest { height }) = sync.on_peer_tip(peer, 3)
+        else {
             panic!("expected a manifest request");
         };
         let mut step = sync.on_manifest(peer, manifest::<()>(source, height));
@@ -417,16 +473,27 @@ mod tests {
     fn a_joiner_imports_the_anchored_snapshot_and_refuses_a_wrong_anchor() {
         let (source, block, _record) = source_chain();
         let joiner = fresh_node();
-        let trust = SnapshotTrust { height: 3, block_hash: block.hash() };
+        let trust = SnapshotTrust {
+            height: 3,
+            block_hash: block.hash(),
+        };
         assert!(matches!(drive(&joiner, &source, trust), Step::Done));
         assert_eq!(joiner.get_tip_height().unwrap(), Some(3));
         assert_eq!(joiner.compute_state_root(&[]).unwrap(), block.state_root);
-        assert!(arxd_finality::verify_finality_record(&joiner, &joiner.get_finality_record(3).unwrap().unwrap()));
+        assert!(arxd_finality::verify_finality_record(
+            &joiner,
+            &joiner.get_finality_record(3).unwrap().unwrap()
+        ));
 
         // The operator anchored a different hash: the manifest is refused
         // before any chunk is fetched.
         let joiner = fresh_node();
-        let wrong = SnapshotTrust { height: 3, block_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".parse().unwrap() };
+        let wrong = SnapshotTrust {
+            height: 3,
+            block_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .parse()
+                .unwrap(),
+        };
         assert!(matches!(drive(&joiner, &source, wrong), Step::Retry));
         assert_eq!(joiner.get_tip_height().unwrap(), Some(0));
     }

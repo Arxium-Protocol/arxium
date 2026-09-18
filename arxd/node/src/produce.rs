@@ -52,7 +52,11 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     actions: Vec<Action<R::Payload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
-) -> Result<(Block<R::Payload>, Vec<(String, String)>, Vec<Action<R::Payload>>)> {
+) -> Result<(
+    Block<R::Payload>,
+    Vec<(String, String)>,
+    Vec<Action<R::Payload>>,
+)> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let next_height = tip_height + 1;
     let parent: Block<R::Payload> = db
@@ -139,20 +143,30 @@ pub fn produce_block_reporting<R: ChainRuntime>(
             .validator_index
             .extend(sealed_updates.stakes.validator_index);
         asset_updates.0.extend(sealed_updates.assets.0);
-        validator_statuses.0.extend(sealed_updates.validator_statuses.0);
+        validator_statuses
+            .0
+            .extend(sealed_updates.validator_statuses.0);
         // Same rule as `accept_block`: only the boundary hook returns a
         // set, and it takes effect at the next height.
         snapshot = sealed_updates
             .validator_set
-            .map(|validators| ValidatorSetSnapshot { effective_height: next_height + 1, validators });
+            .map(|validators| ValidatorSetSnapshot {
+                effective_height: next_height + 1,
+                validators,
+            });
     }
 
     // The root a validator on the receiving end will independently
     // recompute from the same overlay before accepting this block — must be
     // known before signing, since the signature covers it.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> =
-            vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
+        let mut overlay: Vec<&dyn BatchWritable> = vec![
+            &account_updates,
+            &stake_updates,
+            &asset_updates,
+            &holder_states,
+            &validator_statuses,
+        ];
         if let Some(snapshot) = &snapshot {
             overlay.push(snapshot);
         }
@@ -263,8 +277,13 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     // `holder_states` was missing here until the weighted set landed: the
     // proposer signed a root that included it, then never persisted it, so
     // its next root disagreed with every peer's after any freeze/lock.
-    let mut writables: Vec<&dyn BatchWritable> =
-        vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
+    let mut writables: Vec<&dyn BatchWritable> = vec![
+        &account_updates,
+        &stake_updates,
+        &asset_updates,
+        &holder_states,
+        &validator_statuses,
+    ];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -287,7 +306,10 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
-    let block_weight = xc_storage::BlockWeight { height: next_height, weight_used };
+    let block_weight = xc_storage::BlockWeight {
+        height: next_height,
+        weight_used,
+    };
     writables.push(&block_weight);
     writables.push(&new_block);
     // Undo-logged like the accept path — a proposer diverges from the network
@@ -402,7 +424,8 @@ pub fn produce_loop<R: ChainRuntime>(
                 gauge!("arxium_validators_with_bls_key").set(keyed.len() as f64);
                 // Power, not heads: the alertable comparison is
                 //   arxium_voting_power_with_bls_key < arxium_finality_quorum
-                gauge!("arxium_voting_power_with_bls_key").set(signed_power(&validators, keyed) as f64);
+                gauge!("arxium_voting_power_with_bls_key")
+                    .set(signed_power(&validators, keyed) as f64);
                 gauge!("arxium_finality_quorum").set(QUORUM_POWER as f64);
                 let validators: Vec<Address> = validators.into_keys().collect();
 
@@ -653,12 +676,21 @@ mod tests {
         // by signature so a status poll can say why.
         let replay = transfer.clone();
         let (weight, fee) = meter::<CoreChainRuntime>(&transfer);
-        let (block, dropped, _) =
-            produce_block_reporting::<CoreChainRuntime>(&db, vec![transfer, replay.clone()], 1, None).unwrap();
+        let (block, dropped, _) = produce_block_reporting::<CoreChainRuntime>(
+            &db,
+            vec![transfer, replay.clone()],
+            1,
+            None,
+        )
+        .unwrap();
         assert_eq!(block.actions.len(), 1);
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].0, replay.signature.unwrap());
-        assert!(dropped[0].1.contains("nonce"), "reason names the cause: {}", dropped[0].1);
+        assert!(
+            dropped[0].1.contains("nonce"),
+            "reason names the cause: {}",
+            dropped[0].1
+        );
 
         assert_eq!(block.height, 1);
         assert_eq!(
@@ -666,7 +698,11 @@ mod tests {
             20_000_000 - 400 - fee
         );
         assert_eq!(db.get_account(&bob).unwrap().unwrap().balance, 400);
-        assert_eq!(db.get_block_weight(1).unwrap(), weight, "metered weight is persisted beside the block");
+        assert_eq!(
+            db.get_block_weight(1).unwrap(),
+            weight,
+            "metered weight is persisted beside the block"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -703,7 +739,7 @@ mod tests {
             ));
             let db = ArxiumDb::open(&dir).expect("open test db");
             db.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
-            .unwrap();
+                .unwrap();
             let genesis: ChainBlock = xc_primitives::Block::genesis(0);
             db.write_batches(&[&genesis]).unwrap();
 
@@ -739,7 +775,7 @@ mod tests {
             // peer receiving these over gossip would.
             let peer = ArxiumDb::open(&dir.join("peer")).expect("open peer db");
             peer.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
-            .unwrap();
+                .unwrap();
             peer.write_batches(&[&genesis]).unwrap();
 
             for (block, height) in [(block1, 1u64), (block2, 2)] {
@@ -799,7 +835,7 @@ mod tests {
         let key = SigningKey::from_bytes(&[22u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
 

@@ -8,9 +8,9 @@
 // concurrency from one machine can't buy more throughput than pacing does —
 // it would just add complexity for nothing.
 use anyhow::{Context, Result};
+use arxd_runtime::ActionPayload;
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use arxd_runtime::ActionPayload;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -54,19 +54,28 @@ fn keys_file() -> Value {
 }
 
 fn signer(name: &str, keys: &Value) -> SigningKey {
-    let seed_hex = keys[name]["ed25519_seed_hex"].as_str().expect("seed in devnet-keys.json");
+    let seed_hex = keys[name]["ed25519_seed_hex"]
+        .as_str()
+        .expect("seed in devnet-keys.json");
     let seed: [u8; 32] = hex::decode(seed_hex).unwrap().try_into().unwrap();
     SigningKey::from_bytes(&seed)
 }
 
 fn address(name: &str, keys: &Value) -> Address {
-    Address::parse(keys[name]["address"].as_str().expect("address in devnet-keys.json")).unwrap()
+    Address::parse(
+        keys[name]["address"]
+            .as_str()
+            .expect("address in devnet-keys.json"),
+    )
+    .unwrap()
 }
 
 fn http(node: &str, path: &str, body: Option<&str>, token: Option<&str>) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect(node).with_context(|| format!("connect to {node}"))?;
     let body = body.unwrap_or_default();
-    let auth_header = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let auth_header = token
+        .map(|t| format!("Authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
     let method = if body.is_empty() { "GET" } else { "POST" };
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {node}\r\nConnection: close\r\nContent-Type: application/json\r\n{auth_header}Content-Length: {}\r\n\r\n{body}",
@@ -75,7 +84,9 @@ fn http(node: &str, path: &str, body: Option<&str>, token: Option<&str>) -> Resu
     stream.write_all(request.as_bytes())?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    let (head, rest) = response.split_once("\r\n\r\n").context("malformed HTTP response")?;
+    let (head, rest) = response
+        .split_once("\r\n\r\n")
+        .context("malformed HTTP response")?;
     let status = head
         .lines()
         .next()
@@ -96,7 +107,11 @@ fn get_nonce(node: &str, addr: &Address, token: Option<&str>) -> Result<Option<u
     if status != 200 {
         anyhow::bail!("GET /accounts/{addr} -> {status}: {body}");
     }
-    Ok(Some(serde_json::from_str::<Value>(&body)?["nonce"].as_u64().unwrap_or(0)))
+    Ok(Some(
+        serde_json::from_str::<Value>(&body)?["nonce"]
+            .as_u64()
+            .unwrap_or(0),
+    ))
 }
 
 // Startup only, well under the rate limit — a bare retry is fine here,
@@ -130,15 +145,20 @@ fn main() -> Result<()> {
         .map(|a| get_nonce_retrying(&args.node, a, args.token.as_deref()))
         .collect::<Result<_>>()?;
 
-    let target_count = args.burst.unwrap_or_else(|| {
-        (args.rate * args.duration_secs as f64).round() as u64
-    });
-    let interval = args.burst.is_none().then(|| Duration::from_secs_f64(1.0 / args.rate.max(0.001)));
+    let target_count = args
+        .burst
+        .unwrap_or_else(|| (args.rate * args.duration_secs as f64).round() as u64);
+    let interval = args
+        .burst
+        .is_none()
+        .then(|| Duration::from_secs_f64(1.0 / args.rate.max(0.001)));
 
     println!(
         "sending {target_count} action(s) against {} ({})",
         args.node,
-        args.burst.map(|_| "burst, unpaced".to_string()).unwrap_or_else(|| format!("paced at {:.2}/s", args.rate)),
+        args.burst
+            .map(|_| "burst, unpaced".to_string())
+            .unwrap_or_else(|| format!("paced at {:.2}/s", args.rate)),
     );
 
     let mut outcomes = Vec::with_capacity(target_count as usize);
@@ -156,21 +176,32 @@ fn main() -> Result<()> {
             sender: addrs[sender_idx].clone(),
             nonce,
             signature: None,
-            payload: ActionPayload::Transfer { to: addrs[to_idx].clone(), amount: 1 },
+            payload: ActionPayload::Transfer {
+                to: addrs[to_idx].clone(),
+                amount: 1,
+            },
         };
         let signature = signers[sender_idx].sign(&action.signing_bytes());
         action.signature = Some(hex::encode(signature.to_bytes()));
         let payload = serde_json::to_string(&action)?;
 
         let sent_at = Instant::now();
-        let status = match http(&args.node, "/actions", Some(&payload), args.token.as_deref()) {
+        let status = match http(
+            &args.node,
+            "/actions",
+            Some(&payload),
+            args.token.as_deref(),
+        ) {
             Ok((status, _)) => status,
             Err(_) => 0, // connection-level failure, not an HTTP status
         };
         if status == 202 {
             nonces[sender_idx] = nonce + 1;
         }
-        outcomes.push(Outcome { status, latency: sent_at.elapsed() });
+        outcomes.push(Outcome {
+            status,
+            latency: sent_at.elapsed(),
+        });
 
         if let Some(interval) = interval {
             if let Some(remaining) = interval.checked_sub(sent_at.elapsed()) {
@@ -185,12 +216,22 @@ fn main() -> Result<()> {
     let other_rejected = outcomes.len() - accepted - rate_limited;
     let mut latencies: Vec<Duration> = outcomes.iter().map(|o| o.latency).collect();
     latencies.sort();
-    let p50 = latencies.get(latencies.len() / 2).copied().unwrap_or_default();
-    let p99 = latencies.get(latencies.len() * 99 / 100).copied().unwrap_or_default();
+    let p50 = latencies
+        .get(latencies.len() / 2)
+        .copied()
+        .unwrap_or_default();
+    let p99 = latencies
+        .get(latencies.len() * 99 / 100)
+        .copied()
+        .unwrap_or_default();
 
     println!("--- submit phase ---");
     println!("sent: {}, accepted (202): {accepted}, rate-limited (429): {rate_limited}, other rejected: {other_rejected}", outcomes.len());
-    println!("wall time: {:.2}s, actual throughput: {:.2}/s", submit_wall.as_secs_f64(), outcomes.len() as f64 / submit_wall.as_secs_f64());
+    println!(
+        "wall time: {:.2}s, actual throughput: {:.2}/s",
+        submit_wall.as_secs_f64(),
+        outcomes.len() as f64 / submit_wall.as_secs_f64()
+    );
     println!("submit latency: p50={p50:?} p99={p99:?}");
 
     // Confirmation phase: poll each sender's nonce until it matches what we
@@ -231,12 +272,18 @@ fn main() -> Result<()> {
     for ((name, ok), rate_limited) in senders.iter().zip(&confirmed).zip(&rate_limited_last) {
         let status = match (ok, rate_limited) {
             (true, _) => "all accepted actions confirmed on-chain".to_string(),
-            (false, true) => "unknown — still rate-limited (429) after 90s, not a confirmed inclusion failure".to_string(),
+            (false, true) => {
+                "unknown — still rate-limited (429) after 90s, not a confirmed inclusion failure"
+                    .to_string()
+            }
             (false, false) => "not yet included after 90s".to_string(),
         };
         println!("{name}: {status}");
     }
-    println!("confirmation wall time: {:.2}s", confirm_start.elapsed().as_secs_f64());
+    println!(
+        "confirmation wall time: {:.2}s",
+        confirm_start.elapsed().as_secs_f64()
+    );
 
     Ok(())
 }

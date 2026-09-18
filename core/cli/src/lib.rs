@@ -241,11 +241,19 @@ pub struct RunArgs {
     /// the node has history. The peer must still hold that height's undo
     /// window (`xc_storage::UNDO_RETAIN` blocks below its watermark), so
     /// pick a recent one.
-    #[arg(long, env = "ARXD_SNAPSHOT_TRUST_HEIGHT", requires = "snapshot_trust_hash")]
+    #[arg(
+        long,
+        env = "ARXD_SNAPSHOT_TRUST_HEIGHT",
+        requires = "snapshot_trust_hash"
+    )]
     pub snapshot_trust_height: Option<u64>,
 
     /// The `0x…` hash of the block at `--snapshot-trust-height`.
-    #[arg(long, env = "ARXD_SNAPSHOT_TRUST_HASH", requires = "snapshot_trust_height")]
+    #[arg(
+        long,
+        env = "ARXD_SNAPSHOT_TRUST_HASH",
+        requires = "snapshot_trust_height"
+    )]
     pub snapshot_trust_hash: Option<String>,
 
     /// Harness-only, and only compiled in at all with `--features
@@ -396,7 +404,10 @@ mod tests {
             .run
             .into_config();
         assert!(cfg.rpc_token.is_none());
-        assert!(cfg.admin_token.is_none(), "a blank admin token must not mount /admin");
+        assert!(
+            cfg.admin_token.is_none(),
+            "a blank admin token must not mount /admin"
+        );
     }
 
     #[test]
@@ -405,13 +416,24 @@ mod tests {
             .unwrap()
             .run
             .into_config();
-        assert!(cfg.bootnodes.is_empty(), "blank must fall back to the chain spec");
+        assert!(
+            cfg.bootnodes.is_empty(),
+            "blank must fall back to the chain spec"
+        );
 
-        let cfg = Cli::try_parse_from(["arxd", "--bootnodes", "/ip4/1.2.3.4/tcp/30334,,/ip4/5.6.7.8/tcp/30334"])
-            .unwrap()
-            .run
-            .into_config();
-        assert_eq!(cfg.bootnodes.len(), 2, "a stray comma must not add an empty entry");
+        let cfg = Cli::try_parse_from([
+            "arxd",
+            "--bootnodes",
+            "/ip4/1.2.3.4/tcp/30334,,/ip4/5.6.7.8/tcp/30334",
+        ])
+        .unwrap()
+        .run
+        .into_config();
+        assert_eq!(
+            cfg.bootnodes.len(),
+            2,
+            "a stray comma must not add an empty entry"
+        );
     }
 
     // `set_var`/`remove_var` are `unsafe` since 2024: they mutate process-wide
@@ -437,7 +459,10 @@ mod tests {
             std::env::set_var("ARXD_BOOTNODE", "false");
         }
         let cli = Cli::try_parse_from(["arxd"]).unwrap();
-        assert!(!cli.run.validator, "ARXD_VALIDATOR=false must not enable it");
+        assert!(
+            !cli.run.validator,
+            "ARXD_VALIDATOR=false must not enable it"
+        );
         assert!(!cli.run.bootnode, "ARXD_BOOTNODE=false must not enable it");
 
         unsafe { std::env::set_var("ARXD_VALIDATOR", "true") }
@@ -448,7 +473,10 @@ mod tests {
         // override the installed env file for a one-off run.
         unsafe { std::env::set_var("ARXD_VALIDATOR", "false") }
         let cli = Cli::try_parse_from(["arxd", "--validator"]).unwrap();
-        assert!(cli.run.validator, "explicit flag must win over the env file");
+        assert!(
+            cli.run.validator,
+            "explicit flag must win over the env file"
+        );
 
         unsafe {
             std::env::remove_var("ARXD_VALIDATOR");

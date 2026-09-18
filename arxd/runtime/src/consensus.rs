@@ -3,8 +3,8 @@
 
 use xc_bls::BlsPublicKey;
 use xc_circuit::{
-    BlsKeyKey, ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey, StakeKey,
-    ValidatorStatusKey,
+    BlsKeyKey, ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey,
+    StakeKey, ValidatorStatusKey,
 };
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, Hash32, ValidatorStatus};
@@ -78,7 +78,12 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
         );
     }
 
-    let mut updates = fault_slash(view, &equivocator, circuit_staking::SlashReason::DoubleSign, current_height)?;
+    let mut updates = fault_slash(
+        view,
+        &equivocator,
+        circuit_staking::SlashReason::DoubleSign,
+        current_height,
+    )?;
     updates.evidence = Some(EvidenceMarker {
         height: block_a.height,
         proposer: equivocator,
@@ -279,23 +284,41 @@ fn fault_slash<V: KvRead<Error = StorageError>>(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no stake to slash for {reason:?}"))?;
     let allocation = view
-        .get(&StakeKey { master: &master, validator: culprit })?
+        .get(&StakeKey {
+            master: &master,
+            validator: culprit,
+        })?
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
-    let total = allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
-    let (accounts, stakes) =
-        circuit_staking::apply_slash(view, culprit, xc_evidence::slash_amount(total), reason, current_height)?;
+    let total =
+        allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let (accounts, stakes) = circuit_staking::apply_slash(
+        view,
+        culprit,
+        xc_evidence::slash_amount(total),
+        reason,
+        current_height,
+    )?;
     updates.accounts = accounts;
     updates.stakes = stakes;
-    updates.validator_statuses.0.insert(culprit.clone(), Some(ValidatorStatus::Tombstoned));
+    updates
+        .validator_statuses
+        .0
+        .insert(culprit.clone(), Some(ValidatorStatus::Tombstoned));
     Ok(updates)
 }
 
 /// First height of the epoch after the one `current_height` is in — when
 /// a key registered now starts verifying, so keys and membership activate
 /// together at the boundary.
-pub(crate) fn next_epoch_start<V: KvRead<Error = StorageError>>(view: &V, current_height: u64) -> Result<u64, StorageError> {
+pub(crate) fn next_epoch_start<V: KvRead<Error = StorageError>>(
+    view: &V,
+    current_height: u64,
+) -> Result<u64, StorageError> {
     let epoch_length = view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length;
-    Ok(xc_primitives::boundary_of(xc_primitives::epoch_of(current_height, epoch_length), epoch_length) + 1)
+    Ok(xc_primitives::boundary_of(
+        xc_primitives::epoch_of(current_height, epoch_length),
+        epoch_length,
+    ) + 1)
 }
 
 /// Registers `validator`'s BLS pubkey for finality-certificate
@@ -339,8 +362,8 @@ pub(crate) fn register_bls_key<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
     use crate::ActionPayload;
+    use crate::test_support::*;
     use std::collections::HashMap;
     use xc_primitives::Action;
 
@@ -476,7 +499,8 @@ mod tests {
         );
         view.put(&StakeByValidatorKey(&voter), &vec![voter.clone()])
             .unwrap();
-        view.put(&GenesisHashKey, &hex::encode([0xa1u8; 32])).unwrap();
+        view.put(&GenesisHashKey, &hex::encode([0xa1u8; 32]))
+            .unwrap();
 
         // The culprit signs with a BLS key, which has no address derivation —
         // the registry lookup is the only way back to who gets slashed.
@@ -569,10 +593,20 @@ mod tests {
         let sub_account = circuit_staking::stake_subaccount(&equivocator);
         let mut view = seeded_view(
             &db,
-            HashMap::from([(sub_account.clone(), funded(10_000)), (reporter.clone(), funded(10 * FEE_BUDGET))]),
-            HashMap::from([((equivocator.clone(), equivocator.clone()), self_allocation(&equivocator, 10_000))]),
+            HashMap::from([
+                (sub_account.clone(), funded(10_000)),
+                (reporter.clone(), funded(10 * FEE_BUDGET)),
+            ]),
+            HashMap::from([(
+                (equivocator.clone(), equivocator.clone()),
+                self_allocation(&equivocator, 10_000),
+            )]),
         );
-        view.put(&StakeByValidatorKey(&equivocator), &vec![equivocator.clone()]).unwrap();
+        view.put(
+            &StakeByValidatorKey(&equivocator),
+            &vec![equivocator.clone()],
+        )
+        .unwrap();
         let submit = |view: &_, height: u64, nonce: u64| {
             let action = Action {
                 sender: reporter.clone(),
@@ -583,25 +617,52 @@ mod tests {
                     block_b: Box::new(signed_chain_block(&key, height, 200)),
                 },
             };
-            crate::dispatch(&action, view, &operator_lookup, &operator_validators_lookup, &[], 10, &no_bls_owner)
-                .unwrap()
+            crate::dispatch(
+                &action,
+                view,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &[],
+                10,
+                &no_bls_owner,
+            )
+            .unwrap()
         };
 
         let first = submit(&view, 5, 0);
-        assert!(first.accounts.0[&sub_account].balance < 10_000, "first offence slashes");
-        assert!(first.stakes.allocations.contains_key(&(equivocator.clone(), equivocator.clone())));
-        assert_eq!(first.validator_statuses.0[&equivocator], Some(ValidatorStatus::Tombstoned));
+        assert!(
+            first.accounts.0[&sub_account].balance < 10_000,
+            "first offence slashes"
+        );
+        assert!(
+            first
+                .stakes
+                .allocations
+                .contains_key(&(equivocator.clone(), equivocator.clone()))
+        );
+        assert_eq!(
+            first.validator_statuses.0[&equivocator],
+            Some(ValidatorStatus::Tombstoned)
+        );
         assert!(first.evidence.is_some());
         view.apply_accounts(&first.accounts).unwrap();
         view.apply_stakes(&first.stakes).unwrap();
-        view.apply_validator_statuses(&first.validator_statuses).unwrap();
+        view.apply_validator_statuses(&first.validator_statuses)
+            .unwrap();
 
         let second = submit(&view, 6, 1);
         // Only the reporter's own fee/nonce row moves — nothing of the validator's.
-        assert!(second.accounts.0.keys().all(|a| *a == reporter), "no validator balance moves");
+        assert!(
+            second.accounts.0.keys().all(|a| *a == reporter),
+            "no validator balance moves"
+        );
         assert!(second.stakes.allocations.is_empty(), "no stake moves");
         assert!(second.validator_statuses.0.is_empty());
-        assert_eq!(second.evidence.map(|m| m.height), Some(6), "the marker is still recorded");
+        assert_eq!(
+            second.evidence.map(|m| m.height),
+            Some(6),
+            "the marker is still recorded"
+        );
     }
 
     #[test]
@@ -826,19 +887,29 @@ mod tests {
     fn execution_fault_from_another_chain_is_rejected() {
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
-        view.put(&GenesisHashKey, &format!("0x{}", "aa".repeat(32))).unwrap();
+        view.put(&GenesisHashKey, &format!("0x{}", "aa".repeat(32)))
+            .unwrap();
         let no_bls_owner = |_: &BlsPublicKey| -> Result<Option<Address>, StorageError> { Ok(None) };
 
-        let err =
-            submit_execution_fault(&view, &foreign_artifact_json(&format!("0x{}", "bb".repeat(32))), 1, &no_bls_owner)
-                .unwrap_err();
+        let err = submit_execution_fault(
+            &view,
+            &foreign_artifact_json(&format!("0x{}", "bb".repeat(32))),
+            1,
+            &no_bls_owner,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains(&"bb".repeat(32)), "{err}");
 
         // Same artifact, this chain's genesis (and the `0x`/case spelling
         // artifacts actually use): the genesis check is out of the way and
         // the fault kind itself is what rejects it.
-        let err = submit_execution_fault(&view, &foreign_artifact_json(&format!("0x{}", "AA".repeat(32))), 1, &no_bls_owner)
-            .unwrap_err();
+        let err = submit_execution_fault(
+            &view,
+            &foreign_artifact_json(&format!("0x{}", "AA".repeat(32))),
+            1,
+            &no_bls_owner,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("SubmitEquivocationEvidence"),
             "{err}"

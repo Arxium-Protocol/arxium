@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use xc_bls::BlsPublicKey;
-use xc_circuit::{AccountKey, BlsKeyKey, ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
+use xc_circuit::{
+    AccountKey, BlsKeyKey, ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey,
+    ValidatorStatusKey,
+};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, ValidatorStatus, epoch_of};
 use xc_storage::{BlsKeyRegistration, StorageError};
@@ -89,7 +92,10 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
         }),
         ..Default::default()
     };
-    updates.validator_statuses.0.insert(validator.clone(), Some(status_after_join(view, validator)?));
+    updates
+        .validator_statuses
+        .0
+        .insert(validator.clone(), Some(status_after_join(view, validator)?));
     Ok(updates)
 }
 
@@ -99,13 +105,18 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
 /// re-enters; with `validator_attestation_required` the validator address
 /// must carry an attestation (the same `identity_hash` the asset layer
 /// gates on, granted through the attestor registry).
-pub(crate) fn check_join_admission<V: KvRead<Error = StorageError>>(view: &V, validator: &Address) -> anyhow::Result<()> {
+pub(crate) fn check_join_admission<V: KvRead<Error = StorageError>>(
+    view: &V,
+    validator: &Address,
+) -> anyhow::Result<()> {
     if view.get(&ValidatorStatusKey(validator))? == Some(ValidatorStatus::Tombstoned) {
         anyhow::bail!("{validator} is tombstoned and can never rejoin the validator set");
     }
     let params = view.get(&ChainParamsKey)?.unwrap_or_default();
     if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, validator)? {
-        anyhow::bail!("{validator} has no attestation from a registered attestor, and this chain requires one to validate");
+        anyhow::bail!(
+            "{validator} has no attestation from a registered attestor, and this chain requires one to validate"
+        );
     }
     Ok(())
 }
@@ -114,7 +125,10 @@ pub(crate) fn check_join_admission<V: KvRead<Error = StorageError>>(view: &V, va
 /// `Pending` for the boundary; a current member topping up stays `Active`;
 /// a jailed one stays jailed (more stake is not an early release); one that
 /// announced leaving and re-joins is back to waiting.
-fn status_after_join<V: KvRead<Error = StorageError>>(view: &V, validator: &Address) -> Result<ValidatorStatus, StorageError> {
+fn status_after_join<V: KvRead<Error = StorageError>>(
+    view: &V,
+    validator: &Address,
+) -> Result<ValidatorStatus, StorageError> {
     Ok(match view.get(&ValidatorStatusKey(validator))? {
         Some(ValidatorStatus::Active) => ValidatorStatus::Active,
         Some(jailed @ ValidatorStatus::Jailed { .. }) => jailed,
@@ -125,7 +139,10 @@ fn status_after_join<V: KvRead<Error = StorageError>>(view: &V, validator: &Addr
 /// Blocks an unbonding batch started at `height` stays locked for —
 /// `ChainParams::unbonding_blocks`.
 fn unbonding_blocks<V: KvRead<Error = StorageError>>(view: &V) -> Result<u64, StorageError> {
-    Ok(view.get(&ChainParamsKey)?.unwrap_or_default().unbonding_blocks)
+    Ok(view
+        .get(&ChainParamsKey)?
+        .unwrap_or_default()
+        .unbonding_blocks)
 }
 
 pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
@@ -188,10 +205,16 @@ pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
     // Keeps voting until the boundary; the stake is already unbonding and
     // stays slashable for the whole unbonding window.
     let epoch_length = view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length;
-    let mut updates = BlockUpdates { accounts, stakes, ..Default::default() };
+    let mut updates = BlockUpdates {
+        accounts,
+        stakes,
+        ..Default::default()
+    };
     updates.validator_statuses.0.insert(
         validator.clone(),
-        Some(ValidatorStatus::Leaving { from_epoch: epoch_of(current_height, epoch_length) + 1 }),
+        Some(ValidatorStatus::Leaving {
+            from_epoch: epoch_of(current_height, epoch_length) + 1,
+        }),
     );
     Ok(updates)
 }
@@ -251,8 +274,8 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
     use crate::ActionPayload;
+    use crate::test_support::*;
     use std::collections::HashMap;
     use xc_primitives::{Action, StakeAllocation};
 
@@ -317,7 +340,10 @@ mod tests {
             &no_bls_owner,
         )
         .unwrap();
-        assert!(matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. }))));
+        assert!(matches!(
+            updates.validator_statuses.0.get(&alice),
+            Some(Some(ValidatorStatus::Leaving { .. }))
+        ));
     }
 
     #[test]
@@ -326,7 +352,10 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
+            HashMap::from([(
+                alice.clone(),
+                funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET),
+            )]),
             HashMap::new(),
         );
         let action = Action {
@@ -352,9 +381,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending)))
-        );
+        assert!(matches!(
+            updates.validator_statuses.0.get(&alice),
+            Some(Some(ValidatorStatus::Pending))
+        ));
         assert_eq!(
             updates.accounts.0.get(&alice).unwrap().balance,
             2_000_000 + FEE_BUDGET - fee_of(&action)
@@ -527,9 +557,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. })))
-        );
+        assert!(matches!(
+            updates.validator_statuses.0.get(&alice),
+            Some(Some(ValidatorStatus::Leaving { .. }))
+        ));
         let allocation = updates
             .stakes
             .allocations
@@ -644,7 +675,10 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(bob.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
+            HashMap::from([(
+                bob.clone(),
+                funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET),
+            )]),
             HashMap::new(),
         );
         let operator_lookup = make_operator_lookup(HashMap::from([(alice.clone(), bob.clone())]));
@@ -671,9 +705,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending)))
-        );
+        assert!(matches!(
+            updates.validator_statuses.0.get(&alice),
+            Some(Some(ValidatorStatus::Pending))
+        ));
         // The operator's own balance funds a delegated join, same as a
         // third-party `Stake` action would.
         assert_eq!(
@@ -746,9 +781,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Leaving { .. })))
-        );
+        assert!(matches!(
+            updates.validator_statuses.0.get(&alice),
+            Some(Some(ValidatorStatus::Leaving { .. }))
+        ));
         let allocation = updates
             .stakes
             .allocations
@@ -811,7 +847,10 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
+            HashMap::from([(
+                alice.clone(),
+                funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET),
+            )]),
             HashMap::new(),
         );
 
@@ -856,7 +895,10 @@ mod tests {
         let db = temp_db();
         let view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET))]),
+            HashMap::from([(
+                alice.clone(),
+                funded(MIN_VALIDATOR_STAKE + 2_000_000 + FEE_BUDGET),
+            )]),
             HashMap::new(),
         );
         let pubkey = test_bls_pubkey(42);
@@ -884,7 +926,10 @@ mod tests {
         .expect("a well-formed join must succeed");
 
         assert!(
-            matches!(updates.validator_statuses.0.get(&alice), Some(Some(ValidatorStatus::Pending))),
+            matches!(
+                updates.validator_statuses.0.get(&alice),
+                Some(Some(ValidatorStatus::Pending))
+            ),
             "the join itself must still be applied",
         );
         let registration = updates

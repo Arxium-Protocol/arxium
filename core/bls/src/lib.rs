@@ -5,8 +5,8 @@
 //! signatures in G2) for block finality certificates. Role-agnostic crypto
 //! primitive — no consensus/quorum logic lives here, that's `arxd/finality`.
 
-use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
 use blst::BLST_ERROR;
+use blst::min_pk::{AggregateSignature, PublicKey, SecretKey, Signature};
 use serde::{Deserialize, Serialize};
 
 /// Domain separation tag — required by the BLS signature spec so a
@@ -42,7 +42,11 @@ pub enum BlsError {
 }
 
 fn map_blst_err(err: BLST_ERROR) -> Result<(), BlsError> {
-    if err == BLST_ERROR::BLST_SUCCESS { Ok(()) } else { Err(BlsError::VerificationFailed) }
+    if err == BLST_ERROR::BLST_SUCCESS {
+        Ok(())
+    } else {
+        Err(BlsError::VerificationFailed)
+    }
 }
 
 #[derive(Clone)]
@@ -63,7 +67,8 @@ mod serde_bytes_48 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 48], D::Error> {
         let v: Vec<u8> = serde::Deserialize::deserialize(d)?;
-        v.try_into().map_err(|_| D::Error::custom("expected 48 bytes"))
+        v.try_into()
+            .map_err(|_| D::Error::custom("expected 48 bytes"))
     }
 }
 
@@ -76,7 +81,8 @@ mod serde_bytes_96 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 96], D::Error> {
         let v: Vec<u8> = serde::Deserialize::deserialize(d)?;
-        v.try_into().map_err(|_| D::Error::custom("expected 96 bytes"))
+        v.try_into()
+            .map_err(|_| D::Error::custom("expected 96 bytes"))
     }
 }
 
@@ -95,7 +101,10 @@ pub fn sign(sk: &BlsSecretKey, msg: &[u8]) -> BlsSignature {
 /// tag used for nothing else. Mandatory before a key may be registered
 /// anywhere it will later be aggregated over — see [`verify_possession`].
 pub fn prove_possession(sk: &BlsSecretKey) -> BlsSignature {
-    BlsSignature(sk.0.sign(&sk.0.sk_to_pk().to_bytes(), POP_DST, &[]).to_bytes())
+    BlsSignature(
+        sk.0.sign(&sk.0.sk_to_pk().to_bytes(), POP_DST, &[])
+            .to_bytes(),
+    )
 }
 
 /// Verifies a [`prove_possession`] proof, and that `pubkey` is a valid
@@ -136,7 +145,8 @@ pub fn aggregate(sigs: &[BlsSignature]) -> Result<BlsSignature, BlsError> {
         .map(|s| Signature::from_bytes(&s.0).map_err(|_| BlsError::InvalidSignature))
         .collect::<Result<_, _>>()?;
     let refs: Vec<&Signature> = parsed.iter().collect();
-    let agg = AggregateSignature::aggregate(&refs, true).map_err(|_| BlsError::VerificationFailed)?;
+    let agg =
+        AggregateSignature::aggregate(&refs, true).map_err(|_| BlsError::VerificationFailed)?;
     Ok(BlsSignature(agg.to_signature().to_bytes()))
 }
 
@@ -157,7 +167,11 @@ pub fn aggregate(sigs: &[BlsSignature]) -> Result<BlsSignature, BlsError> {
 /// times. That implements `CoreAggregateVerify`, which is documented as
 /// sound only for *distinct* messages; with identical ones it degenerates
 /// into exactly this check while merely looking like the stricter one.)
-pub fn verify_aggregate(msg: &[u8], signers: &[BlsPublicKey], agg: &BlsSignature) -> Result<(), BlsError> {
+pub fn verify_aggregate(
+    msg: &[u8],
+    signers: &[BlsPublicKey],
+    agg: &BlsSignature,
+) -> Result<(), BlsError> {
     if signers.is_empty() {
         return Err(BlsError::EmptyAggregate);
     }
@@ -204,7 +218,9 @@ mod tests {
 
     #[test]
     fn aggregate_and_verify_quorum() {
-        let keys: Vec<_> = (0u8..5).map(|i| keygen_from_seed(&[i + 10; 32]).unwrap()).collect();
+        let keys: Vec<_> = (0u8..5)
+            .map(|i| keygen_from_seed(&[i + 10; 32]).unwrap())
+            .collect();
         let msg = b"finalized-block-hash";
         let sigs: Vec<BlsSignature> = keys.iter().map(|(sk, _)| sign(sk, msg)).collect();
         let pubkeys: Vec<BlsPublicKey> = keys.iter().map(|(_, pk)| *pk).collect();
@@ -215,7 +231,9 @@ mod tests {
 
     #[test]
     fn aggregate_verify_rejects_missing_signer() {
-        let keys: Vec<_> = (0u8..3).map(|i| keygen_from_seed(&[i + 20; 32]).unwrap()).collect();
+        let keys: Vec<_> = (0u8..3)
+            .map(|i| keygen_from_seed(&[i + 20; 32]).unwrap())
+            .collect();
         let msg = b"finalized-block-hash";
         let sigs: Vec<BlsSignature> = keys.iter().map(|(sk, _)| sign(sk, msg)).collect();
         let agg = aggregate(&sigs).unwrap();

@@ -3,16 +3,16 @@
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::warn;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::collections::BTreeMap;
-use xc_primitives::{
-    Action, Address, Block, Hash32, MAX_FUTURE_DRIFT_SECS, QUORUM_POWER, RoundCertificate, SignatureError, VotingPower,
-    eligible_proposer, round_timeout_signing_bytes, signed_power,
-};
-use xc_primitives::Asset;
 use xc_circuit::{ChainParamsKey, KvRead, OperatorIndexKey, OperatorKey};
+use xc_primitives::Asset;
+use xc_primitives::{
+    Action, Address, Block, Hash32, MAX_FUTURE_DRIFT_SECS, QUORUM_POWER, RoundCertificate,
+    SignatureError, VotingPower, eligible_proposer, round_timeout_signing_bytes, signed_power,
+};
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
     BatchWritable, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates,
@@ -111,7 +111,11 @@ pub struct BlockUpdates {
 pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpdates, StorageError> {
     let due = db.get_allocations_with_unbonding_due(height)?;
     let (accounts, stakes) = circuit_staking::resolve_due_unbonding(db, due)?;
-    Ok(BlockUpdates { accounts, stakes, ..Default::default() })
+    Ok(BlockUpdates {
+        accounts,
+        stakes,
+        ..Default::default()
+    })
 }
 
 #[derive(Error, Debug)]
@@ -153,7 +157,9 @@ pub enum AcceptBlockError {
     },
     #[error("block {height} claims round {round} but carries no round certificate to prove round {} timed out", round - 1)]
     MissingRoundCertificate { height: u64, round: u32 },
-    #[error("block {height} claims round 0 but carries a round certificate — round 0 needs no proof")]
+    #[error(
+        "block {height} claims round 0 but carries a round certificate — round 0 needs no proof"
+    )]
     UnexpectedRoundCertificate { height: u64 },
     #[error(
         "block {height} round {round} carries a certificate for height {cert_height} round {cert_round} — must be this block's own height and round - 1"
@@ -184,8 +190,14 @@ pub enum AcceptBlockError {
         signers: usize,
         validators: usize,
     },
-    #[error("block {height} round {round} certificate includes signer {signer} who is not a registered BLS validator at this height")]
-    RoundCertificateUnknownSigner { height: u64, round: u32, signer: Address },
+    #[error(
+        "block {height} round {round} certificate includes signer {signer} who is not a registered BLS validator at this height"
+    )]
+    RoundCertificateUnknownSigner {
+        height: u64,
+        round: u32,
+        signer: Address,
+    },
     #[error("block {height} round {round} certificate's aggregate signature does not verify")]
     RoundCertificateInvalid { height: u64, round: u32 },
     #[error("block height {block_height} does not extend local tip {tip_height}")]
@@ -221,8 +233,14 @@ pub enum AcceptBlockError {
     Storage(#[from] StorageError),
     #[error("failed to execute block actions: {0}")]
     Execution(#[from] ExecutorError),
-    #[error("block {height} exceeds max_block_weight {max_block_weight} — {over} action(s) do not fit")]
-    BlockOverWeight { height: u64, max_block_weight: u64, over: usize },
+    #[error(
+        "block {height} exceeds max_block_weight {max_block_weight} — {over} action(s) do not fit"
+    )]
+    BlockOverWeight {
+        height: u64,
+        max_block_weight: u64,
+        over: usize,
+    },
     #[error(
         "block {block_height} claimed {claimed} action(s) but only {executed} executed successfully — proposer included an invalid action"
     )]
@@ -241,7 +259,9 @@ pub enum AcceptBlockError {
         /// proof for. See `execute_actions`'s `record_touched_keys`.
         touched_keys: Vec<Vec<u8>>,
     },
-    #[error("block {height} claimed state root {claimed}, locally computed {expected} — proposer's state disagrees with ours")]
+    #[error(
+        "block {height} claimed state root {claimed}, locally computed {expected} — proposer's state disagrees with ours"
+    )]
     StateRootMismatch {
         height: u64,
         expected: String,
@@ -264,7 +284,10 @@ impl AcceptBlockError {
     /// added above without a matching arm here defaults to `false`, so a
     /// silent miss fails closed (no dissent) rather than open.
     pub fn is_execution_disagreement(&self) -> bool {
-        matches!(self, AcceptBlockError::StateRootMismatch { .. } | AcceptBlockError::ActionMismatch { .. })
+        matches!(
+            self,
+            AcceptBlockError::StateRootMismatch { .. } | AcceptBlockError::ActionMismatch { .. }
+        )
     }
 }
 
@@ -342,7 +365,8 @@ fn verify_round_certificate(
         pubkeys.push(pubkey);
     }
 
-    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, height, round - 1, parent_hash);
+    let msg =
+        round_timeout_signing_bytes(&db.genesis_hash_bytes()?, height, round - 1, parent_hash);
     xc_bls::verify_aggregate(&msg, &pubkeys, &cert.aggregate_signature)
         .map_err(|_| AcceptBlockError::RoundCertificateInvalid { height, round })
 }
@@ -385,7 +409,13 @@ pub fn accept_block<P>(
         &dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
         &[Address],
     ) -> anyhow::Result<BlockUpdates>,
-    on_block_sealed: impl Fn(&BlockView<'_>, &Address, u128, &[Address], u64) -> anyhow::Result<BlockUpdates>,
+    on_block_sealed: impl Fn(
+        &BlockView<'_>,
+        &Address,
+        u128,
+        &[Address],
+        u64,
+    ) -> anyhow::Result<BlockUpdates>,
 ) -> Result<Block<P>, AcceptBlockError>
 where
     P: Serialize + DeserializeOwned + Clone,
@@ -518,13 +548,25 @@ where
     match &block.round_certificate {
         None if round == 0 => {}
         None => {
-            return Err(AcceptBlockError::MissingRoundCertificate { height: block.height, round });
+            return Err(AcceptBlockError::MissingRoundCertificate {
+                height: block.height,
+                round,
+            });
         }
         Some(_) if round == 0 => {
-            return Err(AcceptBlockError::UnexpectedRoundCertificate { height: block.height });
+            return Err(AcceptBlockError::UnexpectedRoundCertificate {
+                height: block.height,
+            });
         }
         Some(cert) => {
-            verify_round_certificate(db, cert, block.height, round, &block.parent_hash, &validator_set)?;
+            verify_round_certificate(
+                db,
+                cert,
+                block.height,
+                round,
+                &block.parent_hash,
+                &validator_set,
+            )?;
         }
     }
     let expected = eligible_proposer(&validators, block.height, round);
@@ -564,7 +606,16 @@ where
         weight_used,
         fees_collected,
         deferred,
-    } = execute_actions(db, block.actions.clone(), &validators, seed, dispatch, meter, None, true)?;
+    } = execute_actions(
+        db,
+        block.actions.clone(),
+        &validators,
+        seed,
+        dispatch,
+        meter,
+        None,
+        true,
+    )?;
     if !deferred.is_empty() {
         let max_block_weight = max_block_weight(db)?;
         return Err(AcceptBlockError::BlockOverWeight {
@@ -574,7 +625,12 @@ where
         });
     }
     if applied.len() != claimed {
-        let overlay: Vec<&dyn BatchWritable> = vec![&account_updates, &stake_updates, &asset_updates, &holder_states];
+        let overlay: Vec<&dyn BatchWritable> = vec![
+            &account_updates,
+            &stake_updates,
+            &asset_updates,
+            &holder_states,
+        ];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
@@ -587,33 +643,51 @@ where
 
     // `verify_proposer_signature` above already guarantees `Some` — an
     // unsigned block never reaches this point.
-    let proposer = block.proposer.as_ref().expect("signed block always has a proposer");
+    let proposer = block
+        .proposer
+        .as_ref()
+        .expect("signed block always has a proposer");
     let mut view = BlockView::new(db);
     view.apply_accounts(&account_updates)?;
     view.apply_stakes(&stake_updates)?;
     view.apply_asset_balances(&asset_updates)?;
     view.apply_holder_states(&holder_states)?;
     view.apply_validator_statuses(&validator_statuses)?;
-    let sealed_updates = on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
-        .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
+    let sealed_updates =
+        on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
+            .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
     account_updates.0.extend(sealed_updates.accounts.0);
-    stake_updates.allocations.extend(sealed_updates.stakes.allocations);
-    stake_updates.validator_index.extend(sealed_updates.stakes.validator_index);
+    stake_updates
+        .allocations
+        .extend(sealed_updates.stakes.allocations);
+    stake_updates
+        .validator_index
+        .extend(sealed_updates.stakes.validator_index);
     asset_updates.0.extend(sealed_updates.assets.0);
-    validator_statuses.0.extend(sealed_updates.validator_statuses.0);
+    validator_statuses
+        .0
+        .extend(sealed_updates.validator_statuses.0);
 
     // Only the boundary hook ever hands back a set; it takes effect at the
     // next height, the first block of the new epoch.
     let new_validator_set = sealed_updates
         .validator_set
-        .map(|validators| ValidatorSetSnapshot { effective_height: block.height + 1, validators });
+        .map(|validators| ValidatorSetSnapshot {
+            effective_height: block.height + 1,
+            validators,
+        });
 
     // A proposer's claimed post-block state must match what re-executing its
     // actions locally actually produces — same principle as `ActionMismatch`
     // above, applied to state instead of the action list.
     let state_root_overlay: Vec<&dyn BatchWritable> = {
-        let mut overlay: Vec<&dyn BatchWritable> =
-            vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
+        let mut overlay: Vec<&dyn BatchWritable> = vec![
+            &account_updates,
+            &stake_updates,
+            &asset_updates,
+            &holder_states,
+            &validator_statuses,
+        ];
         if let Some(snapshot) = &new_validator_set {
             overlay.push(snapshot);
         }
@@ -663,8 +737,13 @@ where
     // `CF_META` rows, outside `is_state_key`, so they must not move the root.
     let asset_index = db.asset_index_updates(&asset_registrations, &asset_updates)?;
 
-    let mut writables: Vec<&dyn BatchWritable> =
-        vec![&account_updates, &stake_updates, &asset_updates, &holder_states, &validator_statuses];
+    let mut writables: Vec<&dyn BatchWritable> = vec![
+        &account_updates,
+        &stake_updates,
+        &asset_updates,
+        &holder_states,
+        &validator_statuses,
+    ];
     if !asset_index.is_empty() {
         writables.push(&asset_index);
     }
@@ -687,7 +766,10 @@ where
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
-    let block_weight = BlockWeight { height: block.height, weight_used };
+    let block_weight = BlockWeight {
+        height: block.height,
+        weight_used,
+    };
     writables.push(&block_weight);
     writables.push(&block);
     // One batch, and the undo record for it: the block, its state changes, and
@@ -699,7 +781,9 @@ where
 /// `ChainParams.max_block_weight` as of current state — read here (not
 /// passed in) so producer and acceptor cannot be handed different caps.
 pub fn max_block_weight(db: &ArxiumDb) -> Result<u64, StorageError> {
-    Ok(KvRead::get(db, &ChainParamsKey)?.unwrap_or_default().max_block_weight)
+    Ok(KvRead::get(db, &ChainParamsKey)?
+        .unwrap_or_default()
+        .max_block_weight)
 }
 
 /// Applies each action to current state, in order, buffering every success
@@ -789,7 +873,11 @@ where
     let mut attestor_deregistrations: Vec<AttestorDeregistration> =
         seed.attestor_deregistration.into_iter().collect();
 
-    let mut view = if record_touched_keys { BlockView::new_recording(db) } else { BlockView::new(db) };
+    let mut view = if record_touched_keys {
+        BlockView::new_recording(db)
+    } else {
+        BlockView::new(db)
+    };
     view.apply_accounts(&AccountUpdates(overlay.clone()))?;
     view.apply_stakes(&StakeUpdates {
         allocations: stake_overlay.clone(),
@@ -809,7 +897,10 @@ where
     while let Some(action) = actions.next() {
         if let Err(err) = action.verify_signature() {
             warn!("dropping action from {}: {err}", action.sender);
-            dropped.push((action.signature.clone().unwrap_or_default(), err.to_string()));
+            dropped.push((
+                action.signature.clone().unwrap_or_default(),
+                err.to_string(),
+            ));
             continue;
         }
         let (weight, fee) = meter(&action);
@@ -828,11 +919,19 @@ where
             KvRead::get(&view, &OperatorIndexKey(operator)).map(Option::unwrap_or_default)
         };
 
-        match dispatch(&action, &view, &operator_lookup, &operator_validators_lookup, validators) {
+        match dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            validators,
+        ) {
             Ok(updates) => {
                 overlay.extend(updates.accounts.0.clone());
                 view.apply_accounts(&updates.accounts)?;
-                status_overlay.0.extend(updates.validator_statuses.0.clone());
+                status_overlay
+                    .0
+                    .extend(updates.validator_statuses.0.clone());
                 view.apply_validator_statuses(&updates.validator_statuses)?;
                 stake_overlay.extend(updates.stakes.allocations.clone());
                 validator_index_overlay.extend(updates.stakes.validator_index.clone());
@@ -867,7 +966,10 @@ where
             }
             Err(err) => {
                 warn!("dropping action from {}: {err}", action.sender);
-                dropped.push((action.signature.clone().unwrap_or_default(), err.to_string()));
+                dropped.push((
+                    action.signature.clone().unwrap_or_default(),
+                    err.to_string(),
+                ));
             }
         }
 
@@ -891,8 +993,16 @@ where
                 &status_overlay,
                 &operator_snapshot,
             ];
-            snapshot_overlay.extend(attestor_registrations.iter().map(|r| r as &dyn BatchWritable));
-            snapshot_overlay.extend(attestor_deregistrations.iter().map(|d| d as &dyn BatchWritable));
+            snapshot_overlay.extend(
+                attestor_registrations
+                    .iter()
+                    .map(|r| r as &dyn BatchWritable),
+            );
+            snapshot_overlay.extend(
+                attestor_deregistrations
+                    .iter()
+                    .map(|d| d as &dyn BatchWritable),
+            );
             snapshot_overlay.extend(asset_registrations.iter().map(|a| a as &dyn BatchWritable));
             snapshot_overlay.extend(evidence_markers.iter().map(|m| m as &dyn BatchWritable));
             snapshot_overlay.extend(bls_keys.iter().map(|k| k as &dyn BatchWritable));
@@ -939,11 +1049,22 @@ mod tests {
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     enum TestPayload {
-        Transfer { to: Address, amount: u128 },
+        Transfer {
+            to: Address,
+            amount: u128,
+        },
         Join,
-        Stake { validator: Address, amount: u128 },
-        RegisterAsset { id: String, compliance_required: bool },
-        IssueAsset { id: String },
+        Stake {
+            validator: Address,
+            amount: u128,
+        },
+        RegisterAsset {
+            id: String,
+            compliance_required: bool,
+        },
+        IssueAsset {
+            id: String,
+        },
     }
 
     /// Unmetered: every action weighs 1 and pays nothing.
@@ -980,17 +1101,20 @@ mod tests {
             }),
             TestPayload::Join => {
                 let mut updates = BlockUpdates::default();
-                updates
-                    .validator_statuses
-                    .0
-                    .insert(action.sender.clone(), Some(xc_primitives::ValidatorStatus::Pending));
+                updates.validator_statuses.0.insert(
+                    action.sender.clone(),
+                    Some(xc_primitives::ValidatorStatus::Pending),
+                );
                 Ok(updates)
             }
             // Mirrors `arxd_runtime::asset::{register_asset, resolve_asset}`'s
             // duplicate-check/lookup, without the private runtime code: what's
             // under test here is whether a same-block registration is visible
             // through `view`, not the registration logic itself.
-            TestPayload::RegisterAsset { id, compliance_required } => {
+            TestPayload::RegisterAsset {
+                id,
+                compliance_required,
+            } => {
                 let asset_ref = xc_primitives::AssetRef::derive(&action.sender, id)?;
                 if view.get(&AssetKey(&asset_ref))?.is_some() {
                     anyhow::bail!("asset {id} already registered");
@@ -1024,7 +1148,10 @@ mod tests {
         validators: &[Address],
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
-        let reward_per_block = view.get(&ChainParamsKey)?.unwrap_or_default().reward_per_block;
+        let reward_per_block = view
+            .get(&ChainParamsKey)?
+            .unwrap_or_default()
+            .reward_per_block;
         let reward_updates =
             circuit_staking::apply_block_reward(view, proposer, fees_collected, reward_per_block)?;
         let mut updates = BlockUpdates {
@@ -1035,8 +1162,14 @@ mod tests {
             let (downtime_accounts, downtime_stakes) =
                 circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
             updates.accounts.0.extend(downtime_accounts.0);
-            updates.stakes.allocations.extend(downtime_stakes.allocations);
-            updates.stakes.validator_index.extend(downtime_stakes.validator_index);
+            updates
+                .stakes
+                .allocations
+                .extend(downtime_stakes.allocations);
+            updates
+                .stakes
+                .validator_index
+                .extend(downtime_stakes.validator_index);
         }
         // A toy boundary hook: every `TEST_EPOCH_LENGTH` blocks, the set
         // becomes everyone with a status row, equally weighted — enough to
@@ -1046,8 +1179,13 @@ mod tests {
             // Only tests that write status rows opt into rotation; the
             // rest pre-compute roots without a snapshot in the overlay.
             if !joined.is_empty() {
-                let members: Vec<Address> = validators.iter().cloned().chain(joined.into_keys()).collect();
-                updates.validator_set = Some(ValidatorSetSnapshot::equal_power(height + 1, &members).validators);
+                let members: Vec<Address> = validators
+                    .iter()
+                    .cloned()
+                    .chain(joined.into_keys())
+                    .collect();
+                updates.validator_set =
+                    Some(ValidatorSetSnapshot::equal_power(height + 1, &members).validators);
             }
         }
         Ok(updates)
@@ -1060,7 +1198,11 @@ mod tests {
         let db = ArxiumDb::open(&path).unwrap();
         // `verify_round_certificate` binds the genesis hash; seed one as
         // `arxd/genesis` would.
-        db.write_batch(&xc_storage::GenesisHash(format!("0x{}", hex::encode([0xa1u8; 32])))).unwrap();
+        db.write_batch(&xc_storage::GenesisHash(format!(
+            "0x{}",
+            hex::encode([0xa1u8; 32])
+        )))
+        .unwrap();
         db
     }
 
@@ -1142,7 +1284,7 @@ mod tests {
         let bob = Address::from_pubkey_bytes(bob_key.verifying_key().as_bytes()).unwrap();
 
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -1211,8 +1353,22 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let ExecutionOutcome { applied, accounts: updates, validator_statuses, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
+        let ExecutionOutcome {
+            applied,
+            accounts: updates,
+            validator_statuses,
+            ..
+        } = execute_actions(
+            &db,
+            actions,
+            &[],
+            BlockUpdates::default(),
+            dispatch,
+            &flat,
+            None,
+            false,
+        )
+        .unwrap();
         assert!(validator_statuses.0.is_empty());
         assert_eq!(
             applied.len(),
@@ -1233,8 +1389,18 @@ mod tests {
         assert_eq!(bob_after.balance, 50);
     }
 
-    fn signed_action(key: &SigningKey, sender: &Address, nonce: u64, payload: TestPayload) -> Action<TestPayload> {
-        let mut action = Action { sender: sender.clone(), nonce, signature: None, payload };
+    fn signed_action(
+        key: &SigningKey,
+        sender: &Address,
+        nonce: u64,
+        payload: TestPayload,
+    ) -> Action<TestPayload> {
+        let mut action = Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload,
+        };
         let signature = key.sign(&action.signing_bytes());
         action.signature = Some(hex::encode(signature.to_bytes()));
         action
@@ -1252,13 +1418,39 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
 
         let actions = vec![
-            signed_action(&alice_key, &alice, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: true }),
-            signed_action(&alice_key, &alice, 1, TestPayload::IssueAsset { id: "gold".into() }),
+            signed_action(
+                &alice_key,
+                &alice,
+                0,
+                TestPayload::RegisterAsset {
+                    id: "gold".into(),
+                    compliance_required: true,
+                },
+            ),
+            signed_action(
+                &alice_key,
+                &alice,
+                1,
+                TestPayload::IssueAsset { id: "gold".into() },
+            ),
         ];
 
-        let ExecutionOutcome { applied, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
-        assert_eq!(applied.len(), 2, "IssueAsset must see the same-block registration");
+        let ExecutionOutcome { applied, .. } = execute_actions(
+            &db,
+            actions,
+            &[],
+            BlockUpdates::default(),
+            dispatch,
+            &flat,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            applied.len(),
+            2,
+            "IssueAsset must see the same-block registration"
+        );
     }
 
     /// Stage 1A: two `RegisterAsset` for the same slug in one block used to
@@ -1277,19 +1469,66 @@ mod tests {
         let mallory = Address::from_pubkey_bytes(mallory_key.verifying_key().as_bytes()).unwrap();
 
         let actions = vec![
-            signed_action(&alice_key, &alice, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: true }),
-            signed_action(&alice_key, &alice, 1, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
-            signed_action(&mallory_key, &mallory, 0, TestPayload::RegisterAsset { id: "gold".into(), compliance_required: false }),
+            signed_action(
+                &alice_key,
+                &alice,
+                0,
+                TestPayload::RegisterAsset {
+                    id: "gold".into(),
+                    compliance_required: true,
+                },
+            ),
+            signed_action(
+                &alice_key,
+                &alice,
+                1,
+                TestPayload::RegisterAsset {
+                    id: "gold".into(),
+                    compliance_required: false,
+                },
+            ),
+            signed_action(
+                &mallory_key,
+                &mallory,
+                0,
+                TestPayload::RegisterAsset {
+                    id: "gold".into(),
+                    compliance_required: false,
+                },
+            ),
         ];
 
-        let ExecutionOutcome { applied, asset_registrations, .. } =
-            execute_actions(&db, actions, &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
-        assert_eq!(applied.len(), 2, "the same-issuer duplicate must be dropped, the other issuer's kept");
+        let ExecutionOutcome {
+            applied,
+            asset_registrations,
+            ..
+        } = execute_actions(
+            &db,
+            actions,
+            &[],
+            BlockUpdates::default(),
+            dispatch,
+            &flat,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            applied.len(),
+            2,
+            "the same-issuer duplicate must be dropped, the other issuer's kept"
+        );
         assert_eq!(asset_registrations.len(), 2);
-        assert_eq!(asset_registrations[0].issuer, alice, "first registration's issuer must survive");
+        assert_eq!(
+            asset_registrations[0].issuer, alice,
+            "first registration's issuer must survive"
+        );
         assert!(asset_registrations[0].compliance_required);
         assert_eq!(asset_registrations[1].issuer, mallory);
-        assert_ne!(asset_registrations[0].asset_ref, asset_registrations[1].asset_ref);
+        assert_ne!(
+            asset_registrations[0].asset_ref,
+            asset_registrations[1].asset_ref
+        );
     }
 
     /// Part 3 Stage 1's `inter_action_roots` mode: bisection needs "the
@@ -1309,7 +1548,10 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            AccountEntry { balance: 100, ..Default::default() },
+            AccountEntry {
+                balance: 100,
+                ..Default::default()
+            },
         )])))
         .unwrap();
 
@@ -1320,8 +1562,21 @@ mod tests {
         ];
 
         let mut roots = Vec::new();
-        let ExecutionOutcome { applied, accounts: updates, .. } =
-            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, &flat, Some(&mut roots), false).unwrap();
+        let ExecutionOutcome {
+            applied,
+            accounts: updates,
+            ..
+        } = execute_actions(
+            &db,
+            actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            dispatch,
+            &flat,
+            Some(&mut roots),
+            false,
+        )
+        .unwrap();
         assert_eq!(applied.len(), 3);
         assert_eq!(roots.len(), 3, "one root per input action, in order");
         db.write_batch(&updates).unwrap();
@@ -1334,12 +1589,27 @@ mod tests {
         reference_db
             .write_batch(&AccountUpdates(BTreeMap::from([(
                 alice.clone(),
-                AccountEntry { balance: 100, ..Default::default() },
+                AccountEntry {
+                    balance: 100,
+                    ..Default::default()
+                },
             )])))
             .unwrap();
         for (i, action) in actions.into_iter().enumerate() {
-            let ExecutionOutcome { accounts: prefix_updates, .. } =
-                execute_actions(&reference_db, vec![action], &[], BlockUpdates::default(), dispatch, &flat, None, false).unwrap();
+            let ExecutionOutcome {
+                accounts: prefix_updates,
+                ..
+            } = execute_actions(
+                &reference_db,
+                vec![action],
+                &[],
+                BlockUpdates::default(),
+                dispatch,
+                &flat,
+                None,
+                false,
+            )
+            .unwrap();
             reference_db.write_batch(&prefix_updates).unwrap();
             assert_eq!(
                 roots[i],
@@ -1378,7 +1648,7 @@ mod tests {
         let validator = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
 
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(
@@ -1427,7 +1697,7 @@ mod tests {
         let validator = Address::from_pubkey_bytes(&[14u8; 32]).unwrap();
 
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(
@@ -1523,7 +1793,7 @@ mod tests {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
 
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -1531,7 +1801,8 @@ mod tests {
         // No actions, but the block reward still touches state (see
         // `signed_block_at`'s comment) — the root must account for it.
         let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr, 0, circuit_staking::REWARD_PER_BLOCK)
+                .unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash().to_string(),
@@ -1567,7 +1838,8 @@ mod tests {
         // `addr` regardless — the root must include that overlay too, or a
         // block that should be accepted fails its own StateRootMismatch check.
         let reward_updates =
-            circuit_staking::apply_block_reward(db, addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
+            circuit_staking::apply_block_reward(db, addr, 0, circuit_staking::REWARD_PER_BLOCK)
+                .unwrap();
         let mut block = Block {
             height: parent.height + 1,
             parent_hash: parent.hash().to_string(),
@@ -1595,7 +1867,10 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             alice.clone(),
-            AccountEntry { balance: 100, ..Default::default() },
+            AccountEntry {
+                balance: 100,
+                ..Default::default()
+            },
         )])))
         .unwrap();
         let cap = max_block_weight(&db).unwrap();
@@ -1606,11 +1881,23 @@ mod tests {
             signed_transfer(&alice_key, &alice, 1, &bob, 10),
         ];
 
-        let outcome =
-            execute_actions(&db, actions.clone(), &[], BlockUpdates::default(), dispatch, &heavy, None, false).unwrap();
+        let outcome = execute_actions(
+            &db,
+            actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            dispatch,
+            &heavy,
+            None,
+            false,
+        )
+        .unwrap();
         assert_eq!(outcome.applied.len(), 1);
         assert_eq!(outcome.deferred.len(), 1);
-        assert_eq!(outcome.deferred[0].nonce, 1, "the tail comes back in order, unexecuted");
+        assert_eq!(
+            outcome.deferred[0].nonce, 1,
+            "the tail comes back in order, unexecuted"
+        );
         assert_eq!(outcome.weight_used, cap / 10 * 6);
 
         let mut block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
@@ -1618,7 +1905,10 @@ mod tests {
         block2.tx_root = xc_poe::tx_root(&block2.actions).unwrap();
         block2.sign(addr.clone(), &key);
         let err = accept_block(&db, block2, false, &heavy, dispatch, seal).unwrap_err();
-        assert!(matches!(err, AcceptBlockError::BlockOverWeight { over: 1, .. }), "{err}");
+        assert!(
+            matches!(err, AcceptBlockError::BlockOverWeight { over: 1, .. }),
+            "{err}"
+        );
     }
 
     /// A proposer must not be able to stamp a block at or before its parent.
@@ -1661,7 +1951,13 @@ mod tests {
         );
 
         // Just past the bound is still rejected.
-        let block2 = signed_block_at(&db, &key, &addr, &block1, now_secs() + MAX_FUTURE_DRIFT_SECS + 5);
+        let block2 = signed_block_at(
+            &db,
+            &key,
+            &addr,
+            &block1,
+            now_secs() + MAX_FUTURE_DRIFT_SECS + 5,
+        );
         assert!(matches!(
             accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err(),
             AcceptBlockError::TimestampTooFarAhead { .. }
@@ -1696,17 +1992,17 @@ mod tests {
     #[test]
     fn the_block_after_genesis_is_exempt_from_the_timestamp_rules() {
         let (_db, _key, _addr, block1) = chain_at_height_one(now_secs());
-        assert_eq!(block1.height, 1, "block 1 must be accepted over synthetic genesis");
+        assert_eq!(
+            block1.height, 1,
+            "block 1 must be accepted over synthetic genesis"
+        );
     }
 
     /// Builds a two-validator chain at height 1 and returns both keys,
     /// sorted by address (the order `eligible_proposer` itself sorts into).
     /// Block 1's primary is whichever sorts to index `1 % 2 == 1`.
-    fn two_validator_chain_at_height_one() -> (
-        ArxiumDb,
-        [(SigningKey, Address); 2],
-        Block<TestPayload>,
-    ) {
+    fn two_validator_chain_at_height_one()
+    -> (ArxiumDb, [(SigningKey, Address); 2], Block<TestPayload>) {
         let db = temp_db();
         let key_a = SigningKey::from_bytes(&[21u8; 32]);
         let addr_a = Address::from_pubkey_bytes(key_a.verifying_key().as_bytes()).unwrap();
@@ -1715,8 +2011,11 @@ mod tests {
         let mut sorted = [(key_a, addr_a), (key_b, addr_b)];
         sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[sorted[0].1.clone(), sorted[1].1.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            &[sorted[0].1.clone(), sorted[1].1.clone()],
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -1724,7 +2023,8 @@ mod tests {
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
         let (key1, addr1) = sorted[1].clone();
         let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr1, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
+            circuit_staking::apply_block_reward(&db, &addr1, 0, circuit_staking::REWARD_PER_BLOCK)
+                .unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash().to_string(),
@@ -1878,7 +2178,9 @@ mod tests {
         // A certificate naming a different block at height 2.
         db.write_batch(&xc_storage::FinalityRecord {
             height: 2,
-            block_hash: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap(),
+            block_hash: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                .parse()
+                .unwrap(),
             signers: vec![addr.clone()],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
             ep: [0u8; 32],
@@ -1925,7 +2227,7 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[32u8; 32]).unwrap();
 
         db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-        .unwrap();
+            .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(
@@ -1963,7 +2265,14 @@ mod tests {
 
         let err = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap_err();
         assert!(
-            matches!(err, AcceptBlockError::ActionMismatch { claimed: 2, executed: 1, .. }),
+            matches!(
+                err,
+                AcceptBlockError::ActionMismatch {
+                    claimed: 2,
+                    executed: 1,
+                    ..
+                }
+            ),
             "got {err:?}",
         );
     }
@@ -1982,8 +2291,9 @@ mod tests {
     fn round_certificate_quorum_is_by_power_not_head_count() {
         let db = temp_db();
         let addr = |i: u8| Address::from_pubkey_bytes(&[i; 32]).unwrap();
-        let stakes: BTreeMap<Address, u128> =
-            (1u8..=20).map(|i| (addr(i), if i <= 4 { 100 } else { 10 })).collect();
+        let stakes: BTreeMap<Address, u128> = (1u8..=20)
+            .map(|i| (addr(i), if i <= 4 { 100 } else { 10 }))
+            .collect();
         let set = xc_primitives::assign_voting_power(&stakes);
         assert_eq!(set[&addr(1)].0, 1_000);
         assert_eq!(set[&addr(20)].0, 375);
@@ -1995,11 +2305,21 @@ mod tests {
             signers: signers.to_vec(),
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
         };
-        let err = verify_round_certificate(&db, &cert(&all_small), 7, 1, "parent", &set).unwrap_err();
-        assert!(matches!(err, AcceptBlockError::RoundCertificateBelowQuorum { power: 6_000, .. }), "{err:?}");
+        let err =
+            verify_round_certificate(&db, &cert(&all_small), 7, 1, "parent", &set).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AcceptBlockError::RoundCertificateBelowQuorum { power: 6_000, .. }
+            ),
+            "{err:?}"
+        );
         // Past the power check; fails later on the (unregistered) BLS keys.
         let err = verify_round_certificate(&db, &cert(&mixed), 7, 1, "parent", &set).unwrap_err();
-        assert!(matches!(err, AcceptBlockError::RoundCertificateUnknownSigner { .. }), "{err:?}");
+        assert!(
+            matches!(err, AcceptBlockError::RoundCertificateUnknownSigner { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2022,7 +2342,11 @@ mod tests {
         assert!(
             matches!(
                 err,
-                AcceptBlockError::RoundCertificateOversized { signers: 4, validators: 3, .. }
+                AcceptBlockError::RoundCertificateOversized {
+                    signers: 4,
+                    validators: 3,
+                    ..
+                }
             ),
             "got {err:?}",
         );

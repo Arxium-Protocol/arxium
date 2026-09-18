@@ -24,13 +24,20 @@ pub(super) async fn get_action_status<P: Payload>(
             return Ok(Json(serde_json::json!({ "status": "pending" })).into_response());
         }
         if let Some(reason) = mempool.dropped_reason(&signature) {
-            return Ok(Json(serde_json::json!({ "status": "dropped", "reason": reason })).into_response());
+            return Ok(
+                Json(serde_json::json!({ "status": "dropped", "reason": reason })).into_response(),
+            );
         }
     }
 
-    let height = state.db.get_action_block_height(&signature)?.ok_or(ApiError::NotFound)?;
+    let height = state
+        .db
+        .get_action_block_height(&signature)?
+        .ok_or(ApiError::NotFound)?;
     let block = state.db.get_block::<P>(height)?.ok_or_else(|| {
-        ApiError::internal(anyhow::anyhow!("action index points at missing block {height} for {signature}"))
+        ApiError::internal(anyhow::anyhow!(
+            "action index points at missing block {height} for {signature}"
+        ))
     })?;
     let action = block
         .actions
@@ -98,8 +105,10 @@ pub(super) async fn get_blocks<P: Payload>(
     // is bounded; a single watermark comparison would be cheaper but wrong
     // for the reason `block_with_finality` documents.
     let blocks = state.db.get_block_range::<P>(range.from, range.to)?;
-    let annotated =
-        blocks.iter().map(|block| block_with_finality(&state.db, block)).collect::<Result<Vec<_>, _>>()?;
+    let annotated = blocks
+        .iter()
+        .map(|block| block_with_finality(&state.db, block))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(annotated))
 }
 
@@ -122,9 +131,14 @@ pub(super) async fn get_block_by_hash<P: Payload>(
     let Ok(hash) = hash.parse::<Hash32>() else {
         return Err(ApiError::NotFound);
     };
-    let height = state.db.get_block_height_by_hash(&hash)?.ok_or(ApiError::NotFound)?;
+    let height = state
+        .db
+        .get_block_height_by_hash(&hash)?
+        .ok_or(ApiError::NotFound)?;
     let block = state.db.get_block::<P>(height)?.ok_or_else(|| {
-        ApiError::internal(anyhow::anyhow!("block_hash index points at missing block {height} for {hash}"))
+        ApiError::internal(anyhow::anyhow!(
+            "block_hash index points at missing block {height} for {hash}"
+        ))
     })?;
     Ok(Json(block_with_finality(&state.db, &block)?))
 }
@@ -182,20 +196,20 @@ pub(super) async fn search<P: Payload>(
     Query(SearchQuery { q }): Query<SearchQuery>,
 ) -> Response {
     if let Ok(height) = q.parse::<u64>()
-        && matches!(state.db.get_block::<P>(height), Ok(Some(_))) {
-            return Json(serde_json::json!({ "kind": "block", "height": height }))
-                .into_response();
-        }
+        && matches!(state.db.get_block::<P>(height), Ok(Some(_)))
+    {
+        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+    }
 
     if let Ok(address) = Address::parse(&q) {
-        return Json(serde_json::json!({ "kind": "account", "address": address }))
-            .into_response();
+        return Json(serde_json::json!({ "kind": "account", "address": address })).into_response();
     }
 
     if let Ok(hash) = q.parse::<Hash32>()
-        && let Ok(Some(height)) = state.db.get_block_height_by_hash(&hash) {
-            return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
-        }
+        && let Ok(Some(height)) = state.db.get_block_height_by_hash(&hash)
+    {
+        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+    }
 
     if let Ok(Some(height)) = state.db.get_action_block_height(&q) {
         return Json(serde_json::json!({ "kind": "action", "signature": q, "height": height }))

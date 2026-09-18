@@ -26,7 +26,11 @@ pub struct BlockView<'a> {
 
 impl<'a> BlockView<'a> {
     pub fn new(db: &'a ArxiumDb) -> Self {
-        Self { db, entries: HashMap::new(), touched: None }
+        Self {
+            db,
+            entries: HashMap::new(),
+            touched: None,
+        }
     }
 
     /// Same as `new`, but logs every Merkleized key touched via `get`/
@@ -34,7 +38,11 @@ impl<'a> BlockView<'a> {
     /// filtered by `is_state_key`) aren't logged: they have no trie proof
     /// to fetch, so recording them would just be noise for the caller.
     pub fn new_recording(db: &'a ArxiumDb) -> Self {
-        Self { db, entries: HashMap::new(), touched: Some(RefCell::new(BTreeSet::new())) }
+        Self {
+            db,
+            entries: HashMap::new(),
+            touched: Some(RefCell::new(BTreeSet::new())),
+        }
     }
 
     /// The Merkleized keys logged so far, in recording mode. Empty for a
@@ -48,9 +56,10 @@ impl<'a> BlockView<'a> {
 
     fn record_touched(&self, raw_key: &[u8]) {
         if let Some(touched) = &self.touched
-            && is_state_key(raw_key) {
-                touched.borrow_mut().insert(raw_key.to_vec());
-            }
+            && is_state_key(raw_key)
+        {
+            touched.borrow_mut().insert(raw_key.to_vec());
+        }
     }
 
     pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
@@ -99,14 +108,20 @@ impl<'a> BlockView<'a> {
     /// Folds a batch of asset-balance changes into the view — every entry is
     /// an upsert, mirroring `apply_accounts` (balances go to 0, never get
     /// deleted as a row).
-    pub fn apply_asset_balances(&mut self, updates: &AssetBalanceUpdates) -> Result<(), StorageError> {
+    pub fn apply_asset_balances(
+        &mut self,
+        updates: &AssetBalanceUpdates,
+    ) -> Result<(), StorageError> {
         for ((asset, owner), balance) in &updates.0 {
             self.put(&AssetBalanceKey { asset, owner }, balance)?;
         }
         Ok(())
     }
 
-    pub fn apply_holder_states(&mut self, updates: &HolderStateUpdates) -> Result<(), StorageError> {
+    pub fn apply_holder_states(
+        &mut self,
+        updates: &HolderStateUpdates,
+    ) -> Result<(), StorageError> {
         for ((asset, holder), state) in &updates.0 {
             self.put(&AssetHolderStateKey { asset, holder }, state)?;
         }
@@ -118,7 +133,10 @@ impl<'a> BlockView<'a> {
     /// view instead of a deferred `Vec`: without it, a same-block
     /// `RegisterAsset` followed by `IssueAsset` or a duplicate
     /// `RegisterAsset` reads stale (pre-block) state.
-    pub fn apply_validator_statuses(&mut self, updates: &ValidatorStatusUpdates) -> Result<(), StorageError> {
+    pub fn apply_validator_statuses(
+        &mut self,
+        updates: &ValidatorStatusUpdates,
+    ) -> Result<(), StorageError> {
         for (address, status) in &updates.0 {
             match status {
                 Some(status) => self.put(&ValidatorStatusKey(address), status)?,
@@ -154,7 +172,10 @@ impl<'a> BlockView<'a> {
     /// concern (range-scanned, never `get`).
     pub fn apply_bls_key(&mut self, registration: &BlsKeyRegistration) -> Result<(), StorageError> {
         self.put(&BlsKeyKey(&registration.address), &registration.pubkey)?;
-        self.put(&BlsPubkeyOwnerKey(&registration.pubkey), &registration.address)?;
+        self.put(
+            &BlsPubkeyOwnerKey(&registration.pubkey),
+            &registration.address,
+        )?;
         if let Some(previous) = &registration.previous_pubkey
             && previous != &registration.pubkey
         {
@@ -179,8 +200,14 @@ impl<'a> BlockView<'a> {
     /// above, used directly (not a `KeySpec` bulk struct like
     /// `apply_asset_balances`) since a block registers/deregisters at most
     /// one attestor per action.
-    pub fn apply_attestor_registration(&mut self, registration: &AttestorRegistration) -> Result<(), StorageError> {
-        self.put(&AttestorRecordKey(&registration.attestor), &registration.record)
+    pub fn apply_attestor_registration(
+        &mut self,
+        registration: &AttestorRegistration,
+    ) -> Result<(), StorageError> {
+        self.put(
+            &AttestorRecordKey(&registration.attestor),
+            &registration.record,
+        )
     }
 
     /// Folds a `DeregisterAttestor` write into the view.

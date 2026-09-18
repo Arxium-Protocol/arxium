@@ -4,9 +4,9 @@
 // ponytail: testing-only tool for a local devnet. Raw std::net HTTP instead of
 // pulling in an HTTP client crate; devnet-keys.json instead of a real wallet.
 use anyhow::{bail, Context, Result};
+use arxd_runtime::{ActionPayload, ChainAction};
 use clap::Parser;
 use ed25519_dalek::{Signer, SigningKey};
-use arxd_runtime::{ActionPayload, ChainAction};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -101,8 +101,8 @@ fn resolve_signer(name: &str, keys: &Value) -> Result<SigningKey> {
             .to_string(),
         None => name.to_string(),
     };
-    let seed = hex::decode(&seed_hex)
-        .context("--from is not a name in devnet-keys.json or a hex seed")?;
+    let seed =
+        hex::decode(&seed_hex).context("--from is not a name in devnet-keys.json or a hex seed")?;
     let seed: [u8; 32] = seed
         .try_into()
         .map_err(|_| anyhow::anyhow!("seed must be 32 bytes"))?;
@@ -123,7 +123,13 @@ fn resolve_address(name: &str, keys: &Value) -> Result<Address> {
 }
 
 // Minimal HTTP/1.1 client: local testing only, plain text responses with Content-Length.
-fn http(method: &str, node: &str, path: &str, body: Option<&str>, token: Option<&str>) -> Result<(u16, String)> {
+fn http(
+    method: &str,
+    node: &str,
+    path: &str,
+    body: Option<&str>,
+    token: Option<&str>,
+) -> Result<(u16, String)> {
     let mut stream = TcpStream::connect(node).with_context(|| format!("connect to {node}"))?;
     let body = body.unwrap_or_default();
     let auth_header = token
@@ -158,7 +164,9 @@ fn main() -> Result<()> {
     // actually landed on-chain after a stake/unstake/slash.
     if args.action == "sub-account" {
         let validator = resolve_address(
-            args.validator.as_deref().context("--validator is required for sub-account")?,
+            args.validator
+                .as_deref()
+                .context("--validator is required for sub-account")?,
             &keys,
         )?;
         println!("{}", circuit_staking::stake_subaccount(&validator));
@@ -189,36 +197,44 @@ fn main() -> Result<()> {
     let action_payload = match args.action.as_str() {
         "transfer" => ActionPayload::Transfer {
             to: resolve_address(
-                args.to.as_deref().context("--to is required for transfer")?,
+                args.to
+                    .as_deref()
+                    .context("--to is required for transfer")?,
                 &keys,
             )?,
             amount: args.amount.context("--amount is required for transfer")?,
         },
         "join-validator" => ActionPayload::JoinValidator {
             validator: target_validator()?,
-            stake: args.stake.context("--stake is required for join-validator")?,
+            stake: args
+                .stake
+                .context("--stake is required for join-validator")?,
             // Required: joining without a finality key would put a validator
             // in the set that raises the quorum threshold without being able
             // to vote toward it.
-            bls_pubkey: hex::decode(
-                args.bls_pubkey
-                    .as_deref()
-                    .context("--bls-pubkey is required for join-validator (get it from `arxd bls-key`)")?,
-            )
+            bls_pubkey: hex::decode(args.bls_pubkey.as_deref().context(
+                "--bls-pubkey is required for join-validator (get it from `arxd bls-key`)",
+            )?)
             .context("--bls-pubkey is not valid hex")?,
             bls_pop: decoded_bls_pop(args.bls_pop.as_deref(), "join-validator")?,
         },
-        "leave-validator" => ActionPayload::LeaveValidator { validator: target_validator()? },
+        "leave-validator" => ActionPayload::LeaveValidator {
+            validator: target_validator()?,
+        },
         "stake" => ActionPayload::Stake {
             validator: resolve_address(
-                args.validator.as_deref().context("--validator is required for stake")?,
+                args.validator
+                    .as_deref()
+                    .context("--validator is required for stake")?,
                 &keys,
             )?,
             amount: args.amount.context("--amount is required for stake")?,
         },
         "unstake" => ActionPayload::Unstake {
             validator: resolve_address(
-                args.validator.as_deref().context("--validator is required for unstake")?,
+                args.validator
+                    .as_deref()
+                    .context("--validator is required for unstake")?,
                 &keys,
             )?,
             amount: args.amount.context("--amount is required for unstake")?,
@@ -226,14 +242,18 @@ fn main() -> Result<()> {
         "register-bls-key" => ActionPayload::RegisterBlsKey {
             validator: target_validator()?,
             pubkey: hex::decode(
-                args.bls_pubkey.as_deref().context("--bls-pubkey is required for register-bls-key")?,
+                args.bls_pubkey
+                    .as_deref()
+                    .context("--bls-pubkey is required for register-bls-key")?,
             )
             .context("--bls-pubkey is not valid hex")?,
             pop: decoded_bls_pop(args.bls_pop.as_deref(), "register-bls-key")?,
         },
         "authorize-operator" => ActionPayload::AuthorizeOperator {
             operator: resolve_address(
-                args.operator.as_deref().context("--operator is required for authorize-operator")?,
+                args.operator
+                    .as_deref()
+                    .context("--operator is required for authorize-operator")?,
                 &keys,
             )?,
         },
@@ -248,7 +268,13 @@ fn main() -> Result<()> {
     let nonce = match args.nonce {
         Some(n) => n,
         None => {
-            let (status, body) = http("GET", &args.node, &format!("/accounts/{sender}"), None, args.token.as_deref())?;
+            let (status, body) = http(
+                "GET",
+                &args.node,
+                &format!("/accounts/{sender}"),
+                None,
+                args.token.as_deref(),
+            )?;
             if status != 200 {
                 bail!("GET /accounts/{sender} -> {status}: {body}");
             }
@@ -269,7 +295,13 @@ fn main() -> Result<()> {
 
     let payload = serde_json::to_string(&action)?;
     println!("submitting: {payload}");
-    let (status, body) = http("POST", &args.node, "/actions", Some(&payload), args.token.as_deref())?;
+    let (status, body) = http(
+        "POST",
+        &args.node,
+        "/actions",
+        Some(&payload),
+        args.token.as_deref(),
+    )?;
     println!("-> {status} {body}");
     if status != 202 {
         bail!("node rejected the action");

@@ -59,7 +59,11 @@ impl BatchWritable for Snapshot {
                 updated_at: self.height,
             };
             entries.push((
-                StakeKey { master: address, validator: address }.encode(),
+                StakeKey {
+                    master: address,
+                    validator: address,
+                }
+                .encode(),
                 bincode::serde::encode_to_vec(&allocation, config)?,
             ));
             entries.push((
@@ -83,7 +87,10 @@ impl BatchWritable for Snapshot {
                 .accounts
                 .get(&sub_account)
                 .cloned()
-                .unwrap_or(AccountEntry { balance: 0, ..Default::default() });
+                .unwrap_or(AccountEntry {
+                    balance: 0,
+                    ..Default::default()
+                });
             sub_entry.balance += validator.stake;
             entries.push((
                 AccountKey(&sub_account).encode(),
@@ -92,8 +99,11 @@ impl BatchWritable for Snapshot {
         }
         // Genesis set: powers from the spec's stakes, same rule the boundary
         // hook applies later; every genesis validator starts `Active`.
-        let genesis_stakes: BTreeMap<Address, u128> =
-            self.validators.iter().map(|(a, v)| (a.clone(), v.stake)).collect();
+        let genesis_stakes: BTreeMap<Address, u128> = self
+            .validators
+            .iter()
+            .map(|(a, v)| (a.clone(), v.stake))
+            .collect();
         entries.push((
             b"validator_set:00000000000000000000".to_vec(),
             bincode::serde::encode_to_vec(assign_voting_power(&genesis_stakes), config)?,
@@ -104,13 +114,19 @@ impl BatchWritable for Snapshot {
                 bincode::serde::encode_to_vec(&ValidatorStatus::Active, config)?,
             ));
         }
-        entries.push((ChainParamsKey.encode(), bincode::serde::encode_to_vec(&self.params, config)?));
+        entries.push((
+            ChainParamsKey.encode(),
+            bincode::serde::encode_to_vec(&self.params, config)?,
+        ));
         if let Some(attestor) = &self.attestor {
             // Seeds the multi-attestor registry with this chain-spec's
             // legacy single attestor field, so a spec written before the
             // Trust Spectrum registry existed still grants a working
             // attestor at genesis instead of silently having none.
-            let record = AttestorRecord { name: "genesis".to_string(), registered_at: self.height };
+            let record = AttestorRecord {
+                name: "genesis".to_string(),
+                registered_at: self.height,
+            };
             entries.push((
                 AttestorRecordKey(attestor).encode(),
                 bincode::serde::encode_to_vec(&record, config)?,
@@ -122,7 +138,10 @@ impl BatchWritable for Snapshot {
             (AdminRole::Recovery, &self.recovery_admin),
         ] {
             if let Some(admin) = admin {
-                entries.push((AdminKey(role).encode(), bincode::serde::encode_to_vec(admin, config)?));
+                entries.push((
+                    AdminKey(role).encode(),
+                    bincode::serde::encode_to_vec(admin, config)?,
+                ));
             }
         }
         Ok(entries)
@@ -146,7 +165,10 @@ impl ValidatorSetSnapshot {
     /// tooling that only care about membership.
     pub fn equal_power(effective_height: u64, validators: &[Address]) -> Self {
         let stakes: BTreeMap<Address, u128> = validators.iter().map(|a| (a.clone(), 1)).collect();
-        Self { effective_height, validators: assign_voting_power(&stakes) }
+        Self {
+            effective_height,
+            validators: assign_voting_power(&stakes),
+        }
     }
 }
 
@@ -169,7 +191,10 @@ pub struct ChainParamsRow(pub ChainParams);
 
 impl BatchWritable for ChainParamsRow {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
-        Ok(vec![(ChainParamsKey.encode(), bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?)])
+        Ok(vec![(
+            ChainParamsKey.encode(),
+            bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?,
+        )])
     }
 }
 
@@ -185,13 +210,21 @@ impl BatchWritable for ValidatorStatusUpdates {
             .iter()
             .filter_map(|(address, status)| status.as_ref().map(|s| (address, s)))
             .map(|(address, status)| {
-                Ok((ValidatorStatusKey(address).encode(), bincode::serde::encode_to_vec(status, config)?))
+                Ok((
+                    ValidatorStatusKey(address).encode(),
+                    bincode::serde::encode_to_vec(status, config)?,
+                ))
             })
             .collect()
     }
 
     fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
-        Ok(self.0.iter().filter(|(_, s)| s.is_none()).map(|(a, _)| ValidatorStatusKey(a).encode()).collect())
+        Ok(self
+            .0
+            .iter()
+            .filter(|(_, s)| s.is_none())
+            .map(|(a, _)| ValidatorStatusKey(a).encode())
+            .collect())
     }
 }
 
@@ -239,7 +272,11 @@ pub struct EvidenceMarker {
 
 impl BatchWritable for EvidenceMarker {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
-        let key = EvidenceMarkerKey { height: self.height, proposer: &self.proposer }.encode();
+        let key = EvidenceMarkerKey {
+            height: self.height,
+            proposer: &self.proposer,
+        }
+        .encode();
         Ok(vec![(key, vec![1u8])])
     }
 }
@@ -275,16 +312,25 @@ impl BatchWritable for BlsKeyRegistration {
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self.pubkey, config)?;
         let current_key = BlsKeyKey(&self.address).encode();
-        let history_key =
-            format!("meta:blskey_hist:{}:{:020}", self.address, self.effective_height).into_bytes();
+        let history_key = format!(
+            "meta:blskey_hist:{}:{:020}",
+            self.address, self.effective_height
+        )
+        .into_bytes();
         let owner_key = BlsPubkeyOwnerKey(&self.pubkey).encode();
         let owner_value = bincode::serde::encode_to_vec(&self.address, config)?;
-        Ok(vec![(current_key, value.clone()), (history_key, value), (owner_key, owner_value)])
+        Ok(vec![
+            (current_key, value.clone()),
+            (history_key, value),
+            (owner_key, owner_value),
+        ])
     }
 
     fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
         match &self.previous_pubkey {
-            Some(previous) if previous != &self.pubkey => Ok(vec![BlsPubkeyOwnerKey(previous).encode()]),
+            Some(previous) if previous != &self.pubkey => {
+                Ok(vec![BlsPubkeyOwnerKey(previous).encode()])
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -358,7 +404,10 @@ pub(crate) fn block_weight_key(height: u64) -> Vec<u8> {
 
 impl BatchWritable for BlockWeight {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
-        Ok(vec![(block_weight_key(self.height), self.weight_used.to_le_bytes().to_vec())])
+        Ok(vec![(
+            block_weight_key(self.height),
+            self.weight_used.to_le_bytes().to_vec(),
+        )])
     }
 }
 
@@ -399,7 +448,11 @@ pub struct PrecommitVoteRecord {
 
 impl BatchWritable for PrecommitVoteRecord {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
-        let key = format!("meta:precommit:{:020}:{}:{}", self.height, self.block_hash, self.voter).into_bytes();
+        let key = format!(
+            "meta:precommit:{:020}:{}:{}",
+            self.height, self.block_hash, self.voter
+        )
+        .into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
         Ok(vec![(key, value)])
@@ -472,8 +525,11 @@ pub struct RoundTimeoutVoteRecord {
 
 impl BatchWritable for RoundTimeoutVoteRecord {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
-        let key =
-            format!("meta:roundtimeout:{:020}:{}:{}", self.height, self.round, self.voter).into_bytes();
+        let key = format!(
+            "meta:roundtimeout:{:020}:{}:{}",
+            self.height, self.round, self.voter
+        )
+        .into_bytes();
         let config = bincode::config::standard();
         let value = bincode::serde::encode_to_vec(self, config)?;
         Ok(vec![(key, value)])

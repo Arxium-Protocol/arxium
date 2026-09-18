@@ -11,7 +11,9 @@ pub(super) async fn get_account<P: Payload>(
     Path(address): Path<String>,
 ) -> Result<Json<xc_primitives::AccountEntry>, ApiError> {
     let address = parse_address(&address)?;
-    Ok(Json(state.db.get_account(&address)?.ok_or(ApiError::NotFound)?))
+    Ok(Json(
+        state.db.get_account(&address)?.ok_or(ApiError::NotFound)?,
+    ))
 }
 
 pub(super) async fn get_account_stake<P: Payload>(
@@ -19,7 +21,12 @@ pub(super) async fn get_account_stake<P: Payload>(
     Path(address): Path<String>,
 ) -> Result<Json<xc_primitives::StakeAllocation>, ApiError> {
     let address = parse_address(&address)?;
-    Ok(Json(state.db.get_stake_allocation(&address, &address)?.ok_or(ApiError::NotFound)?))
+    Ok(Json(
+        state
+            .db
+            .get_stake_allocation(&address, &address)?
+            .ok_or(ApiError::NotFound)?,
+    ))
 }
 
 /// Every allocation `address` holds as master, one per validator, so a
@@ -45,7 +52,12 @@ pub(super) async fn get_delegated_stake<P: Payload>(
 ) -> Result<Json<xc_primitives::StakeAllocation>, ApiError> {
     let master = parse_address(&master)?;
     let validator = parse_address(&validator)?;
-    Ok(Json(state.db.get_stake_allocation(&master, &validator)?.ok_or(ApiError::NotFound)?))
+    Ok(Json(
+        state
+            .db
+            .get_stake_allocation(&master, &validator)?
+            .ok_or(ApiError::NotFound)?,
+    ))
 }
 
 /// Whether `address` has a BLS key registered for finality precommit voting
@@ -58,16 +70,25 @@ pub(super) async fn get_account_bls_key<P: Payload>(
 ) -> Result<Response, ApiError> {
     let address = parse_address(&address)?;
 
-    let tip_height = state.db.get_tip_height()?.ok_or(ApiError::ServiceUnavailable)?;
+    let tip_height = state
+        .db
+        .get_tip_height()?
+        .ok_or(ApiError::ServiceUnavailable)?;
     let height = resolve_height(query.height, tip_height)?;
 
     // Certificates must be checked against the key registered at their height.
     // Reading the current key after rotation would incorrectly reject an old
     // valid certificate or accept a forged historical one.
-    let pubkey = state.db.get_bls_pubkey_at(&address, height)?.ok_or(ApiError::NotFound)?;
+    let pubkey = state
+        .db
+        .get_bls_pubkey_at(&address, height)?
+        .ok_or(ApiError::NotFound)?;
     // Hex, not the serde byte array: every JSON consumer (Explorer, Retracer)
     // expects the same `0x…` form as `voter_pubkey` in the fault report.
-    Ok(Json(serde_json::json!({ "pubkey": format!("0x{}", hex::encode(pubkey.0)) })).into_response())
+    Ok(
+        Json(serde_json::json!({ "pubkey": format!("0x{}", hex::encode(pubkey.0)) }))
+            .into_response(),
+    )
 }
 
 /// One row of `GET /accounts/{address}/assets`.
@@ -107,7 +128,12 @@ pub(super) struct AccountAssetBalance {
 }
 
 impl AccountAssetBalance {
-    fn new(db: &ArxiumDb, address: &Address, asset: Asset, balance: u128) -> Result<Self, StorageError> {
+    fn new(
+        db: &ArxiumDb,
+        address: &Address,
+        asset: Asset,
+        balance: u128,
+    ) -> Result<Self, StorageError> {
         let issuer_attested = issuer_attested(db, &asset.issuer)?;
         let holder_state = db.get_holder_state(&asset.asset_ref, address)?;
         let eligibility = circuit_rwa_asset::transfer_eligibility(db, &asset, address, balance)?;
@@ -149,9 +175,13 @@ pub(super) async fn get_account_assets<P: Payload>(
         // Indexed but unregistered is impossible through the normal write
         // path (both rows land in one atomic batch), so skip rather than
         // fail the whole listing.
-        let Some(asset) = state.db.get_asset(&asset_ref)? else { continue };
+        let Some(asset) = state.db.get_asset(&asset_ref)? else {
+            continue;
+        };
         let balance = state.db.get_asset_balance(&asset_ref, &address)?;
-        balances.push(AccountAssetBalance::new(&state.db, &address, asset, balance)?);
+        balances.push(AccountAssetBalance::new(
+            &state.db, &address, asset, balance,
+        )?);
     }
 
     Ok(Json(balances))
@@ -168,5 +198,7 @@ pub(super) async fn get_account_asset_balance<P: Payload>(
     let asset_ref = parse_ref(&asset_ref)?;
     let asset = state.db.get_asset(&asset_ref)?.ok_or(ApiError::NotFound)?;
     let balance = state.db.get_asset_balance(&asset_ref, &address)?;
-    Ok(Json(AccountAssetBalance::new(&state.db, &address, asset, balance)?))
+    Ok(Json(AccountAssetBalance::new(
+        &state.db, &address, asset, balance,
+    )?))
 }

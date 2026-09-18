@@ -400,11 +400,17 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
     // restarted node with history ignores the anchor and syncs blocks.
     let mut snapshot: Option<snapshot_sync::SnapshotSync<P>> = match snapshot_trust {
         Some(trust) if local_tip_height(&db) == 0 => {
-            info!("snapshot sync: will fetch state at height {} ({}) from the first peer that can serve it", trust.height, trust.block_hash);
+            info!(
+                "snapshot sync: will fetch state at height {} ({}) from the first peer that can serve it",
+                trust.height, trust.block_hash
+            );
             Some(snapshot_sync::SnapshotSync::new(trust))
         }
         Some(trust) => {
-            info!("snapshot sync: anchor at height {} ignored, this node already has history", trust.height);
+            info!(
+                "snapshot sync: anchor at height {} ignored, this node already has history",
+                trust.height
+            );
             None
         }
         None => None,

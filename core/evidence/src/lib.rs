@@ -12,8 +12,8 @@ use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tracing::{error, info, warn};
 use xc_artifact::{
-    BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation, EvidenceArtifact, Fault,
-    PrecommitAttestation, ARTIFACT_VERSION,
+    ARTIFACT_VERSION, BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation,
+    EvidenceArtifact, Fault, PrecommitAttestation,
 };
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
@@ -84,7 +84,10 @@ pub fn verify_equivocation<P: Serialize>(
 /// on `arxd/finality`).
 pub enum EvidenceEvent<P> {
     BlockObserved(Block<P>),
-    ExecutionDisagreement { proposed: Block<P>, dissent: DissentAttestation },
+    ExecutionDisagreement {
+        proposed: Block<P>,
+        dissent: DissentAttestation,
+    },
     /// Same trigger as `ExecutionDisagreement` (`arxd/node` rejected a block
     /// on execution grounds) but paired with a whole-block fraud proof
     /// instead of just a signed claim: `dissent_claim.proofs` covers every
@@ -169,14 +172,20 @@ fn write_equivocation_artifact<P: Serialize>(
     };
 
     if let Err(err) = std::fs::create_dir_all(evidence_dir) {
-        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        warn!(
+            "evidence: failed to create evidence dir {}: {err}",
+            evidence_dir.display()
+        );
         return;
     }
     let path = evidence_dir.join(format!("{}-{proposer}.json", evidence.block_a.height));
     match serde_json::to_vec_pretty(&artifact) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(&path, bytes) {
-                warn!("evidence: failed to write artifact {}: {err}", path.display());
+                warn!(
+                    "evidence: failed to write artifact {}: {err}",
+                    path.display()
+                );
             } else {
                 info!("evidence: wrote artifact {}", path.display());
             }
@@ -233,14 +242,23 @@ fn write_disagreement_artifact<P: Serialize>(
     };
 
     if let Err(err) = std::fs::create_dir_all(evidence_dir) {
-        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        warn!(
+            "evidence: failed to create evidence dir {}: {err}",
+            evidence_dir.display()
+        );
         return;
     }
-    let path = evidence_dir.join(format!("{}-disagreement-{}.json", proposed.height, dissent.voter));
+    let path = evidence_dir.join(format!(
+        "{}-disagreement-{}.json",
+        proposed.height, dissent.voter
+    ));
     match serde_json::to_vec_pretty(&artifact) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(&path, bytes) {
-                warn!("evidence: failed to write artifact {}: {err}", path.display());
+                warn!(
+                    "evidence: failed to write artifact {}: {err}",
+                    path.display()
+                );
             } else {
                 info!("evidence: wrote artifact {}", path.display());
             }
@@ -283,7 +301,10 @@ fn write_precommit_equivocation_artifact(
         std::fs::write(&path, bytes)
     }) {
         Ok(()) => info!("evidence: wrote artifact {}", path.display()),
-        Err(err) => warn!("evidence: failed to write artifact {}: {err}", path.display()),
+        Err(err) => warn!(
+            "evidence: failed to write artifact {}: {err}",
+            path.display()
+        ),
     }
     artifact
 }
@@ -307,7 +328,9 @@ fn write_block_divergence_artifact<P: Serialize>(
     let proposer_pubkey = match proposer.pubkey_bytes() {
         Ok(bytes) => format!("0x{}", hex::encode(bytes)),
         Err(err) => {
-            warn!("evidence: failed to encode proposer pubkey for block divergence artifact: {err}");
+            warn!(
+                "evidence: failed to encode proposer pubkey for block divergence artifact: {err}"
+            );
             return None;
         }
     };
@@ -328,7 +351,8 @@ fn write_block_divergence_artifact<P: Serialize>(
         .actions
         .iter()
         .map(|action| {
-            bincode::serde::encode_to_vec(action, config).map(|bytes| format!("0x{}", hex::encode(bytes)))
+            bincode::serde::encode_to_vec(action, config)
+                .map(|bytes| format!("0x{}", hex::encode(bytes)))
         })
         .collect::<Result<Vec<String>, bincode::error::EncodeError>>()
     {
@@ -358,14 +382,20 @@ fn write_block_divergence_artifact<P: Serialize>(
     };
 
     if let Err(err) = std::fs::create_dir_all(evidence_dir) {
-        warn!("evidence: failed to create evidence dir {}: {err}", evidence_dir.display());
+        warn!(
+            "evidence: failed to create evidence dir {}: {err}",
+            evidence_dir.display()
+        );
         return None;
     }
     let path = evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
     match serde_json::to_vec_pretty(&artifact) {
         Ok(bytes) => {
             if let Err(err) = std::fs::write(&path, bytes) {
-                warn!("evidence: failed to write artifact {}: {err}", path.display());
+                warn!(
+                    "evidence: failed to write artifact {}: {err}",
+                    path.display()
+                );
                 None
             } else {
                 info!("evidence: wrote artifact {}", path.display());
@@ -436,10 +466,22 @@ where
                         );
                         continue;
                     };
-                    write_disagreement_artifact(&evidence_dir, genesis_hash, &proposer, &proposed, &dissent);
+                    write_disagreement_artifact(
+                        &evidence_dir,
+                        genesis_hash,
+                        &proposer,
+                        &proposed,
+                        &dissent,
+                    );
                     continue;
                 }
-                EvidenceEvent::BlockDivergence { proposed, parent_state_root, voter, voter_pubkey, dissent_claim } => {
+                EvidenceEvent::BlockDivergence {
+                    proposed,
+                    parent_state_root,
+                    voter,
+                    voter_pubkey,
+                    dissent_claim,
+                } => {
                     let Some(proposer) = proposed.proposer.clone() else {
                         warn!(
                             "evidence: block divergence for unsigned block at height {}, skipping artifact",
@@ -461,7 +503,8 @@ where
                     // (still useful bookkeeping/relay even on a resubmit) but
                     // only the first one attempts an on-chain submission —
                     // see the HashSet comment at the top of this thread.
-                    let already_attempted = !fault_attempted.insert((proposed.height, proposer.clone()));
+                    let already_attempted =
+                        !fault_attempted.insert((proposed.height, proposer.clone()));
                     if let (false, Some(artifact), Some(build_execution_fault_action)) =
                         (already_attempted, artifact, &build_execution_fault_action)
                     {
@@ -472,27 +515,37 @@ where
                         if let Some(action) = build_execution_fault_action(artifact) {
                             let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
                             match guard.push(action) {
-                                Ok(()) => info!("evidence: submitted block divergence fault against {proposer}"),
+                                Ok(()) => info!(
+                                    "evidence: submitted block divergence fault against {proposer}"
+                                ),
                                 Err(err @ xc_mempool::MempoolError::TooLarge { .. }) => {
                                     // The fault loop looks alive (this fires every time, not
                                     // just once) but this fault never reaches anyone — no
                                     // amount of retrying shrinks the artifact. See
                                     // Implementation_log_2026-09-05.md #3.
-                                    metrics::counter!("arxium_evidence_rejected_oversized_total").increment(1);
+                                    metrics::counter!("arxium_evidence_rejected_oversized_total")
+                                        .increment(1);
                                     error!(
                                         "evidence: block divergence fault against {proposer} rejected, \
                                          too large to submit: {err}"
                                     );
                                 }
                                 Err(err) => {
-                                    warn!("evidence: failed to submit block divergence fault for {proposer}: {err}")
+                                    warn!(
+                                        "evidence: failed to submit block divergence fault for {proposer}: {err}"
+                                    )
                                 }
                             }
                         }
                     }
                     continue;
                 }
-                EvidenceEvent::PrecommitEquivocation { voter, voter_pubkey, height, precommits } => {
+                EvidenceEvent::PrecommitEquivocation {
+                    voter,
+                    voter_pubkey,
+                    height,
+                    precommits,
+                } => {
                     let artifact = write_precommit_equivocation_artifact(
                         &evidence_dir,
                         genesis_hash,
@@ -513,13 +566,21 @@ where
                     {
                         continue;
                     }
-                    let build = build_execution_fault_action.as_ref().expect("checked above");
-                    let Some(action) = build(artifact) else { continue };
+                    let build = build_execution_fault_action
+                        .as_ref()
+                        .expect("checked above");
+                    let Some(action) = build(artifact) else {
+                        continue;
+                    };
                     let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
                     match guard.push(action) {
-                        Ok(()) => info!("evidence: submitted precommit equivocation against {voter}"),
+                        Ok(()) => {
+                            info!("evidence: submitted precommit equivocation against {voter}")
+                        }
                         Err(err) => {
-                            warn!("evidence: failed to submit precommit equivocation for {voter}: {err}")
+                            warn!(
+                                "evidence: failed to submit precommit equivocation for {voter}: {err}"
+                            )
                         }
                     }
                     continue;
@@ -540,7 +601,10 @@ where
                 continue;
             }
 
-            let evidence = EquivocationEvidence { block_a: existing, block_b: block };
+            let evidence = EquivocationEvidence {
+                block_a: existing,
+                block_b: block,
+            };
             let proposer = match verify_equivocation(&evidence) {
                 Ok(proposer) => proposer,
                 Err(err) => {
@@ -563,14 +627,18 @@ where
             write_equivocation_artifact(&evidence_dir, genesis_hash, &proposer, &evidence);
 
             let Some(build_evidence_action) = &build_evidence_action else {
-                warn!("evidence: observed equivocation by {proposer}, no local validator key to report it");
+                warn!(
+                    "evidence: observed equivocation by {proposer}, no local validator key to report it"
+                );
                 continue;
             };
             let action = build_evidence_action(evidence);
             let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
             match guard.push(action) {
                 Ok(()) => info!("evidence: submitted equivocation evidence against {proposer}"),
-                Err(err) => warn!("evidence: failed to submit equivocation evidence for {proposer}: {err}"),
+                Err(err) => {
+                    warn!("evidence: failed to submit equivocation evidence for {proposer}: {err}")
+                }
             }
         }
     })
@@ -601,7 +669,10 @@ mod tests {
         let block_b = signed_block(&key, 5, 200);
 
         let proposer = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap();
-        assert_eq!(proposer, Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap());
+        assert_eq!(
+            proposer,
+            Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap()
+        );
     }
 
     #[test]
@@ -656,7 +727,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-spawn-evidence-watcher-disagreement-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = ArxiumDb::open(&dir).expect("open test db");
 
@@ -689,18 +763,29 @@ mod tests {
             [7u8; 32],
         );
 
-        tx.send(EvidenceEvent::ExecutionDisagreement { proposed: proposed.clone(), dissent }).unwrap();
+        tx.send(EvidenceEvent::ExecutionDisagreement {
+            proposed: proposed.clone(),
+            dissent,
+        })
+        .unwrap();
         drop(tx);
 
         let path = evidence_dir.join(format!("{}-disagreement-arx1voter.json", proposed.height));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !path.exists() {
-            assert!(std::time::Instant::now() < deadline, "disagreement artifact was never written");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "disagreement artifact was never written"
+            );
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(artifact.fault, Fault::ExecutionDisagreement { height: 5, .. }));
+        let artifact: EvidenceArtifact =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            artifact.fault,
+            Fault::ExecutionDisagreement { height: 5, .. }
+        ));
     }
 
     /// Exercises the `BlockDivergence` event path: same trigger as
@@ -712,7 +797,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-spawn-evidence-watcher-block-divergence-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = ArxiumDb::open(&dir).expect("open test db");
 
@@ -756,19 +844,32 @@ mod tests {
         .unwrap();
         drop(tx);
 
-        let path = evidence_dir.join(format!("{}-block-divergence-arx1voter.json", proposed.height));
+        let path = evidence_dir.join(format!(
+            "{}-block-divergence-arx1voter.json",
+            proposed.height
+        ));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !path.exists() {
-            assert!(std::time::Instant::now() < deadline, "block divergence artifact was never written");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "block divergence artifact was never written"
+            );
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        let artifact: EvidenceArtifact = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(artifact.fault, Fault::BlockDivergence { height: 5, .. }));
+        let artifact: EvidenceArtifact =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            artifact.fault,
+            Fault::BlockDivergence { height: 5, .. }
+        ));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while mempool.lock().unwrap().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "block divergence fault was never submitted to mempool");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "block divergence fault was never submitted to mempool"
+            );
             thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -787,7 +888,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-spawn-evidence-watcher-block-divergence-dedup-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = ArxiumDb::open(&dir).expect("open test db");
 
@@ -842,23 +946,34 @@ mod tests {
         // Both artifacts still get written (local bookkeeping is cheap and
         // per-voter) — only the mempool submission is deduped.
         for voter in ["arx1voter-a", "arx1voter-b"] {
-            let path = evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
+            let path =
+                evidence_dir.join(format!("{}-block-divergence-{voter}.json", proposed.height));
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while !path.exists() {
-                assert!(std::time::Instant::now() < deadline, "artifact for {voter} was never written");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "artifact for {voter} was never written"
+                );
                 thread::sleep(std::time::Duration::from_millis(10));
             }
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while mempool.lock().unwrap().is_empty() {
-            assert!(std::time::Instant::now() < deadline, "block divergence fault was never submitted to mempool");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "block divergence fault was never submitted to mempool"
+            );
             thread::sleep(std::time::Duration::from_millis(10));
         }
         // Give the second event's (would-be) submission a moment to land if
         // the dedup were broken, then confirm it never did.
         thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(mempool.lock().unwrap().len(), 1, "second dissent for the same height must not resubmit");
+        assert_eq!(
+            mempool.lock().unwrap().len(),
+            1,
+            "second dissent for the same height must not resubmit"
+        );
     }
 
     /// A round change can put a *different* proposer at the same height —
@@ -873,7 +988,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-spawn-evidence-watcher-block-divergence-round-change-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = ArxiumDb::open(&dir).expect("open test db");
 
@@ -985,23 +1103,35 @@ mod tests {
             if !mempool.lock().unwrap().is_empty() {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "evidence watcher never submitted evidence action");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "evidence watcher never submitted evidence action"
+            );
             thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let reported = mempool.lock().unwrap().drain_pending(1);
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].sender, addr);
-        assert!(!db.evidence_processed(5, &addr).unwrap_or(false), "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself");
+        assert!(
+            !db.evidence_processed(5, &addr).unwrap_or(false),
+            "dedup marker is written by dispatch/apply_slash, not by the evidence subsystem itself"
+        );
 
         let artifact_path = evidence_dir.join(format!("5-{addr}.json"));
-        let artifact: xc_artifact::EvidenceArtifact =
-            serde_json::from_slice(&std::fs::read(&artifact_path).expect("artifact written to disk"))
-                .expect("artifact is valid JSON");
+        let artifact: xc_artifact::EvidenceArtifact = serde_json::from_slice(
+            &std::fs::read(&artifact_path).expect("artifact written to disk"),
+        )
+        .expect("artifact is valid JSON");
         let verdict = xc_artifact::verify(&artifact).expect("artifact verifies standalone");
         match verdict {
-            xc_artifact::Verdict::Culpable { culpable_pubkey, .. } => {
-                assert_eq!(culpable_pubkey, format!("0x{}", hex::encode(key.verifying_key().as_bytes())));
+            xc_artifact::Verdict::Culpable {
+                culpable_pubkey, ..
+            } => {
+                assert_eq!(
+                    culpable_pubkey,
+                    format!("0x{}", hex::encode(key.verifying_key().as_bytes()))
+                );
             }
             other => panic!("expected Culpable verdict, got {other:?}"),
         }

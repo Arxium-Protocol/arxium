@@ -223,8 +223,8 @@ pub(crate) fn verify_identity_credential<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
     use crate::ActionPayload;
+    use crate::test_support::*;
     use ark_serialize::CanonicalSerialize;
     use std::collections::HashMap;
     use xc_primitives::{Action, Address};
@@ -529,7 +529,10 @@ mod tests {
             &no_bls_owner,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("failed verification"), "got: {err}");
+        assert!(
+            err.to_string().contains("failed verification"),
+            "got: {err}"
+        );
     }
 
     #[test]

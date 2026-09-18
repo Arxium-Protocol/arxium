@@ -42,16 +42,16 @@ fn load_or_generate_keypair_inner(
     let key_path = base_path.join(KEY_FILE);
 
     let keypair = if key_path.exists() {
-        let bytes = Zeroizing::new(
-            std::fs::read(&key_path).context("failed to read network key file")?,
-        );
+        let bytes =
+            Zeroizing::new(std::fs::read(&key_path).context("failed to read network key file")?);
         Keypair::from_protobuf_encoding(&bytes)
             .context("network key file is not valid protobuf-encoded keypair")?
     } else {
         let keypair = match fixed_seed {
             Some(seed) => {
                 let mut seed = Zeroizing::new(seed);
-                Keypair::ed25519_from_bytes(seed.as_mut()).context("invalid devnet bootnode seed")?
+                Keypair::ed25519_from_bytes(seed.as_mut())
+                    .context("invalid devnet bootnode seed")?
             }
             None => Keypair::generate_ed25519(),
         };

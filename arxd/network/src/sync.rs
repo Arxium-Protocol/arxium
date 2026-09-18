@@ -55,7 +55,11 @@ pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
 /// what it is missing — gossip delivers once, and a validator that was down
 /// for that delivery would otherwise never see the block it has to vote on.
 pub(crate) fn blocks_page_end(from: u64, watermark: u64, tip: u64) -> u64 {
-    if watermark == 0 || from > watermark { tip } else { watermark }
+    if watermark == 0 || from > watermark {
+        tip
+    } else {
+        watermark
+    }
 }
 
 pub(crate) fn build_sync_response<P: Payload>(
@@ -159,9 +163,9 @@ pub(crate) fn build_sync_response<P: Payload>(
                 });
             SyncResponse::<Block<P>>::Certificate { height, record }
         }
-        SyncRequest::SnapshotManifest { height } => {
-            SyncResponse::<Block<P>>::SnapshotManifest(crate::snapshot_sync::manifest::<P>(db, height))
-        }
+        SyncRequest::SnapshotManifest { height } => SyncResponse::<Block<P>>::SnapshotManifest(
+            crate::snapshot_sync::manifest::<P>(db, height),
+        ),
         SyncRequest::SnapshotChunk { height, index } => SyncResponse::<Block<P>>::SnapshotChunk {
             height,
             index,

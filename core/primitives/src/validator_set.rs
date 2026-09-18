@@ -15,7 +15,9 @@ use crate::Address;
 /// One validator's share of consensus influence, in units of
 /// `TOTAL_VOTING_POWER`. A newtype so a raw stake amount (u128 IUM) can
 /// never be mistaken for a power (u32 basis points of the whole).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct VotingPower(pub u32);
 
 /// Every active set's powers sum to exactly this.
@@ -137,7 +139,11 @@ pub fn assign_voting_power(stakes: &BTreeMap<Address, u128>) -> BTreeMap<Address
         }
         // Clamp. Anyone over the cap is fixed at the cap and leaves the
         // pool; the excess is redistributed next iteration.
-        let over: Vec<&Address> = assigned.iter().filter(|(_, p)| **p > cap).map(|(a, _)| *a).collect();
+        let over: Vec<&Address> = assigned
+            .iter()
+            .filter(|(_, p)| **p > cap)
+            .map(|(a, _)| *a)
+            .collect();
         if over.is_empty() {
             powers.extend(assigned);
             break;
@@ -161,7 +167,10 @@ pub fn assign_voting_power(stakes: &BTreeMap<Address, u128>) -> BTreeMap<Address
             break;
         }
     }
-    powers.into_iter().map(|(a, p)| (a.clone(), VotingPower(p))).collect()
+    powers
+        .into_iter()
+        .map(|(a, p)| (a.clone(), VotingPower(p)))
+        .collect()
 }
 
 /// Consensus parameters fixed at genesis and read from state at dispatch
@@ -341,7 +350,10 @@ mod tests {
         }
         // Nobody can block finality alone once there are four or more.
         for n in 4..=200usize {
-            assert!(power_cap(n) < TOTAL_VOTING_POWER - QUORUM_POWER + 1, "n={n}");
+            assert!(
+                power_cap(n) < TOTAL_VOTING_POWER - QUORUM_POWER + 1,
+                "n={n}"
+            );
         }
     }
 
@@ -413,7 +425,9 @@ mod tests {
     #[test]
     fn set_sizes_from_one_to_one_hundred_all_sum_exactly() {
         for n in [1usize, 2, 3, 4, 6, 10, 11, 37, 100] {
-            let list: Vec<(u8, u128)> = (0..n as u8).map(|i| (i, 1 + (i as u128 * 7919) % 1000)).collect();
+            let list: Vec<(u8, u128)> = (0..n as u8)
+                .map(|i| (i, 1 + (i as u128 * 7919) % 1000))
+                .collect();
             let set = assign_voting_power(&stakes(&list));
             assert_eq!(set.len(), n);
             check_invariants(&set);
@@ -439,7 +453,10 @@ mod tests {
         // Whale plus one small: ~5,556 < 6,667.
         assert!(!quorum_reached(&set, [&addr(1), &addr(2)]));
         // Non-member and duplicates count for nothing.
-        assert_eq!(signed_power(&set, [&addr(2), &addr(2), &addr(99)]), set[&addr(2)].0);
+        assert_eq!(
+            signed_power(&set, [&addr(2), &addr(2), &addr(99)]),
+            set[&addr(2)].0
+        );
     }
 
     #[test]
@@ -447,7 +464,16 @@ mod tests {
         // 8 validators, cap 2,500: three big ones clamp to the cap (7,500)
         // and the five tiny ones share 2,500. Five of eight by head-count is
         // a quarter of the power; three of eight is quorum.
-        let set = assign_voting_power(&stakes(&[(1, 1000), (2, 1000), (3, 1000), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1)]));
+        let set = assign_voting_power(&stakes(&[
+            (1, 1000),
+            (2, 1000),
+            (3, 1000),
+            (4, 1),
+            (5, 1),
+            (6, 1),
+            (7, 1),
+            (8, 1),
+        ]));
         check_invariants(&set);
         let tiny: Vec<Address> = (4..=8).map(addr).collect();
         assert!(!quorum_reached(&set, tiny.iter()));

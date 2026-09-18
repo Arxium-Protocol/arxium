@@ -22,10 +22,10 @@
 //! `xc_bls::verify_possession`).
 
 use anyhow::Result;
-use xc_runtime_api::ChainRuntime;
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address, Asset};
+use xc_runtime_api::ChainRuntime;
 use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
 
 /// toy-chain has no `RegisterAsset` action or registry — there is exactly
@@ -97,10 +97,17 @@ impl ChainRuntime for ToyRuntime {
         Ok(())
     }
 
-    fn dispatch(action: &RwaAction, ctx: &xc_runtime_api::DispatchCtx<'_>) -> anyhow::Result<BlockUpdates> {
+    fn dispatch(
+        action: &RwaAction,
+        ctx: &xc_runtime_api::DispatchCtx<'_>,
+    ) -> anyhow::Result<BlockUpdates> {
         let issuer = Address::parse(ISSUER).expect("ISSUER is a valid address");
         let (accounts, assets) = dispatch(action, ctx.view, &issuer)?;
-        Ok(BlockUpdates { accounts, assets, ..Default::default() })
+        Ok(BlockUpdates {
+            accounts,
+            assets,
+            ..Default::default()
+        })
     }
 
     // toy-chain has no block-level economics of its own (no reward pool, no

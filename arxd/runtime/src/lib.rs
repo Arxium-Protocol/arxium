@@ -95,8 +95,12 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
         let params = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default();
-        let reward_updates =
-            circuit_staking::apply_block_reward(view, proposer, fees_collected, params.reward_per_block)?;
+        let reward_updates = circuit_staking::apply_block_reward(
+            view,
+            proposer,
+            fees_collected,
+            params.reward_per_block,
+        )?;
         let mut updates = BlockUpdates {
             accounts: reward_updates,
             ..Default::default()
@@ -116,7 +120,10 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
                     Some(xc_primitives::ValidatorStatus::Tombstoned)
                     | Some(xc_primitives::ValidatorStatus::Jailed { .. }) => {}
                     _ => {
-                        updates.validator_statuses.0.insert(primary.clone(), Some(jailed));
+                        updates
+                            .validator_statuses
+                            .0
+                            .insert(primary.clone(), Some(jailed));
                     }
                 }
             }
@@ -133,7 +140,10 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         // Epoch boundary: the one place the set changes. Runs last so it
         // sees this block's slash/jail above through the same view.
         let boundary = epoch::boundary_hook(view, height)?;
-        updates.validator_statuses.0.extend(boundary.validator_statuses.0);
+        updates
+            .validator_statuses
+            .0
+            .extend(boundary.validator_statuses.0);
         updates.validator_set = boundary.validator_set;
         Ok(updates)
     }
@@ -221,7 +231,9 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
     let weight = metering::action_weight(action);
     let max_block_weight = db.chain_params()?.max_block_weight;
     if weight > max_block_weight {
-        anyhow::bail!("action weight {weight} exceeds max_block_weight {max_block_weight} and can never be included");
+        anyhow::bail!(
+            "action weight {weight} exceeds max_block_weight {max_block_weight} and can never be included"
+        );
     }
     let fee = metering::action_fee_for(weight);
     if balance < fee {
@@ -338,7 +350,11 @@ fn consume_nonce<V: KvRead<Error = StorageError>>(
         return Ok(());
     }
     if action.nonce != current {
-        anyhow::bail!("invalid nonce for {}: expected {current}, got {}", action.sender, action.nonce);
+        anyhow::bail!(
+            "invalid nonce for {}: expected {current}, got {}",
+            action.sender,
+            action.nonce
+        );
     }
     entry.nonce = current + 1;
     updates.accounts.0.insert(action.sender.clone(), entry);
@@ -366,9 +382,10 @@ fn charge_action_fee<V: KvRead<Error = StorageError>>(
         })?,
     };
     let fee = metering::action_fee_for(metering::action_weight(action));
-    entry.balance = entry.balance.checked_sub(fee).ok_or_else(|| {
-        anyhow::anyhow!("insufficient balance for the action fee ({fee} IUM)")
-    })?;
+    entry.balance = entry
+        .balance
+        .checked_sub(fee)
+        .ok_or_else(|| anyhow::anyhow!("insufficient balance for the action fee ({fee} IUM)"))?;
     updates.accounts.0.insert(action.sender.clone(), entry);
     Ok(())
 }
@@ -474,9 +491,11 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::IssueAsset { asset, amount } => {
             asset::issue_asset(view, action, asset, *amount)
         }
-        ActionPayload::RegisterAttestor { attestor, name, reason } => {
-            identity::register_attestor(view, action, attestor, name, reason, current_height)
-        }
+        ActionPayload::RegisterAttestor {
+            attestor,
+            name,
+            reason,
+        } => identity::register_attestor(view, action, attestor, name, reason, current_height),
         ActionPayload::DeregisterAttestor { attestor, reason } => {
             identity::deregister_attestor(view, action, attestor, reason)
         }
@@ -493,33 +512,50 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             amount,
             reason,
         } => asset::forced_transfer(view, action, asset, from, to, *amount, reason),
-        ActionPayload::BurnAsset { asset, amount } => asset::burn_asset(view, action, asset, *amount),
+        ActionPayload::BurnAsset { asset, amount } => {
+            asset::burn_asset(view, action, asset, *amount)
+        }
         ActionPayload::LockIssuance { asset } => asset::lock_issuance(view, action, asset),
-        ActionPayload::TransferIssuer { asset, new_issuer } => asset::transfer_issuer(view, action, asset, new_issuer),
-        ActionPayload::SetAssetMetadataUri { asset, metadata_uri } => {
-            asset::set_metadata_uri(view, action, asset, metadata_uri.clone())
+        ActionPayload::TransferIssuer { asset, new_issuer } => {
+            asset::transfer_issuer(view, action, asset, new_issuer)
         }
-        ActionPayload::SetHolderFrozen { asset, holder, frozen } => {
-            asset::set_holder_frozen(view, action, asset, holder, *frozen)
-        }
-        ActionPayload::LockHolderAmount { asset, holder, amount } => {
-            asset::lock_holder_amount(view, action, asset, holder, *amount, true)
-        }
-        ActionPayload::UnlockHolderAmount { asset, holder, amount } => {
-            asset::lock_holder_amount(view, action, asset, holder, *amount, false)
-        }
-        ActionPayload::IssuerForcedTransfer { asset, from, to, amount, reason } => {
-            asset::issuer_forced_transfer(view, action, asset, from, to, *amount, reason)
-        }
-        ActionPayload::RecoverHolder { asset, lost, replacement } => {
-            asset::recover_holder(view, action, asset, lost, replacement)
-        }
-        ActionPayload::IssueAssetTo { asset, to, amount } => asset::issue_asset_to(view, action, asset, to, *amount),
-        ActionPayload::TransferAsset {
+        ActionPayload::SetAssetMetadataUri {
             asset,
+            metadata_uri,
+        } => asset::set_metadata_uri(view, action, asset, metadata_uri.clone()),
+        ActionPayload::SetHolderFrozen {
+            asset,
+            holder,
+            frozen,
+        } => asset::set_holder_frozen(view, action, asset, holder, *frozen),
+        ActionPayload::LockHolderAmount {
+            asset,
+            holder,
+            amount,
+        } => asset::lock_holder_amount(view, action, asset, holder, *amount, true),
+        ActionPayload::UnlockHolderAmount {
+            asset,
+            holder,
+            amount,
+        } => asset::lock_holder_amount(view, action, asset, holder, *amount, false),
+        ActionPayload::IssuerForcedTransfer {
+            asset,
+            from,
             to,
             amount,
-        } => asset::transfer_asset(view, action, asset, to, *amount),
+            reason,
+        } => asset::issuer_forced_transfer(view, action, asset, from, to, *amount, reason),
+        ActionPayload::RecoverHolder {
+            asset,
+            lost,
+            replacement,
+        } => asset::recover_holder(view, action, asset, lost, replacement),
+        ActionPayload::IssueAssetTo { asset, to, amount } => {
+            asset::issue_asset_to(view, action, asset, to, *amount)
+        }
+        ActionPayload::TransferAsset { asset, to, amount } => {
+            asset::transfer_asset(view, action, asset, to, *amount)
+        }
         ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
             view,
             artifact_json,
@@ -599,8 +635,7 @@ pub(crate) mod test_support {
     /// Enough to pay any single action's metered fee — what tests fund
     /// "one action's worth" with, since the real fee depends on the variant
     /// and size. Exact post-fee balances use `fee_of`.
-    pub(crate) const FEE_BUDGET: u128 =
-        crate::ACTION_FEE + 1_000_000 * crate::metering::WEIGHT_FEE;
+    pub(crate) const FEE_BUDGET: u128 = crate::ACTION_FEE + 1_000_000 * crate::metering::WEIGHT_FEE;
 
     pub(crate) fn fee_of(action: &crate::ChainAction) -> u128 {
         crate::metering::action_fee_for(crate::metering::action_weight(action))
@@ -663,7 +698,8 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
-        db.write_batches(&[&ValidatorSetSnapshot::equal_power(0, validators)]).unwrap();
+        db.write_batches(&[&ValidatorSetSnapshot::equal_power(0, validators)])
+            .unwrap();
         db
     }
 
@@ -911,7 +947,11 @@ mod client_signing_vectors {
 
     fn gold() -> AssetRef {
         let derived = AssetRef::derive(&Address::parse(ALICE).unwrap(), "gold").unwrap();
-        assert_eq!(derived.to_string(), ALICE_GOLD, "the pinned ref constant drifted from the derivation");
+        assert_eq!(
+            derived.to_string(),
+            ALICE_GOLD,
+            "the pinned ref constant drifted from the derivation"
+        );
         derived
     }
 
@@ -1010,7 +1050,13 @@ mod client_signing_vectors {
     #[test]
     fn issue_asset_vector_matches_the_client_codecs() {
         assert_eq!(
-            hex_signing_bytes(1, ActionPayload::IssueAsset { asset: gold(), amount: 1000 }),
+            hex_signing_bytes(
+                1,
+                ActionPayload::IssueAsset {
+                    asset: gold(),
+                    amount: 1000
+                }
+            ),
             ISSUE_ASSET_VECTOR,
             "IssueAsset signing bytes changed — the Console and Arx-Plus-Api \
              codecs pin this exact string"
@@ -1023,12 +1069,40 @@ mod client_signing_vectors {
         let bob = Address::parse(BOB).expect("valid");
         let alice = Address::parse(ALICE).expect("valid");
         let cases: [(&str, ActionPayload, &str); 3] = [
-            ("FreezeAsset", ActionPayload::FreezeAsset { asset: gold(), reason: "court".into() }, FREEZE_ASSET_VECTOR),
-            ("UnfreezeAsset", ActionPayload::UnfreezeAsset { asset: gold(), reason: "court".into() }, UNFREEZE_ASSET_VECTOR),
-            ("ForcedTransfer", ActionPayload::ForcedTransfer { asset: gold(), from: bob, to: alice, amount: 1000, reason: "court".into() }, FORCED_TRANSFER_VECTOR),
+            (
+                "FreezeAsset",
+                ActionPayload::FreezeAsset {
+                    asset: gold(),
+                    reason: "court".into(),
+                },
+                FREEZE_ASSET_VECTOR,
+            ),
+            (
+                "UnfreezeAsset",
+                ActionPayload::UnfreezeAsset {
+                    asset: gold(),
+                    reason: "court".into(),
+                },
+                UNFREEZE_ASSET_VECTOR,
+            ),
+            (
+                "ForcedTransfer",
+                ActionPayload::ForcedTransfer {
+                    asset: gold(),
+                    from: bob,
+                    to: alice,
+                    amount: 1000,
+                    reason: "court".into(),
+                },
+                FORCED_TRANSFER_VECTOR,
+            ),
         ];
         for (name, payload, expected) in cases {
-            assert_eq!(hex_signing_bytes(2, payload), expected, "{name} signing bytes changed — the client codecs pin this exact string");
+            assert_eq!(
+                hex_signing_bytes(2, payload),
+                expected,
+                "{name} signing bytes changed — the client codecs pin this exact string"
+            );
         }
     }
 
@@ -1040,15 +1114,68 @@ mod client_signing_vectors {
         let bob = Address::parse(BOB).expect("valid");
         let alice = Address::parse(ALICE).expect("valid");
         let cases: [(&str, ActionPayload, &str); 6] = [
-            ("BurnAsset", ActionPayload::BurnAsset { asset: gold(), amount: 1000 }, BURN_ASSET_VECTOR),
-            ("SetHolderFrozen", ActionPayload::SetHolderFrozen { asset: gold(), holder: bob.clone(), frozen: true }, SET_HOLDER_FROZEN_VECTOR),
-            ("LockHolderAmount", ActionPayload::LockHolderAmount { asset: gold(), holder: bob.clone(), amount: 1000 }, LOCK_HOLDER_AMOUNT_VECTOR),
-            ("UnlockHolderAmount", ActionPayload::UnlockHolderAmount { asset: gold(), holder: bob.clone(), amount: 1000 }, UNLOCK_HOLDER_AMOUNT_VECTOR),
-            ("IssuerForcedTransfer", ActionPayload::IssuerForcedTransfer { asset: gold(), from: bob.clone(), to: alice.clone(), amount: 1000, reason: "court".into() }, ISSUER_FORCED_TRANSFER_VECTOR),
-            ("RecoverHolder", ActionPayload::RecoverHolder { asset: gold(), lost: bob, replacement: alice }, RECOVER_HOLDER_VECTOR),
+            (
+                "BurnAsset",
+                ActionPayload::BurnAsset {
+                    asset: gold(),
+                    amount: 1000,
+                },
+                BURN_ASSET_VECTOR,
+            ),
+            (
+                "SetHolderFrozen",
+                ActionPayload::SetHolderFrozen {
+                    asset: gold(),
+                    holder: bob.clone(),
+                    frozen: true,
+                },
+                SET_HOLDER_FROZEN_VECTOR,
+            ),
+            (
+                "LockHolderAmount",
+                ActionPayload::LockHolderAmount {
+                    asset: gold(),
+                    holder: bob.clone(),
+                    amount: 1000,
+                },
+                LOCK_HOLDER_AMOUNT_VECTOR,
+            ),
+            (
+                "UnlockHolderAmount",
+                ActionPayload::UnlockHolderAmount {
+                    asset: gold(),
+                    holder: bob.clone(),
+                    amount: 1000,
+                },
+                UNLOCK_HOLDER_AMOUNT_VECTOR,
+            ),
+            (
+                "IssuerForcedTransfer",
+                ActionPayload::IssuerForcedTransfer {
+                    asset: gold(),
+                    from: bob.clone(),
+                    to: alice.clone(),
+                    amount: 1000,
+                    reason: "court".into(),
+                },
+                ISSUER_FORCED_TRANSFER_VECTOR,
+            ),
+            (
+                "RecoverHolder",
+                ActionPayload::RecoverHolder {
+                    asset: gold(),
+                    lost: bob,
+                    replacement: alice,
+                },
+                RECOVER_HOLDER_VECTOR,
+            ),
         ];
         for (name, payload, expected) in cases {
-            assert_eq!(hex_signing_bytes(2, payload), expected, "{name} signing bytes changed — the client codecs pin this exact string");
+            assert_eq!(
+                hex_signing_bytes(2, payload),
+                expected,
+                "{name} signing bytes changed — the client codecs pin this exact string"
+            );
         }
     }
 
@@ -1066,12 +1193,24 @@ mod client_signing_vectors {
     #[test]
     fn transfer_issuer_and_metadata_uri_vectors_match_the_client_codecs() {
         assert_eq!(
-            hex_signing_bytes(2, ActionPayload::TransferIssuer { asset: gold(), new_issuer: Address::parse(BOB).expect("valid") }),
+            hex_signing_bytes(
+                2,
+                ActionPayload::TransferIssuer {
+                    asset: gold(),
+                    new_issuer: Address::parse(BOB).expect("valid")
+                }
+            ),
             TRANSFER_ISSUER_VECTOR,
             "TransferIssuer signing bytes changed — the client codecs pin this exact string"
         );
         assert_eq!(
-            hex_signing_bytes(2, ActionPayload::SetAssetMetadataUri { asset: gold(), metadata_uri: Some("ipfs://terms".into()) }),
+            hex_signing_bytes(
+                2,
+                ActionPayload::SetAssetMetadataUri {
+                    asset: gold(),
+                    metadata_uri: Some("ipfs://terms".into())
+                }
+            ),
             SET_ASSET_METADATA_URI_VECTOR,
             "SetAssetMetadataUri signing bytes changed — the client codecs pin this exact string"
         );
@@ -1081,7 +1220,14 @@ mod client_signing_vectors {
     #[test]
     fn issue_asset_to_vector_matches_the_client_codecs() {
         assert_eq!(
-            hex_signing_bytes(2, ActionPayload::IssueAssetTo { asset: gold(), to: Address::parse(BOB).expect("valid"), amount: 1000 }),
+            hex_signing_bytes(
+                2,
+                ActionPayload::IssueAssetTo {
+                    asset: gold(),
+                    to: Address::parse(BOB).expect("valid"),
+                    amount: 1000
+                }
+            ),
             ISSUE_ASSET_TO_VECTOR,
             "IssueAssetTo signing bytes changed — the client codecs pin this exact string"
         );

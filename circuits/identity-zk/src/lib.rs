@@ -21,10 +21,10 @@
 //! real credential data flows through this circuit.
 
 use ark_bls12_381::{Bls12_381, Fr};
-use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
 use ark_crypto_primitives::crh::poseidon::CRH;
+use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
 use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget};
-use ark_crypto_primitives::sponge::poseidon::{find_poseidon_ark_and_mds, PoseidonConfig};
+use ark_crypto_primitives::sponge::poseidon::{PoseidonConfig, find_poseidon_ark_and_mds};
 use ark_ff::PrimeField;
 use ark_r1cs_std::alloc::AllocVar;
 use ark_r1cs_std::eq::EqGadget;
@@ -86,18 +86,23 @@ pub struct PreimageCircuit {
 
 impl ConstraintSynthesizer<Fr> for PreimageCircuit {
     fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> ark_relations::gr1cs::Result<()> {
-        let hash_var =
-            FpVar::new_input(cs.clone(), || self.credential_hash.ok_or(SynthesisError::AssignmentMissing))?;
-        let sender_var =
-            FpVar::new_input(cs.clone(), || self.sender.ok_or(SynthesisError::AssignmentMissing))?;
-        let preimage_var =
-            FpVar::new_witness(cs.clone(), || self.preimage.ok_or(SynthesisError::AssignmentMissing))?;
+        let hash_var = FpVar::new_input(cs.clone(), || {
+            self.credential_hash
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let sender_var = FpVar::new_input(cs.clone(), || {
+            self.sender.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let preimage_var = FpVar::new_witness(cs.clone(), || {
+            self.preimage.ok_or(SynthesisError::AssignmentMissing)
+        })?;
         // A public input that appears in no constraint has a zero column in
         // the QAP and so a zero `gamma_abc` term — the verifier would accept
         // any value for it. One linear constraint against a witness copy is
         // enough to give it a non-zero column and make the binding real.
-        let sender_witness =
-            FpVar::new_witness(cs.clone(), || self.sender.ok_or(SynthesisError::AssignmentMissing))?;
+        let sender_witness = FpVar::new_witness(cs.clone(), || {
+            self.sender.ok_or(SynthesisError::AssignmentMissing)
+        })?;
         sender_witness.enforce_equal(&sender_var)?;
         let params_var = CRHParametersVar::new_constant(cs, self.params)?;
         let computed = CRHGadget::<Fr>::evaluate(&params_var, &[preimage_var])?;
@@ -109,8 +114,12 @@ impl ConstraintSynthesizer<Fr> for PreimageCircuit {
 pub fn setup<R: RngCore + ark_std::rand::CryptoRng>(
     rng: &mut R,
 ) -> (ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>) {
-    let circuit =
-        PreimageCircuit { params: poseidon_params(), preimage: None, credential_hash: None, sender: None };
+    let circuit = PreimageCircuit {
+        params: poseidon_params(),
+        preimage: None,
+        credential_hash: None,
+        sender: None,
+    };
     ark_groth16::Groth16::<Bls12_381>::circuit_specific_setup(circuit, rng).expect("groth16 setup")
 }
 
@@ -139,13 +148,14 @@ pub fn verify(
     proof: &Proof<Bls12_381>,
     vk: &VerifyingKey<Bls12_381>,
 ) -> bool {
-    ark_groth16::Groth16::<Bls12_381>::verify(vk, &[*credential_hash, *sender], proof).unwrap_or(false)
+    ark_groth16::Groth16::<Bls12_381>::verify(vk, &[*credential_hash, *sender], proof)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_std::rand::{rngs::StdRng, SeedableRng};
+    use ark_std::rand::{SeedableRng, rngs::StdRng};
 
     fn test_rng() -> StdRng {
         StdRng::seed_from_u64(42)

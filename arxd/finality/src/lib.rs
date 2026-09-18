@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,7 +38,12 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Exact bytes a validator signs for a precommit vote.
-pub fn precommit_signing_bytes(genesis: &[u8; 32], height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+pub fn precommit_signing_bytes(
+    genesis: &[u8; 32],
+    height: u64,
+    block_hash: &str,
+    ep: &[u8; 32],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_PRECOMMIT);
     push_field(&mut buf, genesis);
@@ -98,7 +103,12 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
     let Ok(genesis) = db.genesis_hash_bytes() else {
         return false;
     };
-    let msg = precommit_signing_bytes(&genesis, record.height, &record.block_hash.to_string(), &record.ep);
+    let msg = precommit_signing_bytes(
+        &genesis,
+        record.height,
+        &record.block_hash.to_string(),
+        &record.ep,
+    );
     xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).is_ok()
 }
 
@@ -649,11 +659,20 @@ where
                         }
                     };
                     let weight_used = db.get_block_weight(block.height).unwrap_or_else(|err| {
-                        warn!("finality: failed to read block weight at height {}: {err}", block.height);
+                        warn!(
+                            "finality: failed to read block weight at height {}: {err}",
+                            block.height
+                        );
                         0
                     });
-                    let ep = xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root, weight_used);
-                    let msg = precommit_signing_bytes(&genesis, block.height, &hash.to_string(), &ep);
+                    let ep = xc_poe::block_ep(
+                        &parent_state_root,
+                        &block.tx_root,
+                        &block.state_root,
+                        weight_used,
+                    );
+                    let msg =
+                        precommit_signing_bytes(&genesis, block.height, &hash.to_string(), &ep);
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {
                         height: block.height,
@@ -668,9 +687,14 @@ where
                     // Gossipsub publication is not a local loopback mechanism,
                     // so waiting for VoteObserved would leave every validator
                     // counting only its peers' votes.
-                    if let Err(err) =
-                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, &equivocation_tx, vote.clone())
-                    {
+                    if let Err(err) = tally_vote::<P>(
+                        &db,
+                        &chain_lock,
+                        &mut tallies,
+                        &mut my_votes,
+                        &equivocation_tx,
+                        vote.clone(),
+                    ) {
                         warn!("finality: failed to process local precommit vote: {err}");
                     }
 
@@ -680,9 +704,14 @@ where
                     }
                 }
                 FinalityEvent::VoteObserved(vote) => {
-                    if let Err(err) =
-                        tally_vote::<P>(&db, &chain_lock, &mut tallies, &mut my_votes, &equivocation_tx, vote)
-                    {
+                    if let Err(err) = tally_vote::<P>(
+                        &db,
+                        &chain_lock,
+                        &mut tallies,
+                        &mut my_votes,
+                        &equivocation_tx,
+                        vote,
+                    ) {
                         warn!("finality: failed to process precommit vote: {err}");
                     }
                 }
@@ -730,7 +759,12 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = precommit_signing_bytes(&db.genesis_hash_bytes()?, vote.height, &vote.block_hash.to_string(), &vote.ep);
+    let msg = precommit_signing_bytes(
+        &db.genesis_hash_bytes()?,
+        vote.height,
+        &vote.block_hash.to_string(),
+        &vote.ep,
+    );
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping vote from {} with an invalid signature",
@@ -764,9 +798,13 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         by_key
             .iter()
             // Same message: an ordinary duplicate or rebroadcast, not a fault.
-            .filter(|((block_hash, ep), _)| (block_hash.to_string(), *ep) != (vote.block_hash.to_string(), vote.ep))
+            .filter(|((block_hash, ep), _)| {
+                (block_hash.to_string(), *ep) != (vote.block_hash.to_string(), vote.ep)
+            })
             .find_map(|((block_hash, ep), signers)| {
-                signers.get(&vote.voter).map(|sig| (block_hash.clone(), *ep, sig.clone()))
+                signers
+                    .get(&vote.voter)
+                    .map(|sig| (block_hash.clone(), *ep, sig.clone()))
             })
     });
     if let Some((prior_hash, prior_ep, prior_signature)) = prior {
@@ -779,7 +817,9 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
             votes: [
                 PrecommitVote {
                     height: vote.height,
-                    block_hash: prior_hash.parse().expect("tally key is always a Hash32::to_string()"),
+                    block_hash: prior_hash
+                        .parse()
+                        .expect("tally key is always a Hash32::to_string()"),
                     voter: vote.voter.clone(),
                     signature: prior_signature,
                     ep: prior_ep,
@@ -937,7 +977,12 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, vote.height, vote.round, &parent.hash().to_string());
+    let msg = round_timeout_signing_bytes(
+        &db.genesis_hash_bytes()?,
+        vote.height,
+        vote.round,
+        &parent.hash().to_string(),
+    );
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping round-timeout vote from {} with an invalid signature",
@@ -1139,8 +1184,11 @@ mod tests {
         let db = ArxiumDb::open(&dir).expect("open test db");
         // Every signing-bytes function binds the genesis hash, so a test DB
         // must have one seeded exactly like `arxd/genesis` does.
-        db.write_batch(&xc_storage::GenesisHash(format!("0x{}", hex::encode(GENESIS))))
-            .expect("seed genesis hash");
+        db.write_batch(&xc_storage::GenesisHash(format!(
+            "0x{}",
+            hex::encode(GENESIS)
+        )))
+        .expect("seed genesis hash");
         (db, dir)
     }
 
@@ -1208,7 +1256,10 @@ mod tests {
     #[test]
     fn a_certificate_naming_another_block_unwinds_this_node_to_the_parent() {
         let (db, dir, _) = chain_of_two();
-        let record = certificate(1, "0xc1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1");
+        let record = certificate(
+            1,
+            "0xc1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        );
         // Precondition: the watermark is stuck exactly because of the
         // disagreement, so the revert floor cannot be in the way.
         db.write_batch(&record).unwrap();
@@ -1243,7 +1294,10 @@ mod tests {
     #[test]
     fn a_certificate_ahead_of_our_tip_is_not_a_disagreement() {
         let (db, dir, _) = chain_of_two();
-        let record = certificate(7, "0xc2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2");
+        let record = certificate(
+            7,
+            "0xc2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+        );
 
         enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
 
@@ -1271,8 +1325,11 @@ mod tests {
             let key = SigningKey::from_bytes(&[i; 32]);
             validators.push(Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap());
         }
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
-            .unwrap();
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
+        .unwrap();
 
         let (tx, rx) = std::sync::mpsc::channel();
         let mut tallies = HashMap::new();
@@ -1289,16 +1346,33 @@ mod tests {
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &tx, v).unwrap()
         };
 
-        tally(vote("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        tally(vote(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ));
         // A rebroadcast of the same vote is not a fault.
-        tally(vote("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        tally(vote(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ));
         assert!(rx.try_recv().is_err());
 
-        tally(vote("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+        tally(vote(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ));
         let reported = rx.try_recv().expect("expected a reported equivocation");
-        assert_eq!(reported.votes[0].block_hash, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(reported.votes[1].block_hash, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
-        assert!(reported.votes.iter().all(|v| v.voter == addr && v.height == 5));
+        assert_eq!(
+            reported.votes[0].block_hash,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            reported.votes[1].block_hash,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(
+            reported
+                .votes
+                .iter()
+                .all(|v| v.voter == addr && v.height == 5)
+        );
         // Reporting does not drop the vote: withholding it from the tally
         // would let an equivocator stall a height instead of losing stake.
         assert_eq!(tallies[&5].len(), 2);
@@ -1310,7 +1384,9 @@ mod tests {
     /// don't — same head-counts as the old 2/3+1 rule, now by power.
     #[test]
     fn equal_power_quorum_matches_the_old_head_count() {
-        let addrs: Vec<Address> = (1u8..=4).map(|i| Address::from_pubkey_bytes(&[i; 32]).unwrap()).collect();
+        let addrs: Vec<Address> = (1u8..=4)
+            .map(|i| Address::from_pubkey_bytes(&[i; 32]).unwrap())
+            .collect();
         let set = xc_storage::ValidatorSetSnapshot::equal_power(0, &addrs).validators;
         assert!(!quorum_reached(&set, addrs.iter().take(2)));
         assert!(quorum_reached(&set, addrs.iter().take(3)));
@@ -1335,7 +1411,10 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1350,10 +1429,21 @@ mod tests {
                 height: 5,
                 block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+                signature: xc_bls::sign(
+                    sk,
+                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                ),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
+            tally_vote::<()>(
+                &db,
+                &Mutex::new(()),
+                &mut tallies,
+                &mut my_votes,
+                &equivocation_tx_for_test(),
+                vote,
+            )
+            .unwrap();
             assert!(db.get_finality_record(5).unwrap().is_none());
         }
 
@@ -1362,10 +1452,21 @@ mod tests {
             height: 5,
             block_hash: block_hash,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+            signature: xc_bls::sign(
+                sk,
+                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+            ),
             ep,
         };
-        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
+        tally_vote::<()>(
+            &db,
+            &Mutex::new(()),
+            &mut tallies,
+            &mut my_votes,
+            &equivocation_tx_for_test(),
+            vote,
+        )
+        .unwrap();
 
         let record = db
             .get_finality_record(5)
@@ -1396,7 +1497,10 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1412,10 +1516,21 @@ mod tests {
                 height: 5,
                 block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+                signature: xc_bls::sign(
+                    sk,
+                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                ),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
+            tally_vote::<()>(
+                &db,
+                &Mutex::new(()),
+                &mut tallies,
+                &mut my_votes,
+                &equivocation_tx_for_test(),
+                vote,
+            )
+            .unwrap();
         }
         drop(tallies);
 
@@ -1447,7 +1562,10 @@ mod tests {
             height: 5,
             block_hash: block_hash,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+            signature: xc_bls::sign(
+                sk,
+                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+            ),
             ep,
         };
         tally_vote::<()>(
@@ -1490,7 +1608,10 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
         .unwrap();
 
         let block_hash = signed_block(&SigningKey::from_bytes(&[9u8; 32]), 5, 100).hash();
@@ -1509,10 +1630,21 @@ mod tests {
                 height: 5,
                 block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+                signature: xc_bls::sign(
+                    sk,
+                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                ),
                 ep,
             };
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
+            tally_vote::<()>(
+                &db,
+                &Mutex::new(()),
+                &mut tallies,
+                &mut my_votes,
+                &equivocation_tx_for_test(),
+                vote,
+            )
+            .unwrap();
         }
 
         assert!(
@@ -1585,11 +1717,19 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &[addr.clone()],
+        )])
         .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
-        let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1");
+        let dissent = dissent_fixture(
+            addr.clone(),
+            &sk,
+            5,
+            "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+        );
         handle_dissent(&db, dissent, &dissent_tx).unwrap();
 
         let stored = db
@@ -1614,13 +1754,21 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &[addr.clone()],
+        )])
         .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"),
+            dissent_fixture(
+                addr.clone(),
+                &sk,
+                5,
+                "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            ),
             &dissent_tx,
         )
         .unwrap();
@@ -1628,7 +1776,12 @@ mod tests {
         // same height must not overwrite the first.
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &sk, 5, "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"),
+            dissent_fixture(
+                addr.clone(),
+                &sk,
+                5,
+                "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+            ),
             &dissent_tx,
         )
         .unwrap();
@@ -1656,14 +1809,22 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &[addr.clone()],
+        )])
         .unwrap();
 
         // Signed with a key that doesn't match the registered pubkey for `addr`.
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &other_sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"),
+            dissent_fixture(
+                addr.clone(),
+                &other_sk,
+                5,
+                "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+            ),
             &dissent_tx,
         )
         .unwrap();
@@ -1695,7 +1856,10 @@ mod tests {
             previous_pubkey: None,
         }])
         .unwrap();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &[addr.clone()])])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &[addr.clone()],
+        )])
         .unwrap();
 
         let (event_tx, event_rx) = mpsc::channel();
@@ -2012,7 +2176,10 @@ mod tests {
             })
             .collect();
         let validators: Vec<Address> = addrs_and_keys.iter().map(|(a, _)| a.clone()).collect();
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(0, &validators)])
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
         .unwrap();
         addrs_and_keys
     }
@@ -2039,7 +2206,10 @@ mod tests {
             height,
             round,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &round_timeout_signing_bytes(&GENESIS, height, round, parent_hash)),
+            signature: xc_bls::sign(
+                sk,
+                &round_timeout_signing_bytes(&GENESIS, height, round, parent_hash),
+            ),
         }
     }
 
@@ -2053,9 +2223,19 @@ mod tests {
             .map(|(i, (a, _))| (a.clone(), if i < 4 { 100 } else { 10 }))
             .collect();
         let validators = xc_primitives::assign_voting_power(&stakes);
-        assert_eq!(validators[&addrs_and_keys[0].0], xc_primitives::VotingPower(1_000));
-        assert_eq!(validators[&addrs_and_keys[19].0], xc_primitives::VotingPower(375));
-        db.write_batches(&[&xc_storage::ValidatorSetSnapshot { effective_height: 0, validators }]).unwrap();
+        assert_eq!(
+            validators[&addrs_and_keys[0].0],
+            xc_primitives::VotingPower(1_000)
+        );
+        assert_eq!(
+            validators[&addrs_and_keys[19].0],
+            xc_primitives::VotingPower(375)
+        );
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot {
+            effective_height: 0,
+            validators,
+        }])
+        .unwrap();
         addrs_and_keys
     }
 
@@ -2072,18 +2252,43 @@ mod tests {
             height: 5,
             block_hash: block_hash,
             voter: keys[i].0.clone(),
-            signature: xc_bls::sign(&keys[i].1, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
+            signature: xc_bls::sign(
+                &keys[i].1,
+                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+            ),
             ep,
         };
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
         for i in 4..20 {
-            tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(i)).unwrap();
+            tally_vote::<()>(
+                &db,
+                &Mutex::new(()),
+                &mut tallies,
+                &mut my_votes,
+                &equivocation_tx_for_test(),
+                vote(i),
+            )
+            .unwrap();
         }
-        assert!(db.get_finality_record(5).unwrap().is_none(), "16 small signers hold 6,000 < 6,667");
+        assert!(
+            db.get_finality_record(5).unwrap().is_none(),
+            "16 small signers hold 6,000 < 6,667"
+        );
         // One large signer adds 1,000: 6,000 → 7,000, past quorum.
-        tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote(0)).unwrap();
-        let record = db.get_finality_record(5).unwrap().expect("7,000 ≥ 6,667 finalizes");
+        tally_vote::<()>(
+            &db,
+            &Mutex::new(()),
+            &mut tallies,
+            &mut my_votes,
+            &equivocation_tx_for_test(),
+            vote(0),
+        )
+        .unwrap();
+        let record = db
+            .get_finality_record(5)
+            .unwrap()
+            .expect("7,000 ≥ 6,667 finalizes");
         assert_eq!(record.signers.len(), 17);
         assert!(verify_finality_record(&db, &record));
 
@@ -2091,7 +2296,10 @@ mod tests {
         // signers only, however honestly aggregated, is not a certificate.
         let mut short = record.clone();
         short.signers.retain(|s| s != &keys[0].0);
-        assert!(!verify_finality_record(&db, &short), "membership check passes, power check must not");
+        assert!(
+            !verify_finality_record(&db, &short),
+            "membership check passes, power check must not"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2104,14 +2312,34 @@ mod tests {
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
         for (addr, sk) in &keys[4..20] {
-            tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()))
-                .unwrap();
-        }
-        assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "16 of 20 by count is 6,000 by power");
-        let (addr, sk) = &keys[0];
-        tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()))
+            tally_round_timeout::<()>(
+                &db,
+                &mut tallies,
+                &mut my_votes,
+                round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
+            )
             .unwrap();
-        assert_eq!(db.get_round_certificate(5, 0).unwrap().unwrap().signers.len(), 17);
+        }
+        assert!(
+            db.get_round_certificate(5, 0).unwrap().is_none(),
+            "16 of 20 by count is 6,000 by power"
+        );
+        let (addr, sk) = &keys[0];
+        tally_round_timeout::<()>(
+            &db,
+            &mut tallies,
+            &mut my_votes,
+            round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_round_certificate(5, 0)
+                .unwrap()
+                .unwrap()
+                .signers
+                .len(),
+            17
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use tracing::warn;
 use xc_circuit::{ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary};
+use xc_primitives::{
+    Address, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary,
+};
 use xc_storage::{BlockView, StorageError};
 
 use crate::staking::MIN_VALIDATOR_STAKE;
@@ -44,11 +46,14 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
         if !status.eligible_for(next_epoch) {
             continue;
         }
-        let Some(stake) = total_stake(view, address)? else { continue };
+        let Some(stake) = total_stake(view, address)? else {
+            continue;
+        };
         if stake < MIN_VALIDATOR_STAKE {
             continue;
         }
-        if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, address)? {
+        if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, address)?
+        {
             continue;
         }
         eligible.push((address.clone(), stake));
@@ -100,8 +105,13 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
 /// (`circuit_staking`'s single-master invariant), but summed so a relaxed
 /// invariant later doesn't silently under-count. `None` when nothing is
 /// staked at all.
-fn total_stake<V: KvRead<Error = StorageError>>(view: &V, validator: &Address) -> Result<Option<u128>, StorageError> {
-    let masters = view.get(&StakeByValidatorKey(validator))?.unwrap_or_default();
+fn total_stake<V: KvRead<Error = StorageError>>(
+    view: &V,
+    validator: &Address,
+) -> Result<Option<u128>, StorageError> {
+    let masters = view
+        .get(&StakeByValidatorKey(validator))?
+        .unwrap_or_default();
     if masters.is_empty() {
         return Ok(None);
     }

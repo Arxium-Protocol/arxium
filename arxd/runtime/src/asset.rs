@@ -43,7 +43,10 @@ pub(crate) fn check_reason(reason: &str, what: &str) -> anyhow::Result<()> {
         anyhow::bail!("{what} needs a non-empty reason");
     }
     if reason.len() > MAX_REASON_LEN {
-        anyhow::bail!("reason is {} bytes, over the {MAX_REASON_LEN}-byte limit", reason.len());
+        anyhow::bail!(
+            "reason is {} bytes, over the {MAX_REASON_LEN}-byte limit",
+            reason.len()
+        );
     }
     Ok(())
 }
@@ -83,9 +86,15 @@ fn validate_asset_id(asset_id: &str) -> anyhow::Result<()> {
 /// never silently upcased, so what is stored is what the issuer signed.
 fn validate_symbol(symbol: &str) -> anyhow::Result<()> {
     if symbol.is_empty() || symbol.len() > MAX_SYMBOL_LEN {
-        anyhow::bail!("symbol must be 1–{MAX_SYMBOL_LEN} bytes, got {}", symbol.len());
+        anyhow::bail!(
+            "symbol must be 1–{MAX_SYMBOL_LEN} bytes, got {}",
+            symbol.len()
+        );
     }
-    if let Some(bad) = symbol.chars().find(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit())) {
+    if let Some(bad) = symbol
+        .chars()
+        .find(|c| !(c.is_ascii_uppercase() || c.is_ascii_digit()))
+    {
         anyhow::bail!("symbol {symbol:?} contains {bad:?}: only A-Z and 0-9 are allowed");
     }
     Ok(())
@@ -94,7 +103,10 @@ fn validate_symbol(symbol: &str) -> anyhow::Result<()> {
 fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
     validate_symbol(&metadata.symbol)?;
     if metadata.name.is_empty() || metadata.name.len() > MAX_NAME_LEN {
-        anyhow::bail!("name must be 1–{MAX_NAME_LEN} bytes, got {}", metadata.name.len());
+        anyhow::bail!(
+            "name must be 1–{MAX_NAME_LEN} bytes, got {}",
+            metadata.name.len()
+        );
     }
     if metadata.decimals > MAX_DECIMALS {
         anyhow::bail!(
@@ -139,7 +151,10 @@ pub(crate) fn register_asset<V: KvRead<Error = StorageError>>(
     // check needs no alias index.
     let asset_ref = AssetRef::derive(&action.sender, asset_id)?;
     if view.get(&AssetKey(&asset_ref))?.is_some() {
-        anyhow::bail!("{} already has an asset with id {asset_id} ({asset_ref})", action.sender);
+        anyhow::bail!(
+            "{} already has an asset with id {asset_id} ({asset_ref})",
+            action.sender
+        );
     }
     let asset = Asset::register(
         asset_ref,
@@ -237,7 +252,8 @@ pub(crate) fn set_frozen<V: KvRead<Error = StorageError>>(
         crate::identity::require_admin(view, action, AdminRole::Freeze).map_err(|_| {
             anyhow::anyhow!(
                 "{} is neither the issuer of {} nor the freeze admin",
-                action.sender, asset.asset_ref
+                action.sender,
+                asset.asset_ref
             )
         })?;
     }
@@ -278,10 +294,19 @@ pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
     })
 }
 
-fn require_issuer<V: KvRead<Error = StorageError>>(view: &V, action: &ChainAction, asset: &AssetRef) -> anyhow::Result<Asset> {
+fn require_issuer<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+) -> anyhow::Result<Asset> {
     let asset = resolve_asset(view, asset)?;
     if action.sender != asset.issuer {
-        anyhow::bail!("only the issuer ({}) of {} may do this, got {}", asset.issuer, asset.asset_ref, action.sender);
+        anyhow::bail!(
+            "only the issuer ({}) of {} may do this, got {}",
+            asset.issuer,
+            asset.asset_ref,
+            action.sender
+        );
     }
     Ok(asset)
 }
@@ -403,7 +428,9 @@ pub(crate) fn transfer_issuer<V: KvRead<Error = StorageError>>(
     new_issuer: &Address,
 ) -> anyhow::Result<BlockUpdates> {
     let mut asset = require_issuer(view, action, asset)?;
-    new_issuer.pubkey_bytes().map_err(|e| anyhow::anyhow!("new issuer {new_issuer} is not a valid address: {e}"))?;
+    new_issuer
+        .pubkey_bytes()
+        .map_err(|e| anyhow::anyhow!("new issuer {new_issuer} is not a valid address: {e}"))?;
     asset.issuer = new_issuer.clone();
     Ok(BlockUpdates {
         asset_registration: Some(asset),
@@ -437,7 +464,8 @@ pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
         anyhow::bail!("recovery needs a different replacement address");
     }
     let asset = require_issuer(view, action, asset)?;
-    let (assets, holder_states) = circuit_rwa_asset::apply_recover(view, &asset, lost, replacement)?;
+    let (assets, holder_states) =
+        circuit_rwa_asset::apply_recover(view, &asset, lost, replacement)?;
     Ok(BlockUpdates {
         assets,
         holder_states,
@@ -448,8 +476,8 @@ pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::*;
     use crate::ActionPayload;
+    use crate::test_support::*;
     use std::collections::HashMap;
     use xc_primitives::Action;
     use xc_storage::BlockView;
@@ -457,7 +485,11 @@ mod tests {
     /// The smallest metadata that passes validation — `symbol`/`name` are
     /// mandatory, so `AssetMetadata::default()` no longer registers.
     fn meta() -> AssetMetadata {
-        AssetMetadata { symbol: "GOLD".into(), name: "Gold".into(), ..Default::default() }
+        AssetMetadata {
+            symbol: "GOLD".into(),
+            name: "Gold".into(),
+            ..Default::default()
+        }
     }
 
     fn gold_of(issuer: &Address) -> AssetRef {
@@ -566,10 +598,7 @@ mod tests {
             },
         };
         let updates = dispatch(&transfer, &view).unwrap();
-        assert_eq!(
-            updates.assets.0[&(gold.clone(), recipient.clone())],
-            100
-        );
+        assert_eq!(updates.assets.0[&(gold.clone(), recipient.clone())], 100);
         view.apply_accounts(&updates.accounts).unwrap();
         view.apply_asset_balances(&updates.assets).unwrap();
 
@@ -639,43 +668,73 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(
             &db,
-            HashMap::from([(alice.clone(), funded(FEE_BUDGET * 8)), (bob.clone(), funded(FEE_BUDGET * 8))]),
+            HashMap::from([
+                (alice.clone(), funded(FEE_BUDGET * 8)),
+                (bob.clone(), funded(FEE_BUDGET * 8)),
+            ]),
             HashMap::new(),
         );
         let register = |sender: &Address| ChainAction {
             sender: sender.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::RegisterAsset { asset_id: "gold".into(), compliance_required: false, metadata: meta() },
+            payload: ActionPayload::RegisterAsset {
+                asset_id: "gold".into(),
+                compliance_required: false,
+                metadata: meta(),
+            },
         };
 
-        let alice_gold = dispatch_at(&register(&alice), &view, 0).unwrap().asset_registration.unwrap();
-        view.put(&AssetKey(&alice_gold.asset_ref), &alice_gold).unwrap();
-        let bob_gold = dispatch_at(&register(&bob), &view, 0).unwrap().asset_registration.unwrap();
+        let alice_gold = dispatch_at(&register(&alice), &view, 0)
+            .unwrap()
+            .asset_registration
+            .unwrap();
+        view.put(&AssetKey(&alice_gold.asset_ref), &alice_gold)
+            .unwrap();
+        let bob_gold = dispatch_at(&register(&bob), &view, 0)
+            .unwrap()
+            .asset_registration
+            .unwrap();
         view.put(&AssetKey(&bob_gold.asset_ref), &bob_gold).unwrap();
         assert_ne!(alice_gold.asset_ref, bob_gold.asset_ref);
         assert_eq!(alice_gold.asset_ref, gold_of(&alice));
         assert_eq!(bob_gold.asset_id, "gold");
 
         let err = dispatch_at(&register(&alice), &view, 0).unwrap_err();
-        assert!(err.to_string().contains("already has an asset with id gold"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("already has an asset with id gold"),
+            "{err}"
+        );
 
         // Supply is per ref: issuing under alice's leaves bob's untouched.
         let issue = ChainAction {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::IssueAsset { asset: alice_gold.asset_ref.clone(), amount: 10 },
+            payload: ActionPayload::IssueAsset {
+                asset: alice_gold.asset_ref.clone(),
+                amount: 10,
+            },
         };
         let updates = dispatch_at(&issue, &view, 0).unwrap();
         assert_eq!(updates.asset_registration.unwrap().total_supply, 10);
-        assert!(!updates.assets.0.contains_key(&(bob_gold.asset_ref.clone(), alice.clone())));
+        assert!(
+            !updates
+                .assets
+                .0
+                .contains_key(&(bob_gold.asset_ref.clone(), alice.clone()))
+        );
 
         let unknown = ChainAction {
             sender: alice.clone(),
             nonce: 0,
             signature: None,
-            payload: ActionPayload::TransferAsset { asset: AssetRef::derive(&alice, "nope").unwrap(), to: bob.clone(), amount: 1 },
+            payload: ActionPayload::TransferAsset {
+                asset: AssetRef::derive(&alice, "nope").unwrap(),
+                to: bob.clone(),
+                amount: 1,
+            },
         };
         let err = dispatch_at(&unknown, &view, 0).unwrap_err();
         assert!(err.to_string().contains("unknown asset"), "{err}");
@@ -685,14 +744,49 @@ mod tests {
     /// punctuated and lowercase are all refused — lowercase is not upcased.
     #[test]
     fn register_rejects_bad_symbols_and_names() {
-        for bad in ["", "gold", "Gold", "GOLD-X", "G".repeat(MAX_SYMBOL_LEN + 1).as_str()] {
-            let err = register("gold", AssetMetadata { symbol: bad.into(), ..meta() }).unwrap_err();
-            assert!(err.to_string().contains("symbol"), "symbol {bad:?} should be rejected, got: {err}");
+        for bad in [
+            "",
+            "gold",
+            "Gold",
+            "GOLD-X",
+            "G".repeat(MAX_SYMBOL_LEN + 1).as_str(),
+        ] {
+            let err = register(
+                "gold",
+                AssetMetadata {
+                    symbol: bad.into(),
+                    ..meta()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("symbol"),
+                "symbol {bad:?} should be rejected, got: {err}"
+            );
         }
-        assert!(register("gold", AssetMetadata { symbol: "G".repeat(MAX_SYMBOL_LEN), ..meta() }).is_ok());
+        assert!(
+            register(
+                "gold",
+                AssetMetadata {
+                    symbol: "G".repeat(MAX_SYMBOL_LEN),
+                    ..meta()
+                }
+            )
+            .is_ok()
+        );
         for bad in ["", "n".repeat(MAX_NAME_LEN + 1).as_str()] {
-            let err = register("gold", AssetMetadata { name: bad.into(), ..meta() }).unwrap_err();
-            assert!(err.to_string().contains("name"), "name {bad:?} should be rejected, got: {err}");
+            let err = register(
+                "gold",
+                AssetMetadata {
+                    name: bad.into(),
+                    ..meta()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("name"),
+                "name {bad:?} should be rejected, got: {err}"
+            );
         }
     }
 
@@ -882,8 +976,10 @@ mod tests {
         );
         view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
             .unwrap();
-        view.put(&xc_circuit::AdminKey(AdminRole::Attestor), &stranger).unwrap();
-        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &stranger).unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Attestor), &stranger)
+            .unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &stranger)
+            .unwrap();
 
         let action = ChainAction {
             sender: stranger.clone(),
@@ -897,7 +993,8 @@ mod tests {
         let err = set_frozen(&view, &action, &gold, true, "test").unwrap_err();
         assert!(err.to_string().contains("neither the issuer"), "got: {err}");
 
-        view.put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger).unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger)
+            .unwrap();
         set_frozen(&view, &action, &gold, true, "test").unwrap();
 
         // Freeze admin alone cannot force a transfer.
@@ -906,18 +1003,38 @@ mod tests {
             HashMap::from([(stranger.clone(), funded(FEE_BUDGET * 2))]),
             HashMap::new(),
         );
-        freeze_only.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true)).unwrap();
-        freeze_only.put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger).unwrap();
-        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why").unwrap_err();
-        assert!(err.to_string().contains("only the recovery admin"), "got: {err}");
+        freeze_only
+            .put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
+            .unwrap();
+        freeze_only
+            .put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger)
+            .unwrap();
+        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("only the recovery admin"),
+            "got: {err}"
+        );
     }
 
     /// A forced transfer is recovery-admin-only and must carry a reason. The issuer
     /// is deliberately *not* enough here, unlike freeze: moving someone
     /// else's holding without their signature is a regulatory power, not an
     /// issuer's housekeeping.
-    fn dispatch_at(action: &ChainAction, view: &BlockView<'_>, height: u64) -> anyhow::Result<BlockUpdates> {
-        crate::dispatch(action, view, &operator_lookup, &operator_validators_lookup, &[], height, &no_bls_owner)
+    fn dispatch_at(
+        action: &ChainAction,
+        view: &BlockView<'_>,
+        height: u64,
+    ) -> anyhow::Result<BlockUpdates> {
+        crate::dispatch(
+            action,
+            view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            height,
+            &no_bls_owner,
+        )
     }
 
     /// The handover moves every issuer right, and the old key keeps none.
@@ -928,22 +1045,85 @@ mod tests {
         let gold = AssetRef::derive(&issuer, "gold").unwrap();
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
-        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false)).unwrap();
+        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false))
+            .unwrap();
 
-        let act = |sender: &Address, payload| ChainAction { sender: sender.clone(), nonce: 0, signature: None, payload };
-        let err = transfer_issuer(&view, &act(&successor, ActionPayload::TransferIssuer { asset: gold.clone(), new_issuer: successor.clone() }), &gold, &successor).unwrap_err();
+        let act = |sender: &Address, payload| ChainAction {
+            sender: sender.clone(),
+            nonce: 0,
+            signature: None,
+            payload,
+        };
+        let err = transfer_issuer(
+            &view,
+            &act(
+                &successor,
+                ActionPayload::TransferIssuer {
+                    asset: gold.clone(),
+                    new_issuer: successor.clone(),
+                },
+            ),
+            &gold,
+            &successor,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("only the issuer"), "got: {err}");
 
-        let updates = transfer_issuer(&view, &act(&issuer, ActionPayload::TransferIssuer { asset: gold.clone(), new_issuer: successor.clone() }), &gold, &successor).unwrap();
+        let updates = transfer_issuer(
+            &view,
+            &act(
+                &issuer,
+                ActionPayload::TransferIssuer {
+                    asset: gold.clone(),
+                    new_issuer: successor.clone(),
+                },
+            ),
+            &gold,
+            &successor,
+        )
+        .unwrap();
         let handed = updates.asset_registration.unwrap();
         assert_eq!(handed.issuer, successor);
-        assert_eq!(handed.asset_ref, gold, "ref is identity — it must not follow the issuer");
+        assert_eq!(
+            handed.asset_ref, gold,
+            "ref is identity — it must not follow the issuer"
+        );
         view.put(&AssetKey(&gold), &handed).unwrap();
 
-        let err = set_metadata_uri(&view, &act(&issuer, ActionPayload::SetAssetMetadataUri { asset: gold.clone(), metadata_uri: None }), &gold, Some("x".into())).unwrap_err();
-        assert!(err.to_string().contains("only the issuer"), "old issuer must be locked out: {err}");
-        let updates = set_metadata_uri(&view, &act(&successor, ActionPayload::SetAssetMetadataUri { asset: gold.clone(), metadata_uri: None }), &gold, Some("ipfs://terms".into())).unwrap();
-        assert_eq!(updates.asset_registration.unwrap().metadata_uri.as_deref(), Some("ipfs://terms"));
+        let err = set_metadata_uri(
+            &view,
+            &act(
+                &issuer,
+                ActionPayload::SetAssetMetadataUri {
+                    asset: gold.clone(),
+                    metadata_uri: None,
+                },
+            ),
+            &gold,
+            Some("x".into()),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("only the issuer"),
+            "old issuer must be locked out: {err}"
+        );
+        let updates = set_metadata_uri(
+            &view,
+            &act(
+                &successor,
+                ActionPayload::SetAssetMetadataUri {
+                    asset: gold.clone(),
+                    metadata_uri: None,
+                },
+            ),
+            &gold,
+            Some("ipfs://terms".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            updates.asset_registration.unwrap().metadata_uri.as_deref(),
+            Some("ipfs://terms")
+        );
     }
 
     #[test]
@@ -964,32 +1144,129 @@ mod tests {
         let mut asset = Asset::new("gold", issuer.clone(), false);
         asset.total_supply = 100;
         view.put(&AssetKey(&gold), &asset).unwrap();
-        view.put(&xc_circuit::AssetBalanceKey { asset: &gold, owner: &issuer }, &60u128).unwrap();
-        view.put(&xc_circuit::AssetBalanceKey { asset: &gold, owner: &holder }, &40u128).unwrap();
+        view.put(
+            &xc_circuit::AssetBalanceKey {
+                asset: &gold,
+                owner: &issuer,
+            },
+            &60u128,
+        )
+        .unwrap();
+        view.put(
+            &xc_circuit::AssetBalanceKey {
+                asset: &gold,
+                owner: &holder,
+            },
+            &40u128,
+        )
+        .unwrap();
 
-        let act = |sender: &Address, payload: ActionPayload| ChainAction { sender: sender.clone(), nonce: 0, signature: None, payload };
+        let act = |sender: &Address, payload: ActionPayload| ChainAction {
+            sender: sender.clone(),
+            nonce: 0,
+            signature: None,
+            payload,
+        };
 
         for payload in [
-            ActionPayload::BurnAsset { asset: gold.clone(), amount: 1 },
-            ActionPayload::SetHolderFrozen { asset: gold.clone(), holder: holder.clone(), frozen: true },
-            ActionPayload::LockHolderAmount { asset: gold.clone(), holder: holder.clone(), amount: 1 },
-            ActionPayload::IssuerForcedTransfer { asset: gold.clone(), from: holder.clone(), to: issuer.clone(), amount: 1, reason: "x".into() },
-            ActionPayload::RecoverHolder { asset: gold.clone(), lost: holder.clone(), replacement: stranger.clone() },
+            ActionPayload::BurnAsset {
+                asset: gold.clone(),
+                amount: 1,
+            },
+            ActionPayload::SetHolderFrozen {
+                asset: gold.clone(),
+                holder: holder.clone(),
+                frozen: true,
+            },
+            ActionPayload::LockHolderAmount {
+                asset: gold.clone(),
+                holder: holder.clone(),
+                amount: 1,
+            },
+            ActionPayload::IssuerForcedTransfer {
+                asset: gold.clone(),
+                from: holder.clone(),
+                to: issuer.clone(),
+                amount: 1,
+                reason: "x".into(),
+            },
+            ActionPayload::RecoverHolder {
+                asset: gold.clone(),
+                lost: holder.clone(),
+                replacement: stranger.clone(),
+            },
         ] {
             let err = dispatch_at(&act(&stranger, payload), &view, 0).unwrap_err();
-            assert!(err.to_string().contains("only the issuer"), "stranger must be refused: {err}");
+            assert!(
+                err.to_string().contains("only the issuer"),
+                "stranger must be refused: {err}"
+            );
         }
 
-        let updates = dispatch_at(&act(&issuer, ActionPayload::BurnAsset { asset: gold.clone(), amount: 10 }), &view, 0).unwrap();
+        let updates = dispatch_at(
+            &act(
+                &issuer,
+                ActionPayload::BurnAsset {
+                    asset: gold.clone(),
+                    amount: 10,
+                },
+            ),
+            &view,
+            0,
+        )
+        .unwrap();
         assert_eq!(updates.asset_registration.unwrap().total_supply, 90);
         assert_eq!(updates.assets.0[&(gold.clone(), issuer.clone())], 50);
 
-        let updates = dispatch_at(&act(&issuer, ActionPayload::LockHolderAmount { asset: gold.clone(), holder: holder.clone(), amount: 25 }), &view, 0).unwrap();
-        assert_eq!(updates.holder_states.0[&(gold.clone(), holder.clone())].frozen_amount, 25);
+        let updates = dispatch_at(
+            &act(
+                &issuer,
+                ActionPayload::LockHolderAmount {
+                    asset: gold.clone(),
+                    holder: holder.clone(),
+                    amount: 25,
+                },
+            ),
+            &view,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            updates.holder_states.0[&(gold.clone(), holder.clone())].frozen_amount,
+            25
+        );
 
-        let updates = dispatch_at(&act(&issuer, ActionPayload::IssuerForcedTransfer { asset: gold.clone(), from: holder.clone(), to: issuer.clone(), amount: 40, reason: "court order".into() }), &view, 0).unwrap();
+        let updates = dispatch_at(
+            &act(
+                &issuer,
+                ActionPayload::IssuerForcedTransfer {
+                    asset: gold.clone(),
+                    from: holder.clone(),
+                    to: issuer.clone(),
+                    amount: 40,
+                    reason: "court order".into(),
+                },
+            ),
+            &view,
+            0,
+        )
+        .unwrap();
         assert_eq!(updates.assets.0[&(gold.clone(), holder.clone())], 0);
-        let err = dispatch_at(&act(&issuer, ActionPayload::IssuerForcedTransfer { asset: gold.clone(), from: holder.clone(), to: issuer.clone(), amount: 1, reason: "  ".into() }), &view, 0).unwrap_err();
+        let err = dispatch_at(
+            &act(
+                &issuer,
+                ActionPayload::IssuerForcedTransfer {
+                    asset: gold.clone(),
+                    from: holder.clone(),
+                    to: issuer.clone(),
+                    amount: 1,
+                    reason: "  ".into(),
+                },
+            ),
+            &view,
+            0,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("non-empty reason"), "{err}");
     }
 
@@ -998,12 +1275,20 @@ mod tests {
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let gold = gold_of(&issuer);
         let db = temp_db();
-        let view = seeded_view(&db, HashMap::from([(issuer.clone(), funded(FEE_BUDGET * 8))]), HashMap::new());
+        let view = seeded_view(
+            &db,
+            HashMap::from([(issuer.clone(), funded(FEE_BUDGET * 8))]),
+            HashMap::new(),
+        );
         let register = |nonce: u64, id: &str| ChainAction {
             sender: issuer.clone(),
             nonce,
             signature: None,
-            payload: ActionPayload::RegisterAsset { asset_id: id.into(), compliance_required: false, metadata: meta() },
+            payload: ActionPayload::RegisterAsset {
+                asset_id: id.into(),
+                compliance_required: false,
+                metadata: meta(),
+            },
         };
 
         // The nonce must match and is consumed, even for actions whose circuit
@@ -1012,12 +1297,25 @@ mod tests {
         assert!(err.to_string().contains("invalid nonce"), "{err}");
         let updates = dispatch_at(&register(0, "b"), &view, 0).unwrap();
         assert_eq!(updates.accounts.0[&issuer].nonce, 1);
-        assert_eq!(updates.accounts.0[&issuer].balance, FEE_BUDGET * 8 - fee_of(&register(0, "b")), "fee still charged once");
+        assert_eq!(
+            updates.accounts.0[&issuer].balance,
+            FEE_BUDGET * 8 - fee_of(&register(0, "b")),
+            "fee still charged once"
+        );
 
         // An action whose circuit already bumps the nonce is not bumped twice.
-        let issue = ChainAction { sender: issuer.clone(), nonce: 0, signature: None, payload: ActionPayload::IssueAsset { asset: gold.clone(), amount: 5 } };
+        let issue = ChainAction {
+            sender: issuer.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::IssueAsset {
+                asset: gold.clone(),
+                amount: 5,
+            },
+        };
         let mut view = view;
-        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false)).unwrap();
+        view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false))
+            .unwrap();
         let updates = dispatch_at(&issue, &view, 0).unwrap();
         assert_eq!(updates.accounts.0[&issuer].nonce, 1);
     }
@@ -1038,7 +1336,8 @@ mod tests {
             ]),
             HashMap::new(),
         );
-        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &governor).unwrap();
+        view.put(&xc_circuit::AdminKey(AdminRole::Recovery), &governor)
+            .unwrap();
         view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), true))
             .unwrap();
         view.put(
@@ -1117,9 +1416,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(updates.assets.0[&(gold.clone(), holder.clone())], 60);
-        assert_eq!(
-            updates.assets.0[&(gold.clone(), receiver.clone())],
-            40
-        );
+        assert_eq!(updates.assets.0[&(gold.clone(), receiver.clone())], 40);
     }
 }

@@ -15,21 +15,22 @@ mod validator_set;
 
 pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
-pub use hash32::{Hash32, Hash32Error};
 pub use asset_ref::{AssetRef, AssetRefError};
 pub use block::{Block, RawBlock};
 pub use consensus::{
-    MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer, round_timeout_signing_bytes,
+    MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer,
+    round_timeout_signing_bytes,
+};
+pub use hash32::{Hash32, Hash32Error};
+pub use state::{
+    AccountEntry, Asset, AssetClass, AssetMetadata, AttestorRecord, ClaimTopic, CountryCode,
+    HolderState, Snapshot, StakeAllocation, Unbonding, ValidatorEntry, reward_pool_account,
+    stake_subaccount, treasury_account,
 };
 pub use validator_set::{
-    DEFAULT_REWARD_PER_BLOCK, DEFAULT_UNBONDING_BLOCKS,
-    ChainParams, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
+    ChainParams, DEFAULT_REWARD_PER_BLOCK, DEFAULT_UNBONDING_BLOCKS, QUORUM_POWER,
+    TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power, boundary_of, epoch_of,
     is_boundary, power_cap, quorum_reached, signed_power, validator_set_effective_height,
-};
-pub use state::{
-    HolderState,
-    reward_pool_account, stake_subaccount, treasury_account, AccountEntry, Asset, AssetClass,
-    AssetMetadata, AttestorRecord, ClaimTopic, CountryCode, Snapshot, StakeAllocation, Unbonding, ValidatorEntry,
 };
 
 /// Ceiling for any single bincode-decoded value read from untrusted bytes
@@ -74,7 +75,9 @@ where
 {
     let (value, consumed) = bincode::serde::decode_from_slice(bytes, wire_config())?;
     if consumed != bytes.len() {
-        return Err(bincode::error::DecodeError::Other("trailing bytes after decoded value"));
+        return Err(bincode::error::DecodeError::Other(
+            "trailing bytes after decoded value",
+        ));
     }
     let canonical = bincode::serde::encode_to_vec(&value, wire_config())
         .map_err(|_| bincode::error::DecodeError::Other("value did not re-encode"))?;
@@ -198,7 +201,8 @@ mod wire_decode_tests {
         non_canonical.extend_from_slice(&canonical[1..]);
 
         assert!(
-            bincode::serde::decode_from_slice::<Block<()>, _>(&non_canonical, wire_config()).is_ok(),
+            bincode::serde::decode_from_slice::<Block<()>, _>(&non_canonical, wire_config())
+                .is_ok(),
             "bincode itself accepts it — that is why this guard exists"
         );
         assert!(decode_wire_canonical::<Block<()>>(&non_canonical).is_err());

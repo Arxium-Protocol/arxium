@@ -7,7 +7,6 @@ mod validator;
 
 use crate::components::new_partial;
 use anyhow::{Context, Result};
-use xc_circuit::KeySpec as _;
 use clap::Parser;
 use ed25519_dalek::Signer;
 use metrics::{counter, gauge};
@@ -19,11 +18,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
+use xc_circuit::KeySpec as _;
 use xc_runtime_api::ChainRuntime;
 
 use arxd_finality::{
-    Dissent, DissentReason, FinalityEvent, PrecommitEquivocation, PrecommitVote, RoundTimeoutVote,
-    PEER_EVENT_BACKLOG_CAP, dissent_signing_bytes, spawn_finality,
+    Dissent, DissentReason, FinalityEvent, PEER_EVENT_BACKLOG_CAP, PrecommitEquivocation,
+    PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault, PrecommitAttestation};
@@ -31,9 +31,9 @@ use xc_cli::{Cli, Command};
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address, Block};
 #[cfg(test)]
 use xc_primitives::Hash32;
+use xc_primitives::{Action, Address, Block};
 use xc_rpc::{IngestConfig, spawn_http_ingest};
 use xc_storage::{ArxiumDb, DissentRecord};
 
@@ -97,7 +97,9 @@ mod reject_severity_tests {
     #[test]
     fn parent_mismatch_is_not_routine() {
         let err = AcceptBlockError::ParentMismatch {
-            local: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
+            local: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap(),
             expected: "b".into(),
         };
         assert!(!is_routine_reject(&err));
@@ -261,7 +263,9 @@ mod dissent_evidence_bridge_tests {
             }
             EvidenceEvent::BlockObserved(_)
             | EvidenceEvent::BlockDivergence { .. }
-            | EvidenceEvent::PrecommitEquivocation { .. } => panic!("expected ExecutionDisagreement"),
+            | EvidenceEvent::PrecommitEquivocation { .. } => {
+                panic!("expected ExecutionDisagreement")
+            }
         }
 
         std::fs::remove_dir_all(&dir).ok();
@@ -474,12 +478,24 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     // there without a matching arm here must not panic the block-handling
     // path: skip the dissent instead.
     let dissent_fields = match err {
-        AcceptBlockError::StateRootMismatch { expected, touched_keys, .. } => {
-            Some((expected.clone(), DissentReason::StateRootMismatch, touched_keys.clone()))
-        }
-        AcceptBlockError::ActionMismatch { local_state_root, touched_keys, .. } => {
-            Some((local_state_root.clone(), DissentReason::ActionMismatch, touched_keys.clone()))
-        }
+        AcceptBlockError::StateRootMismatch {
+            expected,
+            touched_keys,
+            ..
+        } => Some((
+            expected.clone(),
+            DissentReason::StateRootMismatch,
+            touched_keys.clone(),
+        )),
+        AcceptBlockError::ActionMismatch {
+            local_state_root,
+            touched_keys,
+            ..
+        } => Some((
+            local_state_root.clone(),
+            DissentReason::ActionMismatch,
+            touched_keys.clone(),
+        )),
         _ => {
             warn!(
                 "is_execution_disagreement() true for a variant this match doesn't handle ({err}) — \
@@ -488,7 +504,9 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
             None
         }
     };
-    let Some((state_root, reason, touched_keys)) = dissent_fields else { return };
+    let Some((state_root, reason, touched_keys)) = dissent_fields else {
+        return;
+    };
 
     // A node that can't read its own parent stays quiet instead of signing a
     // dissent built on an EP it never actually read — same principle that
@@ -512,8 +530,16 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     // block *would* have used had it executed as claimed — the same sum the
     // proposer hashed into its EP.
     let weight_used = candidate.actions.iter().map(R::action_weight).sum();
-    let ep = xc_poe::block_ep(&parent_state_root, &candidate.tx_root, &state_root, weight_used);
-    let proposer = candidate.proposer.as_ref().expect("signature already verified, proposer present");
+    let ep = xc_poe::block_ep(
+        &parent_state_root,
+        &candidate.tx_root,
+        &state_root,
+        weight_used,
+    );
+    let proposer = candidate
+        .proposer
+        .as_ref()
+        .expect("signature already verified, proposer present");
     let header_commitment: [u8; 32] = Sha256::digest(candidate.signing_bytes(proposer)).into();
     let msg = dissent_signing_bytes(
         &genesis_hash,
@@ -537,7 +563,9 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     };
     send_peer_event(FinalityEvent::DissentObserved(dissent.clone()));
     let _ = dissent_tx.send(dissent.clone());
-    let Ok(Some(pubkey)) = db.get_bls_pubkey(address) else { return };
+    let Ok(Some(pubkey)) = db.get_bls_pubkey(address) else {
+        return;
+    };
 
     let attestation = DissentAttestation {
         height: dissent.height,
@@ -565,16 +593,26 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     // parameter, and it is located via `chain_params` — so a block with a
     // `LeaveValidator` can still be replayed.
     let mut touched_keys = touched_keys;
-    let epoch_length = db.chain_params().map(|p| p.epoch_length).unwrap_or_default();
+    let epoch_length = db
+        .chain_params()
+        .map(|p| p.epoch_length)
+        .unwrap_or_default();
     touched_keys.push(xc_circuit::ChainParamsKey.encode());
     touched_keys.push(
-        xc_circuit::ValidatorSetKey(xc_primitives::validator_set_effective_height(height, epoch_length)).encode(),
+        xc_circuit::ValidatorSetKey(xc_primitives::validator_set_effective_height(
+            height,
+            epoch_length,
+        ))
+        .encode(),
     );
     touched_keys.sort();
     touched_keys.dedup();
     let proofs: Result<Vec<xc_artifact::StateProof>, xc_storage::StorageError> = touched_keys
         .iter()
-        .map(|key| db.prove(key, &parent_state_root).map(|proof| proof.into_state_proof()))
+        .map(|key| {
+            db.prove(key, &parent_state_root)
+                .map(|proof| proof.into_state_proof())
+        })
         .collect();
     match proofs {
         Ok(proofs) => {
@@ -600,7 +638,9 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
             });
         }
         Err(err) => {
-            warn!("failed to prove a touched key for block divergence artifact — sending plain dissent only: {err}");
+            warn!(
+                "failed to prove a touched key for block divergence artifact — sending plain dissent only: {err}"
+            );
         }
     }
 }
@@ -635,7 +675,16 @@ fn handle_rejected_block<R: ChainRuntime>(
     if err.is_execution_disagreement() {
         if let Some((address, bls_key)) = bls_identity {
             dissent_on_execution_disagreement::<R>(
-                err, height, candidate, db, genesis_hash, address, bls_key, send_peer_event, dissent_tx, evidence_tx,
+                err,
+                height,
+                candidate,
+                db,
+                genesis_hash,
+                address,
+                bls_key,
+                send_peer_event,
+                dissent_tx,
+                evidence_tx,
             );
         }
     } else if matches!(
@@ -1140,16 +1189,33 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
     match &cli.command {
         Some(Command::NodeKey { base_path }) => return cmd_node_key(base_path),
-        Some(Command::Keys { base_path, json, stake }) => return cmd_keys(base_path, *json, *stake),
+        Some(Command::Keys {
+            base_path,
+            json,
+            stake,
+        }) => return cmd_keys(base_path, *json, *stake),
         Some(Command::ValidatorKey { base_path }) => return cmd_validator_key(base_path),
         Some(Command::BlsKey { base_path, qr, pop }) => return cmd_bls_key(base_path, *qr, *pop),
-        Some(Command::Pair { base_path, node, token, revoke }) => {
+        Some(Command::Pair {
+            base_path,
+            node,
+            token,
+            revoke,
+        }) => {
             return cmd_pair::<R>(base_path, node, token.as_deref(), *revoke);
         }
-        Some(Command::Snapshot { base_path, chain, output }) => {
+        Some(Command::Snapshot {
+            base_path,
+            chain,
+            output,
+        }) => {
             return cmd_snapshot::<R>(base_path, chain, output);
         }
-        Some(Command::Prune { base_path, chain, retain_blocks }) => {
+        Some(Command::Prune {
+            base_path,
+            chain,
+            retain_blocks,
+        }) => {
             return cmd_prune::<R>(base_path, chain, *retain_blocks);
         }
         Some(Command::ChainInfo { chain, list }) => return cmd_chain_info::<R>(chain, *list),
@@ -1175,7 +1241,8 @@ fn cmd_keys(base_path: &std::path::Path, json: bool, stake: u128) -> Result<()> 
     let (bls_secret, bls_pubkey) = validator::load_or_generate_bls_key(base_path)?;
     let bls_hex = hex::encode(bls_pubkey.0);
     let bls_pop_hex = hex::encode(xc_bls::prove_possession(&bls_secret).0);
-    let peer_id = arxd_network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
+    let peer_id =
+        arxd_network::PeerId::from(identity::load_or_generate_keypair(base_path)?.public());
 
     // Built from `ValidatorEntry` itself rather than hand-written JSON, so
     // the field names cannot drift from what the spec loader expects —
@@ -1220,7 +1287,10 @@ fn cmd_keys(base_path: &std::path::Path, json: bool, stake: u128) -> Result<()> 
 fn cmd_validator_key(base_path: &std::path::Path) -> Result<()> {
     std::fs::create_dir_all(base_path).context("failed to create base-path directory")?;
     let key = validator::load_or_generate_key(base_path)?;
-    println!("{}", Address::from_pubkey_bytes(key.verifying_key().as_bytes())?);
+    println!(
+        "{}",
+        Address::from_pubkey_bytes(key.verifying_key().as_bytes())?
+    );
     Ok(())
 }
 
@@ -1236,7 +1306,10 @@ fn cmd_bls_key(base_path: &std::path::Path, qr: bool, pop: bool) -> Result<()> {
     if qr {
         // pubkey ‖ pop in one code: the app's JoinValidator/RegisterBlsKey
         // both need the proof of possession, and scanning twice is worse.
-        let payload = format!("{hex_pubkey}{}", hex::encode(xc_bls::prove_possession(&secret).0));
+        let payload = format!(
+            "{hex_pubkey}{}",
+            hex::encode(xc_bls::prove_possession(&secret).0)
+        );
         let code =
             qrcode::QrCode::new(&payload).context("failed to render BLS key as a QR code")?;
         let image = code
@@ -1271,7 +1344,11 @@ fn cmd_pair<R: ChainRuntime>(
     R::pair(&key.to_bytes(), &sender, node, token, revoke)
 }
 
-fn cmd_snapshot<R: ChainRuntime>(base_path: &std::path::Path, chain: &str, output: &std::path::Path) -> Result<()> {
+fn cmd_snapshot<R: ChainRuntime>(
+    base_path: &std::path::Path,
+    chain: &str,
+    output: &std::path::Path,
+) -> Result<()> {
     // Read-only, so goes through `new_partial` like the running node
     // does rather than opening the DB by hand — same tip-signature
     // verification, same genesis-write-on-first-run behavior, so a
@@ -1300,11 +1377,18 @@ fn cmd_snapshot<R: ChainRuntime>(base_path: &std::path::Path, chain: &str, outpu
         )
     })?;
     let tip = components.db.get_tip_height()?.unwrap_or(0);
-    println!("wrote checkpoint at tip height {tip} to {}", output.display());
+    println!(
+        "wrote checkpoint at tip height {tip} to {}",
+        output.display()
+    );
     Ok(())
 }
 
-fn cmd_prune<R: ChainRuntime>(base_path: &std::path::Path, chain: &str, retain_blocks: u64) -> Result<()> {
+fn cmd_prune<R: ChainRuntime>(
+    base_path: &std::path::Path,
+    chain: &str,
+    retain_blocks: u64,
+) -> Result<()> {
     let config = xc_primitives::NodeConfig {
         base_path: base_path.to_path_buf(),
         chain: chain.to_string(),
@@ -1341,7 +1425,9 @@ fn cmd_chain_info<R: ChainRuntime>(chain: &str, list: bool) -> Result<()> {
     let chain_spec = arxd_genesis::ChainSpec::parse(&spec_json)?;
     match &chain_spec {
         arxd_genesis::ChainSpec::Plain(snapshot) => {
-            snapshot.validate().context("chain spec failed validation")?;
+            snapshot
+                .validate()
+                .context("chain spec failed validation")?;
             println!("format:         plain");
             println!("chain name:     {}", snapshot.chain_name);
             // A chain's genesis hash is block 0's state root — the state
@@ -1357,7 +1443,10 @@ fn cmd_chain_info<R: ChainRuntime>(chain: &str, list: bool) -> Result<()> {
             println!("boot nodes:     {}", snapshot.boot_nodes.len());
         }
         arxd_genesis::ChainSpec::Raw(raw) => {
-            println!("format:         raw (format_version {})", raw.format_version);
+            println!(
+                "format:         raw (format_version {})",
+                raw.format_version
+            );
             println!("chain name:     {}", raw.chain_name);
             println!("genesis hash:   {}", raw.state_root);
             println!("source spec:    {}", raw.source_spec_hash);

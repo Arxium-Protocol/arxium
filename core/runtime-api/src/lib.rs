@@ -26,9 +26,9 @@
 //! codebase, not a per-runtime choice, so genesis writing stays a node-level
 //! concern rather than a trait method a runtime could override or skip.
 
-use xc_evidence::EquivocationEvidence;
 use serde::{Serialize, de::DeserializeOwned};
 use xc_chain_spec::presets::PresetRegistry;
+use xc_evidence::EquivocationEvidence;
 use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
@@ -97,7 +97,10 @@ pub trait ChainRuntime: Send + Sync + 'static {
     /// lookup closures for everything, so a generic node never needs to know
     /// what a given runtime looks up (e.g. CoreChain's evidence/BLS-owner
     /// checks).
-    fn dispatch(action: &Action<Self::Payload>, ctx: &DispatchCtx<'_>) -> anyhow::Result<BlockUpdates>;
+    fn dispatch(
+        action: &Action<Self::Payload>,
+        ctx: &DispatchCtx<'_>,
+    ) -> anyhow::Result<BlockUpdates>;
 
     /// Runs once per block, after every action in it has been dispatched.
     /// This is where a chain applies whole-block economics — block rewards,

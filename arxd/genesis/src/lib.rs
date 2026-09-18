@@ -34,7 +34,10 @@ const BLS_KEY_PREFIX: &[u8] = b"blskey:";
 /// registered here, or they enter the validator set unable to vote — the
 /// chain then produces blocks but never finalizes anything. Same job as
 /// `session.keys` in a Substrate genesis config.
-pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, ValidatorEntry>) -> Result<()> {
+pub fn register_genesis_bls_keys(
+    db: &ArxiumDb,
+    validators: &BTreeMap<Address, ValidatorEntry>,
+) -> Result<()> {
     for (address, entry) in validators {
         let Some(hex_pubkey) = &entry.bls_pubkey else {
             tracing::warn!(
@@ -70,15 +73,20 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
                 )
             })?;
         xc_bls::verify_possession(&BlsPublicKey(bytes), &xc_bls::BlsSignature(pop)).map_err(
-            |_| anyhow::anyhow!("genesis validator {address} has an invalid BLS proof of possession"),
+            |_| {
+                anyhow::anyhow!(
+                    "genesis validator {address} has an invalid BLS proof of possession"
+                )
+            },
         )?;
         // `RegisterBlsKey`/`JoinValidator` both reject a pubkey already
         // owned by another validator — genesis must enforce the same rule,
         // or two validators could unknowingly share a BLS identity.
         if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
-            && owner != *address {
-                bail!("genesis validator {address} BLS pubkey is already owned by {owner}");
-            }
+            && owner != *address
+        {
+            bail!("genesis validator {address} BLS pubkey is already owned by {owner}");
+        }
         db.write_batch(&xc_storage::BlsKeyRegistration {
             address: address.clone(),
             pubkey: BlsPublicKey(bytes),
@@ -104,7 +112,9 @@ pub fn register_genesis_bls_keys(db: &ArxiumDb, validators: &BTreeMap<Address, V
 /// snapshot is written `db.is_initialized()` is already true, so only the
 /// block-0 check below still needs to run.
 pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
-    snapshot.validate().context("genesis spec failed validation")?;
+    snapshot
+        .validate()
+        .context("genesis spec failed validation")?;
     if !db.is_initialized()? {
         db.write_batch(snapshot)?;
         register_genesis_bls_keys(db, &snapshot.validators)?;
@@ -204,7 +214,8 @@ fn seed_genesis_hash(db: &ArxiumDb, root: &str) -> Result<()> {
 /// quietly drifting from the real one, which is exactly the "two genesis
 /// mechanisms, never cross-checked" failure this format replaces.
 pub fn derive_raw(spec_json: &str) -> Result<RawGenesis> {
-    let snapshot: Snapshot = serde_json::from_str(spec_json).context("failed to parse genesis spec")?;
+    let snapshot: Snapshot =
+        serde_json::from_str(spec_json).context("failed to parse genesis spec")?;
     let source_spec_hash = {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(spec_json.as_bytes()))
@@ -213,7 +224,10 @@ pub fn derive_raw(spec_json: &str) -> Result<RawGenesis> {
     let scratch_dir = std::env::temp_dir().join(format!(
         "arxium-genesis-derive-{}-{}-{:?}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
         std::thread::current().id(),
     ));
     let db = ArxiumDb::open(&scratch_dir).context("failed to open scratch DB")?;
@@ -224,7 +238,11 @@ pub fn derive_raw(spec_json: &str) -> Result<RawGenesis> {
 
     let entries = raw_entries
         .into_iter()
-        .map(|(cf, key, value)| GenesisEntry { cf, key_hex: hex::encode(key), value_hex: hex::encode(value) })
+        .map(|(cf, key, value)| GenesisEntry {
+            cf,
+            key_hex: hex::encode(key),
+            value_hex: hex::encode(value),
+        })
         .collect();
     let raw = RawGenesis {
         format_version: RAW_FORMAT_VERSION,
@@ -267,12 +285,22 @@ fn verify_raw_entries(entries: &[GenesisEntry]) -> Result<()> {
         if key.starts_with(BLS_KEY_PREFIX) {
             let config = bincode::config::standard();
             let (pubkey, _): (BlsPublicKey, _) = bincode::serde::decode_from_slice(&value, config)
-                .with_context(|| format!("entry key {} holds an undecodable BLS pubkey", entry.key_hex))?;
+                .with_context(|| {
+                    format!(
+                        "entry key {} holds an undecodable BLS pubkey",
+                        entry.key_hex
+                    )
+                })?;
             blst::min_pk::PublicKey::from_bytes(&pubkey.0)
                 .and_then(|pk| pk.validate())
-                .map_err(|_| anyhow::anyhow!("entry key {} holds an invalid BLS pubkey", entry.key_hex))?;
+                .map_err(|_| {
+                    anyhow::anyhow!("entry key {} holds an invalid BLS pubkey", entry.key_hex)
+                })?;
             if !seen_pubkeys.insert(pubkey.0) {
-                bail!("BLS pubkey at entry key {} is reused by another validator", entry.key_hex);
+                bail!(
+                    "BLS pubkey at entry key {} is reused by another validator",
+                    entry.key_hex
+                );
             }
         }
     }
@@ -296,7 +324,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!(
             "arxium-test-genesis-{}-{}-{:?}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
             std::thread::current().id(),
         ));
         (ArxiumDb::open(&dir).unwrap(), dir)
@@ -336,7 +367,10 @@ mod tests {
         raw.format_version = RAW_FORMAT_VERSION + 1;
         let (db, dir) = scratch_db();
         let err = write_raw(&db, &raw).unwrap_err();
-        assert!(err.to_string().contains("format_version"), "expected a format_version error, got {err:?}");
+        assert!(
+            err.to_string().contains("format_version"),
+            "expected a format_version error, got {err:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -352,12 +386,19 @@ mod tests {
         // well-formed validators-CF entry) but does feed
         // `compute_state_root` (accounts + validators only), so only the
         // state-root comparison catches it.
-        let idx = raw.entries.iter().position(|e| e.cf == "validators").expect("a validators entry must exist");
+        let idx = raw
+            .entries
+            .iter()
+            .position(|e| e.cf == "validators")
+            .expect("a validators entry must exist");
         raw.entries[idx].value_hex = hex::encode(b"tampered-validator-set-value");
 
         let (db, dir) = scratch_db();
         let err = write_raw(&db, &raw).unwrap_err();
-        assert!(err.to_string().contains("state_root"), "expected a state_root mismatch error, got {err:?}");
+        assert!(
+            err.to_string().contains("state_root"),
+            "expected a state_root mismatch error, got {err:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -378,11 +419,15 @@ mod tests {
         let mut updates = AccountUpdates::default();
         updates.0.insert(
             address,
-            xc_primitives::AccountEntry { balance: 1_000, ..Default::default() },
+            xc_primitives::AccountEntry {
+                balance: 1_000,
+                ..Default::default()
+            },
         );
         db.write_batch(&updates).unwrap();
 
-        write_raw(&db, &raw).expect("reboot on a chain that has since produced state must not be rejected");
+        write_raw(&db, &raw)
+            .expect("reboot on a chain that has since produced state must not be rejected");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -431,11 +476,28 @@ mod tests {
         let addr_a = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let addr_b = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let mut validators = BTreeMap::new();
-        validators.insert(addr_a, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex.clone()), bls_pop: Some(pop_hex.clone()) });
-        validators.insert(addr_b, ValidatorEntry { stake: 0, bls_pubkey: Some(pubkey_hex), bls_pop: Some(pop_hex) });
+        validators.insert(
+            addr_a,
+            ValidatorEntry {
+                stake: 0,
+                bls_pubkey: Some(pubkey_hex.clone()),
+                bls_pop: Some(pop_hex.clone()),
+            },
+        );
+        validators.insert(
+            addr_b,
+            ValidatorEntry {
+                stake: 0,
+                bls_pubkey: Some(pubkey_hex),
+                bls_pop: Some(pop_hex),
+            },
+        );
 
         let err = register_genesis_bls_keys(&db, &validators).unwrap_err();
-        assert!(err.to_string().contains("already owned by"), "expected an already-owned rejection, got {err:?}");
+        assert!(
+            err.to_string().contains("already owned by"),
+            "expected an already-owned rejection, got {err:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -462,10 +524,16 @@ mod tests {
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.cf == "governance" && hex::decode(&e.key_hex).unwrap().starts_with(BLS_KEY_PREFIX))
+            .filter(|(_, e)| {
+                e.cf == "governance" && hex::decode(&e.key_hex).unwrap().starts_with(BLS_KEY_PREFIX)
+            })
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(bls_indices.len(), 2, "spec must register 2 validator BLS keys");
+        assert_eq!(
+            bls_indices.len(),
+            2,
+            "spec must register 2 validator BLS keys"
+        );
         // ...but a hand-edited duplicate must be rejected by verify_raw_entries.
         let value = raw.entries[bls_indices[0]].value_hex.clone();
         raw.entries[bls_indices[1]].value_hex = value;
@@ -482,7 +550,10 @@ mod tests {
             }
         },"boot_nodes":[]}"#;
         let err = derive_raw(spec).unwrap_err();
-        assert!(format!("{err:#}").contains("bls_pubkey"), "expected a bls_pubkey error, got {err:?}");
+        assert!(
+            format!("{err:#}").contains("bls_pubkey"),
+            "expected a bls_pubkey error, got {err:?}"
+        );
     }
 
     /// A `--chain` file with no recognizable `genesis_format` tag (or an
@@ -490,6 +561,9 @@ mod tests {
     #[test]
     fn chain_spec_with_unknown_format_tag_is_rejected() {
         let err = ChainSpec::parse(r#"{"genesis_format":"artifact","entries":[]}"#).unwrap_err();
-        assert!(err.to_string().contains("genesis_format"), "expected a genesis_format error, got {err:?}");
+        assert!(
+            err.to_string().contains("genesis_format"),
+            "expected a genesis_format error, got {err:?}"
+        );
     }
 }

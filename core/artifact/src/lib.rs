@@ -89,8 +89,10 @@ struct SigningPayload<'a> {
 /// "signing bytes" means for this format.
 pub fn signing_bytes_for(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyError> {
     let tx_root = decode_hex("tx_root", &header.tx_root)?;
-    let tx_root: [u8; 32] =
-        tx_root.as_slice().try_into().map_err(|_| VerifyError::BadTxRootLength(tx_root.len()))?;
+    let tx_root: [u8; 32] = tx_root
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadTxRootLength(tx_root.len()))?;
     let payload = SigningPayload {
         height: header.height,
         parent_hash: &header.parent_hash,
@@ -218,7 +220,12 @@ pub struct PrecommitAttestation {
 /// `arxd_finality::precommit_signing_bytes` byte-for-byte, the same
 /// cross-crate duplication (and for the same reason) as
 /// `dissent_signing_bytes` above.
-pub fn precommit_signing_bytes(genesis: &[u8; 32], height: u64, block_hash: &str, ep: &[u8; 32]) -> Vec<u8> {
+pub fn precommit_signing_bytes(
+    genesis: &[u8; 32],
+    height: u64,
+    block_hash: &str,
+    ep: &[u8; 32],
+) -> Vec<u8> {
     let mut buf = Vec::new();
     push_field(&mut buf, DOMAIN_PRECOMMIT);
     push_field(&mut buf, genesis);
@@ -496,7 +503,11 @@ pub enum VerifyError {
     #[error("unsupported artifact_version {0}, verifier knows version {ARTIFACT_VERSION}")]
     UnsupportedVersion(u32),
     #[error("{field} not valid hex: {source}")]
-    BadHex { field: &'static str, #[source] source: hex::FromHexError },
+    BadHex {
+        field: &'static str,
+        #[source]
+        source: hex::FromHexError,
+    },
     #[error("tx_root must be 32 bytes, got {0}")]
     BadTxRootLength(usize),
     #[error("proposer_pubkey must be 32 bytes, got {0}")]
@@ -513,8 +524,13 @@ pub enum VerifyError {
     SameBlock,
     #[error("signature over block {0} does not verify against proposer_pubkey")]
     SignatureInvalid(usize),
-    #[error("dissent claims height {dissent_height} but the proposed block is at height {fault_height}")]
-    DisagreementHeightMismatch { dissent_height: u64, fault_height: u64 },
+    #[error(
+        "dissent claims height {dissent_height} but the proposed block is at height {fault_height}"
+    )]
+    DisagreementHeightMismatch {
+        dissent_height: u64,
+        fault_height: u64,
+    },
     #[error("proposed block signature does not verify against proposer_pubkey")]
     ProposedSignatureInvalid,
     #[error("voter_pubkey must be 48 bytes, got {0}")]
@@ -529,15 +545,23 @@ pub enum VerifyError {
     DissentSignatureInvalid,
     #[error("dissent's state_root is identical to the proposed block's — not a disagreement")]
     NoDisagreement,
-    #[error("dissent's header_commitment does not match the proposed block's header — the dissent targets a different block")]
+    #[error(
+        "dissent's header_commitment does not match the proposed block's header — the dissent targets a different block"
+    )]
     DissentTargetsDifferentBlock,
     #[error("{field} must be {expected} bytes, got {len}")]
-    BadFixedLength { field: &'static str, len: usize, expected: usize },
+    BadFixedLength {
+        field: &'static str,
+        len: usize,
+        expected: usize,
+    },
     #[error("a state proof must carry exactly 256 siblings")]
     BadProofShape,
     #[error("a state proof does not verify against its claim's pre_state_root")]
     StateProofDoesNotVerify,
-    #[error("proposed_claim and dissent_claim disagree on pre_state_root — not a single-action divergence")]
+    #[error(
+        "proposed_claim and dissent_claim disagree on pre_state_root — not a single-action divergence"
+    )]
     ActionClaimsDisagreeOnPreState,
     #[error("proposed_claim and dissent_claim agree on post_state_root — not a divergence")]
     ActionClaimsAgreeOnPostState,
@@ -551,7 +575,9 @@ pub enum VerifyError {
     BlockAttestationSignatureInvalid,
     #[error("dissent_claim signature does not verify against voter_pubkey")]
     BlockDissentSignatureInvalid,
-    #[error("dissent_claim's computed_state_root is identical to the proposer's signed state_root — not a divergence")]
+    #[error(
+        "dissent_claim's computed_state_root is identical to the proposer's signed state_root — not a divergence"
+    )]
     BlockDivergenceNoDisagreement,
     #[error("precommit {0} does not verify against voter_pubkey")]
     PrecommitSignatureInvalid(usize),
@@ -609,26 +635,43 @@ fn decode_hex(field: &'static str, s: &str) -> Result<Vec<u8>, VerifyError> {
 
 fn decode_hex_32(field: &'static str, s: &str) -> Result<[u8; 32], VerifyError> {
     let bytes = decode_hex(field, s)?;
-    bytes.as_slice().try_into().map_err(|_| VerifyError::BadFixedLength { field, len: bytes.len(), expected: 32 })
+    bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadFixedLength {
+            field,
+            len: bytes.len(),
+            expected: 32,
+        })
 }
 
 /// Decodes a hex-encoded Ed25519 public key. Every `Fault` variant repeated
 /// this decode -> `[u8; 32]` -> `VerifyingKey` dance for `proposer_pubkey`.
 fn verifying_key(field: &'static str, hex: &str) -> Result<VerifyingKey, VerifyError> {
     let bytes = decode_hex(field, hex)?;
-    let bytes: [u8; 32] =
-        bytes.as_slice().try_into().map_err(|_| VerifyError::BadPubkeyLength(bytes.len()))?;
+    let bytes: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadPubkeyLength(bytes.len()))?;
     VerifyingKey::from_bytes(&bytes).map_err(|_| VerifyError::BadPubkey)
 }
 
 /// Decodes a hex-encoded Ed25519 signature and checks it against `message`
 /// under `key`, using `invalid` for a verification failure — the other half
 /// of the pattern every `Fault` variant repeated alongside `verifying_key`.
-fn check_sig(key: &VerifyingKey, sig_hex: &str, message: &[u8], invalid: VerifyError) -> Result<(), VerifyError> {
+fn check_sig(
+    key: &VerifyingKey,
+    sig_hex: &str,
+    message: &[u8],
+    invalid: VerifyError,
+) -> Result<(), VerifyError> {
     let sig_bytes = decode_hex("signature", sig_hex)?;
-    let sig_bytes: [u8; 64] =
-        sig_bytes.as_slice().try_into().map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
-    key.verify_strict(message, &Signature::from_bytes(&sig_bytes)).map_err(|_| invalid)
+    let sig_bytes: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadSignatureLength(sig_bytes.len()))?;
+    key.verify_strict(message, &Signature::from_bytes(&sig_bytes))
+        .map_err(|_| invalid)
 }
 
 /// Sparse-Merkle-trie hash functions — must stay byte-for-byte identical to
@@ -687,7 +730,10 @@ pub fn verify_state_proof(root: [u8; 32], proof: &StateProof) -> Result<(), Veri
     let mut siblings = [[0u8; 32]; 256];
     for (level, slot) in siblings.iter_mut().enumerate() {
         *slot = if (bitmap[level / 8] >> (7 - level % 8)) & 1 == 1 {
-            decode_hex_32("proof sibling", non_default.next().ok_or(VerifyError::BadProofShape)?)?
+            decode_hex_32(
+                "proof sibling",
+                non_default.next().ok_or(VerifyError::BadProofShape)?,
+            )?
         } else {
             defaults[255 - level]
         };
@@ -708,8 +754,11 @@ pub fn verify_state_proof(root: [u8; 32], proof: &StateProof) -> Result<(), Veri
     };
     for level in (0..256).rev() {
         let sibling = siblings[level];
-        let (left, right) =
-            if sibling_bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+        let (left, right) = if sibling_bit_at(&key_hash, level) == 0 {
+            (current, sibling)
+        } else {
+            (sibling, current)
+        };
         current = sibling_internal_hash(&left, &right);
     }
     if current != root {
@@ -732,15 +781,22 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
     let genesis = decode_hex_32("genesis_hash", &artifact.genesis_hash)?;
 
     match &artifact.fault {
-        Fault::Equivocation { proposer_pubkey, height, blocks } => {
-            verify_equivocation(proposer_pubkey, *height, blocks)
-        }
-        Fault::ExecutionDisagreement { proposer_pubkey, height, proposed, dissent } => {
-            verify_execution_disagreement(&genesis, proposer_pubkey, *height, proposed, dissent)
-        }
-        Fault::PrecommitEquivocation { voter_pubkey, height, precommits } => {
-            verify_precommit_equivocation(&genesis, voter_pubkey, *height, precommits)
-        }
+        Fault::Equivocation {
+            proposer_pubkey,
+            height,
+            blocks,
+        } => verify_equivocation(proposer_pubkey, *height, blocks),
+        Fault::ExecutionDisagreement {
+            proposer_pubkey,
+            height,
+            proposed,
+            dissent,
+        } => verify_execution_disagreement(&genesis, proposer_pubkey, *height, proposed, dissent),
+        Fault::PrecommitEquivocation {
+            voter_pubkey,
+            height,
+            precommits,
+        } => verify_precommit_equivocation(&genesis, voter_pubkey, *height, precommits),
         Fault::ActionDivergence {
             proposer_pubkey,
             voter_pubkey,
@@ -787,16 +843,27 @@ fn verify_equivocation(
     let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
 
     if blocks[0].header.height != blocks[1].header.height {
-        return Err(VerifyError::HeightMismatch(blocks[0].header.height, blocks[1].header.height));
+        return Err(VerifyError::HeightMismatch(
+            blocks[0].header.height,
+            blocks[1].header.height,
+        ));
     }
     if blocks[0].header.height != height {
-        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: blocks[0].header.height });
+        return Err(VerifyError::FaultHeightMismatch {
+            claimed: height,
+            actual: blocks[0].header.height,
+        });
     }
 
     let mut signed = Vec::with_capacity(2);
     for (i, block) in blocks.iter().enumerate() {
         let bytes = signing_bytes_for(&block.header)?;
-        check_sig(&key, &block.signature, &bytes, VerifyError::SignatureInvalid(i))?;
+        check_sig(
+            &key,
+            &block.signature,
+            &bytes,
+            VerifyError::SignatureInvalid(i),
+        )?;
         signed.push(bytes);
     }
 
@@ -804,7 +871,10 @@ fn verify_equivocation(
         return Err(VerifyError::SameBlock);
     }
 
-    Ok(Verdict::Culpable { fault: "equivocation", culpable_pubkey: proposer_pubkey.to_string() })
+    Ok(Verdict::Culpable {
+        fault: "equivocation",
+        culpable_pubkey: proposer_pubkey.to_string(),
+    })
 }
 
 fn verify_execution_disagreement(
@@ -817,7 +887,10 @@ fn verify_execution_disagreement(
     let key = verifying_key("proposer_pubkey", proposer_pubkey)?;
 
     if proposed.header.height != height {
-        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: proposed.header.height });
+        return Err(VerifyError::FaultHeightMismatch {
+            claimed: height,
+            actual: proposed.header.height,
+        });
     }
     if dissent.height != height {
         return Err(VerifyError::DisagreementHeightMismatch {
@@ -827,7 +900,12 @@ fn verify_execution_disagreement(
     }
 
     let bytes = signing_bytes_for(&proposed.header)?;
-    check_sig(&key, &proposed.signature, &bytes, VerifyError::ProposedSignatureInvalid)?;
+    check_sig(
+        &key,
+        &proposed.signature,
+        &bytes,
+        VerifyError::ProposedSignatureInvalid,
+    )?;
 
     let header_commitment_bytes = decode_hex("header_commitment", &dissent.header_commitment)?;
     let header_commitment_bytes: [u8; 32] = header_commitment_bytes
@@ -864,8 +942,10 @@ fn verify_execution_disagreement(
     let dissent_signature = BlsSignature(dissent_sig_bytes);
 
     let ep_bytes = decode_hex("ep", &dissent.ep)?;
-    let ep_bytes: [u8; 32] =
-        ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+    let ep_bytes: [u8; 32] = ep_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
 
     let dissent_msg = dissent_signing_bytes(
         genesis,
@@ -899,24 +979,33 @@ fn verify_precommit_equivocation(
     let voter = BlsPublicKey(pubkey_bytes);
 
     if precommits[0].height != precommits[1].height {
-        return Err(VerifyError::HeightMismatch(precommits[0].height, precommits[1].height));
+        return Err(VerifyError::HeightMismatch(
+            precommits[0].height,
+            precommits[1].height,
+        ));
     }
     if precommits[0].height != height {
-        return Err(VerifyError::FaultHeightMismatch { claimed: height, actual: precommits[0].height });
+        return Err(VerifyError::FaultHeightMismatch {
+            claimed: height,
+            actual: precommits[0].height,
+        });
     }
 
     let mut signed = Vec::with_capacity(2);
     for (i, precommit) in precommits.iter().enumerate() {
         let ep_bytes = decode_hex("ep", &precommit.ep)?;
-        let ep_bytes: [u8; 32] =
-            ep_bytes.as_slice().try_into().map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+        let ep_bytes: [u8; 32] = ep_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
         let sig_bytes = decode_hex("signature", &precommit.signature)?;
         let sig_bytes: [u8; 96] = sig_bytes
             .as_slice()
             .try_into()
             .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
 
-        let bytes = precommit_signing_bytes(genesis, precommit.height, &precommit.block_hash, &ep_bytes);
+        let bytes =
+            precommit_signing_bytes(genesis, precommit.height, &precommit.block_hash, &ep_bytes);
         xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
             .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
         signed.push(bytes);
@@ -930,7 +1019,10 @@ fn verify_precommit_equivocation(
         return Err(VerifyError::SamePrecommit);
     }
 
-    Ok(Verdict::Culpable { fault: "precommit_equivocation", culpable_pubkey: voter_pubkey.to_string() })
+    Ok(Verdict::Culpable {
+        fault: "precommit_equivocation",
+        culpable_pubkey: voter_pubkey.to_string(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -990,14 +1082,24 @@ fn verify_action_divergence(
         .as_slice()
         .try_into()
         .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
-    xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
-        .map_err(|_| VerifyError::DissentClaimSignatureInvalid)?;
+    xc_bls::verify(
+        &dissent_msg,
+        &bls_voter_pubkey,
+        &BlsSignature(dissent_sig_bytes),
+    )
+    .map_err(|_| VerifyError::DissentClaimSignatureInvalid)?;
 
-    let proposed_root = decode_hex_32("proposed_claim.pre_state_root", &proposed_claim.pre_state_root)?;
+    let proposed_root = decode_hex_32(
+        "proposed_claim.pre_state_root",
+        &proposed_claim.pre_state_root,
+    )?;
     for proof in &proposed_claim.proofs {
         verify_state_proof(proposed_root, proof)?;
     }
-    let dissent_root = decode_hex_32("dissent_claim.pre_state_root", &dissent_claim.pre_state_root)?;
+    let dissent_root = decode_hex_32(
+        "dissent_claim.pre_state_root",
+        &dissent_claim.pre_state_root,
+    )?;
     for proof in &dissent_claim.proofs {
         verify_state_proof(dissent_root, proof)?;
     }
@@ -1057,8 +1159,12 @@ fn verify_block_divergence(
         .as_slice()
         .try_into()
         .map_err(|_| VerifyError::BadBlsSignatureLength(dissent_sig_bytes.len()))?;
-    xc_bls::verify(&dissent_msg, &bls_voter_pubkey, &BlsSignature(dissent_sig_bytes))
-        .map_err(|_| VerifyError::BlockDissentSignatureInvalid)?;
+    xc_bls::verify(
+        &dissent_msg,
+        &bls_voter_pubkey,
+        &BlsSignature(dissent_sig_bytes),
+    )
+    .map_err(|_| VerifyError::BlockDissentSignatureInvalid)?;
 
     let parent_root = decode_hex_32("parent_state_root", parent_state_root)?;
     for proof in &dissent_claim.proofs {
@@ -1090,7 +1196,8 @@ mod tests {
             timestamp: 1234,
             tx_root: format!("0x{}", hex::encode([tx_root; 32])),
             proposer: proposer.to_string(),
-            state_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            state_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
             round: 0,
         }
     }
@@ -1098,7 +1205,10 @@ mod tests {
     fn attestation(key: &SigningKey, header: CanonicalHeader) -> BlockAttestation {
         let bytes = signing_bytes_for(&header).unwrap();
         let signature = key.sign(&bytes);
-        BlockAttestation { header, signature: format!("0x{}", hex::encode(signature.to_bytes())) }
+        BlockAttestation {
+            header,
+            signature: format!("0x{}", hex::encode(signature.to_bytes())),
+        }
     }
 
     fn artifact(key: &SigningKey, blocks: [BlockAttestation; 2], height: u64) -> EvidenceArtifact {
@@ -1106,14 +1216,26 @@ mod tests {
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
-            fault: Fault::Equivocation { proposer_pubkey: pubkey, height, blocks },
+            fault: Fault::Equivocation {
+                proposer_pubkey: pubkey,
+                height,
+                blocks,
+            },
             human_readable: serde_json::json!({}),
         }
     }
 
-    fn precommit(sk: &xc_bls::BlsSecretKey, height: u64, block_hash: &str, ep: u8) -> PrecommitAttestation {
+    fn precommit(
+        sk: &xc_bls::BlsSecretKey,
+        height: u64,
+        block_hash: &str,
+        ep: u8,
+    ) -> PrecommitAttestation {
         let ep = [ep; 32];
-        let signature = xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, height, block_hash, &ep));
+        let signature = xc_bls::sign(
+            sk,
+            &precommit_signing_bytes(&GENESIS, height, block_hash, &ep),
+        );
         PrecommitAttestation {
             height,
             block_hash: block_hash.to_string(),
@@ -1122,7 +1244,11 @@ mod tests {
         }
     }
 
-    fn precommit_artifact(pubkey: &BlsPublicKey, height: u64, precommits: [PrecommitAttestation; 2]) -> EvidenceArtifact {
+    fn precommit_artifact(
+        pubkey: &BlsPublicKey,
+        height: u64,
+        precommits: [PrecommitAttestation; 2],
+    ) -> EvidenceArtifact {
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
@@ -1138,8 +1264,11 @@ mod tests {
     #[test]
     fn precommit_equivocation_names_the_double_signer() {
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
-        let artifact =
-            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xbbb", 1)]);
+        let artifact = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xbbb", 1)],
+        );
         assert_eq!(
             verify(&artifact).unwrap(),
             Verdict::Culpable {
@@ -1154,25 +1283,37 @@ mod tests {
         // Same block, two execution proofs: distinct signed messages, and
         // they split a quorum exactly like two block hashes would.
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
-        let artifact =
-            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 2)]);
+        let artifact = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 2)],
+        );
         assert!(matches!(verify(&artifact), Ok(Verdict::Culpable { .. })));
     }
 
     #[test]
     fn precommit_equivocation_rejects_the_same_vote_twice() {
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
-        let artifact =
-            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 1)]);
+        let artifact = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 1)],
+        );
         assert!(matches!(verify(&artifact), Err(VerifyError::SamePrecommit)));
     }
 
     #[test]
     fn precommit_equivocation_rejects_votes_at_different_heights() {
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
-        let artifact =
-            precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 6, "0xaaa", 1)]);
-        assert!(matches!(verify(&artifact), Err(VerifyError::HeightMismatch(5, 6))));
+        let artifact = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 6, "0xaaa", 1)],
+        );
+        assert!(matches!(
+            verify(&artifact),
+            Err(VerifyError::HeightMismatch(5, 6))
+        ));
     }
 
     #[test]
@@ -1184,9 +1325,15 @@ mod tests {
         let artifact = precommit_artifact(
             &pk,
             5,
-            [precommit(&sk, 5, "0xaaa", 1), precommit(&other_sk, 5, "0xbbb", 1)],
+            [
+                precommit(&sk, 5, "0xaaa", 1),
+                precommit(&other_sk, 5, "0xbbb", 1),
+            ],
         );
-        assert!(matches!(verify(&artifact), Err(VerifyError::PrecommitSignatureInvalid(1))));
+        assert!(matches!(
+            verify(&artifact),
+            Err(VerifyError::PrecommitSignatureInvalid(1))
+        ));
     }
 
     #[test]
@@ -1195,7 +1342,13 @@ mod tests {
         let a = attestation(&key, header(5, 1, "arx1proposer"));
         let b = attestation(&key, header(5, 2, "arx1proposer"));
         let verdict = verify(&artifact(&key, [a, b], 5)).unwrap();
-        assert!(matches!(verdict, Verdict::Culpable { fault: "equivocation", .. }));
+        assert!(matches!(
+            verdict,
+            Verdict::Culpable {
+                fault: "equivocation",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1232,7 +1385,10 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let a = attestation(&key, header(5, 1, "arx1proposer"));
         let b = attestation(&key, header(5, 1, "arx1proposer"));
-        assert!(matches!(verify(&artifact(&key, [a, b], 5)), Err(VerifyError::SameBlock)));
+        assert!(matches!(
+            verify(&artifact(&key, [a, b], 5)),
+            Err(VerifyError::SameBlock)
+        ));
     }
 
     /// Flaw 2 from review (fatal): any two blocks ever signed by the same
@@ -1257,7 +1413,10 @@ mod tests {
         // Claimed height (99) disagrees with what the headers actually say (5).
         assert!(matches!(
             verify(&artifact(&key, [a, b], 99)),
-            Err(VerifyError::FaultHeightMismatch { claimed: 99, actual: 5 })
+            Err(VerifyError::FaultHeightMismatch {
+                claimed: 99,
+                actual: 5
+            })
         ));
     }
 
@@ -1313,7 +1472,10 @@ mod tests {
         let b = attestation(&key, header(5, 2, "arx1proposer"));
         let mut art = artifact(&key, [a, b], 5);
         art.artifact_version = 99;
-        assert!(matches!(verify(&art), Err(VerifyError::UnsupportedVersion(99))));
+        assert!(matches!(
+            verify(&art),
+            Err(VerifyError::UnsupportedVersion(99))
+        ));
     }
 
     fn dissent_attestation(
@@ -1357,13 +1519,21 @@ mod tests {
     ) -> EvidenceArtifact {
         let disputed_header = header(height, 1, "arx1proposer");
         let proposed = attestation(proposer_key, disputed_header.clone());
-        let dissent =
-            dissent_attestation(voter_sk, voter_pubkey, height, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &disputed_header);
+        let dissent = dissent_attestation(
+            voter_sk,
+            voter_pubkey,
+            height,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &disputed_header,
+        );
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
             fault: Fault::ExecutionDisagreement {
-                proposer_pubkey: format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes())),
+                proposer_pubkey: format!(
+                    "0x{}",
+                    hex::encode(proposer_key.verifying_key().as_bytes())
+                ),
                 height,
                 proposed,
                 dissent,
@@ -1385,7 +1555,10 @@ mod tests {
         let on_a = precommit(&sk, 5, "0xblock_on_a", 1);
         let other_genesis = [0xb2u8; 32];
         let ep = [2u8; 32];
-        let sig = xc_bls::sign(&sk, &precommit_signing_bytes(&other_genesis, 5, "0xblock_on_b", &ep));
+        let sig = xc_bls::sign(
+            &sk,
+            &precommit_signing_bytes(&other_genesis, 5, "0xblock_on_b", &ep),
+        );
         let on_b = PrecommitAttestation {
             height: 5,
             block_hash: "0xblock_on_b".to_string(),
@@ -1393,14 +1566,24 @@ mod tests {
             signature: format!("0x{}", hex::encode(sig.0)),
         };
         let art = precommit_artifact(&pk, 5, [on_a, on_b]);
-        assert!(matches!(verify(&art), Err(VerifyError::PrecommitSignatureInvalid(1))));
+        assert!(matches!(
+            verify(&art),
+            Err(VerifyError::PrecommitSignatureInvalid(1))
+        ));
 
         // And the label itself is now load-bearing: relabel a genuine
         // artifact to another chain and every signature in it stops verifying.
-        let mut relabeled = precommit_artifact(&pk, 5, [precommit(&sk, 5, "0xa", 1), precommit(&sk, 5, "0xb", 1)]);
+        let mut relabeled = precommit_artifact(
+            &pk,
+            5,
+            [precommit(&sk, 5, "0xa", 1), precommit(&sk, 5, "0xb", 1)],
+        );
         assert!(verify(&relabeled).is_ok());
         relabeled.genesis_hash = format!("0x{}", hex::encode(other_genesis));
-        assert!(matches!(verify(&relabeled), Err(VerifyError::PrecommitSignatureInvalid(0))));
+        assert!(matches!(
+            verify(&relabeled),
+            Err(VerifyError::PrecommitSignatureInvalid(0))
+        ));
     }
 
     /// The exploit this fix closes: a real dissent at height H, signed
@@ -1421,7 +1604,10 @@ mod tests {
         if let Fault::ExecutionDisagreement { proposed, .. } = &mut art.fault {
             *proposed = attestation(&proposer, header(5, 99, "arx1proposer"));
         }
-        assert!(matches!(verify(&art), Err(VerifyError::DissentTargetsDifferentBlock)));
+        assert!(matches!(
+            verify(&art),
+            Err(VerifyError::DissentTargetsDifferentBlock)
+        ));
     }
 
     /// Regenerates `tools/arx-verify/examples/disagreement.json` from the
@@ -1435,10 +1621,16 @@ mod tests {
         let proposer = SigningKey::from_bytes(&[7u8; 32]);
         let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let mut art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
-        art.genesis_hash = "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff".to_string();
+        art.genesis_hash =
+            "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff".to_string();
         // The README's genesis, not the tests' — re-sign the dissent for it.
         let genesis = decode_hex_32("genesis_hash", &art.genesis_hash).unwrap();
-        let Fault::ExecutionDisagreement { proposed, dissent, .. } = &mut art.fault else { unreachable!() };
+        let Fault::ExecutionDisagreement {
+            proposed, dissent, ..
+        } = &mut art.fault
+        else {
+            unreachable!()
+        };
         let msg = dissent_signing_bytes(
             &genesis,
             dissent.height,
@@ -1452,7 +1644,10 @@ mod tests {
         let _ = proposed;
         art.human_readable = serde_json::json!({ "note": "devnet soak run, height 5" });
         verify(&art).unwrap();
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/arx-verify/examples/disagreement.json");
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/arx-verify/examples/disagreement.json"
+        );
         std::fs::write(path, serde_json::to_string_pretty(&art).unwrap() + "\n").unwrap();
     }
 
@@ -1463,7 +1658,10 @@ mod tests {
         let art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
         let verdict = verify(&art).unwrap();
         match verdict {
-            Verdict::Disagreement { fault: "execution_disagreement", parties } => {
+            Verdict::Disagreement {
+                fault: "execution_disagreement",
+                parties,
+            } => {
                 assert_eq!(parties.len(), 2);
             }
             other => panic!("expected Disagreement, got {other:?}"),
@@ -1477,7 +1675,10 @@ mod tests {
         let (other_sk, _) = xc_bls::keygen_from_seed(&[22u8; 32]).unwrap();
         // Sign with a different key than the one named as voter_pubkey.
         let art = disagreement_artifact(&proposer, &other_sk, &voter_pk, 5);
-        assert!(matches!(verify(&art), Err(VerifyError::DissentSignatureInvalid)));
+        assert!(matches!(
+            verify(&art),
+            Err(VerifyError::DissentSignatureInvalid)
+        ));
     }
 
     #[test]
@@ -1487,7 +1688,13 @@ mod tests {
         let disputed_header = header(5, 1, "arx1proposer");
         let proposed = attestation(&proposer, disputed_header.clone());
         // Dissenter's claimed state_root matches the proposer's (set by `header()`).
-        let dissent = dissent_attestation(&voter_sk, &voter_pk, 5, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &disputed_header);
+        let dissent = dissent_attestation(
+            &voter_sk,
+            &voter_pk,
+            5,
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &disputed_header,
+        );
         let art = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
@@ -1510,11 +1717,20 @@ mod tests {
         let mut art = disagreement_artifact(&proposer, &voter_sk, &voter_pk, 5);
         let disputed_header = header(5, 1, "arx1proposer");
         if let Fault::ExecutionDisagreement { dissent, .. } = &mut art.fault {
-            *dissent = dissent_attestation(&voter_sk, &voter_pk, 99, "0xdifferentstate", &disputed_header);
+            *dissent = dissent_attestation(
+                &voter_sk,
+                &voter_pk,
+                99,
+                "0xdifferentstate",
+                &disputed_header,
+            );
         }
         assert!(matches!(
             verify(&art),
-            Err(VerifyError::DisagreementHeightMismatch { dissent_height: 99, fault_height: 5 })
+            Err(VerifyError::DisagreementHeightMismatch {
+                dissent_height: 99,
+                fault_height: 5
+            })
         ));
     }
 
@@ -1524,34 +1740,98 @@ mod tests {
     /// differently between the signer and verifier).
     #[test]
     fn dissent_signing_bytes_is_deterministic_and_field_sensitive() {
-        let base = dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch");
+        let base = dissent_signing_bytes(
+            &GENESIS,
+            5,
+            "0xblock",
+            "0xstate",
+            &[9u8; 32],
+            &[1u8; 32],
+            "state_root_mismatch",
+        );
         assert_eq!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xblock",
+                "0xstate",
+                &[9u8; 32],
+                &[1u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 6, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                6,
+                "0xblock",
+                "0xstate",
+                &[9u8; 32],
+                &[1u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xother", "0xstate", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xother",
+                "0xstate",
+                &[9u8; 32],
+                &[1u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xother", &[9u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xblock",
+                "0xother",
+                &[9u8; 32],
+                &[1u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[8u8; 32], &[1u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xblock",
+                "0xstate",
+                &[8u8; 32],
+                &[1u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[2u8; 32], "state_root_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xblock",
+                "0xstate",
+                &[9u8; 32],
+                &[2u8; 32],
+                "state_root_mismatch"
+            )
         );
         assert_ne!(
             base,
-            dissent_signing_bytes(&GENESIS, 5, "0xblock", "0xstate", &[9u8; 32], &[1u8; 32], "action_mismatch")
+            dissent_signing_bytes(
+                &GENESIS,
+                5,
+                "0xblock",
+                "0xstate",
+                &[9u8; 32],
+                &[1u8; 32],
+                "action_mismatch"
+            )
         );
     }
 
@@ -1588,8 +1868,11 @@ mod tests {
             let mut current = sibling_leaf_hash(&key_hash, value);
             for level in (0..256).rev() {
                 let sibling = defaults[255 - level];
-                let (left, right) =
-                    if sibling_bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if sibling_bit_at(&key_hash, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 current = sibling_internal_hash(&left, &right);
             }
             current
@@ -1652,12 +1935,19 @@ mod tests {
             move |msg| format!("0x{}", hex::encode(xc_bls::sign(sk, msg).0))
         }
 
-        fn artifact_with(fx: &Fixture, proposed_claim: ActionClaim, dissent_claim: ActionClaim) -> EvidenceArtifact {
+        fn artifact_with(
+            fx: &Fixture,
+            proposed_claim: ActionClaim,
+            dissent_claim: ActionClaim,
+        ) -> EvidenceArtifact {
             EvidenceArtifact {
                 artifact_version: ARTIFACT_VERSION,
                 genesis_hash: genesis_hex(),
                 fault: Fault::ActionDivergence {
-                    proposer_pubkey: format!("0x{}", hex::encode(fx.proposer_key.verifying_key().as_bytes())),
+                    proposer_pubkey: format!(
+                        "0x{}",
+                        hex::encode(fx.proposer_key.verifying_key().as_bytes())
+                    ),
                     voter_pubkey: format!("0x{}", hex::encode(fx.voter_pk.0)),
                     height: fx.height,
                     action_index: fx.action_index,
@@ -1682,18 +1972,28 @@ mod tests {
             let dissent_post = root_after_writing(key, b"dissenter's value");
 
             let proposed = claim(
-                &fx, pre, proposed_post,
+                &fx,
+                pre,
+                proposed_post,
                 vec![empty_trie_state_proof(key)],
                 &ed25519_signer(&fx.proposer_key),
             );
             let dissent = claim(
-                &fx, pre, dissent_post,
+                &fx,
+                pre,
+                dissent_post,
                 vec![empty_trie_state_proof(key)],
                 &bls_signer(&fx.voter_sk),
             );
 
             let verdict = verify(&artifact_with(&fx, proposed, dissent)).unwrap();
-            assert!(matches!(verdict, Verdict::Disagreement { fault: "action_divergence", .. }));
+            assert!(matches!(
+                verdict,
+                Verdict::Disagreement {
+                    fault: "action_divergence",
+                    ..
+                }
+            ));
         }
 
         #[test]
@@ -1704,12 +2004,16 @@ mod tests {
             let pre_b = root_after_writing(key_hash(9), b"some other prior write");
 
             let proposed = claim(
-                &fx, pre_a, root_after_writing(key, b"x"),
+                &fx,
+                pre_a,
+                root_after_writing(key, b"x"),
                 vec![empty_trie_state_proof(key)],
                 &ed25519_signer(&fx.proposer_key),
             );
             let dissent = claim(
-                &fx, pre_b, root_after_writing(key, b"y"),
+                &fx,
+                pre_b,
+                root_after_writing(key, b"y"),
                 vec![], // pre_b's proof doesn't matter, this must fail before proofs are checked
                 &bls_signer(&fx.voter_sk),
             );
@@ -1728,12 +2032,16 @@ mod tests {
             let post = root_after_writing(key, b"same value both sides");
 
             let proposed = claim(
-                &fx, pre, post,
+                &fx,
+                pre,
+                post,
                 vec![empty_trie_state_proof(key)],
                 &ed25519_signer(&fx.proposer_key),
             );
             let dissent = claim(
-                &fx, pre, post,
+                &fx,
+                pre,
+                post,
                 vec![empty_trie_state_proof(key)],
                 &bls_signer(&fx.voter_sk),
             );
@@ -1752,12 +2060,16 @@ mod tests {
             let pre = empty_trie_root();
 
             let proposed = claim(
-                &fx, pre, root_after_writing(key, b"x"),
+                &fx,
+                pre,
+                root_after_writing(key, b"x"),
                 vec![empty_trie_state_proof(key)],
                 &ed25519_signer(&other_key), // signed by the wrong key
             );
             let dissent = claim(
-                &fx, pre, root_after_writing(key, b"y"),
+                &fx,
+                pre,
+                root_after_writing(key, b"y"),
                 vec![empty_trie_state_proof(key)],
                 &bls_signer(&fx.voter_sk),
             );
@@ -1776,12 +2088,16 @@ mod tests {
             let pre = empty_trie_root();
 
             let proposed = claim(
-                &fx, pre, root_after_writing(key, b"x"),
+                &fx,
+                pre,
+                root_after_writing(key, b"x"),
                 vec![empty_trie_state_proof(key)],
                 &ed25519_signer(&fx.proposer_key),
             );
             let dissent = claim(
-                &fx, pre, root_after_writing(key, b"y"),
+                &fx,
+                pre,
+                root_after_writing(key, b"y"),
                 vec![empty_trie_state_proof(key)],
                 &bls_signer(&other_sk), // signed by the wrong key
             );
@@ -1808,12 +2124,16 @@ mod tests {
             bad_proof.siblings = vec![format!("0x{}", hex::encode([0xFFu8; 32]))];
 
             let proposed = claim(
-                &fx, pre, root_after_writing(key, b"x"),
+                &fx,
+                pre,
+                root_after_writing(key, b"x"),
                 vec![bad_proof],
                 &ed25519_signer(&fx.proposer_key),
             );
             let dissent = claim(
-                &fx, pre, root_after_writing(key, b"y"),
+                &fx,
+                pre,
+                root_after_writing(key, b"y"),
                 vec![empty_trie_state_proof(key)],
                 &bls_signer(&fx.voter_sk),
             );
@@ -1830,7 +2150,9 @@ mod tests {
     // `key_hash`) since both build proofs against the same sparse-Merkle
     // shape; only the claim/signing side differs.
     mod block_divergence {
-        use super::action_divergence::{empty_trie_root, empty_trie_state_proof, key_hash, root_after_writing};
+        use super::action_divergence::{
+            empty_trie_root, empty_trie_state_proof, key_hash, root_after_writing,
+        };
         use super::*;
 
         struct Fixture {
@@ -1842,7 +2164,12 @@ mod tests {
 
         fn fixture() -> Fixture {
             let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
-            Fixture { proposer_key: SigningKey::from_bytes(&[7u8; 32]), voter_sk, voter_pk, height: 5 }
+            Fixture {
+                proposer_key: SigningKey::from_bytes(&[7u8; 32]),
+                voter_sk,
+                voter_pk,
+                height: 5,
+            }
         }
 
         fn block_header(fx: &Fixture, state_root: &str) -> CanonicalHeader {
@@ -1860,7 +2187,10 @@ mod tests {
         fn block_attestation(fx: &Fixture, header: CanonicalHeader) -> BlockAttestation {
             let bytes = signing_bytes_for(&header).unwrap();
             let signature = fx.proposer_key.sign(&bytes);
-            BlockAttestation { header, signature: format!("0x{}", hex::encode(signature.to_bytes())) }
+            BlockAttestation {
+                header,
+                signature: format!("0x{}", hex::encode(signature.to_bytes())),
+            }
         }
 
         fn dissent_claim(
@@ -1875,7 +2205,13 @@ mod tests {
             let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
             let parent_state_root = format!("0x{}", hex::encode(parent_root));
             let computed_state_root = format!("0x{}", hex::encode(computed_root));
-            let msg = block_divergence_signing_bytes(&GENESIS, fx.height, &header_commitment, &parent_state_root, &computed_state_root);
+            let msg = block_divergence_signing_bytes(
+                &GENESIS,
+                fx.height,
+                &header_commitment,
+                &parent_state_root,
+                &computed_state_root,
+            );
             BlockDissentClaim {
                 computed_state_root,
                 proofs,
@@ -1893,7 +2229,10 @@ mod tests {
                 artifact_version: ARTIFACT_VERSION,
                 genesis_hash: genesis_hex(),
                 fault: Fault::BlockDivergence {
-                    proposer_pubkey: format!("0x{}", hex::encode(fx.proposer_key.verifying_key().as_bytes())),
+                    proposer_pubkey: format!(
+                        "0x{}",
+                        hex::encode(fx.proposer_key.verifying_key().as_bytes())
+                    ),
                     voter_pubkey: format!("0x{}", hex::encode(fx.voter_pk.0)),
                     height: fx.height,
                     parent_state_root,
@@ -1916,12 +2255,28 @@ mod tests {
             let header = block_header(&fx, &format!("0x{}", hex::encode(proposer_post)));
             let attestation = block_attestation(&fx, header.clone());
             let dissent = dissent_claim(
-                &fx, &header, parent, dissent_post, vec![empty_trie_state_proof(key)], &fx.voter_sk,
+                &fx,
+                &header,
+                parent,
+                dissent_post,
+                vec![empty_trie_state_proof(key)],
+                &fx.voter_sk,
             );
 
-            let verdict =
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)).unwrap();
-            assert!(matches!(verdict, Verdict::Disagreement { fault: "block_divergence", .. }));
+            let verdict = verify(&artifact_with(
+                &fx,
+                format!("0x{}", hex::encode(parent)),
+                attestation,
+                dissent,
+            ))
+            .unwrap();
+            assert!(matches!(
+                verdict,
+                Verdict::Disagreement {
+                    fault: "block_divergence",
+                    ..
+                }
+            ));
         }
 
         #[test]
@@ -1933,11 +2288,22 @@ mod tests {
 
             let header = block_header(&fx, &format!("0x{}", hex::encode(post)));
             let attestation = block_attestation(&fx, header.clone());
-            let dissent =
-                dissent_claim(&fx, &header, parent, post, vec![empty_trie_state_proof(key)], &fx.voter_sk);
+            let dissent = dissent_claim(
+                &fx,
+                &header,
+                parent,
+                post,
+                vec![empty_trie_state_proof(key)],
+                &fx.voter_sk,
+            );
 
             assert!(matches!(
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                verify(&artifact_with(
+                    &fx,
+                    format!("0x{}", hex::encode(parent)),
+                    attestation,
+                    dissent
+                )),
                 Err(VerifyError::BlockDivergenceNoDisagreement)
             ));
         }
@@ -1949,17 +2315,32 @@ mod tests {
             let key = key_hash(1);
             let parent = empty_trie_root();
 
-            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let header = block_header(
+                &fx,
+                &format!("0x{}", hex::encode(root_after_writing(key, b"x"))),
+            );
             let header_bytes = signing_bytes_for(&header).unwrap();
             let forged_signature = other_key.sign(&header_bytes);
-            let attestation =
-                BlockAttestation { header: header.clone(), signature: format!("0x{}", hex::encode(forged_signature.to_bytes())) };
+            let attestation = BlockAttestation {
+                header: header.clone(),
+                signature: format!("0x{}", hex::encode(forged_signature.to_bytes())),
+            };
             let dissent = dissent_claim(
-                &fx, &header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &fx.voter_sk,
+                &fx,
+                &header,
+                parent,
+                root_after_writing(key, b"y"),
+                vec![empty_trie_state_proof(key)],
+                &fx.voter_sk,
             );
 
             assert!(matches!(
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                verify(&artifact_with(
+                    &fx,
+                    format!("0x{}", hex::encode(parent)),
+                    attestation,
+                    dissent
+                )),
                 Err(VerifyError::BlockAttestationSignatureInvalid)
             ));
         }
@@ -1971,14 +2352,27 @@ mod tests {
             let key = key_hash(1);
             let parent = empty_trie_root();
 
-            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let header = block_header(
+                &fx,
+                &format!("0x{}", hex::encode(root_after_writing(key, b"x"))),
+            );
             let attestation = block_attestation(&fx, header.clone());
             let dissent = dissent_claim(
-                &fx, &header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &other_sk,
+                &fx,
+                &header,
+                parent,
+                root_after_writing(key, b"y"),
+                vec![empty_trie_state_proof(key)],
+                &other_sk,
             );
 
             assert!(matches!(
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                verify(&artifact_with(
+                    &fx,
+                    format!("0x{}", hex::encode(parent)),
+                    attestation,
+                    dissent
+                )),
                 Err(VerifyError::BlockDissentSignatureInvalid)
             ));
         }
@@ -1995,17 +2389,33 @@ mod tests {
             let key = key_hash(1);
             let parent = empty_trie_root();
 
-            let real_header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
-            let other_header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"z"))));
+            let real_header = block_header(
+                &fx,
+                &format!("0x{}", hex::encode(root_after_writing(key, b"x"))),
+            );
+            let other_header = block_header(
+                &fx,
+                &format!("0x{}", hex::encode(root_after_writing(key, b"z"))),
+            );
             let attestation = block_attestation(&fx, real_header);
             // Dissent signed against `other_header`'s commitment, paired with
             // an attestation for `real_header`.
             let dissent = dissent_claim(
-                &fx, &other_header, parent, root_after_writing(key, b"y"), vec![empty_trie_state_proof(key)], &fx.voter_sk,
+                &fx,
+                &other_header,
+                parent,
+                root_after_writing(key, b"y"),
+                vec![empty_trie_state_proof(key)],
+                &fx.voter_sk,
             );
 
             assert!(matches!(
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                verify(&artifact_with(
+                    &fx,
+                    format!("0x{}", hex::encode(parent)),
+                    attestation,
+                    dissent
+                )),
                 Err(VerifyError::BlockDissentSignatureInvalid)
             ));
         }
@@ -2022,13 +2432,27 @@ mod tests {
             bad_proof.siblings_bitmap = format!("0x{}", hex::encode(bitmap0));
             bad_proof.siblings = vec![format!("0x{}", hex::encode([0xFFu8; 32]))];
 
-            let header = block_header(&fx, &format!("0x{}", hex::encode(root_after_writing(key, b"x"))));
+            let header = block_header(
+                &fx,
+                &format!("0x{}", hex::encode(root_after_writing(key, b"x"))),
+            );
             let attestation = block_attestation(&fx, header.clone());
-            let dissent =
-                dissent_claim(&fx, &header, parent, root_after_writing(key, b"y"), vec![bad_proof], &fx.voter_sk);
+            let dissent = dissent_claim(
+                &fx,
+                &header,
+                parent,
+                root_after_writing(key, b"y"),
+                vec![bad_proof],
+                &fx.voter_sk,
+            );
 
             assert!(matches!(
-                verify(&artifact_with(&fx, format!("0x{}", hex::encode(parent)), attestation, dissent)),
+                verify(&artifact_with(
+                    &fx,
+                    format!("0x{}", hex::encode(parent)),
+                    attestation,
+                    dissent
+                )),
                 Err(VerifyError::StateProofDoesNotVerify)
             ));
         }

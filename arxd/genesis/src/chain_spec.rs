@@ -49,10 +49,15 @@ impl ChainSpec {
         struct Tag {
             genesis_format: String,
         }
-        let tag: Tag = serde_json::from_str(json).context("chain spec is missing genesis_format")?;
+        let tag: Tag =
+            serde_json::from_str(json).context("chain spec is missing genesis_format")?;
         match tag.genesis_format.as_str() {
-            "plain" => Ok(ChainSpec::Plain(serde_json::from_str(json).context("failed to parse plain chain spec")?)),
-            "raw" => Ok(ChainSpec::Raw(serde_json::from_str(json).context("failed to parse raw chain spec")?)),
+            "plain" => Ok(ChainSpec::Plain(
+                serde_json::from_str(json).context("failed to parse plain chain spec")?,
+            )),
+            "raw" => Ok(ChainSpec::Raw(
+                serde_json::from_str(json).context("failed to parse raw chain spec")?,
+            )),
             other => bail!("unknown genesis_format {other:?}"),
         }
     }

@@ -410,6 +410,9 @@ mod tests {
             assert_eq!(got, *name, "variant index {idx}");
         }
         let past_end = [EXPECTED.len() as u8, 0];
-        assert!(bincode::serde::decode_from_slice::<ActionPayload, _>(&past_end, cfg).is_err(), "new variant appended without updating EXPECTED");
+        assert!(
+            bincode::serde::decode_from_slice::<ActionPayload, _>(&past_end, cfg).is_err(),
+            "new variant appended without updating EXPECTED"
+        );
     }
 }

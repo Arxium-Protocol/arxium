@@ -10,8 +10,8 @@
 //
 // Requires the target node process to be stopped first — RocksDB only
 // allows one writer per DB directory, so this can't run against a live node.
-use anyhow::{Context, Result, bail};
-use circuit_staking::{SlashReason, apply_slash};
+use anyhow::{bail, Context, Result};
+use circuit_staking::{apply_slash, SlashReason};
 use clap::Parser;
 use std::path::PathBuf;
 use xc_primitives::Address;
@@ -55,13 +55,19 @@ fn main() -> Result<()> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
 
     let sub_account = circuit_staking::stake_subaccount(&validator);
-    let before = db.get_account(&sub_account)?.map(|a| a.balance).unwrap_or(0);
+    let before = db
+        .get_account(&sub_account)?
+        .map(|a| a.balance)
+        .unwrap_or(0);
 
     let view = BlockView::new(&db);
     let (accounts, stakes) = apply_slash(&view, &validator, args.amount, reason, tip_height)?;
     db.write_batches(&[&accounts, &stakes])?;
 
-    let after = db.get_account(&sub_account)?.map(|a| a.balance).unwrap_or(0);
+    let after = db
+        .get_account(&sub_account)?
+        .map(|a| a.balance)
+        .unwrap_or(0);
     println!(
         "slashed {validator} ({reason:?}) at height {tip_height}: sub-account {sub_account} {before} -> {after}"
     );

@@ -37,7 +37,10 @@ fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
 fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
     // ponytail: no portable equivalent of creating at 0600 on non-Unix;
     // revisit if this ever needs to run on Windows in production.
-    std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 /// Locks an *already existing* key file down to owner-only. Applied on every

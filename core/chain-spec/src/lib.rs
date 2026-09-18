@@ -14,7 +14,9 @@ pub use source::resolve_chain_spec;
 pub fn parse_snapshot(embedded_json: &str) -> Result<Snapshot> {
     let snapshot: Snapshot =
         serde_json::from_str(embedded_json).context("failed to parse embedded genesis JSON")?;
-    snapshot.validate().context("genesis spec failed validation")?;
+    snapshot
+        .validate()
+        .context("genesis spec failed validation")?;
     Ok(snapshot)
 }
 
@@ -28,6 +30,9 @@ mod tests {
     fn genesis_with_nonzero_height_is_rejected() {
         let spec = r#"{"height":1,"chain_name":"t","accounts":{},"validators":{},"boot_nodes":[]}"#;
         let err = parse_snapshot(spec).unwrap_err();
-        assert!(format!("{err:#}").contains("height"), "expected a height error, got {err:?}");
+        assert!(
+            format!("{err:#}").contains("height"),
+            "expected a height error, got {err:?}"
+        );
     }
 }

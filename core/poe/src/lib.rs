@@ -48,7 +48,12 @@ pub fn block_ep(
     block_state_root: &str,
     weight_used: u64,
 ) -> [u8; 32] {
-    execution_proof(parent_state_root, block_tx_root, block_state_root, weight_used)
+    execution_proof(
+        parent_state_root,
+        block_tx_root,
+        block_state_root,
+        weight_used,
+    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -198,7 +203,11 @@ pub mod state_trie {
                 node = defaults[depth - 1];
             } else {
                 let (left, right) = children(&node)?;
-                let (child, sibling) = if bit_at(key_hash, level) == 0 { (left, right) } else { (right, left) };
+                let (child, sibling) = if bit_at(key_hash, level) == 0 {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
                 siblings[level] = sibling;
                 node = child;
             }
@@ -218,8 +227,10 @@ pub mod state_trie {
     /// until a state has millions of keys; the upgrade is to hash shared
     /// prefixes once (a radix walk over the sorted hashes), not a new trie.
     pub fn root_of(leaves: &std::collections::BTreeMap<[u8; 32], Vec<u8>>) -> [u8; 32] {
-        let hashed: Vec<([u8; 32], [u8; 32])> =
-            leaves.iter().map(|(key_hash, value)| (*key_hash, leaf_hash(key_hash, value))).collect();
+        let hashed: Vec<([u8; 32], [u8; 32])> = leaves
+            .iter()
+            .map(|(key_hash, value)| (*key_hash, leaf_hash(key_hash, value)))
+            .collect();
         subtree_root(&hashed, 0)
     }
 
@@ -235,7 +246,10 @@ pub mod state_trie {
                 // first: a single partition point splits left from right.
                 let split = sorted.partition_point(|(key_hash, _)| bit_at(key_hash, level) == 0);
                 let (left, right) = sorted.split_at(split);
-                internal_hash(&subtree_root(left, level + 1), &subtree_root(right, level + 1))
+                internal_hash(
+                    &subtree_root(left, level + 1),
+                    &subtree_root(right, level + 1),
+                )
             }
         }
     }
@@ -289,7 +303,10 @@ pub mod state_trie {
                 key_hash: format!("0x{}", hex::encode(self.key_hash)),
                 value: self.value.as_ref().map(|v| format!("0x{}", hex::encode(v))),
                 siblings_bitmap: format!("0x{}", hex::encode(bitmap)),
-                siblings: siblings.iter().map(|s| format!("0x{}", hex::encode(s))).collect(),
+                siblings: siblings
+                    .iter()
+                    .map(|s| format!("0x{}", hex::encode(s)))
+                    .collect(),
             }
         }
     }
@@ -309,8 +326,11 @@ pub mod state_trie {
         };
         for level in (0..256).rev() {
             let sibling = proof.siblings[level];
-            let (left, right) =
-                if bit_at(&proof.key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+            let (left, right) = if bit_at(&proof.key_hash, level) == 0 {
+                (current, sibling)
+            } else {
+                (sibling, current)
+            };
             current = internal_hash(&left, &right);
         }
         current == root
@@ -353,7 +373,11 @@ pub mod state_trie {
         /// against `root` — a partially-bad proof set is exactly as
         /// untrustworthy as a wholly-bad one.
         pub fn from_proofs(root: [u8; 32], proofs: &[InclusionProof]) -> Result<Self, UnprovenKey> {
-            let mut trie = Self { root, nodes: std::collections::HashMap::new(), leaves: std::collections::HashMap::new() };
+            let mut trie = Self {
+                root,
+                nodes: std::collections::HashMap::new(),
+                leaves: std::collections::HashMap::new(),
+            };
             for proof in proofs {
                 if !verify_proof(root, proof) {
                     // A proof that fails verification is indistinguishable,
@@ -383,8 +407,11 @@ pub mod state_trie {
             };
             for level in (0..256).rev() {
                 let sibling = proof.siblings[level];
-                let (left, right) =
-                    if bit_at(&proof.key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if bit_at(&proof.key_hash, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 let parent = internal_hash(&left, &right);
                 self.nodes.insert(parent, (left, right));
                 current = parent;
@@ -409,7 +436,11 @@ pub mod state_trie {
             if leaf_node == default_hashes()[0] {
                 return Ok(None);
             }
-            self.leaves.get(&leaf_node).cloned().map(Some).ok_or(UnprovenKey)
+            self.leaves
+                .get(&leaf_node)
+                .cloned()
+                .map(Some)
+                .ok_or(UnprovenKey)
         }
 
         /// Updates `key_hash` to `new_value` (`None` deletes) and returns
@@ -419,7 +450,11 @@ pub mod state_trie {
         /// same root a real commit would, as long as every key touched was
         /// covered by a proof (directly, or via a node an earlier `apply`
         /// in this same trie already created).
-        pub fn apply(&mut self, key_hash: [u8; 32], new_value: Option<Vec<u8>>) -> Result<[u8; 32], UnprovenKey> {
+        pub fn apply(
+            &mut self,
+            key_hash: [u8; 32],
+            new_value: Option<Vec<u8>>,
+        ) -> Result<[u8; 32], UnprovenKey> {
             let (siblings, _leaf) = self.descend(&key_hash)?;
             let defaults = default_hashes();
             let mut current = match &new_value {
@@ -432,8 +467,11 @@ pub mod state_trie {
             };
             for level in (0..256).rev() {
                 let sibling = siblings[level];
-                let (left, right) =
-                    if bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if bit_at(&key_hash, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 let parent = internal_hash(&left, &right);
                 self.nodes.insert(parent, (left, right));
                 current = parent;
@@ -458,7 +496,11 @@ pub mod state_trie {
             let key_hash = hash_key(b"nonexistent");
             let defaults = default_hashes();
             let siblings: Vec<[u8; 32]> = (0..256).map(|level| defaults[255 - level]).collect();
-            let proof = InclusionProof { key_hash, value: None, siblings };
+            let proof = InclusionProof {
+                key_hash,
+                value: None,
+                siblings,
+            };
             assert!(verify_proof(defaults[256], &proof));
         }
 
@@ -473,26 +515,45 @@ pub mod state_trie {
             for level in (0..256).rev() {
                 let sibling = defaults[255 - level];
                 siblings[level] = sibling;
-                let (left, right) = if bit_at(&key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if bit_at(&key_hash, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 current = internal_hash(&left, &right);
             }
             let root = current;
-            let proof = InclusionProof { key_hash, value: Some(value), siblings };
+            let proof = InclusionProof {
+                key_hash,
+                value: Some(value),
+                siblings,
+            };
             assert!(verify_proof(root, &proof));
 
-            let tampered = InclusionProof { value: Some(b"different".to_vec()), ..proof };
+            let tampered = InclusionProof {
+                value: Some(b"different".to_vec()),
+                ..proof
+            };
             assert!(!verify_proof(root, &tampered));
         }
 
         #[test]
         fn wrong_sibling_count_is_rejected_rather_than_panicking() {
-            let proof = InclusionProof { key_hash: [0u8; 32], value: None, siblings: vec![[0u8; 32]; 3] };
+            let proof = InclusionProof {
+                key_hash: [0u8; 32],
+                value: None,
+                siblings: vec![[0u8; 32]; 3],
+            };
             assert!(!verify_proof([0u8; 32], &proof));
         }
 
         fn empty_trie_proof(key_hash: [u8; 32], value: Option<Vec<u8>>) -> InclusionProof {
             let defaults = default_hashes();
-            InclusionProof { key_hash, value, siblings: (0..256).map(|level| defaults[255 - level]).collect() }
+            InclusionProof {
+                key_hash,
+                value,
+                siblings: (0..256).map(|level| defaults[255 - level]).collect(),
+            }
         }
 
         /// `ProofBackedTrie::apply` must land on exactly the root a real
@@ -504,7 +565,8 @@ pub mod state_trie {
             let key_hash = hash_key(b"account:arx1...");
             let empty_root = default_hashes()[256];
             let mut trie =
-                ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)]).unwrap();
+                ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)])
+                    .unwrap();
 
             let value = b"balance=100".to_vec();
             let new_root = trie.apply(key_hash, Some(value.clone())).unwrap();
@@ -515,8 +577,11 @@ pub mod state_trie {
             let mut expected = leaf_hash(&key_hash, &value);
             for level in (0..256).rev() {
                 let sibling = defaults[255 - level];
-                let (left, right) =
-                    if bit_at(&key_hash, level) == 0 { (expected, sibling) } else { (sibling, expected) };
+                let (left, right) = if bit_at(&key_hash, level) == 0 {
+                    (expected, sibling)
+                } else {
+                    (sibling, expected)
+                };
                 expected = internal_hash(&left, &right);
             }
             assert_eq!(new_root, expected);
@@ -530,7 +595,9 @@ pub mod state_trie {
         fn a_key_proven_absent_reads_as_none_not_an_error() {
             let key_hash = hash_key(b"never-written");
             let empty_root = default_hashes()[256];
-            let trie = ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)]).unwrap();
+            let trie =
+                ProofBackedTrie::from_proofs(empty_root, &[empty_trie_proof(key_hash, None)])
+                    .unwrap();
             assert_eq!(trie.get(&key_hash).unwrap(), None);
         }
 
@@ -569,8 +636,11 @@ pub mod state_trie {
             // each of these levels is the untouched default subtree.
             for level in (0..255).rev() {
                 let sibling = defaults[255 - level];
-                let (left, right) =
-                    if bit_at(&key_hash_a, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if bit_at(&key_hash_a, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 current = internal_hash(&left, &right);
             }
             let root = current;
@@ -580,8 +650,15 @@ pub mod state_trie {
             for level in 0..255 {
                 siblings_a[level] = defaults[255 - level];
             }
-            let proof_a = InclusionProof { key_hash: key_hash_a, value: Some(value_a), siblings: siblings_a };
-            assert!(verify_proof(root, &proof_a), "test setup: proof_a must be valid");
+            let proof_a = InclusionProof {
+                key_hash: key_hash_a,
+                value: Some(value_a),
+                siblings: siblings_a,
+            };
+            assert!(
+                verify_proof(root, &proof_a),
+                "test setup: proof_a must be valid"
+            );
 
             let trie = ProofBackedTrie::from_proofs(root, &[proof_a]).unwrap();
             assert_eq!(
@@ -632,7 +709,10 @@ mod tests {
     #[test]
     fn tx_root_single_action_is_its_hash() {
         let actions = vec![action(1)];
-        assert_eq!(tx_root(&actions).unwrap(), action_hash(&actions[0]).unwrap());
+        assert_eq!(
+            tx_root(&actions).unwrap(),
+            action_hash(&actions[0]).unwrap()
+        );
     }
 
     #[test]

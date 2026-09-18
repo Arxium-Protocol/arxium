@@ -42,7 +42,9 @@ pub enum RwaError {
     AssetFrozen { asset: AssetRef },
     #[error("{address} is frozen for {asset} and may neither send nor receive it")]
     HolderFrozen { asset: AssetRef, address: Address },
-    #[error("{sender} has {locked} of {asset} locked: only {available} of {balance} is spendable, needs {amount}")]
+    #[error(
+        "{sender} has {locked} of {asset} locked: only {available} of {balance} is spendable, needs {amount}"
+    )]
     AmountLocked {
         asset: AssetRef,
         sender: Address,
@@ -51,7 +53,9 @@ pub enum RwaError {
         available: u128,
         amount: u128,
     },
-    #[error("cannot lock {amount} of {asset} for {holder}: balance is {balance}, already locked {locked}")]
+    #[error(
+        "cannot lock {amount} of {asset} for {holder}: balance is {balance}, already locked {locked}"
+    )]
     LockExceedsBalance {
         asset: AssetRef,
         holder: Address,
@@ -143,8 +147,13 @@ impl TransferEligibility {
 /// is exactly the case the registry exists to revoke. The validator
 /// admission gate (`ChainParams::validator_attestation_required`) uses this;
 /// `check_party` keeps its own, asset-specific claim checks.
-pub fn is_attested<V: KvRead<Error = StorageError>>(view: &V, address: &Address) -> Result<bool, StorageError> {
-    let Some(entry) = view.get(&AccountKey(address))? else { return Ok(false) };
+pub fn is_attested<V: KvRead<Error = StorageError>>(
+    view: &V,
+    address: &Address,
+) -> Result<bool, StorageError> {
+    let Some(entry) = view.get(&AccountKey(address))? else {
+        return Ok(false);
+    };
     if entry.identity_hash.is_none() {
         return Ok(false);
     }
@@ -166,16 +175,24 @@ fn check_party<V: KvRead<Error = StorageError>>(
     // An issuer-frozen holder is out of circulation in both directions,
     // whatever its claims say.
     if holder_state(view, asset, party)?.frozen {
-        return Err(RwaError::HolderFrozen { asset: asset.asset_ref.clone(), address: party.clone() });
+        return Err(RwaError::HolderFrozen {
+            asset: asset.asset_ref.clone(),
+            address: party.clone(),
+        });
     }
 
     if !asset.required_claims.is_empty() {
         // An attested account is still the baseline: topics qualify an
         // attestation, they don't substitute for having one.
         if !is_attested(view, party)? {
-            return Err(RwaError::NotCompliant { address: party.clone() });
+            return Err(RwaError::NotCompliant {
+                address: party.clone(),
+            });
         }
-        let held = entry.as_ref().map(|e| e.claims.as_slice()).unwrap_or_default();
+        let held = entry
+            .as_ref()
+            .map(|e| e.claims.as_slice())
+            .unwrap_or_default();
         if let Some(missing) = asset.required_claims.iter().find(|t| !held.contains(t)) {
             return Err(RwaError::MissingClaim {
                 asset: asset.asset_ref.clone(),
@@ -184,7 +201,9 @@ fn check_party<V: KvRead<Error = StorageError>>(
             });
         }
     } else if asset.compliance_required && !is_attested(view, party)? {
-        return Err(RwaError::NotCompliant { address: party.clone() });
+        return Err(RwaError::NotCompliant {
+            address: party.clone(),
+        });
     }
 
     // An unknown jurisdiction is rejected, not waved through: a restricted
@@ -223,7 +242,9 @@ pub fn transfer_eligibility<V: KvRead<Error = StorageError>>(
         Err(RwaError::HolderFrozen { .. }) => return Ok(TransferEligibility::HolderFrozen),
         Err(RwaError::NotCompliant { .. }) => return Ok(TransferEligibility::MissingAttestation),
         Err(RwaError::MissingClaim { .. }) => return Ok(TransferEligibility::MissingRequiredClaim),
-        Err(RwaError::JurisdictionNotAllowed { .. }) => return Ok(TransferEligibility::JurisdictionNotAllowed),
+        Err(RwaError::JurisdictionNotAllowed { .. }) => {
+            return Ok(TransferEligibility::JurisdictionNotAllowed);
+        }
         Err(_) => unreachable!("check_party returned an unrelated transfer error"),
     }
 
@@ -274,15 +295,20 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
     }
 
     if asset.issuance_locked {
-        return Err(RwaError::IssuanceLocked { asset: asset.asset_ref.clone() });
+        return Err(RwaError::IssuanceLocked {
+            asset: asset.asset_ref.clone(),
+        });
     }
     // Checked before any balance math so a rejected issue leaves nothing
     // half-applied. Overflow is its own error rather than a saturating
     // clamp: silently minting less than asked for is worse than failing.
-    let resulting = asset
-        .total_supply
-        .checked_add(amount)
-        .ok_or_else(|| RwaError::SupplyOverflow { asset: asset.asset_ref.clone() })?;
+    let resulting =
+        asset
+            .total_supply
+            .checked_add(amount)
+            .ok_or_else(|| RwaError::SupplyOverflow {
+                asset: asset.asset_ref.clone(),
+            })?;
     if let Some(cap) = asset.max_supply
         && resulting > cap
     {
@@ -309,7 +335,10 @@ pub fn apply_issue<V: KvRead<Error = StorageError>>(
     entry.nonce += 1;
 
     let existing_balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: sender })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: sender,
+        })?
         .unwrap_or(0);
 
     asset.total_supply = resulting;
@@ -340,7 +369,9 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     // circulation outright, so it must not be bypassable by a transfer that
     // would have failed a later check anyway for a different reason.
     if asset.frozen {
-        return Err(RwaError::AssetFrozen { asset: asset.asset_ref.clone() });
+        return Err(RwaError::AssetFrozen {
+            asset: asset.asset_ref.clone(),
+        });
     }
 
     check_party(view, asset, sender)?;
@@ -364,7 +395,10 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     let locked = holder_state(view, asset, sender)?.frozen_amount;
     if locked > 0 {
         let balance = view
-            .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: sender })?
+            .get(&AssetBalanceKey {
+                asset: &asset.asset_ref,
+                owner: sender,
+            })?
             .unwrap_or(0);
         let available = balance.saturating_sub(locked);
         if amount > available {
@@ -396,32 +430,57 @@ pub fn apply_issue_to<V: KvRead<Error = StorageError>>(
     amount: u128,
 ) -> Result<AssetBalanceUpdates, RwaError> {
     if asset.issuance_locked {
-        return Err(RwaError::IssuanceLocked { asset: asset.asset_ref.clone() });
+        return Err(RwaError::IssuanceLocked {
+            asset: asset.asset_ref.clone(),
+        });
     }
     if asset.frozen {
-        return Err(RwaError::AssetFrozen { asset: asset.asset_ref.clone() });
+        return Err(RwaError::AssetFrozen {
+            asset: asset.asset_ref.clone(),
+        });
     }
     check_party(view, asset, to)?;
-    let resulting = asset
-        .total_supply
-        .checked_add(amount)
-        .ok_or_else(|| RwaError::SupplyOverflow { asset: asset.asset_ref.clone() })?;
+    let resulting =
+        asset
+            .total_supply
+            .checked_add(amount)
+            .ok_or_else(|| RwaError::SupplyOverflow {
+                asset: asset.asset_ref.clone(),
+            })?;
     if let Some(cap) = asset.max_supply
         && resulting > cap
     {
-        return Err(RwaError::SupplyCapExceeded { asset: asset.asset_ref.clone(), cap, resulting, amount });
+        return Err(RwaError::SupplyCapExceeded {
+            asset: asset.asset_ref.clone(),
+            cap,
+            resulting,
+            amount,
+        });
     }
     let existing = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: to })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: to,
+        })?
         .unwrap_or(0);
     asset.total_supply = resulting;
     let credited = credit(&asset.asset_ref, existing, amount)?;
-    Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_ref.clone(), to.clone()), credited)])))
+    Ok(AssetBalanceUpdates(BTreeMap::from([(
+        (asset.asset_ref.clone(), to.clone()),
+        credited,
+    )])))
 }
 
-fn holder_state<V: KvRead<Error = StorageError>>(view: &V, asset: &Asset, holder: &Address) -> Result<HolderState, RwaError> {
+fn holder_state<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    holder: &Address,
+) -> Result<HolderState, RwaError> {
     Ok(view
-        .get(&AssetHolderStateKey { asset: &asset.asset_ref, holder })?
+        .get(&AssetHolderStateKey {
+            asset: &asset.asset_ref,
+            holder,
+        })?
         .unwrap_or_default())
 }
 
@@ -429,7 +488,11 @@ fn holder_state<V: KvRead<Error = StorageError>>(view: &V, asset: &Asset, holder
 /// own `checked_add`, but that argument lives in a different variable —
 /// keep the overflow check local so it doesn't have to be reconstructed.
 fn credit(asset: &AssetRef, balance: u128, amount: u128) -> Result<u128, RwaError> {
-    balance.checked_add(amount).ok_or_else(|| RwaError::SupplyOverflow { asset: asset.clone() })
+    balance
+        .checked_add(amount)
+        .ok_or_else(|| RwaError::SupplyOverflow {
+            asset: asset.clone(),
+        })
 }
 
 /// Issuer burns `amount` from its own balance; `total_supply` follows. Only
@@ -443,17 +506,31 @@ pub fn apply_burn<V: KvRead<Error = StorageError>>(
     amount: u128,
 ) -> Result<AssetBalanceUpdates, RwaError> {
     let balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: issuer })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: issuer,
+        })?
         .unwrap_or(0);
     if amount > balance {
-        return Err(RwaError::BurnExceedsBalance { asset: asset.asset_ref.clone(), balance, amount });
+        return Err(RwaError::BurnExceedsBalance {
+            asset: asset.asset_ref.clone(),
+            balance,
+            amount,
+        });
     }
-    asset.total_supply = asset.total_supply.checked_sub(amount).ok_or_else(|| RwaError::BurnExceedsSupply {
-        asset: asset.asset_ref.clone(),
-        total_supply: asset.total_supply,
-        amount,
-    })?;
-    Ok(AssetBalanceUpdates(BTreeMap::from([((asset.asset_ref.clone(), issuer.clone()), balance - amount)])))
+    asset.total_supply =
+        asset
+            .total_supply
+            .checked_sub(amount)
+            .ok_or_else(|| RwaError::BurnExceedsSupply {
+                asset: asset.asset_ref.clone(),
+                total_supply: asset.total_supply,
+                amount,
+            })?;
+    Ok(AssetBalanceUpdates(BTreeMap::from([(
+        (asset.asset_ref.clone(), issuer.clone()),
+        balance - amount,
+    )])))
 }
 
 /// Address freeze: the whole holder in or out of circulation.
@@ -465,7 +542,10 @@ pub fn apply_set_holder_frozen<V: KvRead<Error = StorageError>>(
 ) -> Result<HolderStateUpdates, RwaError> {
     let mut state = holder_state(view, asset, holder)?;
     state.frozen = frozen;
-    Ok(HolderStateUpdates(BTreeMap::from([((asset.asset_ref.clone(), holder.clone()), state)])))
+    Ok(HolderStateUpdates(BTreeMap::from([(
+        (asset.asset_ref.clone(), holder.clone()),
+        state,
+    )])))
 }
 
 /// Partial lock / unlock: lock or release
@@ -481,20 +561,37 @@ pub fn apply_lock_amount<V: KvRead<Error = StorageError>>(
     let mut state = holder_state(view, asset, holder)?;
     if lock {
         let balance = view
-            .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: holder })?
+            .get(&AssetBalanceKey {
+                asset: &asset.asset_ref,
+                owner: holder,
+            })?
             .unwrap_or(0);
         let resulting = state.frozen_amount.checked_add(amount).unwrap_or(u128::MAX);
         if resulting > balance {
-            return Err(RwaError::LockExceedsBalance { asset: asset.asset_ref.clone(), holder: holder.clone(), balance, locked: state.frozen_amount, amount });
+            return Err(RwaError::LockExceedsBalance {
+                asset: asset.asset_ref.clone(),
+                holder: holder.clone(),
+                balance,
+                locked: state.frozen_amount,
+                amount,
+            });
         }
         state.frozen_amount = resulting;
     } else {
         if amount > state.frozen_amount {
-            return Err(RwaError::UnlockExceedsLocked { asset: asset.asset_ref.clone(), holder: holder.clone(), locked: state.frozen_amount, amount });
+            return Err(RwaError::UnlockExceedsLocked {
+                asset: asset.asset_ref.clone(),
+                holder: holder.clone(),
+                locked: state.frozen_amount,
+                amount,
+            });
         }
         state.frozen_amount -= amount;
     }
-    Ok(HolderStateUpdates(BTreeMap::from([((asset.asset_ref.clone(), holder.clone()), state)])))
+    Ok(HolderStateUpdates(BTreeMap::from([(
+        (asset.asset_ref.clone(), holder.clone()),
+        state,
+    )])))
 }
 
 /// Wallet recovery: move everything `lost` holds of `asset` — balance
@@ -509,14 +606,22 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
 ) -> Result<(AssetBalanceUpdates, HolderStateUpdates), RwaError> {
     check_party(view, asset, replacement)?;
     let lost_balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: lost })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: lost,
+        })?
         .unwrap_or(0);
     let replacement_balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: replacement })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: replacement,
+        })?
         .unwrap_or(0);
     let lost_state = holder_state(view, asset, lost)?;
     let mut replacement_state = holder_state(view, asset, replacement)?;
-    replacement_state.frozen_amount = replacement_state.frozen_amount.saturating_add(lost_state.frozen_amount);
+    replacement_state.frozen_amount = replacement_state
+        .frozen_amount
+        .saturating_add(lost_state.frozen_amount);
     // The address freeze travels too: recovery moves a holder,
     // it doesn't launder a frozen one.
     replacement_state.frozen |= lost_state.frozen;
@@ -524,7 +629,10 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
     Ok((
         AssetBalanceUpdates(BTreeMap::from([
             ((id.clone(), lost.clone()), 0),
-            ((id.clone(), replacement.clone()), replacement_balance.saturating_add(lost_balance)),
+            (
+                (id.clone(), replacement.clone()),
+                replacement_balance.saturating_add(lost_balance),
+            ),
         ])),
         HolderStateUpdates(BTreeMap::from([
             ((id.clone(), lost.clone()), HolderState::default()),
@@ -554,7 +662,10 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     amount: u128,
 ) -> Result<AssetBalanceUpdates, RwaError> {
     let from_balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: from })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: from,
+        })?
         .unwrap_or(0);
     if from_balance < amount {
         return Err(RwaError::InsufficientBalance {
@@ -573,12 +684,21 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     }
 
     let to_balance = view
-        .get(&AssetBalanceKey { asset: &asset.asset_ref, owner: to })?
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner: to,
+        })?
         .unwrap_or(0);
 
     Ok(AssetBalanceUpdates(BTreeMap::from([
-        ((asset.asset_ref.clone(), from.clone()), from_balance - amount),
-        ((asset.asset_ref.clone(), to.clone()), credit(&asset.asset_ref, to_balance, amount)?),
+        (
+            (asset.asset_ref.clone(), from.clone()),
+            from_balance - amount,
+        ),
+        (
+            (asset.asset_ref.clone(), to.clone()),
+            credit(&asset.asset_ref, to_balance, amount)?,
+        ),
     ])))
 }
 
@@ -621,23 +741,41 @@ mod tests {
         let db = temp_db();
         let holder = addr(2);
         let mut asset = Asset::new("bond", addr(1), false);
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::Eligible
+        );
 
         asset.frozen = true;
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::AssetFrozen);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::AssetFrozen
+        );
         asset.frozen = false;
         db.write_batch(&HolderStateUpdates(BTreeMap::from([(
             (asset.asset_ref.clone(), holder.clone()),
-            HolderState { frozen: true, frozen_amount: 10 },
+            HolderState {
+                frozen: true,
+                frozen_amount: 10,
+            },
         )])))
         .unwrap();
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::HolderFrozen);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::HolderFrozen
+        );
         db.write_batch(&HolderStateUpdates(BTreeMap::from([(
             (asset.asset_ref.clone(), holder.clone()),
-            HolderState { frozen: false, frozen_amount: 10 },
+            HolderState {
+                frozen: false,
+                frozen_amount: 10,
+            },
         )])))
         .unwrap();
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::NoTransferableBalance);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::NoTransferableBalance
+        );
 
         db.write_batch(&HolderStateUpdates(BTreeMap::from([(
             (asset.asset_ref.clone(), holder.clone()),
@@ -645,7 +783,10 @@ mod tests {
         )])))
         .unwrap();
         asset.compliance_required = true;
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingAttestation);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::MissingAttestation
+        );
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             holder.clone(),
             AccountEntry {
@@ -655,19 +796,37 @@ mod tests {
             },
         )])))
         .unwrap();
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingAttestation);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::MissingAttestation
+        );
 
         attest(&db, &holder, &[], None);
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::Eligible
+        );
         asset.required_claims = vec![ClaimTopic::Kyc];
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::MissingRequiredClaim);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::MissingRequiredClaim
+        );
         attest(&db, &holder, &[ClaimTopic::Kyc], None);
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::Eligible
+        );
 
         asset.allowed_jurisdictions = Some(Vec::new());
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::JurisdictionNotAllowed);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::JurisdictionNotAllowed
+        );
         asset.allowed_jurisdictions = None;
-        assert_eq!(transfer_eligibility(&db, &asset, &holder, 10).unwrap(), TransferEligibility::Eligible);
+        assert_eq!(
+            transfer_eligibility(&db, &asset, &holder, 10).unwrap(),
+            TransferEligibility::Eligible
+        );
     }
 
     #[test]
@@ -693,7 +852,10 @@ mod tests {
         }
 
         let err = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 1).unwrap_err();
-        assert!(matches!(&err, RwaError::NotCompliant { address } if address == &issuer), "got: {err}");
+        assert!(
+            matches!(&err, RwaError::NotCompliant { address } if address == &issuer),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -705,17 +867,32 @@ mod tests {
         let (_, assets) = apply_compliant_transfer(&db, &asset, &issuer, 1, &holder, 40).unwrap();
         db.write_batch(&assets).unwrap();
 
-        db.write_batch(&apply_set_holder_frozen(&db, &asset, &holder, true).unwrap()).unwrap();
+        db.write_batch(&apply_set_holder_frozen(&db, &asset, &holder, true).unwrap())
+            .unwrap();
         let err = apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 10).unwrap_err();
-        assert!(matches!(err, RwaError::HolderFrozen { .. }), "frozen holder cannot send: {err}");
+        assert!(
+            matches!(err, RwaError::HolderFrozen { .. }),
+            "frozen holder cannot send: {err}"
+        );
         let err = apply_compliant_transfer(&db, &asset, &issuer, 2, &holder, 10).unwrap_err();
-        assert!(matches!(err, RwaError::HolderFrozen { .. }), "frozen holder cannot receive: {err}");
+        assert!(
+            matches!(err, RwaError::HolderFrozen { .. }),
+            "frozen holder cannot receive: {err}"
+        );
 
         let assets = apply_forced_transfer(&db, &asset, &holder, &issuer, 40).unwrap();
-        assert_eq!(assets.0[&(asset.asset_ref.clone(), holder.clone())], 0, "forced transfer ignores the freeze");
+        assert_eq!(
+            assets.0[&(asset.asset_ref.clone(), holder.clone())],
+            0,
+            "forced transfer ignores the freeze"
+        );
 
-        db.write_batch(&apply_set_holder_frozen(&db, &asset, &holder, false).unwrap()).unwrap();
-        assert!(apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 10).is_ok(), "unfrozen holder sends again");
+        db.write_batch(&apply_set_holder_frozen(&db, &asset, &holder, false).unwrap())
+            .unwrap();
+        assert!(
+            apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 10).is_ok(),
+            "unfrozen holder sends again"
+        );
     }
 
     #[test]
@@ -729,16 +906,27 @@ mod tests {
 
         let err = apply_lock_amount(&db, &asset, &holder, 60, true).unwrap_err();
         assert!(matches!(err, RwaError::LockExceedsBalance { .. }), "{err}");
-        db.write_batch(&apply_lock_amount(&db, &asset, &holder, 30, true).unwrap()).unwrap();
+        db.write_batch(&apply_lock_amount(&db, &asset, &holder, 30, true).unwrap())
+            .unwrap();
 
         let err = apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 25).unwrap_err();
-        assert!(matches!(err, RwaError::AmountLocked { available: 20, .. }), "{err}");
-        assert!(apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 20).is_ok(), "the unlocked 20 spend");
+        assert!(
+            matches!(err, RwaError::AmountLocked { available: 20, .. }),
+            "{err}"
+        );
+        assert!(
+            apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 20).is_ok(),
+            "the unlocked 20 spend"
+        );
 
         let err = apply_lock_amount(&db, &asset, &holder, 31, false).unwrap_err();
         assert!(matches!(err, RwaError::UnlockExceedsLocked { .. }), "{err}");
-        db.write_batch(&apply_lock_amount(&db, &asset, &holder, 30, false).unwrap()).unwrap();
-        assert!(apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 50).is_ok(), "everything spendable again");
+        db.write_batch(&apply_lock_amount(&db, &asset, &holder, 30, false).unwrap())
+            .unwrap();
+        assert!(
+            apply_compliant_transfer(&db, &asset, &holder, 0, &issuer, 50).is_ok(),
+            "everything spendable again"
+        );
     }
 
     #[test]
@@ -754,7 +942,10 @@ mod tests {
         assert!(matches!(err, RwaError::NotCompliant { .. }), "{err}");
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             investor.clone(),
-            AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() },
+            AccountEntry {
+                identity_hash: Some("kyc".into()),
+                ..Default::default()
+            },
         )])))
         .unwrap();
         let assets = apply_issue_to(&db, &mut asset, &investor, 40).unwrap();
@@ -798,7 +989,17 @@ mod tests {
         // Corrupt supply (below the issuer's own balance) is refused, not clamped to 0.
         asset.total_supply = 10;
         let err = apply_burn(&db, &mut asset, &issuer, 20).unwrap_err();
-        assert!(matches!(err, RwaError::BurnExceedsSupply { total_supply: 10, amount: 20, .. }), "{err}");
+        assert!(
+            matches!(
+                err,
+                RwaError::BurnExceedsSupply {
+                    total_supply: 10,
+                    amount: 20,
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(asset.total_supply, 10);
     }
 
@@ -810,8 +1011,20 @@ mod tests {
         let replacement = addr(3);
         let mut asset = Asset::new("gold", issuer.clone(), true);
         db.write_batch(&AccountUpdates(BTreeMap::from([
-            (issuer.clone(), AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() }),
-            (lost.clone(), AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() }),
+            (
+                issuer.clone(),
+                AccountEntry {
+                    identity_hash: Some("kyc".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                lost.clone(),
+                AccountEntry {
+                    identity_hash: Some("kyc".into()),
+                    ..Default::default()
+                },
+            ),
         ])))
         .unwrap();
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
@@ -819,7 +1032,8 @@ mod tests {
         db.write_batch(&assets).unwrap();
         let (_, assets) = apply_compliant_transfer(&db, &asset, &issuer, 1, &lost, 60).unwrap();
         db.write_batch(&assets).unwrap();
-        db.write_batch(&apply_lock_amount(&db, &asset, &lost, 15, true).unwrap()).unwrap();
+        db.write_batch(&apply_lock_amount(&db, &asset, &lost, 15, true).unwrap())
+            .unwrap();
 
         // Replacement is not attested: recovery must not become a KYC bypass.
         let err = apply_recover(&db, &asset, &lost, &replacement).unwrap_err();
@@ -827,20 +1041,37 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             replacement.clone(),
-            AccountEntry { identity_hash: Some("kyc".into()), ..Default::default() },
+            AccountEntry {
+                identity_hash: Some("kyc".into()),
+                ..Default::default()
+            },
         )])))
         .unwrap();
         let (assets, states) = apply_recover(&db, &asset, &lost, &replacement).unwrap();
         assert_eq!(assets.0[&(asset.asset_ref.clone(), lost.clone())], 0);
-        assert_eq!(assets.0[&(asset.asset_ref.clone(), replacement.clone())], 60);
-        assert_eq!(states.0[&(asset.asset_ref.clone(), replacement.clone())].frozen_amount, 15, "the lock travels with the balance");
+        assert_eq!(
+            assets.0[&(asset.asset_ref.clone(), replacement.clone())],
+            60
+        );
+        assert_eq!(
+            states.0[&(asset.asset_ref.clone(), replacement.clone())].frozen_amount,
+            15,
+            "the lock travels with the balance"
+        );
         assert!(!states.0[&(asset.asset_ref.clone(), replacement.clone())].frozen);
-        assert_eq!(states.0[&(asset.asset_ref.clone(), lost.clone())], HolderState::default());
+        assert_eq!(
+            states.0[&(asset.asset_ref.clone(), lost.clone())],
+            HolderState::default()
+        );
 
         // A frozen lost wallet recovers into a frozen replacement.
-        db.write_batch(&apply_set_holder_frozen(&db, &asset, &lost, true).unwrap()).unwrap();
+        db.write_batch(&apply_set_holder_frozen(&db, &asset, &lost, true).unwrap())
+            .unwrap();
         let (_, states) = apply_recover(&db, &asset, &lost, &replacement).unwrap();
-        assert!(states.0[&(asset.asset_ref.clone(), replacement.clone())].frozen, "the address freeze travels too");
+        assert!(
+            states.0[&(asset.asset_ref.clone(), replacement.clone())].frozen,
+            "the address freeze travels too"
+        );
     }
 
     #[test]
@@ -852,10 +1083,16 @@ mod tests {
 
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 1000).unwrap();
         assert_eq!(assets.0[&(asset.asset_ref.clone(), issuer.clone())], 1000);
-        assert_eq!(accounts.0[&issuer].balance, 0, "issue must not touch the native balance");
+        assert_eq!(
+            accounts.0[&issuer].balance, 0,
+            "issue must not touch the native balance"
+        );
         assert_eq!(accounts.0[&issuer].nonce, 1);
 
-        assert_eq!(asset.total_supply, 1000, "issuance tracks cumulative supply");
+        assert_eq!(
+            asset.total_supply, 1000,
+            "issuance tracks cumulative supply"
+        );
 
         let err = apply_issue(&db, &mut asset, &other, 0, 1000).unwrap_err();
         assert!(matches!(err, RwaError::NotIssuer { .. }));
@@ -870,7 +1107,10 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             issuer.clone(),
-            AccountEntry { identity_hash: Some("kyc-issuer".into()), ..Default::default() },
+            AccountEntry {
+                identity_hash: Some("kyc-issuer".into()),
+                ..Default::default()
+            },
         )])))
         .unwrap();
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
@@ -884,10 +1124,14 @@ mod tests {
         // Attestor grants recipient an attestation — now it succeeds.
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             recipient.clone(),
-            AccountEntry { identity_hash: Some("kyc-recipient".into()), ..Default::default() },
+            AccountEntry {
+                identity_hash: Some("kyc-recipient".into()),
+                ..Default::default()
+            },
         )])))
         .unwrap();
-        let (accounts, assets) = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 40).unwrap();
+        let (accounts, assets) =
+            apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 40).unwrap();
         assert_eq!(assets.0[&(asset.asset_ref.clone(), recipient.clone())], 40);
         assert_eq!(assets.0[&(asset.asset_ref.clone(), issuer.clone())], 60);
         assert_eq!(accounts.0[&issuer].nonce, 2);
@@ -910,10 +1154,20 @@ mod tests {
         // One more unit is over.
         let err = apply_issue(&db, &mut asset, &issuer, 0, 1).unwrap_err();
         assert!(
-            matches!(&err, RwaError::SupplyCapExceeded { cap: 100, resulting: 101, .. }),
+            matches!(
+                &err,
+                RwaError::SupplyCapExceeded {
+                    cap: 100,
+                    resulting: 101,
+                    ..
+                }
+            ),
             "got: {err}"
         );
-        assert_eq!(asset.total_supply, 100, "a rejected issue must not move the counter");
+        assert_eq!(
+            asset.total_supply, 100,
+            "a rejected issue must not move the counter"
+        );
     }
 
     #[test]
@@ -946,12 +1200,17 @@ mod tests {
         asset.frozen = true;
         // Un-KYC'd recipient *and* a wrong nonce *and* an over-balance amount:
         // still reports the freeze.
-        let err = apply_compliant_transfer(&db, &asset, &issuer, 99, &recipient, 10_000).unwrap_err();
+        let err =
+            apply_compliant_transfer(&db, &asset, &issuer, 99, &recipient, 10_000).unwrap_err();
         assert!(matches!(err, RwaError::AssetFrozen { .. }), "got: {err}");
 
         asset.frozen = false;
-        let err = apply_compliant_transfer(&db, &asset, &issuer, 99, &recipient, 10_000).unwrap_err();
-        assert!(!matches!(err, RwaError::AssetFrozen { .. }), "unfrozen, so some other check should trip");
+        let err =
+            apply_compliant_transfer(&db, &asset, &issuer, 99, &recipient, 10_000).unwrap_err();
+        assert!(
+            !matches!(err, RwaError::AssetFrozen { .. }),
+            "unfrozen, so some other check should trip"
+        );
     }
 
     /// Issuance is deliberately still allowed while frozen — a freeze stops
@@ -991,7 +1250,12 @@ mod tests {
         let mut asset = Asset::new("bond", issuer.clone(), true);
         asset.required_claims = vec![ClaimTopic::Kyc, ClaimTopic::Accredited];
 
-        attest(&db, &issuer, &[ClaimTopic::Kyc, ClaimTopic::Accredited], None);
+        attest(
+            &db,
+            &issuer,
+            &[ClaimTopic::Kyc, ClaimTopic::Accredited],
+            None,
+        );
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
@@ -1004,7 +1268,12 @@ mod tests {
             "got: {err}"
         );
 
-        attest(&db, &recipient, &[ClaimTopic::Kyc, ClaimTopic::Accredited], None);
+        attest(
+            &db,
+            &recipient,
+            &[ClaimTopic::Kyc, ClaimTopic::Accredited],
+            None,
+        );
         apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 10)
             .expect("both parties now hold every required claim");
     }
@@ -1023,12 +1292,22 @@ mod tests {
         asset.required_claims = vec![ClaimTopic::Kyc, ClaimTopic::Accredited];
         asset.allowed_jurisdictions = Some(vec!["CH".into()]);
 
-        attest(&db, &issuer, &[ClaimTopic::Kyc, ClaimTopic::Accredited], Some("CH"));
+        attest(
+            &db,
+            &issuer,
+            &[ClaimTopic::Kyc, ClaimTopic::Accredited],
+            Some("CH"),
+        );
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
 
-        attest(&db, &seized_from, &[ClaimTopic::Kyc, ClaimTopic::Accredited], Some("CH"));
+        attest(
+            &db,
+            &seized_from,
+            &[ClaimTopic::Kyc, ClaimTopic::Accredited],
+            Some("CH"),
+        );
         let (accounts, assets) =
             apply_compliant_transfer(&db, &asset, &issuer, 1, &seized_from, 60).unwrap();
         db.write_batch(&accounts).unwrap();
@@ -1037,7 +1316,8 @@ mod tests {
         // Freeze the asset and leave the receiver with no attestation at all:
         // a compliant transfer has two independent reasons to refuse here.
         asset.frozen = true;
-        let err = apply_compliant_transfer(&db, &asset, &seized_from, 1, &receiver, 60).unwrap_err();
+        let err =
+            apply_compliant_transfer(&db, &asset, &seized_from, 1, &receiver, 60).unwrap_err();
         assert!(matches!(err, RwaError::AssetFrozen { .. }), "got: {err}");
 
         let moved = apply_forced_transfer(&db, &asset, &seized_from, &receiver, 60).unwrap();
@@ -1048,7 +1328,14 @@ mod tests {
         // more than the holder has would be minting by another name.
         let err = apply_forced_transfer(&db, &asset, &seized_from, &receiver, 61).unwrap_err();
         assert!(
-            matches!(err, RwaError::InsufficientBalance { balance: 60, amount: 61, .. }),
+            matches!(
+                err,
+                RwaError::InsufficientBalance {
+                    balance: 60,
+                    amount: 61,
+                    ..
+                }
+            ),
             "got: {err}"
         );
     }
@@ -1070,7 +1357,10 @@ mod tests {
 
         db.write_batch(&AccountUpdates(BTreeMap::from([(
             recipient.clone(),
-            AccountEntry { claims: vec![ClaimTopic::Kyc], ..Default::default() },
+            AccountEntry {
+                claims: vec![ClaimTopic::Kyc],
+                ..Default::default()
+            },
         )])))
         .unwrap();
         let err = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 10).unwrap_err();
@@ -1150,7 +1440,10 @@ mod tests {
 
         asset.allowed_jurisdictions = Some(Vec::new());
         let err = apply_compliant_transfer(&db, &asset, &issuer, 1, &addr(2), 10).unwrap_err();
-        assert!(matches!(err, RwaError::JurisdictionNotAllowed { .. }), "got: {err}");
+        assert!(
+            matches!(err, RwaError::JurisdictionNotAllowed { .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1164,7 +1457,8 @@ mod tests {
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
 
-        let (_, assets) = apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 10).unwrap();
+        let (_, assets) =
+            apply_compliant_transfer(&db, &asset, &issuer, 1, &recipient, 10).unwrap();
         assert_eq!(assets.0[&(asset.asset_ref.clone(), recipient)], 10);
     }
 }

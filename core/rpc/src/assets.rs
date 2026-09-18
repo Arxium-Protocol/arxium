@@ -39,7 +39,12 @@ pub(super) async fn get_asset_holders<P: Payload>(
     for address in holders {
         let balance = state.db.get_asset_balance(&asset_ref, &address)?;
         let holder_state = state.db.get_holder_state(&asset_ref, &address)?;
-        rows.push(AssetHolderRow { address, balance, frozen: holder_state.frozen, frozen_amount: holder_state.frozen_amount });
+        rows.push(AssetHolderRow {
+            address,
+            balance,
+            frozen: holder_state.frozen,
+            frozen_amount: holder_state.frozen_amount,
+        });
     }
     Ok(Json(rows))
 }
@@ -60,7 +65,12 @@ pub(super) struct AssetResponse {
 pub(super) fn asset_response(db: &ArxiumDb, asset: Asset) -> Result<AssetResponse, StorageError> {
     let holders = db.get_asset_holders(&asset.asset_ref)?.len();
     let issuer_attested = issuer_attested(db, &asset.issuer)?;
-    Ok(AssetResponse { asset_ref: asset.asset_ref.clone(), asset, issuer_attested, holders })
+    Ok(AssetResponse {
+        asset_ref: asset.asset_ref.clone(),
+        asset,
+        issuer_attested,
+        holders,
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -109,10 +119,14 @@ pub(super) async fn get_asset_alias<P: Payload>(
     Path((issuer, asset_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
     let issuer = parse_address(&issuer)?;
-    let asset_ref =
-        AssetRef::derive(&issuer, &asset_id).map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let asset_ref = AssetRef::derive(&issuer, &asset_id)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     match state.db.get_asset(&asset_ref)? {
         Some(asset) => Ok(Json(asset_response(&state.db, asset)?).into_response()),
-        None => Ok((StatusCode::NOT_FOUND, Json(serde_json::json!({ "ref": asset_ref }))).into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ref": asset_ref })),
+        )
+            .into_response()),
     }
 }

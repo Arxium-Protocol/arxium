@@ -116,14 +116,19 @@ mod tests {
     }
 
     fn page(entries: &[(u64, u8)]) -> Vec<(u64, Hash32)> {
-        entries.iter().map(|(height, byte)| (*height, h(*byte))).collect()
+        entries
+            .iter()
+            .map(|(height, byte)| (*height, h(*byte)))
+            .collect()
     }
 
     #[test]
     fn agreement_everywhere_is_not_a_divergence() {
         let remote = page(&[(10, 0xaa), (11, 0xbb), (12, 0xcc)]);
         assert_eq!(
-            first_divergent_height(&remote, |height| Some(h([0xaa, 0xbb, 0xcc][height as usize - 10]))),
+            first_divergent_height(&remote, |height| Some(h(
+                [0xaa, 0xbb, 0xcc][height as usize - 10]
+            ))),
             None
         );
     }

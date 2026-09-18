@@ -1,9 +1,12 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions, WriteBatch};
-use serde::{Deserialize, Serialize};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, DB, Direction, IteratorMode, Options as RocksOptions,
+    WriteBatch,
+};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
@@ -11,20 +14,22 @@ use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
-    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, AssetIndexKey, AssetKey,
-    AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey, EvidenceMarkerKey, GenesisHashKey, AdminKey, AdminRole, KeySpec,
-    KvRead, OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorSetKey, ValidatorStatusKey,
-    ChainParamsKey,
+    AccountAssetsKey, AccountKey, AdminKey, AdminRole, AssetBalanceKey, AssetHolderStateKey,
+    AssetHoldersKey, AssetIndexKey, AssetKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey,
+    ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KeySpec, KvRead, OperatorIndexKey,
+    OperatorKey, StakeByValidatorKey, StakeKey, ValidatorSetKey, ValidatorStatusKey,
 };
 use xc_circuit::{
-    CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
-};
-use xc_primitives::{
-    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, Hash32,
-    HolderState, Snapshot, StakeAllocation, ValidatorStatus, VotingPower,
+    CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META,
+    CF_VALIDATORS,
 };
 #[cfg(test)]
 use xc_primitives::Action;
+use xc_primitives::{
+    AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, Hash32,
+    HolderState, Snapshot, StakeAllocation, ValidatorStatus, VotingPower, assign_voting_power,
+    stake_subaccount,
+};
 
 /// Cap shared by range/history reads, so an explorer client can't force a
 /// full-chain scan in one request.
@@ -91,7 +96,9 @@ pub enum StorageError {
     /// `arxd/genesis` started writing it). Every BLS signing-bytes function
     /// binds the genesis hash, so without it nothing can be signed or
     /// verified — fail closed rather than sign for an unknown chain.
-    #[error("this chain has no seeded genesis hash (meta:genesis_hash) — re-initialize from the chain spec")]
+    #[error(
+        "this chain has no seeded genesis hash (meta:genesis_hash) — re-initialize from the chain spec"
+    )]
     MissingGenesisHash,
 
     /// Not produced by `ArxiumDb` itself — this is the sentinel a
@@ -108,10 +115,14 @@ pub enum StorageError {
     /// can be: a node may never rewrite history the network has certified
     /// contiguously. Reaching this means the divergence is below the
     /// watermark, which is a fault in *this* node — see `revert_to`.
-    #[error("refusing to revert to height {height}: below the contiguous finalized watermark {watermark}")]
+    #[error(
+        "refusing to revert to height {height}: below the contiguous finalized watermark {watermark}"
+    )]
     RevertBelowWatermark { height: u64, watermark: u64 },
 
-    #[error("cannot revert through height {0}: no undo record (pre-v6 block, or one written outside write_block_batches)")]
+    #[error(
+        "cannot revert through height {0}: no undo record (pre-v6 block, or one written outside write_block_batches)"
+    )]
     MissingUndoRecord(u64),
 
     #[error("cannot revert to height {0}: no block stored at that height")]
@@ -121,8 +132,14 @@ pub enum StorageError {
     /// unwinding to `height`, the restored root must equal what the stored
     /// header at that height committed to. A mismatch means the undo log and
     /// the chain disagree, so the revert is abandoned rather than half-applied.
-    #[error("revert to height {height} produced state root {actual}, but the stored header commits to {expected}")]
-    RevertRootMismatch { height: u64, expected: String, actual: String },
+    #[error(
+        "revert to height {height} produced state root {actual}, but the stored header commits to {expected}"
+    )]
+    RevertRootMismatch {
+        height: u64,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Content-addressed Merkle-trie nodes (`B3`) — keyed by node hash, so a
@@ -131,7 +148,14 @@ pub enum StorageError {
 const CF_MERKLE: &str = "merkle";
 
 const COLUMN_FAMILIES: [&str; 9] = [
-    CF_META, CF_BLOCKS, CF_ACCOUNTS, CF_VALIDATORS, CF_MERKLE, CF_ASSETS, CF_ATTESTORS, CF_EVIDENCE,
+    CF_META,
+    CF_BLOCKS,
+    CF_ACCOUNTS,
+    CF_VALIDATORS,
+    CF_MERKLE,
+    CF_ASSETS,
+    CF_ATTESTORS,
+    CF_EVIDENCE,
     CF_GOVERNANCE,
 ];
 
@@ -286,7 +310,10 @@ fn note_write(
     let Some(digits) = key.strip_prefix(b"meta:finality:".as_slice()) else {
         return;
     };
-    let Some(height) = std::str::from_utf8(digits).ok().and_then(|d| d.parse::<u64>().ok()) else {
+    let Some(height) = std::str::from_utf8(digits)
+        .ok()
+        .and_then(|d| d.parse::<u64>().ok())
+    else {
         return;
     };
     // Decoded here rather than re-read after the write, because the watermark
@@ -295,9 +322,10 @@ fn note_write(
         && let Ok((record, _len)) = bincode::serde::decode_from_slice::<FinalityRecord, _>(
             value,
             bincode::config::standard(),
-        ) {
-            certified.insert(height, record.block_hash);
-        }
+        )
+    {
+        certified.insert(height, record.block_hash);
+    }
 }
 
 /// Prior on-disk values for every key one block's write batch touched —
@@ -326,7 +354,9 @@ pub fn is_state_key(key: &[u8]) -> bool {
 fn decode_root(root: &str) -> Result<[u8; 32], StorageError> {
     let hex_part = root.strip_prefix("0x").unwrap_or(root);
     let bytes = hex::decode(hex_part).map_err(|_| StorageError::InvalidRoot(root.to_string()))?;
-    bytes.try_into().map_err(|_| StorageError::InvalidRoot(root.to_string()))
+    bytes
+        .try_into()
+        .map_err(|_| StorageError::InvalidRoot(root.to_string()))
 }
 
 // The trie's hash functions, default-subtree table, and proof
@@ -357,11 +387,17 @@ use xc_poe::state_trie::{
 pub fn cf_for_key(key: &[u8]) -> &'static str {
     if key.starts_with(b"account:") {
         CF_ACCOUNTS
-    } else if key.starts_with(b"block:") || key.starts_with(b"block_hash:") || key.starts_with(b"action:") {
+    } else if key.starts_with(b"block:")
+        || key.starts_with(b"block_hash:")
+        || key.starts_with(b"action:")
+    {
         CF_BLOCKS
     } else if key.starts_with(b"validator") || key.starts_with(b"stake") {
         CF_VALIDATORS
-    } else if key.starts_with(b"asset_balance:") || key.starts_with(b"asset_record:") || key.starts_with(b"asset_holder:") {
+    } else if key.starts_with(b"asset_balance:")
+        || key.starts_with(b"asset_record:")
+        || key.starts_with(b"asset_holder:")
+    {
         CF_ASSETS
     } else if key.starts_with(b"attestor_record:") {
         CF_ATTESTORS
@@ -434,18 +470,28 @@ impl ArxiumDb {
         let meta = self.cf(CF_META);
         match self.db.get_cf(meta, SCHEMA_VERSION_KEY)? {
             None => {
-                self.db.put_cf(meta, SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes())?;
+                self.db
+                    .put_cf(meta, SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes())?;
                 Ok(())
             }
             Some(bytes) => {
-                let arr: [u8; 4] = bytes.as_slice().try_into().map_err(|_| StorageError::CorruptedMeta)?;
+                let arr: [u8; 4] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StorageError::CorruptedMeta)?;
                 let found = u32::from_le_bytes(arr);
                 if found == SCHEMA_VERSION {
                     Ok(())
                 } else if found > SCHEMA_VERSION {
-                    Err(StorageError::SchemaTooNew { found, supported: SCHEMA_VERSION })
+                    Err(StorageError::SchemaTooNew {
+                        found,
+                        supported: SCHEMA_VERSION,
+                    })
                 } else {
-                    Err(StorageError::SchemaTooOld { found, supported: SCHEMA_VERSION })
+                    Err(StorageError::SchemaTooOld {
+                        found,
+                        supported: SCHEMA_VERSION,
+                    })
                 }
             }
         }
@@ -454,7 +500,9 @@ impl ArxiumDb {
     /// Column family handle for `name` — always present since `open` creates
     /// all of `COLUMN_FAMILIES` up front.
     fn cf(&self, name: &str) -> &ColumnFamily {
-        self.db.cf_handle(name).expect("column family created in ArxiumDb::open")
+        self.db
+            .cf_handle(name)
+            .expect("column family created in ArxiumDb::open")
     }
 
     /// Writes a consistent, point-in-time copy of the whole database to
@@ -493,7 +541,9 @@ impl ArxiumDb {
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, StorageError> {
-        self.db.get_cf(self.cf(cf_for_key(key)), key).map_err(StorageError::Rocks)
+        self.db
+            .get_cf(self.cf(cf_for_key(key)), key)
+            .map_err(StorageError::Rocks)
     }
 }
 
@@ -545,8 +595,14 @@ impl ArxiumDb {
     /// already been slashed — replay protection for
     /// `ActionPayload::SubmitEquivocationEvidence`, since the same pair of
     /// conflicting blocks could otherwise be resubmitted for a repeat slash.
-    pub fn evidence_processed(&self, height: u64, proposer: &Address) -> Result<bool, StorageError> {
-        Ok(self.get(&EvidenceMarkerKey { height, proposer }.encode())?.is_some())
+    pub fn evidence_processed(
+        &self,
+        height: u64,
+        proposer: &Address,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .get(&EvidenceMarkerKey { height, proposer }.encode())?
+            .is_some())
     }
 
     /// A validator's *currently* registered BLS pubkey, if any — set via
@@ -569,12 +625,17 @@ impl ArxiumDb {
     /// round eligibility itself, reintroduced through the key lookup instead
     /// of the round lookup. A syncing node replaying an old height must
     /// reach the same verdict as the node that originally verified it live.
-    pub fn get_bls_pubkey_at(&self, address: &Address, height: u64) -> Result<Option<BlsPublicKey>, StorageError> {
+    pub fn get_bls_pubkey_at(
+        &self,
+        address: &Address,
+        height: u64,
+    ) -> Result<Option<BlsPublicKey>, StorageError> {
         let prefix = format!("meta:blskey_hist:{address}:").into_bytes();
         let seek_key = format!("meta:blskey_hist:{address}:{height:020}").into_bytes();
-        let mut iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(&seek_key, Direction::Reverse));
+        let mut iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(&seek_key, Direction::Reverse),
+        );
         // Only the first item can match: the reverse seek lands on the newest
         // entry at or below `height`, and anything past it belongs to another
         // address.
@@ -608,12 +669,18 @@ impl ArxiumDb {
         KvRead::get(self, &OperatorKey(validator))
     }
 
-    pub fn get_validator_status(&self, validator: &Address) -> Result<Option<ValidatorStatus>, StorageError> {
+    pub fn get_validator_status(
+        &self,
+        validator: &Address,
+    ) -> Result<Option<ValidatorStatus>, StorageError> {
         KvRead::get(self, &ValidatorStatusKey(validator))
     }
 
     /// One attestor's registry record, if `attestor` is currently registered.
-    pub fn get_attestor_record(&self, attestor: &Address) -> Result<Option<AttestorRecord>, StorageError> {
+    pub fn get_attestor_record(
+        &self,
+        attestor: &Address,
+    ) -> Result<Option<AttestorRecord>, StorageError> {
         KvRead::get(self, &AttestorRecordKey(attestor))
     }
 
@@ -624,14 +691,18 @@ impl ArxiumDb {
     pub fn list_attestors(&self) -> Result<Vec<(Address, AttestorRecord)>, StorageError> {
         let config = bincode::config::standard();
         let mut attestors = Vec::new();
-        for item in self.db.iterator_cf(self.cf(CF_ATTESTORS), IteratorMode::Start) {
+        for item in self
+            .db
+            .iterator_cf(self.cf(CF_ATTESTORS), IteratorMode::Start)
+        {
             let (key, value) = item?;
             let key_str = std::str::from_utf8(&key).map_err(|_| StorageError::CorruptedMeta)?;
             let address_str = key_str
                 .strip_prefix("attestor_record:")
                 .ok_or(StorageError::CorruptedMeta)?;
             let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
-            let (record, _): (AttestorRecord, _) = bincode::serde::decode_from_slice(&value, config)?;
+            let (record, _): (AttestorRecord, _) =
+                bincode::serde::decode_from_slice(&value, config)?;
             attestors.push((address, record));
         }
         Ok(attestors)
@@ -644,7 +715,11 @@ impl ArxiumDb {
     }
 
     /// `owner`'s balance of `asset`, defaulting to 0 if never minted.
-    pub fn get_asset_balance(&self, asset: &AssetRef, owner: &Address) -> Result<u128, StorageError> {
+    pub fn get_asset_balance(
+        &self,
+        asset: &AssetRef,
+        owner: &Address,
+    ) -> Result<u128, StorageError> {
         Ok(KvRead::get(self, &AssetBalanceKey { asset, owner })?.unwrap_or(0))
     }
 
@@ -691,20 +766,25 @@ impl ArxiumDb {
         let started = std::time::Instant::now();
         let mut rows = 0u64;
         let mut holders = Vec::new();
-        let iter = self.db.iterator_cf(self.cf(CF_ASSETS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_ASSETS),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
             rows += 1;
-            let balance: u128 = bincode::serde::decode_from_slice(&value, bincode::config::standard())
-                .map(|(v, _)| v)
-                .map_err(|_| StorageError::CorruptedMeta)?;
+            let balance: u128 =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())
+                    .map(|(v, _)| v)
+                    .map_err(|_| StorageError::CorruptedMeta)?;
             if balance == 0 {
                 continue;
             }
-            let owner = std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
+            let owner = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|_| StorageError::CorruptedMeta)?;
             if let Ok(address) = Address::parse(owner) {
                 holders.push(address);
             }
@@ -713,7 +793,11 @@ impl ArxiumDb {
         Ok(holders)
     }
 
-    pub fn get_holder_state(&self, asset: &AssetRef, holder: &Address) -> Result<HolderState, StorageError> {
+    pub fn get_holder_state(
+        &self,
+        asset: &AssetRef,
+        holder: &Address,
+    ) -> Result<HolderState, StorageError> {
         Ok(KvRead::get(self, &AssetHolderStateKey { asset, holder })?.unwrap_or_default())
     }
 
@@ -776,7 +860,9 @@ impl ArxiumDb {
                 let listed = holders.iter().position(|h| h == owner);
                 match (listed, balance > 0) {
                     (None, true) => holders.push(owner.clone()),
-                    (Some(i), false) => { holders.remove(i); }
+                    (Some(i), false) => {
+                        holders.remove(i);
+                    }
                     _ => {}
                 }
             }
@@ -790,7 +876,10 @@ impl ArxiumDb {
 
     /// Every validator address currently authorizing `operator` to act for
     /// them — drives a "your validators" listing for a delegated client.
-    pub fn get_validators_for_operator(&self, operator: &Address) -> Result<Vec<Address>, StorageError> {
+    pub fn get_validators_for_operator(
+        &self,
+        operator: &Address,
+    ) -> Result<Vec<Address>, StorageError> {
         Ok(KvRead::get(self, &OperatorIndexKey(operator))?.unwrap_or_default())
     }
 
@@ -810,7 +899,10 @@ impl ArxiumDb {
         let prefix = format!("meta:roundcert:{height:020}:");
         let started = std::time::Instant::now();
         let mut rows = 0u64;
-        let iter = self.db.iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
         let mut highest_certified: Option<u32> = None;
         for item in iter {
             let (key, _value) = item?;
@@ -818,8 +910,8 @@ impl ArxiumDb {
                 break;
             }
             rows += 1;
-            let round_str =
-                std::str::from_utf8(&key[prefix.len()..]).map_err(|_| StorageError::CorruptedMeta)?;
+            let round_str = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|_| StorageError::CorruptedMeta)?;
             let round: u32 = round_str.parse().map_err(|_| StorageError::CorruptedMeta)?;
             highest_certified = Some(highest_certified.map_or(round, |m| m.max(round)));
         }
@@ -827,12 +919,17 @@ impl ArxiumDb {
         Ok(highest_certified.map_or(0, |m| m + 1))
     }
 
-    pub fn get_round_certificate(&self, height: u64, round: u32) -> Result<Option<RoundCertificate>, StorageError> {
+    pub fn get_round_certificate(
+        &self,
+        height: u64,
+        round: u32,
+    ) -> Result<Option<RoundCertificate>, StorageError> {
         let key = format!("meta:roundcert:{height:020}:{round}");
         match self.get(key.as_bytes())? {
             Some(bytes) => {
                 let config = bincode::config::standard();
-                let (record, _len): (RoundCertificate, usize) = bincode::serde::decode_from_slice(&bytes, config)?;
+                let (record, _len): (RoundCertificate, usize) =
+                    bincode::serde::decode_from_slice(&bytes, config)?;
                 Ok(Some(record))
             }
             None => Ok(None),
@@ -854,9 +951,9 @@ impl ArxiumDb {
     /// Get the chain name recorded at genesis.
     pub fn get_chain_name(&self) -> Result<Option<String>, StorageError> {
         match self.get(b"meta:chain_name")? {
-            Some(bytes) => {
-                String::from_utf8(bytes).map(Some).map_err(|_| StorageError::CorruptedMeta)
-            }
+            Some(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                .map_err(|_| StorageError::CorruptedMeta),
             None => Ok(None),
         }
     }
@@ -930,14 +1027,26 @@ impl ArxiumDb {
                 if is_state_key(&key) {
                     state_changes.insert(hash_key(&key), Some(value.clone()));
                 }
-                note_write(&mut touched, &mut certified, &key, Some(&value), undo_height.is_some());
+                note_write(
+                    &mut touched,
+                    &mut certified,
+                    &key,
+                    Some(&value),
+                    undo_height.is_some(),
+                );
                 batch.put_cf(self.cf(cf_for_key(&key)), key, value);
             }
             for key in item.batch_deletes()? {
                 if is_state_key(&key) {
                     state_changes.insert(hash_key(&key), None);
                 }
-                note_write(&mut touched, &mut certified, &key, None, undo_height.is_some());
+                note_write(
+                    &mut touched,
+                    &mut certified,
+                    &key,
+                    None,
+                    undo_height.is_some(),
+                );
                 batch.delete_cf(self.cf(cf_for_key(&key)), key);
             }
         }
@@ -1012,7 +1121,11 @@ impl ArxiumDb {
         if watermark == start {
             return Ok(());
         }
-        batch.put_cf(self.cf(CF_META), FINAL_WATERMARK_KEY, watermark.to_be_bytes());
+        batch.put_cf(
+            self.cf(CF_META),
+            FINAL_WATERMARK_KEY,
+            watermark.to_be_bytes(),
+        );
         let was_pruned_to = start.saturating_sub(UNDO_RETAIN);
         for height in was_pruned_to + 1..=watermark.saturating_sub(UNDO_RETAIN) {
             batch.delete_cf(self.cf(CF_META), undo_key(height));
@@ -1067,7 +1180,9 @@ impl ArxiumDb {
         if height < watermark {
             return Err(StorageError::RevertBelowWatermark { height, watermark });
         }
-        let target = self.get_block::<P>(height)?.ok_or(StorageError::MissingBlock(height))?;
+        let target = self
+            .get_block::<P>(height)?
+            .ok_or(StorageError::MissingBlock(height))?;
 
         let mut batch = WriteBatch::default();
         // Descending, so the value that survives for any key touched by
@@ -1075,7 +1190,9 @@ impl ArxiumDb {
         // `height`. `restored_root` follows the same rule.
         let mut restored_root: Option<Option<Vec<u8>>> = None;
         for h in (height + 1..=tip).rev() {
-            let bytes = self.get(&undo_key(h))?.ok_or(StorageError::MissingUndoRecord(h))?;
+            let bytes = self
+                .get(&undo_key(h))?
+                .ok_or(StorageError::MissingUndoRecord(h))?;
             let (record, _len): (UndoRecord, usize) =
                 bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
             for (key, prior) in record {
@@ -1097,9 +1214,10 @@ impl ArxiumDb {
             b"meta:roundtimeout:".as_slice(),
         ] {
             let seek = [prefix, format!("{:020}", height + 1).as_bytes()].concat();
-            let iter = self
-                .db
-                .iterator_cf(self.cf(CF_META), IteratorMode::From(&seek, Direction::Forward));
+            let iter = self.db.iterator_cf(
+                self.cf(CF_META),
+                IteratorMode::From(&seek, Direction::Forward),
+            );
             for item in iter {
                 let (key, _value) = item?;
                 if !key.starts_with(prefix) {
@@ -1189,7 +1307,10 @@ impl ArxiumDb {
     /// `bootstrap` to load a genesis artifact directly instead of replaying
     /// `Snapshot`/BLS-registration/genesis-block construction on every first
     /// boot.
-    pub fn write_raw_entries(&self, entries: &[(String, Vec<u8>, Vec<u8>)]) -> Result<(), StorageError> {
+    pub fn write_raw_entries(
+        &self,
+        entries: &[(String, Vec<u8>, Vec<u8>)],
+    ) -> Result<(), StorageError> {
         let mut batch = WriteBatch::default();
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for (cf_name, key, value) in entries {
@@ -1249,7 +1370,10 @@ impl ArxiumDb {
     /// operator authorizations (`CF_META`) — those aren't balance-bearing
     /// and can be folded in later if a real light-client use case needs them
     /// covered too.
-    pub fn compute_state_root(&self, overlay: &[&dyn BatchWritable]) -> Result<String, StorageError> {
+    pub fn compute_state_root(
+        &self,
+        overlay: &[&dyn BatchWritable],
+    ) -> Result<String, StorageError> {
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         for writable in overlay {
             for (key, value) in writable.batch_entries()? {
@@ -1273,7 +1397,10 @@ impl ArxiumDb {
     /// to open those, but this stays correct either way).
     fn merkle_root(&self) -> Result<[u8; 32], StorageError> {
         match self.db.get_cf(self.cf(CF_META), MERKLE_ROOT_KEY)? {
-            Some(bytes) => bytes.as_slice().try_into().map_err(|_| StorageError::CorruptedMeta),
+            Some(bytes) => bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| StorageError::CorruptedMeta),
             None => Ok(default_hashes()[256]),
         }
     }
@@ -1283,10 +1410,17 @@ impl ArxiumDb {
     /// `CF_MERKLE`. Only ever called for a hash already known not to be a
     /// default/empty-subtree hash, so a miss here means the trie is
     /// corrupted, not merely sparse.
-    fn node_children(&self, hash: &[u8; 32], overrides: &HashMap<[u8; 32], Vec<u8>>) -> Result<([u8; 32], [u8; 32]), StorageError> {
+    fn node_children(
+        &self,
+        hash: &[u8; 32],
+        overrides: &HashMap<[u8; 32], Vec<u8>>,
+    ) -> Result<([u8; 32], [u8; 32]), StorageError> {
         let bytes = match overrides.get(hash) {
             Some(bytes) => bytes.clone(),
-            None => self.db.get_cf(self.cf(CF_MERKLE), hash)?.ok_or(StorageError::CorruptedMeta)?,
+            None => self
+                .db
+                .get_cf(self.cf(CF_MERKLE), hash)?
+                .ok_or(StorageError::CorruptedMeta)?,
         };
         if bytes.len() != 64 {
             return Err(StorageError::CorruptedMeta);
@@ -1328,14 +1462,20 @@ impl ArxiumDb {
         let value = if leaf_node == default_hashes()[0] {
             None
         } else {
-            let content =
-                self.db.get_cf(self.cf(CF_MERKLE), leaf_node)?.ok_or(StorageError::CorruptedMeta)?;
+            let content = self
+                .db
+                .get_cf(self.cf(CF_MERKLE), leaf_node)?
+                .ok_or(StorageError::CorruptedMeta)?;
             if content.len() < 32 {
                 return Err(StorageError::CorruptedMeta);
             }
             Some(content[32..].to_vec())
         };
-        Ok(InclusionProof { key_hash, value, siblings: siblings.to_vec() })
+        Ok(InclusionProof {
+            key_hash,
+            value,
+            siblings: siblings.to_vec(),
+        })
     }
 
     /// Applies `changes` (key-hash -> new value, or `None` to delete) to the
@@ -1379,7 +1519,11 @@ impl ArxiumDb {
             };
             for level in (0..256).rev() {
                 let sibling = siblings[level];
-                let (left, right) = if bit_at(key_hash, level) == 0 { (current, sibling) } else { (sibling, current) };
+                let (left, right) = if bit_at(key_hash, level) == 0 {
+                    (current, sibling)
+                } else {
+                    (sibling, current)
+                };
                 let parent = internal_hash(&left, &right);
                 let content = [left.as_slice(), right.as_slice()].concat();
                 if let Some(batch) = batch.as_deref_mut() {
@@ -1392,9 +1536,10 @@ impl ArxiumDb {
         }
 
         if let Some(batch) = batch
-            && !changes.is_empty() {
-                batch.put_cf(self.cf(CF_META), MERKLE_ROOT_KEY, root);
-            }
+            && !changes.is_empty()
+        {
+            batch.put_cf(self.cf(CF_META), MERKLE_ROOT_KEY, root);
+        }
         Ok(root)
     }
 
@@ -1405,7 +1550,10 @@ impl ArxiumDb {
 
     /// Get the block from the DB. `P` is the chain-specific action payload
     /// type — callers know it, storage doesn't.
-    pub fn get_block<P: DeserializeOwned>(&self, height: u64) -> Result<Option<Block<P>>, StorageError> {
+    pub fn get_block<P: DeserializeOwned>(
+        &self,
+        height: u64,
+    ) -> Result<Option<Block<P>>, StorageError> {
         let key = format!("block:{height:020}");
         match self.get(key.as_bytes())? {
             Some(bytes) => {
@@ -1454,12 +1602,16 @@ impl ArxiumDb {
     /// the set as it stood before that block, never one it could vote itself
     /// into. Falls back to an empty set only if genesis never wrote height 0
     /// (shouldn't happen on a bootstrapped chain).
-    pub fn get_validator_set_at(&self, height: u64) -> Result<BTreeMap<Address, VotingPower>, StorageError> {
+    pub fn get_validator_set_at(
+        &self,
+        height: u64,
+    ) -> Result<BTreeMap<Address, VotingPower>, StorageError> {
         let prefix = b"validator_set:";
         let seek_key = format!("validator_set:{height:020}");
-        let mut iter = self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(seek_key.as_bytes(), Direction::Reverse));
+        let mut iter = self.db.iterator_cf(
+            self.cf(CF_VALIDATORS),
+            IteratorMode::From(seek_key.as_bytes(), Direction::Reverse),
+        );
         // Only the first item can match: the reverse seek lands on the newest
         // snapshot at or below `height`, so later items are strictly older.
         if let Some(item) = iter.next() {
@@ -1483,10 +1635,15 @@ impl ArxiumDb {
     /// Every validator with a status row — the candidate pool the boundary
     /// hook filters. Full `validator_status:` scan, once per epoch, bounded
     /// by how many addresses ever staked to join.
-    pub fn all_validator_statuses(&self) -> Result<BTreeMap<Address, ValidatorStatus>, StorageError> {
+    pub fn all_validator_statuses(
+        &self,
+    ) -> Result<BTreeMap<Address, ValidatorStatus>, StorageError> {
         let prefix = b"validator_status:";
         let mut out = BTreeMap::new();
-        let iter = self.db.iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_VALIDATORS),
+            IteratorMode::From(prefix, Direction::Forward),
+        );
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
@@ -1496,7 +1653,8 @@ impl ArxiumDb {
                 .ok()
                 .and_then(|s| Address::parse(s).ok())
                 .ok_or(StorageError::CorruptedMeta)?;
-            let (status, _len) = bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            let (status, _len) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
             out.insert(address, status);
         }
         Ok(out)
@@ -1574,12 +1732,16 @@ impl ArxiumDb {
     /// `spawn_finality` on startup to reconstruct its in-memory tallies from
     /// whatever survived a restart, since keys are zero-padded so this seek
     /// lands exactly at `cutoff` and reads forward.
-    pub fn get_precommit_votes_from(&self, cutoff: u64) -> Result<Vec<PrecommitVoteRecord>, StorageError> {
+    pub fn get_precommit_votes_from(
+        &self,
+        cutoff: u64,
+    ) -> Result<Vec<PrecommitVoteRecord>, StorageError> {
         let prefix = b"meta:precommit:";
         let seek_key = format!("meta:precommit:{cutoff:020}");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(seek_key.as_bytes(), Direction::Forward),
+        );
         let mut results = Vec::new();
         for item in iter {
             let (key, value) = item?;
@@ -1587,7 +1749,8 @@ impl ArxiumDb {
                 break;
             }
             let config = bincode::config::standard();
-            let (record, _len): (PrecommitVoteRecord, usize) = bincode::serde::decode_from_slice(&value, config)?;
+            let (record, _len): (PrecommitVoteRecord, usize) =
+                bincode::serde::decode_from_slice(&value, config)?;
             results.push(record);
         }
         Ok(results)
@@ -1599,9 +1762,10 @@ impl ArxiumDb {
     /// memory already bounds.
     pub fn delete_precommit_votes(&self, height: u64) -> Result<(), StorageError> {
         let prefix = format!("meta:precommit:{height:020}:");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
         let mut batch = WriteBatch::default();
         for item in iter {
             let (key, _value) = item?;
@@ -1617,12 +1781,16 @@ impl ArxiumDb {
     /// Every persisted round-timeout vote at heights >= `cutoff` — mirrors
     /// `get_precommit_votes_from`, used by the same kind of restart-recovery
     /// reload for round-timeout tallying.
-    pub fn get_round_timeout_votes_from(&self, cutoff: u64) -> Result<Vec<RoundTimeoutVoteRecord>, StorageError> {
+    pub fn get_round_timeout_votes_from(
+        &self,
+        cutoff: u64,
+    ) -> Result<Vec<RoundTimeoutVoteRecord>, StorageError> {
         let prefix = b"meta:roundtimeout:";
         let seek_key = format!("meta:roundtimeout:{cutoff:020}");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(seek_key.as_bytes(), Direction::Forward),
+        );
         let mut results = Vec::new();
         for item in iter {
             let (key, value) = item?;
@@ -1642,9 +1810,10 @@ impl ArxiumDb {
     /// ages out of `TALLY_RETENTION_HEIGHTS`. Mirrors `delete_precommit_votes`.
     pub fn delete_round_timeout_votes(&self, height: u64, round: u32) -> Result<(), StorageError> {
         let prefix = format!("meta:roundtimeout:{height:020}:{round}:");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
         let mut batch = WriteBatch::default();
         for item in iter {
             let (key, _value) = item?;
@@ -1659,7 +1828,11 @@ impl ArxiumDb {
 
     /// One voter's persisted dissent at `height`, if any — used to enforce
     /// one dissent per (height, voter).
-    pub fn get_dissent(&self, height: u64, voter: &Address) -> Result<Option<DissentRecord>, StorageError> {
+    pub fn get_dissent(
+        &self,
+        height: u64,
+        voter: &Address,
+    ) -> Result<Option<DissentRecord>, StorageError> {
         let key = format!("meta:dissent:{height:020}:{voter}");
         match self.get(key.as_bytes())? {
             Some(bytes) => {
@@ -1676,9 +1849,10 @@ impl ArxiumDb {
     pub fn get_dissents_from(&self, cutoff: u64) -> Result<Vec<DissentRecord>, StorageError> {
         let prefix = b"meta:dissent:";
         let seek_key = format!("meta:dissent:{cutoff:020}");
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_META), IteratorMode::From(seek_key.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(seek_key.as_bytes(), Direction::Forward),
+        );
         let mut results = Vec::new();
         for item in iter {
             let (key, value) = item?;
@@ -1686,7 +1860,8 @@ impl ArxiumDb {
                 break;
             }
             let config = bincode::config::standard();
-            let (record, _len): (DissentRecord, usize) = bincode::serde::decode_from_slice(&value, config)?;
+            let (record, _len): (DissentRecord, usize) =
+                bincode::serde::decode_from_slice(&value, config)?;
             results.push(record);
         }
         Ok(results)
@@ -1722,9 +1897,10 @@ impl ArxiumDb {
     ) -> Result<Vec<StakeAllocation>, StorageError> {
         let prefix = format!("stake:{master}:");
         let mut out = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_VALIDATORS),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix.as_bytes()) {
@@ -1740,7 +1916,10 @@ impl ArxiumDb {
     /// Masters currently staking to `validator`. One-master-per-validator is
     /// an enforced invariant, not just an assumption — callers should treat
     /// a `len() > 1` result as a bug, not a valid multi-delegator state.
-    pub fn get_stakes_by_validator(&self, validator: &Address) -> Result<Vec<Address>, StorageError> {
+    pub fn get_stakes_by_validator(
+        &self,
+        validator: &Address,
+    ) -> Result<Vec<Address>, StorageError> {
         Ok(KvRead::get(self, &StakeByValidatorKey(validator))?.unwrap_or_default())
     }
 
@@ -1760,9 +1939,10 @@ impl ArxiumDb {
         let started = std::time::Instant::now();
         let mut rows = 0u64;
         let mut results = Vec::new();
-        let iter = self
-            .db
-            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix, Direction::Forward));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_VALIDATORS),
+            IteratorMode::From(prefix, Direction::Forward),
+        );
         for item in iter {
             let (key, value) = item?;
             if !key.starts_with(prefix) {
@@ -1773,9 +1953,10 @@ impl ArxiumDb {
             let (allocation, _len): (StakeAllocation, usize) =
                 bincode::serde::decode_from_slice(&value, config)?;
             if let Some(unbonding) = &allocation.unbonding
-                && unbonding.unlock_at_height <= height {
-                    results.push(allocation);
-                }
+                && unbonding.unlock_at_height <= height
+            {
+                results.push(allocation);
+            }
         }
         record_scan("unbonding_due", rows, started);
         Ok(results)
@@ -1794,11 +1975,12 @@ impl ArxiumDb {
     /// so a signature from one Arxium chain can never verify on another.
     /// Fails closed on an unseeded chain — see `StorageError::MissingGenesisHash`.
     pub fn genesis_hash_bytes(&self) -> Result<[u8; 32], StorageError> {
-        let root = self.genesis_hash()?.ok_or(StorageError::MissingGenesisHash)?;
+        let root = self
+            .genesis_hash()?
+            .ok_or(StorageError::MissingGenesisHash)?;
         decode_root(&root)
     }
 }
-
 
 #[cfg(test)]
 mod explorer_index_tests {
@@ -1858,20 +2040,32 @@ mod explorer_index_tests {
         let hash = b.hash();
         db.write_batch(&b).unwrap();
         assert_eq!(db.get_block_height_by_hash(&hash).unwrap(), Some(7));
-        assert_eq!(db.get_block_height_by_hash(&Hash32::from_bytes([0xEE; 32])).unwrap(), None);
+        assert_eq!(
+            db.get_block_height_by_hash(&Hash32::from_bytes([0xEE; 32]))
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn validator_set_at_returns_latest_snapshot_at_or_before_height() {
         let db = temp_db();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)]))
+            .unwrap();
         let mut weighted = BTreeMap::new();
         weighted.insert(addr(1), VotingPower(7_500));
         weighted.insert(addr(2), VotingPower(2_500));
-        db.write_batch(&ValidatorSetSnapshot { effective_height: 5, validators: weighted.clone() }).unwrap();
+        db.write_batch(&ValidatorSetSnapshot {
+            effective_height: 5,
+            validators: weighted.clone(),
+        })
+        .unwrap();
 
         assert_eq!(db.validator_addresses_at(0).unwrap(), vec![addr(1)]);
-        assert_eq!(db.get_validator_set_at(0).unwrap()[&addr(1)], VotingPower(10_000));
+        assert_eq!(
+            db.get_validator_set_at(0).unwrap()[&addr(1)],
+            VotingPower(10_000)
+        );
         assert_eq!(db.validator_addresses_at(4).unwrap(), vec![addr(1)]);
         // Weights survive the round trip, not just membership.
         assert_eq!(db.get_validator_set_at(5).unwrap(), weighted);
@@ -1887,12 +2081,20 @@ mod explorer_index_tests {
     fn boundary_crossing_keeps_both_epochs_sets() {
         let db = temp_db();
         let epoch_length = 10;
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1), addr(2)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1), addr(2)]))
+            .unwrap();
         let boundary = xc_primitives::boundary_of(0, epoch_length);
-        db.write_batch(&ValidatorSetSnapshot::equal_power(boundary + 1, &[addr(1), addr(2), addr(3)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            boundary + 1,
+            &[addr(1), addr(2), addr(3)],
+        ))
+        .unwrap();
         assert_eq!(db.get_validator_set_at(boundary).unwrap().len(), 2);
         assert_eq!(db.get_validator_set_at(boundary + 1).unwrap().len(), 3);
-        assert_ne!(db.get_validator_set_at(boundary).unwrap(), db.get_validator_set_at(boundary + 1).unwrap());
+        assert_ne!(
+            db.get_validator_set_at(boundary).unwrap(),
+            db.get_validator_set_at(boundary + 1).unwrap()
+        );
     }
 
     #[test]
@@ -1900,7 +2102,9 @@ mod explorer_index_tests {
         let db = temp_db();
         let mut updates = ValidatorStatusUpdates::default();
         updates.0.insert(addr(1), Some(ValidatorStatus::Active));
-        updates.0.insert(addr(2), Some(ValidatorStatus::Jailed { until_epoch: 3 }));
+        updates
+            .0
+            .insert(addr(2), Some(ValidatorStatus::Jailed { until_epoch: 3 }));
         db.write_batch(&updates).unwrap();
         let all = db.all_validator_statuses().unwrap();
         assert_eq!(all.len(), 2);
@@ -1921,10 +2125,15 @@ mod explorer_index_tests {
         let path = std::env::temp_dir().join(format!("arxium-test-storage-{}", uuid_like()));
         {
             let db = ArxiumDb::open(&path).unwrap();
-            db.db.put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 9u32.to_le_bytes()).unwrap();
+            db.db
+                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 9u32.to_le_bytes())
+                .unwrap();
         }
         match ArxiumDb::open(&path) {
-            Err(StorageError::SchemaTooOld { found: 9, supported: SCHEMA_VERSION }) => {}
+            Err(StorageError::SchemaTooOld {
+                found: 9,
+                supported: SCHEMA_VERSION,
+            }) => {}
             other => panic!("expected SchemaTooOld, got {:?}", other.map(|_| ())),
         }
     }
@@ -1933,7 +2142,14 @@ mod explorer_index_tests {
     fn genesis_validator_gets_a_real_self_stake_allocation() {
         let db = temp_db();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None, bls_pop: None });
+        validators.insert(
+            addr(1),
+            xc_primitives::ValidatorEntry {
+                stake: 1_000_000,
+                bls_pubkey: None,
+                bls_pop: None,
+            },
+        );
         db.write_batch(&Snapshot {
             height: 0,
             params: Default::default(),
@@ -1948,7 +2164,10 @@ mod explorer_index_tests {
         })
         .unwrap();
 
-        let allocation = db.get_stake_allocation(&addr(1), &addr(1)).unwrap().unwrap();
+        let allocation = db
+            .get_stake_allocation(&addr(1), &addr(1))
+            .unwrap()
+            .unwrap();
         assert_eq!(allocation.active_amount, 1_000_000);
         assert_eq!(db.get_stakes_by_validator(&addr(1)).unwrap(), vec![addr(1)]);
 
@@ -1971,8 +2190,22 @@ mod explorer_index_tests {
     fn multiple_genesis_validators_each_get_a_distinct_funded_subaccount() {
         let db = temp_db();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 1_000_000, bls_pubkey: None, bls_pop: None });
-        validators.insert(addr(2), xc_primitives::ValidatorEntry { stake: 2_000_000, bls_pubkey: None, bls_pop: None });
+        validators.insert(
+            addr(1),
+            xc_primitives::ValidatorEntry {
+                stake: 1_000_000,
+                bls_pubkey: None,
+                bls_pop: None,
+            },
+        );
+        validators.insert(
+            addr(2),
+            xc_primitives::ValidatorEntry {
+                stake: 2_000_000,
+                bls_pubkey: None,
+                bls_pop: None,
+            },
+        );
         db.write_batch(&Snapshot {
             height: 0,
             params: Default::default(),
@@ -2004,7 +2237,14 @@ mod explorer_index_tests {
         db.write_batch(&block(0, vec![])).unwrap();
         db.write_batch(&block(1, vec![])).unwrap();
         let mut validators = std::collections::BTreeMap::new();
-        validators.insert(addr(1), xc_primitives::ValidatorEntry { stake: 500, bls_pubkey: None, bls_pop: None });
+        validators.insert(
+            addr(1),
+            xc_primitives::ValidatorEntry {
+                stake: 500,
+                bls_pubkey: None,
+                bls_pop: None,
+            },
+        );
         db.write_batch(&Snapshot {
             height: 0,
             params: Default::default(),
@@ -2019,14 +2259,19 @@ mod explorer_index_tests {
         })
         .unwrap();
 
-        let checkpoint_path = std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
+        let checkpoint_path =
+            std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
         db.export_checkpoint(&checkpoint_path).unwrap();
 
         let reopened = ArxiumDb::open(&checkpoint_path).unwrap();
         assert_eq!(reopened.get_tip_height().unwrap(), Some(1));
         assert_eq!(reopened.get_block::<()>(0).unwrap().unwrap().height, 0);
         assert_eq!(
-            reopened.get_stake_allocation(&addr(1), &addr(1)).unwrap().unwrap().active_amount,
+            reopened
+                .get_stake_allocation(&addr(1), &addr(1))
+                .unwrap()
+                .unwrap()
+                .active_amount,
             500
         );
 
@@ -2045,7 +2290,8 @@ mod explorer_index_tests {
         let db = temp_db();
         db.write_batch(&block(0, vec![])).unwrap();
 
-        let checkpoint_path = std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
+        let checkpoint_path =
+            std::env::temp_dir().join(format!("arxium-test-checkpoint-{}", uuid_like()));
         db.export_checkpoint(&checkpoint_path).unwrap();
 
         assert!(db.export_checkpoint(&checkpoint_path).is_err());
@@ -2107,7 +2353,9 @@ mod asset_index_tests {
         let gold = asset("gold", &issuer, true);
 
         let updates = balances(&[("gold", &holder, 1_000)]);
-        let index = db.asset_index_updates(std::slice::from_ref(&gold), &updates).unwrap();
+        let index = db
+            .asset_index_updates(std::slice::from_ref(&gold), &updates)
+            .unwrap();
         db.write_batches(&[&gold, &updates, &index]).unwrap();
 
         assert_eq!(db.list_asset_refs().unwrap(), vec![r("gold")]);
@@ -2116,10 +2364,7 @@ mod asset_index_tests {
         assert_eq!(listed[0].asset_id, "gold");
         assert!(listed[0].compliance_required);
 
-        assert_eq!(
-            db.get_account_assets(&holder).unwrap(),
-            vec![r("gold")]
-        );
+        assert_eq!(db.get_account_assets(&holder).unwrap(), vec![r("gold")]);
         assert_eq!(db.get_asset_balance(&r("gold"), &holder).unwrap(), 1_000);
         // An account that has never held anything gets an empty list, not an
         // error and not someone else's.
@@ -2141,13 +2386,24 @@ mod asset_index_tests {
         // Pre-index world: balances written with no holders row at all.
         let legacy = balances(&[("gold", &alice, 10), ("gold", &bob, 0), ("silver", &bob, 5)]);
         db.write_batches(&[&gold, &silver, &legacy]).unwrap();
-        assert_eq!(db.get_asset_holders(&r("gold")).unwrap(), vec![alice.clone()], "scan skips zero balances and other assets");
-        assert_eq!(db.get_asset_holders(&r("silver")).unwrap(), vec![bob.clone()]);
+        assert_eq!(
+            db.get_asset_holders(&r("gold")).unwrap(),
+            vec![alice.clone()],
+            "scan skips zero balances and other assets"
+        );
+        assert_eq!(
+            db.get_asset_holders(&r("silver")).unwrap(),
+            vec![bob.clone()]
+        );
 
         // From now on the index rules: bob buys in, alice sells out.
         let updates = balances(&[("gold", &bob, 4)]);
         let index = db.asset_index_updates(&[], &updates).unwrap();
-        assert_eq!(index.holders[&r("gold")], vec![alice.clone(), bob.clone()], "seeded from the scan, then bob appended");
+        assert_eq!(
+            index.holders[&r("gold")],
+            vec![alice.clone(), bob.clone()],
+            "seeded from the scan, then bob appended"
+        );
         db.write_batches(&[&updates, &index]).unwrap();
         let updates = balances(&[("gold", &alice, 0)]);
         let index = db.asset_index_updates(&[], &updates).unwrap();
@@ -2167,18 +2423,19 @@ mod asset_index_tests {
 
         let gold = asset("gold", &issuer, true);
         let first = balances(&[("gold", &holder, 1_000)]);
-        let index = db.asset_index_updates(std::slice::from_ref(&gold), &first).unwrap();
+        let index = db
+            .asset_index_updates(std::slice::from_ref(&gold), &first)
+            .unwrap();
         db.write_batches(&[&gold, &first, &index]).unwrap();
 
         let silver = asset("silver", &issuer, false);
         let second = balances(&[("silver", &holder, 50)]);
-        let index = db.asset_index_updates(std::slice::from_ref(&silver), &second).unwrap();
+        let index = db
+            .asset_index_updates(std::slice::from_ref(&silver), &second)
+            .unwrap();
         db.write_batches(&[&silver, &second, &index]).unwrap();
 
-        assert_eq!(
-            db.list_asset_refs().unwrap(),
-            vec![r("gold"), r("silver")]
-        );
+        assert_eq!(db.list_asset_refs().unwrap(), vec![r("gold"), r("silver")]);
         assert_eq!(
             db.get_account_assets(&holder).unwrap(),
             vec![r("gold"), r("silver")]
@@ -2201,10 +2458,7 @@ mod asset_index_tests {
             db.write_batches(&[&gold, &updates, &index]).unwrap();
         }
 
-        assert_eq!(
-            db.get_account_assets(&holder).unwrap(),
-            vec![r("gold")]
-        );
+        assert_eq!(db.get_account_assets(&holder).unwrap(), vec![r("gold")]);
     }
 
     /// A block with no asset activity must write nothing, so the common case
@@ -2230,17 +2484,13 @@ mod asset_index_tests {
         let gold = asset("gold", &issuer, true);
 
         let updates = balances(&[("gold", &issuer, 900), ("gold", &recipient, 100)]);
-        let index = db.asset_index_updates(std::slice::from_ref(&gold), &updates).unwrap();
+        let index = db
+            .asset_index_updates(std::slice::from_ref(&gold), &updates)
+            .unwrap();
         db.write_batches(&[&gold, &updates, &index]).unwrap();
 
-        assert_eq!(
-            db.get_account_assets(&issuer).unwrap(),
-            vec![r("gold")]
-        );
-        assert_eq!(
-            db.get_account_assets(&recipient).unwrap(),
-            vec![r("gold")]
-        );
+        assert_eq!(db.get_account_assets(&issuer).unwrap(), vec![r("gold")]);
+        assert_eq!(db.get_account_assets(&recipient).unwrap(), vec![r("gold")]);
     }
 
     /// The index lives in `CF_META`, which `is_state_key` excludes. If it ever
@@ -2286,8 +2536,15 @@ mod schema_version_tests {
         let path = temp_path();
         {
             let db = ArxiumDb::open(&path).unwrap();
-            let stamped = db.db.get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY).unwrap().unwrap();
-            assert_eq!(u32::from_le_bytes(stamped.try_into().unwrap()), SCHEMA_VERSION);
+            let stamped = db
+                .db
+                .get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                u32::from_le_bytes(stamped.try_into().unwrap()),
+                SCHEMA_VERSION
+            );
         }
         assert!(ArxiumDb::open(&path).is_ok());
     }
@@ -2301,11 +2558,18 @@ mod schema_version_tests {
         {
             let db = ArxiumDb::open(&path).unwrap();
             db.db
-                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, (SCHEMA_VERSION + 1).to_le_bytes())
+                .put_cf(
+                    db.cf(CF_META),
+                    SCHEMA_VERSION_KEY,
+                    (SCHEMA_VERSION + 1).to_le_bytes(),
+                )
                 .unwrap();
         }
         match ArxiumDb::open(&path) {
-            Err(err) => assert!(matches!(err, StorageError::SchemaTooNew { .. }), "got {err:?}"),
+            Err(err) => assert!(
+                matches!(err, StorageError::SchemaTooNew { .. }),
+                "got {err:?}"
+            ),
             Ok(_) => panic!("expected SchemaTooNew"),
         }
     }
@@ -2381,7 +2645,10 @@ mod round_certificate_tests {
         };
         db.write_batches(&[&record]).unwrap();
 
-        let fetched = db.get_round_certificate(9, 1).unwrap().expect("certificate should be persisted");
+        let fetched = db
+            .get_round_certificate(9, 1)
+            .unwrap()
+            .expect("certificate should be persisted");
         assert_eq!(fetched.height, 9);
         assert_eq!(fetched.round, 1);
         assert_eq!(fetched.signers, vec![addr(3), addr(4)]);
@@ -2395,9 +2662,24 @@ mod round_certificate_tests {
     fn round_timeout_votes_are_listed_and_pruned_per_round() {
         let db = ArxiumDb::open(&temp_path()).unwrap();
         db.write_batches(&[
-            &RoundTimeoutVoteRecord { height: 10, round: 0, voter: addr(1), signature: sig(1) },
-            &RoundTimeoutVoteRecord { height: 10, round: 1, voter: addr(1), signature: sig(2) },
-            &RoundTimeoutVoteRecord { height: 11, round: 0, voter: addr(1), signature: sig(3) },
+            &RoundTimeoutVoteRecord {
+                height: 10,
+                round: 0,
+                voter: addr(1),
+                signature: sig(1),
+            },
+            &RoundTimeoutVoteRecord {
+                height: 10,
+                round: 1,
+                voter: addr(1),
+                signature: sig(2),
+            },
+            &RoundTimeoutVoteRecord {
+                height: 11,
+                round: 0,
+                voter: addr(1),
+                signature: sig(3),
+            },
         ])
         .unwrap();
 
@@ -2504,11 +2786,19 @@ mod merkle_state_root_tests {
     }
 
     fn entry(balance: u128) -> AccountEntry {
-        AccountEntry { balance, ..Default::default() }
+        AccountEntry {
+            balance,
+            ..Default::default()
+        }
     }
 
     fn accounts(pairs: &[(u8, u128)]) -> AccountUpdates {
-        AccountUpdates(pairs.iter().map(|(n, bal)| (addr(*n), entry(*bal))).collect())
+        AccountUpdates(
+            pairs
+                .iter()
+                .map(|(n, bal)| (addr(*n), entry(*bal)))
+                .collect(),
+        )
     }
 
     /// An empty database's root is the canonical empty-trie hash, and asking
@@ -2548,9 +2838,14 @@ mod merkle_state_root_tests {
         incremental.write_batch(&accounts(&[(3, 300)])).unwrap();
 
         let combined = ArxiumDb::open(&temp_path()).unwrap();
-        combined.write_batch(&accounts(&[(1, 100), (2, 200), (3, 300)])).unwrap();
+        combined
+            .write_batch(&accounts(&[(1, 100), (2, 200), (3, 300)]))
+            .unwrap();
 
-        assert_eq!(incremental.compute_state_root(&[]).unwrap(), combined.compute_state_root(&[]).unwrap());
+        assert_eq!(
+            incremental.compute_state_root(&[]).unwrap(),
+            combined.compute_state_root(&[]).unwrap()
+        );
     }
 
     /// Overwriting an existing key changes the root, and re-overwriting it
@@ -2585,7 +2880,10 @@ mod merkle_state_root_tests {
         let key = format!("account:{}", addr(1)).into_bytes();
         let proof = db.prove(&key, &root).unwrap();
         assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
-        assert_eq!(proof.value, Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap()));
+        assert_eq!(
+            proof.value,
+            Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap())
+        );
     }
 
     /// A key that was never written proves as absent (non-inclusion) rather
@@ -2620,7 +2918,10 @@ mod merkle_state_root_tests {
 
         let key = format!("account:{}", addr(1)).into_bytes();
         let proof = db.prove(&key, &old_root).unwrap();
-        assert_eq!(proof.value, Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap()));
+        assert_eq!(
+            proof.value,
+            Some(bincode::serde::encode_to_vec(entry(100), bincode::config::standard()).unwrap())
+        );
         assert!(xc_poe::state_trie::verify_proof(old_root_bytes, &proof));
     }
 
@@ -2648,9 +2949,14 @@ mod merkle_state_root_tests {
         let new_value1 = bincode::serde::encode_to_vec(&new_entry1, config).unwrap();
         let new_value2 = bincode::serde::encode_to_vec(&new_entry2, config).unwrap();
 
-        let mut trie = xc_poe::state_trie::ProofBackedTrie::from_proofs(pre_root_bytes, &[proof1, proof2]).unwrap();
-        trie.apply(xc_poe::state_trie::hash_key(&key1), Some(new_value1)).unwrap();
-        let proof_backed_root = trie.apply(xc_poe::state_trie::hash_key(&key2), Some(new_value2)).unwrap();
+        let mut trie =
+            xc_poe::state_trie::ProofBackedTrie::from_proofs(pre_root_bytes, &[proof1, proof2])
+                .unwrap();
+        trie.apply(xc_poe::state_trie::hash_key(&key1), Some(new_value1))
+            .unwrap();
+        let proof_backed_root = trie
+            .apply(xc_poe::state_trie::hash_key(&key2), Some(new_value2))
+            .unwrap();
 
         db.write_batch(&accounts(&[(1, 40), (2, 260)])).unwrap();
         let real_root = decode_root(&db.compute_state_root(&[]).unwrap()).unwrap();
@@ -2743,15 +3049,26 @@ mod merkle_state_root_tests {
         let alice_gold = asset("gold", addr(1), true);
         let bob_gold = asset("gold", addr(2), false);
         assert_ne!(alice_gold.asset_ref, bob_gold.asset_ref);
-        assert_ne!(alice_gold.batch_entries().unwrap()[0].0, bob_gold.batch_entries().unwrap()[0].0);
+        assert_ne!(
+            alice_gold.batch_entries().unwrap()[0].0,
+            bob_gold.batch_entries().unwrap()[0].0
+        );
 
         db.write_batches(&[&alice_gold, &bob_gold]).unwrap();
         let root = db.compute_state_root(&[]).unwrap();
         let root_bytes = decode_root(&root).unwrap();
         for gold in [&alice_gold, &bob_gold] {
-            let proof = db.prove(&AssetKey(&gold.asset_ref).encode(), &root).unwrap();
+            let proof = db
+                .prove(&AssetKey(&gold.asset_ref).encode(), &root)
+                .unwrap();
             assert!(xc_poe::state_trie::verify_proof(root_bytes, &proof));
-            assert_eq!(db.get_asset(&gold.asset_ref).unwrap().unwrap().compliance_required, gold.compliance_required);
+            assert_eq!(
+                db.get_asset(&gold.asset_ref)
+                    .unwrap()
+                    .unwrap()
+                    .compliance_required,
+                gold.compliance_required
+            );
         }
     }
 
@@ -2783,7 +3100,10 @@ mod merkle_state_root_tests {
         // "asset_record:" is 13 bytes, so a 19-byte id makes a 32-byte key.
         let id = "1234567890123456789";
         assert_eq!(format!("asset_record:{id}").len(), 32);
-        assert_eq!(cf_for_key(format!("asset_record:{id}").as_bytes()), CF_ASSETS);
+        assert_eq!(
+            cf_for_key(format!("asset_record:{id}").as_bytes()),
+            CF_ASSETS
+        );
     }
 }
 
@@ -2809,7 +3129,10 @@ mod divergence_recovery_tests {
     }
 
     fn entry(balance: u128) -> AccountEntry {
-        AccountEntry { balance, ..Default::default() }
+        AccountEntry {
+            balance,
+            ..Default::default()
+        }
     }
 
     /// Commits one block that sets `holder`'s balance, the same way the
@@ -2834,7 +3157,8 @@ mod divergence_recovery_tests {
             round: 0,
             round_certificate: None,
         };
-        db.write_block_batches(height, &[&updates, &block], true).unwrap();
+        db.write_block_batches(height, &[&updates, &block], true)
+            .unwrap();
         block
     }
 
@@ -2842,7 +3166,11 @@ mod divergence_recovery_tests {
     /// case. `certify_hash` covers the case where the network certified
     /// something else.
     fn certify(db: &ArxiumDb, height: u64) {
-        let block_hash = db.get_block::<()>(height).unwrap().expect("block to certify").hash();
+        let block_hash = db
+            .get_block::<()>(height)
+            .unwrap()
+            .expect("block to certify")
+            .hash();
         certify_hash(db, height, &block_hash);
     }
 
@@ -2863,7 +3191,11 @@ mod divergence_recovery_tests {
     #[test]
     fn the_watermark_only_moves_on_contiguity() {
         let db = ArxiumDb::open(&temp_path()).unwrap();
-        assert_eq!(db.get_final_watermark().unwrap(), 0, "genesis is final by definition");
+        assert_eq!(
+            db.get_final_watermark().unwrap(),
+            0,
+            "genesis is final by definition"
+        );
         for height in 0..=4 {
             commit(&db, height, 1, height as u128);
         }
@@ -2874,8 +3206,16 @@ mod divergence_recovery_tests {
         // Out of order: 3 and 4 land while 2 is still missing.
         certify(&db, 3);
         certify(&db, 4);
-        assert_eq!(db.get_final_watermark().unwrap(), 1, "a gap at 2 blocks the watermark");
-        assert_eq!(db.get_finalized_height().unwrap(), Some(4), "but 4 is certified");
+        assert_eq!(
+            db.get_final_watermark().unwrap(),
+            1,
+            "a gap at 2 blocks the watermark"
+        );
+        assert_eq!(
+            db.get_finalized_height().unwrap(),
+            Some(4),
+            "but 4 is certified"
+        );
 
         // Filling the gap absorbs everything already certified above it.
         certify(&db, 2);
@@ -2904,12 +3244,20 @@ mod divergence_recovery_tests {
             round: 0,
             round_certificate: None,
         };
-        db.write_block_batches(1, &[&updates, &block], true).unwrap();
+        db.write_block_batches(1, &[&updates, &block], true)
+            .unwrap();
         assert_eq!(db.get_account(&addr(2)).unwrap().unwrap().balance, 7);
 
         db.revert_to::<()>(0).unwrap();
-        assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 100, "prior value restored");
-        assert!(db.get_account(&addr(2)).unwrap().is_none(), "key the block created is gone");
+        assert_eq!(
+            db.get_account(&addr(1)).unwrap().unwrap().balance,
+            100,
+            "prior value restored"
+        );
+        assert!(
+            db.get_account(&addr(2)).unwrap().is_none(),
+            "key the block created is gone"
+        );
         assert_eq!(db.compute_state_root(&[]).unwrap(), root_at_0);
         assert!(db.get_block::<()>(1).unwrap().is_none());
         assert_eq!(db.get_tip_height().unwrap(), Some(0));
@@ -2933,7 +3281,9 @@ mod divergence_recovery_tests {
         assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 100);
         assert!(db.get_block::<()>(11).unwrap().is_none());
         assert!(
-            db.get_block_height_by_hash(&db.get_block::<()>(10).unwrap().unwrap().hash()).unwrap().is_some(),
+            db.get_block_height_by_hash(&db.get_block::<()>(10).unwrap().unwrap().hash())
+                .unwrap()
+                .is_some(),
             "the surviving tip keeps its hash index"
         );
 
@@ -2964,7 +3314,16 @@ mod divergence_recovery_tests {
         assert_eq!(db.get_final_watermark().unwrap(), 3);
 
         let err = db.revert_to::<()>(2).unwrap_err();
-        assert!(matches!(err, StorageError::RevertBelowWatermark { height: 2, watermark: 3 }), "{err}");
+        assert!(
+            matches!(
+                err,
+                StorageError::RevertBelowWatermark {
+                    height: 2,
+                    watermark: 3
+                }
+            ),
+            "{err}"
+        );
         assert_eq!(db.get_tip_height().unwrap(), Some(5), "state untouched");
         assert_eq!(db.get_account(&addr(1)).unwrap().unwrap().balance, 5);
 
@@ -2984,8 +3343,11 @@ mod divergence_recovery_tests {
         commit(&db, 0, 1, 100);
 
         let gold = Asset::new("gold", addr(1), false);
-        let balances = AssetBalanceUpdates(BTreeMap::from([((gold.asset_ref.clone(), addr(1)), 5u128)]));
-        let index = db.asset_index_updates(std::slice::from_ref(&gold), &balances).unwrap();
+        let balances =
+            AssetBalanceUpdates(BTreeMap::from([((gold.asset_ref.clone(), addr(1)), 5u128)]));
+        let index = db
+            .asset_index_updates(std::slice::from_ref(&gold), &balances)
+            .unwrap();
         let state_root = db.compute_state_root(&[&gold, &balances]).unwrap();
         let block = Block::<()> {
             height: 1,
@@ -2999,14 +3361,24 @@ mod divergence_recovery_tests {
             round: 0,
             round_certificate: None,
         };
-        db.write_block_batches(1, &[&gold, &balances, &index, &block], true).unwrap();
+        db.write_block_batches(1, &[&gold, &balances, &index, &block], true)
+            .unwrap();
         assert_eq!(db.list_asset_refs().unwrap(), vec![gold.asset_ref.clone()]);
-        assert_eq!(db.get_account_assets(&addr(1)).unwrap(), vec![gold.asset_ref.clone()]);
+        assert_eq!(
+            db.get_account_assets(&addr(1)).unwrap(),
+            vec![gold.asset_ref.clone()]
+        );
 
         db.revert_to::<()>(0).unwrap();
 
-        assert!(db.get_asset(&gold.asset_ref).unwrap().is_none(), "merkleized registry record is gone");
-        assert!(db.list_asset_refs().unwrap().is_empty(), "and so is the index that pointed at it");
+        assert!(
+            db.get_asset(&gold.asset_ref).unwrap().is_none(),
+            "merkleized registry record is gone"
+        );
+        assert!(
+            db.list_asset_refs().unwrap().is_empty(),
+            "and so is the index that pointed at it"
+        );
         assert!(db.get_account_assets(&addr(1)).unwrap().is_empty());
     }
 
@@ -3025,20 +3397,33 @@ mod divergence_recovery_tests {
         }
         assert_eq!(db.get_final_watermark().unwrap(), 4);
         for height in 1..=5 {
-            assert!(db.get(&undo_key(height)).unwrap().is_some(), "undo {height} inside the retain window");
+            assert!(
+                db.get(&undo_key(height)).unwrap().is_some(),
+                "undo {height} inside the retain window"
+            );
         }
         // Fake a watermark far past the window and advance once more: only
         // heights more than `UNDO_RETAIN` below it go.
         let mut batch = WriteBatch::default();
-        batch.put_cf(db.cf(CF_META), FINAL_WATERMARK_KEY, (UNDO_RETAIN + 2).to_be_bytes());
+        batch.put_cf(
+            db.cf(CF_META),
+            FINAL_WATERMARK_KEY,
+            (UNDO_RETAIN + 2).to_be_bytes(),
+        );
         db.db.write(batch).unwrap();
         for height in 6..=UNDO_RETAIN + 3 {
             commit(&db, height, 1, height as u128);
         }
         certify(&db, UNDO_RETAIN + 3);
         assert_eq!(db.get_final_watermark().unwrap(), UNDO_RETAIN + 3);
-        assert!(db.get(&undo_key(3)).unwrap().is_none(), "undo 3 is past the window");
-        assert!(db.get(&undo_key(4)).unwrap().is_some(), "undo 4 is exactly UNDO_RETAIN below");
+        assert!(
+            db.get(&undo_key(3)).unwrap().is_none(),
+            "undo 3 is past the window"
+        );
+        assert!(
+            db.get(&undo_key(4)).unwrap().is_some(),
+            "undo 4 is exactly UNDO_RETAIN below"
+        );
     }
 
     /// The case that makes the watermark a floor on *this node's* history
@@ -3059,7 +3444,11 @@ mod divergence_recovery_tests {
         // The network finalized a different block at height 2.
         certify_hash(&db, 2, &Hash32::from_bytes([0xBE; 32]));
         certify(&db, 3);
-        assert_eq!(db.get_final_watermark().unwrap(), 1, "our block at 2 is not the certified one");
+        assert_eq!(
+            db.get_final_watermark().unwrap(),
+            1,
+            "our block at 2 is not the certified one"
+        );
 
         // So rolling back through 2 stays permitted — this is exactly the
         // recovery the watermark must not block.
@@ -3088,12 +3477,26 @@ mod divergence_recovery_tests {
         db.prune::<()>(10).unwrap();
 
         for height in 0..3 {
-            assert!(db.get_block::<()>(height).unwrap().is_none(), "height {height} pruned");
-            assert!(db.get_block_height_by_hash(&hashes[height as usize]).unwrap().is_none());
+            assert!(
+                db.get_block::<()>(height).unwrap().is_none(),
+                "height {height} pruned"
+            );
+            assert!(
+                db.get_block_height_by_hash(&hashes[height as usize])
+                    .unwrap()
+                    .is_none()
+            );
         }
         for height in 3..=5 {
-            assert!(db.get_block::<()>(height).unwrap().is_some(), "height {height} retained");
-            assert_eq!(db.get_block_height_by_hash(&hashes[height as usize]).unwrap(), Some(height));
+            assert!(
+                db.get_block::<()>(height).unwrap().is_some(),
+                "height {height} retained"
+            );
+            assert_eq!(
+                db.get_block_height_by_hash(&hashes[height as usize])
+                    .unwrap(),
+                Some(height)
+            );
         }
         // State and revert are untouched by pruning blocks — only sync-from-
         // genesis replay loses the ability to walk through the pruned range.
@@ -3113,9 +3516,12 @@ mod divergence_recovery_tests {
         }
         assert_eq!(db.get_final_watermark().unwrap(), 4);
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)])).unwrap();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(2, &[addr(1), addr(2)])).unwrap();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(5, &[addr(3)])).unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr(1)]))
+            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(2, &[addr(1), addr(2)]))
+            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(5, &[addr(3)]))
+            .unwrap();
 
         db.prune::<()>(4).unwrap();
 
@@ -3130,4 +3536,3 @@ mod divergence_recovery_tests {
         assert_eq!(db.validator_addresses_at(5).unwrap(), vec![addr(3)]);
     }
 }
-

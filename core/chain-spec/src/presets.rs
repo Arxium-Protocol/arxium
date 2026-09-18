@@ -31,7 +31,10 @@ impl PresetRegistry {
     }
 
     pub fn get(&self, name: &str) -> Option<&'static str> {
-        self.presets.iter().find(|(n, _)| *n == name).map(|(_, json)| *json)
+        self.presets
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, json)| *json)
     }
 
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {

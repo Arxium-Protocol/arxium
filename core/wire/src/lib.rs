@@ -119,7 +119,9 @@ pub struct SnapshotManifest {
 /// and still speaks the same protocol.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SyncResponse<B> {
-    Status { tip_height: u64 },
+    Status {
+        tip_height: u64,
+    },
     Blocks(Vec<B>),
     NodeInfo(NodeInfo),
     /// `(height, hash)` ascending. Truncated to the responder's page size, and

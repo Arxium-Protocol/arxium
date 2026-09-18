@@ -28,7 +28,8 @@ fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<Zeroizing<[u8; 3
             std::fs::read_to_string(path).with_context(|| format!("failed to read {what} file"))?,
         );
         let seed_bytes = Zeroizing::new(
-            hex::decode(hex_seed.trim()).with_context(|| format!("{what} file is not valid hex"))?,
+            hex::decode(hex_seed.trim())
+                .with_context(|| format!("{what} file is not valid hex"))?,
         );
         Zeroizing::new(
             seed_bytes
@@ -103,7 +104,11 @@ mod tests {
         load_or_generate_bls_key(&dir).unwrap();
 
         for file in [KEY_FILE, BLS_KEY_FILE] {
-            let mode = std::fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777;
+            let mode = std::fs::metadata(dir.join(file))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "{file} mode is {mode:o}");
         }
 
