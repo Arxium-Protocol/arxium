@@ -509,11 +509,10 @@ mod tests {
         view.put(&AssetKey(&gold), &asset).unwrap();
         view.apply_accounts(&updates.accounts).unwrap();
 
-        // RegisterAsset doesn't touch the sender's account nonce, so the
-        // issuer's nonce is still 0 here.
+        // RegisterAsset consumed nonce 0, so issuance is nonce 1.
         let issue = Action {
             sender: issuer.clone(),
-            nonce: 0,
+            nonce: 1,
             signature: None,
             payload: ActionPayload::IssueAsset {
                 asset: gold.clone(),
@@ -536,7 +535,7 @@ mod tests {
         // attempt doesn't consume nonce 1.
         let transfer = Action {
             sender: issuer.clone(),
-            nonce: 1,
+            nonce: 2,
             signature: None,
             payload: ActionPayload::TransferAsset {
                 asset: gold.clone(),
@@ -558,7 +557,7 @@ mod tests {
 
         let transfer = Action {
             sender: issuer.clone(),
-            nonce: 1,
+            nonce: 2,
             signature: None,
             payload: ActionPayload::TransferAsset {
                 asset: gold.clone(),
@@ -579,7 +578,7 @@ mod tests {
         // from state rather than only written to it.
         let freeze = Action {
             sender: issuer.clone(),
-            nonce: 2,
+            nonce: 3,
             signature: None,
             payload: ActionPayload::FreezeAsset {
                 asset: gold.clone(),
@@ -600,7 +599,7 @@ mod tests {
 
         let transfer = Action {
             sender: issuer.clone(),
-            nonce: 2,
+            nonce: 3,
             signature: None,
             payload: ActionPayload::TransferAsset {
                 asset: gold.clone(),
@@ -613,7 +612,7 @@ mod tests {
 
         let unfreeze = Action {
             sender: issuer.clone(),
-            nonce: 2,
+            nonce: 3,
             signature: None,
             payload: ActionPayload::UnfreezeAsset {
                 asset: gold.clone(),
@@ -995,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn nonce_discipline_activates_at_the_configured_height_for_every_action() {
+    fn every_action_consumes_exactly_one_nonce() {
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let gold = gold_of(&issuer);
         let db = temp_db();
@@ -1006,17 +1005,12 @@ mod tests {
             signature: None,
             payload: ActionPayload::RegisterAsset { asset_id: id.into(), compliance_required: false, metadata: meta() },
         };
-        let before = crate::NONCE_DISCIPLINE_HEIGHT - 1;
-        let after = crate::NONCE_DISCIPLINE_HEIGHT;
 
-        // Legacy: any nonce is accepted and the account's nonce is untouched.
-        let updates = dispatch_at(&register(7, "a"), &view, before).unwrap();
-        assert_eq!(updates.accounts.0[&issuer].nonce, 0, "pre-activation history must replay unchanged");
-
-        // Strict: the nonce must match and is consumed.
-        let err = dispatch_at(&register(7, "b"), &view, after).unwrap_err();
+        // The nonce must match and is consumed, even for actions whose circuit
+        // never touches the sender's balance.
+        let err = dispatch_at(&register(7, "b"), &view, 0).unwrap_err();
         assert!(err.to_string().contains("invalid nonce"), "{err}");
-        let updates = dispatch_at(&register(0, "b"), &view, after).unwrap();
+        let updates = dispatch_at(&register(0, "b"), &view, 0).unwrap();
         assert_eq!(updates.accounts.0[&issuer].nonce, 1);
         assert_eq!(updates.accounts.0[&issuer].balance, FEE_BUDGET * 8 - fee_of(&register(0, "b")), "fee still charged once");
 
@@ -1024,7 +1018,7 @@ mod tests {
         let issue = ChainAction { sender: issuer.clone(), nonce: 0, signature: None, payload: ActionPayload::IssueAsset { asset: gold.clone(), amount: 5 } };
         let mut view = view;
         view.put(&AssetKey(&gold), &Asset::new("gold", issuer.clone(), false)).unwrap();
-        let updates = dispatch_at(&issue, &view, after).unwrap();
+        let updates = dispatch_at(&issue, &view, 0).unwrap();
         assert_eq!(updates.accounts.0[&issuer].nonce, 1);
     }
 

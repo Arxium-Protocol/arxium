@@ -312,20 +312,10 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
         current_height,
         bls_pubkey_owner_lookup,
     )?;
-    consume_nonce(action, view, &mut updates, current_height)?;
+    consume_nonce(action, view, &mut updates)?;
     charge_action_fee(action, view, &mut updates)?;
     Ok(updates)
 }
-
-/// First height at which every action must carry — and advance — the
-/// sender's nonce. Before it, only the circuits that moved a balance checked
-/// the nonce (`account`, `staking`, `rwa-asset::apply_issue`/`transfer`), so
-/// `RegisterAsset`, the freezes, attestations and key registrations were
-/// applied at any nonce and never bumped it; devnet history up to here
-/// contains such blocks, and re-executing them under the strict rule would
-/// reject them. ponytail: a constant, not a chain-spec field — devnet is the
-/// only chain and this is its one activation.
-pub const NONCE_DISCIPLINE_HEIGHT: u64 = 80_000;
 
 /// Ensures the action consumed exactly one nonce. Circuits that already
 /// checked and bumped it leave the sender's entry at `current + 1` and are
@@ -335,11 +325,7 @@ fn consume_nonce<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     view: &V,
     updates: &mut BlockUpdates,
-    current_height: u64,
 ) -> anyhow::Result<()> {
-    if current_height < NONCE_DISCIPLINE_HEIGHT {
-        return Ok(());
-    }
     let current = view
         .get(&AccountKey(&action.sender))?
         .map(|entry| entry.nonce)

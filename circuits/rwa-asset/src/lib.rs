@@ -388,7 +388,7 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
 /// balance. `to` must pass the asset's rules; the issuer is not checked —
 /// it never holds the units, which is the point for an issuer that is not
 /// itself an attested party. Nonce handling is left to the runtime's generic
-/// discipline (this was added after `NONCE_DISCIPLINE_HEIGHT`).
+/// discipline (`consume_nonce`).
 pub fn apply_issue_to<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &mut Asset,
