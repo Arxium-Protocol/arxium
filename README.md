@@ -151,7 +151,8 @@ non-loopback deployment.
 | `POST /actions` | Submit a signed action |
 | `GET /status` | Chain name, tip height, tip hash, finalized height |
 | `GET /accounts/{address}` | Balance, nonce, identity hash |
-| `GET /accounts/{address}/stake` | Stake allocations and unbonding |
+| `GET /accounts/{address}/stake` | Self-stake allocation and unbonding |
+| `GET /accounts/{address}/stakes` | Every allocation the account holds, one row per validator |
 | `GET /accounts/{address}/bls-key` | Registered BLS finality key |
 | `GET /actions/{signature}` | Status of a submitted action |
 | `GET /blocks` | Bounded range of blocks |

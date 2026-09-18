@@ -1713,6 +1713,30 @@ impl ArxiumDb {
         KvRead::get(self, &StakeKey { master, validator })
     }
 
+    /// Every allocation `master` holds, across all validators, sorted by
+    /// validator address. `stake:{master}:` prefix scan — bounded by how
+    /// many validators one account staked to, so no scan metric needed.
+    pub fn get_stake_allocations_by_master(
+        &self,
+        master: &Address,
+    ) -> Result<Vec<StakeAllocation>, StorageError> {
+        let prefix = format!("stake:{master}:");
+        let mut out = Vec::new();
+        let iter = self
+            .db
+            .iterator_cf(self.cf(CF_VALIDATORS), IteratorMode::From(prefix.as_bytes(), Direction::Forward));
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let (allocation, _len): (StakeAllocation, usize) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            out.push(allocation);
+        }
+        Ok(out)
+    }
+
     /// Masters currently staking to `validator`. One-master-per-validator is
     /// an enforced invariant, not just an assumption — callers should treat
     /// a `len() > 1` result as a bug, not a valid multi-delegator state.

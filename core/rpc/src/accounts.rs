@@ -22,6 +22,20 @@ pub(super) async fn get_account_stake<P: Payload>(
     Ok(Json(state.db.get_stake_allocation(&address, &address)?.ok_or(ApiError::NotFound)?))
 }
 
+/// Every allocation `address` holds as master, one per validator, so a
+/// wallet can list its delegations without keeping a local file of which
+/// validators it ever staked to. Each row's `active_amount` and `unbonding`
+/// (with `unlock_at_height`) are reported as stored; a fully returned
+/// allocation is deleted on maturity (`resolve_due_unbonding`), so it is
+/// simply absent here. Empty list, not 404, when there are none.
+pub(super) async fn get_account_stakes<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(address): Path<String>,
+) -> Result<Json<Vec<xc_primitives::StakeAllocation>>, ApiError> {
+    let address = parse_address(&address)?;
+    Ok(Json(state.db.get_stake_allocations_by_master(&address)?))
+}
+
 /// A delegated stake allocation: `master` need not equal `validator` (unlike
 /// `GET /accounts/{address}/stake`, the self-stake case) — this is how an
 /// operator/app looks up how much it has staked on a validator's behalf.

@@ -389,6 +389,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/accounts/{address}", get(get_account::<P>))
                 .route("/accounts/{address}/proof", get(get_account_proof::<P>))
                 .route("/accounts/{address}/stake", get(get_account_stake::<P>))
+                .route("/accounts/{address}/stakes", get(get_account_stakes::<P>))
                 .route("/accounts/{address}/bls-key", get(get_account_bls_key::<P>))
                 .route("/accounts/{address}/assets", get(get_account_assets::<P>))
                 .route(
@@ -1023,6 +1024,65 @@ mod tests {
 
             let resp = get_account_stake(State(state.clone()), Path(alice.to_string())).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
+        });
+    }
+
+    #[test]
+    fn account_stakes_lists_every_validator_the_master_staked_to() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let state = test_state();
+            let master = Address::from_pubkey_bytes(&[10u8; 32]).unwrap();
+            let other = Address::from_pubkey_bytes(&[11u8; 32]).unwrap();
+            let v1 = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
+            let v2 = Address::from_pubkey_bytes(&[13u8; 32]).unwrap();
+
+            let resp = get_account_stakes(State(state.clone()), Path(master.to_string())).await.into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&body).unwrap(), serde_json::json!([]));
+
+            let alloc = |m: &Address, v: &Address, active: u128, unbonding| xc_primitives::StakeAllocation {
+                master: m.clone(),
+                validator: v.clone(),
+                active_amount: active,
+                unbonding,
+                created_at: 1,
+                updated_at: 1,
+            };
+            let mut allocations = BTreeMap::new();
+            allocations.insert((master.clone(), v1.clone()), Some(alloc(&master, &v1, 1_000, None)));
+            allocations.insert(
+                (master.clone(), v2.clone()),
+                Some(alloc(
+                    &master,
+                    &v2,
+                    0,
+                    Some(xc_primitives::Unbonding { amount: 300, unlock_at_height: 99 }),
+                )),
+            );
+            // Another master's row must not leak into this master's list.
+            allocations.insert((other.clone(), v1.clone()), Some(alloc(&other, &v1, 7, None)));
+            state
+                .db
+                .write_batch(&xc_storage::StakeUpdates { allocations, validator_index: BTreeMap::new() })
+                .unwrap();
+
+            let resp = get_account_stakes(State(state.clone()), Path(master.to_string())).await.into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let rows = json.as_array().unwrap();
+            assert_eq!(rows.len(), 2);
+            for row in rows {
+                assert_eq!(row["master"], master.to_string());
+            }
+            let by_validator: BTreeMap<String, &serde_json::Value> =
+                rows.iter().map(|r| (r["validator"].as_str().unwrap().to_string(), r)).collect();
+            assert_eq!(by_validator[&v1.to_string()]["active_amount"], 1_000);
+            assert!(by_validator[&v1.to_string()]["unbonding"].is_null());
+            assert_eq!(by_validator[&v2.to_string()]["unbonding"]["unlock_at_height"], 99);
+            assert_eq!(by_validator[&v2.to_string()]["unbonding"]["amount"], 300);
         });
     }
 
