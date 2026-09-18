@@ -620,6 +620,10 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
 
     Ok(Json(serde_json::json!({
         "chain_name": chain_name,
+        // This crate's version — bumped whenever the JSON shape of a block
+        // changes, so an HTTP reader (Retracer) can refuse a node whose
+        // blocks it would misread instead of finding out from the data.
+        "version": env!("CARGO_PKG_VERSION"),
         "genesis_hash": genesis_hash,
         "tip_height": tip_height,
         "tip_hash": tip_hash,
@@ -1935,6 +1939,9 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 
             assert_eq!(json["finalized"], false, "no certificate written yet");
+            // The wire hash and per-action JSON payloads ride alongside, so an
+            // HTTP-only reader needs neither our bincode layout nor `P`.
+            assert_eq!(json["hash"], genesis.hash().to_string());
             // Still flat, still the block's own fields.
             assert_eq!(json["height"], 0);
             assert!(json["timestamp"].is_number());

@@ -90,6 +90,23 @@ fn block_with_finality<P: Payload>(
         object.insert("finalized".into(), serde_json::Value::Bool(finalized));
         // PoE `resources_used`: the metered weight this block carried.
         object.insert("weight_used".into(), serde_json::Value::from(weight_used));
+        // For an HTTP-only reader (Retracer): the wire hash, so it never has
+        // to re-encode the block with a bit-exact copy of our bincode layout
+        // to learn it, and each action's payload as JSON beside the bincode
+        // bytes `Action`'s own serializer emits, so it never has to decode
+        // `P` at all. Additive — `payload` stays for clients that already
+        // decode it. Bump this crate's version when either shape changes;
+        // `/status` reports it and readers refuse an older node.
+        object.insert("hash".into(), serde_json::Value::String(block.hash().to_string()));
+        if let Some(actions) = object.get_mut("actions").and_then(|a| a.as_array_mut()) {
+            for (json, action) in actions.iter_mut().zip(&block.actions) {
+                if let Some(json) = json.as_object_mut() {
+                    let payload = serde_json::to_value(&action.payload)
+                        .unwrap_or(serde_json::Value::Null);
+                    json.insert("payload_json".into(), payload);
+                }
+            }
+        }
     }
     Ok(value)
 }
