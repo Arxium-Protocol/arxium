@@ -25,7 +25,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use xc_circuit::{BlsKeyKey, ChainParamsKey, GenesisHashKey, KeySpec, ValidatorSetKey};
-use xc_primitives::{Block, quorum_reached, validator_set_effective_height};
+use xc_primitives::{Block, Hash32, quorum_reached, validator_set_effective_height};
 use xc_storage::{ArxiumDb, FinalityRecord, StorageError, snapshot_chunks};
 use xc_wire::{SnapshotEntry, SnapshotManifest, SyncRequest};
 
@@ -37,7 +37,7 @@ use crate::gossip::Payload;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotTrust {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
 }
 
 // ---------------------------------------------------------------- server --
@@ -274,7 +274,7 @@ impl<P: Payload> SnapshotSync<P> {
     }
 }
 
-fn entry<'a, K: KeySpec>(entries: &'a [SnapshotEntry], key: &K) -> Option<K::Value> {
+fn entry<K: KeySpec>(entries: &[SnapshotEntry], key: &K) -> Option<K::Value> {
     let raw = key.encode();
     let (_, _, value) = entries.iter().find(|(_, k, _)| *k == raw)?;
     xc_primitives::decode_wire_canonical(value).ok()
@@ -314,7 +314,7 @@ fn verify_certificate_against<P: Payload>(
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or("malformed genesis hash")?;
-    let msg = arxd_finality::precommit_signing_bytes(&genesis, record.height, &record.block_hash, &record.ep);
+    let msg = arxd_finality::precommit_signing_bytes(&genesis, record.height, &record.block_hash.to_string(), &record.ep);
     xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).map_err(|e| format!("aggregate: {e}"))
 }
 
@@ -343,7 +343,8 @@ mod tests {
             AccountEntry { balance, ..Default::default() },
         )]));
         let state_root = db.compute_state_root(&[&updates]).unwrap();
-        let parent_hash = db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash()).unwrap_or_default();
+        let parent_hash =
+            db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash().to_string()).unwrap_or_default();
         let block = Block::<()> {
             height,
             parent_hash,
@@ -376,7 +377,7 @@ mod tests {
             block = commit(&db, height, height as u128 * 10);
         }
         let ep = [0u8; 32];
-        let msg = arxd_finality::precommit_signing_bytes(&GENESIS, 3, &block.hash(), &ep);
+        let msg = arxd_finality::precommit_signing_bytes(&GENESIS, 3, &block.hash().to_string(), &ep);
         let record = FinalityRecord {
             height: 3,
             block_hash: block.hash(),
@@ -425,7 +426,7 @@ mod tests {
         // The operator anchored a different hash: the manifest is refused
         // before any chunk is fetched.
         let joiner = fresh_node();
-        let wrong = SnapshotTrust { height: 3, block_hash: "0xnot-this-block".into() };
+        let wrong = SnapshotTrust { height: 3, block_hash: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".parse().unwrap() };
         assert!(matches!(drive(&joiner, &source, wrong), Step::Retry));
         assert_eq!(joiner.get_tip_height().unwrap(), Some(0));
     }

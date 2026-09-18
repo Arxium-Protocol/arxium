@@ -20,8 +20,8 @@ use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META, CF_VALIDATORS,
 };
 use xc_primitives::{
-    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, HolderState,
-    Snapshot, StakeAllocation, ValidatorStatus, VotingPower,
+    assign_voting_power, stake_subaccount, AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, Hash32,
+    HolderState, Snapshot, StakeAllocation, ValidatorStatus, VotingPower,
 };
 #[cfg(test)]
 use xc_primitives::Action;
@@ -275,7 +275,7 @@ fn undo_key(height: u64) -> Vec<u8> {
 /// height then feeds the contiguous-watermark advance).
 fn note_write(
     touched: &mut BTreeSet<Vec<u8>>,
-    certified: &mut BTreeMap<u64, String>,
+    certified: &mut BTreeMap<u64, Hash32>,
     key: &[u8],
     value: Option<&[u8]>,
     recording: bool,
@@ -924,7 +924,7 @@ impl ArxiumDb {
         let mut batch = WriteBatch::default();
         let mut state_changes: BTreeMap<[u8; 32], Option<Vec<u8>>> = BTreeMap::new();
         let mut touched: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut certified: BTreeMap<u64, String> = BTreeMap::new();
+        let mut certified: BTreeMap<u64, Hash32> = BTreeMap::new();
         for item in items {
             for (key, value) in item.batch_entries()? {
                 if is_state_key(&key) {
@@ -982,7 +982,7 @@ impl ArxiumDb {
     /// is kept so `state_at` can still serve a snapshot at a recent height.
     fn stage_watermark_advance(
         &self,
-        incoming: &BTreeMap<u64, String>,
+        incoming: &BTreeMap<u64, Hash32>,
         batch: &mut WriteBatch,
     ) -> Result<(), StorageError> {
         let start = self.get_final_watermark()?;
@@ -990,7 +990,7 @@ impl ArxiumDb {
         loop {
             let next = watermark + 1;
             let certified = match incoming.get(&next) {
-                Some(block_hash) => block_hash.clone(),
+                Some(block_hash) => *block_hash,
                 None => match self.get_finality_record(next)? {
                     Some(record) => record.block_hash,
                     None => break,
@@ -1693,7 +1693,7 @@ impl ArxiumDb {
     }
 
     /// Look up a block's height by its content hash.
-    pub fn get_block_height_by_hash(&self, hash: &str) -> Result<Option<u64>, StorageError> {
+    pub fn get_block_height_by_hash(&self, hash: &Hash32) -> Result<Option<u64>, StorageError> {
         let key = format!("block_hash:{}", hash);
         match self.get(key.as_bytes())? {
             Some(bytes) => {
@@ -1834,7 +1834,7 @@ mod explorer_index_tests {
         let hash = b.hash();
         db.write_batch(&b).unwrap();
         assert_eq!(db.get_block_height_by_hash(&hash).unwrap(), Some(7));
-        assert_eq!(db.get_block_height_by_hash("0xnope").unwrap(), None);
+        assert_eq!(db.get_block_height_by_hash(&Hash32::from_bytes([0xEE; 32])).unwrap(), None);
     }
 
     #[test]
@@ -2796,7 +2796,7 @@ mod divergence_recovery_tests {
         let parent_hash = db
             .get_block::<()>(height.saturating_sub(1))
             .unwrap()
-            .map(|b| b.hash())
+            .map(|b| b.hash().to_string())
             .unwrap_or_default();
         let block = Block::<()> {
             height,
@@ -2822,10 +2822,10 @@ mod divergence_recovery_tests {
         certify_hash(db, height, &block_hash);
     }
 
-    fn certify_hash(db: &ArxiumDb, height: u64, block_hash: &str) {
+    fn certify_hash(db: &ArxiumDb, height: u64, block_hash: &Hash32) {
         db.write_batch(&FinalityRecord {
             height,
-            block_hash: block_hash.to_string(),
+            block_hash: *block_hash,
             signers: vec![addr(9)],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
             ep: [0u8; 32],
@@ -2870,7 +2870,7 @@ mod divergence_recovery_tests {
         let state_root = db.compute_state_root(&[&updates]).unwrap();
         let block = Block::<()> {
             height: 1,
-            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash(),
+            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash().to_string(),
             timestamp: 1,
             actions: Vec::new(),
             tx_root: [0u8; 32],
@@ -2965,7 +2965,7 @@ mod divergence_recovery_tests {
         let state_root = db.compute_state_root(&[&gold, &balances]).unwrap();
         let block = Block::<()> {
             height: 1,
-            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash(),
+            parent_hash: db.get_block::<()>(0).unwrap().unwrap().hash().to_string(),
             timestamp: 1,
             actions: Vec::new(),
             tx_root: [0u8; 32],
@@ -3033,7 +3033,7 @@ mod divergence_recovery_tests {
         assert_eq!(db.get_final_watermark().unwrap(), 1);
 
         // The network finalized a different block at height 2.
-        certify_hash(&db, 2, "0xsomebodyelses-block");
+        certify_hash(&db, 2, &Hash32::from_bytes([0xBE; 32]));
         certify(&db, 3);
         assert_eq!(db.get_final_watermark().unwrap(), 1, "our block at 2 is not the certified one");
 

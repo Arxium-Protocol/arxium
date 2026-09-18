@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
-use xc_primitives::{Address, Block, quorum_reached, round_timeout_signing_bytes};
+use xc_primitives::{Address, Block, Hash32, quorum_reached, round_timeout_signing_bytes};
 use xc_storage::{
     ArxiumDb, DissentRecord, FinalityRecord, PrecommitVoteRecord, RoundCertificate,
     RoundTimeoutVoteRecord,
@@ -98,7 +98,7 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
     let Ok(genesis) = db.genesis_hash_bytes() else {
         return false;
     };
-    let msg = precommit_signing_bytes(&genesis, record.height, &record.block_hash, &record.ep);
+    let msg = precommit_signing_bytes(&genesis, record.height, &record.block_hash.to_string(), &record.ep);
     xc_bls::verify_aggregate(&msg, &pubkeys, &record.aggregate_signature).is_ok()
 }
 
@@ -159,7 +159,7 @@ impl DissentReason {
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub struct Dissent {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub state_root: String,
     /// `sha256(signing_bytes_for(disputed block's header))` — binds this
     /// dissent to the exact block it disagrees with, since `block_hash`
@@ -212,7 +212,7 @@ const VOTE_REBROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub struct PrecommitVote {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub voter: Address,
     pub signature: BlsSignature,
     /// Execution proof this voter computed for the block — see
@@ -422,7 +422,7 @@ where
                     tallies
                         .entry(record.height)
                         .or_default()
-                        .entry((record.block_hash, record.ep))
+                        .entry((record.block_hash.to_string(), record.ep))
                         .or_default()
                         .insert(record.voter, record.signature);
                 }
@@ -511,7 +511,7 @@ where
                                                 &genesis,
                                                 next_height,
                                                 round,
-                                                &parent.hash(),
+                                                &parent.hash().to_string(),
                                             );
                                             let signature = xc_bls::sign(secret_key, &msg);
                                             let vote = RoundTimeoutVote {
@@ -653,7 +653,7 @@ where
                         0
                     });
                     let ep = xc_poe::block_ep(&parent_state_root, &block.tx_root, &block.state_root, weight_used);
-                    let msg = precommit_signing_bytes(&genesis, block.height, &hash, &ep);
+                    let msg = precommit_signing_bytes(&genesis, block.height, &hash.to_string(), &ep);
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {
                         height: block.height,
@@ -730,7 +730,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = precommit_signing_bytes(&db.genesis_hash_bytes()?, vote.height, &vote.block_hash, &vote.ep);
+    let msg = precommit_signing_bytes(&db.genesis_hash_bytes()?, vote.height, &vote.block_hash.to_string(), &vote.ep);
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping vote from {} with an invalid signature",
@@ -764,7 +764,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
         by_key
             .iter()
             // Same message: an ordinary duplicate or rebroadcast, not a fault.
-            .filter(|((block_hash, ep), _)| (block_hash.as_str(), *ep) != (vote.block_hash.as_str(), vote.ep))
+            .filter(|((block_hash, ep), _)| (block_hash.to_string(), *ep) != (vote.block_hash.to_string(), vote.ep))
             .find_map(|((block_hash, ep), signers)| {
                 signers.get(&vote.voter).map(|sig| (block_hash.clone(), *ep, sig.clone()))
             })
@@ -779,7 +779,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
             votes: [
                 PrecommitVote {
                     height: vote.height,
-                    block_hash: prior_hash,
+                    block_hash: prior_hash.parse().expect("tally key is always a Hash32::to_string()"),
                     voter: vote.voter.clone(),
                     signature: prior_signature,
                     ep: prior_ep,
@@ -791,7 +791,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
 
     let vote_record = PrecommitVoteRecord {
         height: vote.height,
-        block_hash: vote.block_hash.clone(),
+        block_hash: vote.block_hash,
         voter: vote.voter.clone(),
         signature: vote.signature.clone(),
         ep: vote.ep,
@@ -800,7 +800,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     let signers = tallies
         .entry(vote.height)
         .or_default()
-        .entry((vote.block_hash.clone(), vote.ep))
+        .entry((vote.block_hash.to_string(), vote.ep))
         .or_default();
     signers.insert(vote.voter, vote.signature);
 
@@ -834,7 +834,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
 
     let record = FinalityRecord {
         height: vote.height,
-        block_hash: vote.block_hash.clone(),
+        block_hash: vote.block_hash,
         signers: signers.keys().cloned().collect(),
         aggregate_signature,
         ep: vote.ep,
@@ -937,7 +937,7 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         );
         return Ok(());
     };
-    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, vote.height, vote.round, &parent.hash());
+    let msg = round_timeout_signing_bytes(&db.genesis_hash_bytes()?, vote.height, vote.round, &parent.hash().to_string());
     if xc_bls::verify(&msg, &pubkey, &vote.signature).is_err() {
         warn!(
             "finality: dropping round-timeout vote from {} with an invalid signature",
@@ -1045,7 +1045,7 @@ fn handle_dissent(
     let msg = dissent_signing_bytes(
         &db.genesis_hash_bytes()?,
         dissent.height,
-        &dissent.block_hash,
+        &dissent.block_hash.to_string(),
         &dissent.state_root,
         &dissent.header_commitment,
         &dissent.ep,
@@ -1175,7 +1175,7 @@ mod tests {
     fn certificate(height: u64, block_hash: &str) -> FinalityRecord {
         FinalityRecord {
             height,
-            block_hash: block_hash.to_string(),
+            block_hash: block_hash.parse().unwrap(),
             signers: vec![],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
             ep: [0u8; 32],
@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn a_certificate_naming_another_block_unwinds_this_node_to_the_parent() {
         let (db, dir, _) = chain_of_two();
-        let record = certificate(1, "0xwhatthenetworkactuallyfinalized");
+        let record = certificate(1, "0xc1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1");
         // Precondition: the watermark is stuck exactly because of the
         // disagreement, so the revert floor cannot be in the way.
         db.write_batch(&record).unwrap();
@@ -1227,7 +1227,7 @@ mod tests {
     #[test]
     fn a_certificate_for_the_block_we_hold_changes_nothing() {
         let (db, dir, one) = chain_of_two();
-        let record = certificate(1, &one.hash());
+        let record = certificate(1, &one.hash().to_string());
         db.write_batch(&record).unwrap();
 
         enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
@@ -1243,7 +1243,7 @@ mod tests {
     #[test]
     fn a_certificate_ahead_of_our_tip_is_not_a_disagreement() {
         let (db, dir, _) = chain_of_two();
-        let record = certificate(7, "0xnotherebutcertified");
+        let record = certificate(7, "0xc2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2");
 
         enforce_certificate::<()>(&db, &Mutex::new(()), &record).unwrap();
 
@@ -1280,7 +1280,7 @@ mod tests {
         let ep = [1u8; 32];
         let vote = |block_hash: &str| PrecommitVote {
             height: 5,
-            block_hash: block_hash.to_string(),
+            block_hash: block_hash.parse().unwrap(),
             voter: addr.clone(),
             signature: xc_bls::sign(&sk, &precommit_signing_bytes(&GENESIS, 5, block_hash, &ep)),
             ep,
@@ -1289,15 +1289,15 @@ mod tests {
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &tx, v).unwrap()
         };
 
-        tally(vote("0xaaa"));
+        tally(vote("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         // A rebroadcast of the same vote is not a fault.
-        tally(vote("0xaaa"));
+        tally(vote("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(rx.try_recv().is_err());
 
-        tally(vote("0xbbb"));
+        tally(vote("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
         let reported = rx.try_recv().expect("expected a reported equivocation");
-        assert_eq!(reported.votes[0].block_hash, "0xaaa");
-        assert_eq!(reported.votes[1].block_hash, "0xbbb");
+        assert_eq!(reported.votes[0].block_hash, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(reported.votes[1].block_hash, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         assert!(reported.votes.iter().all(|v| v.voter == addr && v.height == 5));
         // Reporting does not drop the vote: withholding it from the tally
         // would let an equivocator stall a height instead of losing stake.
@@ -1348,9 +1348,9 @@ mod tests {
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
-                block_hash: block_hash.clone(),
+                block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1360,9 +1360,9 @@ mod tests {
         let (addr, sk) = &addrs_and_keys[2];
         let vote = PrecommitVote {
             height: 5,
-            block_hash: block_hash.clone(),
+            block_hash: block_hash,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
             ep,
         };
         tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1410,9 +1410,9 @@ mod tests {
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
-                block_hash: block_hash.clone(),
+                block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1424,7 +1424,7 @@ mod tests {
             reloaded
                 .entry(record.height)
                 .or_default()
-                .entry((record.block_hash, record.ep))
+                .entry((record.block_hash.to_string(), record.ep))
                 .or_default()
                 .insert(record.voter, record.signature);
         }
@@ -1433,7 +1433,7 @@ mod tests {
             reloaded
                 .get(&5)
                 .unwrap()
-                .get(&(block_hash.clone(), ep))
+                .get(&(block_hash.to_string(), ep))
                 .unwrap()
                 .len(),
             2,
@@ -1445,9 +1445,9 @@ mod tests {
         let (addr, sk) = &addrs_and_keys[2];
         let vote = PrecommitVote {
             height: 5,
-            block_hash: block_hash.clone(),
+            block_hash: block_hash,
             voter: addr.clone(),
-            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+            signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
             ep,
         };
         tally_vote::<()>(
@@ -1507,9 +1507,9 @@ mod tests {
             let ep = if i < 2 { ep_a } else { ep_b };
             let vote = PrecommitVote {
                 height: 5,
-                block_hash: block_hash.clone(),
+                block_hash: block_hash,
                 voter: addr.clone(),
-                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+                signature: xc_bls::sign(sk, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
                 ep,
             };
             tally_vote::<()>(&db, &Mutex::new(()), &mut tallies, &mut my_votes, &equivocation_tx_for_test(), vote).unwrap();
@@ -1523,7 +1523,7 @@ mod tests {
             tallies
                 .get(&5)
                 .unwrap()
-                .get(&(block_hash.clone(), ep_a))
+                .get(&(block_hash.to_string(), ep_a))
                 .unwrap()
                 .len(),
             2
@@ -1532,7 +1532,7 @@ mod tests {
             tallies
                 .get(&5)
                 .unwrap()
-                .get(&(block_hash, ep_b))
+                .get(&(block_hash.to_string(), ep_b))
                 .unwrap()
                 .len(),
             2
@@ -1562,7 +1562,7 @@ mod tests {
         );
         Dissent {
             height,
-            block_hash: block_hash.to_string(),
+            block_hash: block_hash.parse().unwrap(),
             state_root,
             header_commitment,
             ep,
@@ -1589,7 +1589,7 @@ mod tests {
         .unwrap();
 
         let (dissent_tx, _dissent_rx) = mpsc::channel();
-        let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xblockhash");
+        let dissent = dissent_fixture(addr.clone(), &sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1");
         handle_dissent(&db, dissent, &dissent_tx).unwrap();
 
         let stored = db
@@ -1620,7 +1620,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &sk, 5, "0xblockhash"),
+            dissent_fixture(addr.clone(), &sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"),
             &dissent_tx,
         )
         .unwrap();
@@ -1628,14 +1628,14 @@ mod tests {
         // same height must not overwrite the first.
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &sk, 5, "0xotherblockhash"),
+            dissent_fixture(addr.clone(), &sk, 5, "0xb2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"),
             &dissent_tx,
         )
         .unwrap();
 
         let stored = db.get_dissent(5, &addr).unwrap().unwrap();
         assert_eq!(
-            stored.block_hash, "0xblockhash",
+            stored.block_hash, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
             "the first dissent must win, not be overwritten"
         );
 
@@ -1663,7 +1663,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         handle_dissent(
             &db,
-            dissent_fixture(addr.clone(), &other_sk, 5, "0xblockhash"),
+            dissent_fixture(addr.clone(), &other_sk, 5, "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"),
             &dissent_tx,
         )
         .unwrap();
@@ -1722,7 +1722,7 @@ mod tests {
                 addr.clone(),
                 &sk,
                 dissent_height,
-                "0xblockhash",
+                "0xb1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
             )))
             .unwrap();
 
@@ -1931,7 +1931,7 @@ mod tests {
         event_tx
             .send(FinalityEvent::VoteObserved(PrecommitVote {
                 height: u64::MAX,
-                block_hash: "0".repeat(64),
+                block_hash: "0".repeat(64).parse().unwrap(),
                 voter: Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
                 signature: xc_bls::sign(&attacker_sk, b"not a precommit"),
                 ep: [0u8; 32],
@@ -2070,9 +2070,9 @@ mod tests {
         let ep = [1u8; 32];
         let vote = |i: usize| PrecommitVote {
             height: 5,
-            block_hash: block_hash.clone(),
+            block_hash: block_hash,
             voter: keys[i].0.clone(),
-            signature: xc_bls::sign(&keys[i].1, &precommit_signing_bytes(&GENESIS, 5, &block_hash, &ep)),
+            signature: xc_bls::sign(&keys[i].1, &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep)),
             ep,
         };
         let mut tallies = HashMap::new();
@@ -2104,12 +2104,12 @@ mod tests {
         let mut tallies = HashMap::new();
         let mut my_votes = HashMap::new();
         for (addr, sk) in &keys[4..20] {
-            tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
+            tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()))
                 .unwrap();
         }
         assert!(db.get_round_certificate(5, 0).unwrap().is_none(), "16 of 20 by count is 6,000 by power");
         let (addr, sk) = &keys[0];
-        tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash()))
+        tally_round_timeout::<()>(&db, &mut tallies, &mut my_votes, round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()))
             .unwrap();
         assert_eq!(db.get_round_certificate(5, 0).unwrap().unwrap().signers.len(), 17);
         std::fs::remove_dir_all(&dir).ok();
@@ -2131,7 +2131,7 @@ mod tests {
                 &db,
                 &mut tallies,
                 &mut my_votes,
-                round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+                round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
             )
             .unwrap();
         }
@@ -2145,7 +2145,7 @@ mod tests {
             &db,
             &mut tallies,
             &mut my_votes,
-            round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+            round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
         )
         .unwrap();
 
@@ -2176,14 +2176,14 @@ mod tests {
             &db,
             &mut tallies,
             &mut my_votes,
-            round_timeout_vote(addr0, sk0, 5, 0, &parent.hash()),
+            round_timeout_vote(addr0, sk0, 5, 0, &parent.hash().to_string()),
         )
         .unwrap();
         tally_round_timeout::<()>(
             &db,
             &mut tallies,
             &mut my_votes,
-            round_timeout_vote(addr1, sk1, 5, 1, &parent.hash()),
+            round_timeout_vote(addr1, sk1, 5, 1, &parent.hash().to_string()),
         )
         .unwrap();
 
@@ -2215,7 +2215,7 @@ mod tests {
                 &db,
                 &mut tallies,
                 &mut my_votes,
-                round_timeout_vote(addr, sk, 5, 0, &parent.hash()),
+                round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
             )
             .unwrap();
         }
@@ -2229,7 +2229,7 @@ mod tests {
             &db,
             &mut tallies,
             &mut my_votes,
-            round_timeout_vote(&late_addr, &late_sk, 5, 0, &parent.hash()),
+            round_timeout_vote(&late_addr, &late_sk, 5, 0, &parent.hash().to_string()),
         )
         .unwrap();
 

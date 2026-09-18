@@ -96,7 +96,7 @@ impl BatchWritable for Snapshot {
             self.validators.iter().map(|(a, v)| (a.clone(), v.stake)).collect();
         entries.push((
             b"validator_set:00000000000000000000".to_vec(),
-            bincode::serde::encode_to_vec(&assign_voting_power(&genesis_stakes), config)?,
+            bincode::serde::encode_to_vec(assign_voting_power(&genesis_stakes), config)?,
         ));
         for address in self.validators.keys() {
             entries.push((
@@ -370,7 +370,7 @@ impl BatchWritable for BlockWeight {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityRecord {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub signers: Vec<Address>,
     pub aggregate_signature: BlsSignature,
     /// The execution-proof commitment every signer signed over, alongside
@@ -391,7 +391,7 @@ pub struct FinalityRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecommitVoteRecord {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub voter: Address,
     pub signature: BlsSignature,
     pub ep: [u8; 32],
@@ -412,7 +412,7 @@ impl BatchWritable for PrecommitVoteRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DissentRecord {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub state_root: String,
     pub ep: [u8; 32],
     pub reason: String,

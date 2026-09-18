@@ -23,6 +23,7 @@
 //! mismatch visible rather than silent.
 
 use serde::{Deserialize, Serialize};
+use xc_primitives::Hash32;
 
 /// libp2p protocol name, chain-scoped so two nodes on different chains can't
 /// open a sync stream and exchange blocks that fail verification — the same
@@ -99,7 +100,7 @@ pub type SnapshotEntry = (String, Vec<u8>, Vec<u8>);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotManifest {
     pub height: u64,
-    pub block_hash: String,
+    pub block_hash: Hash32,
     pub state_root: String,
     pub entries: u64,
     pub chunks: u32,
@@ -123,7 +124,7 @@ pub enum SyncResponse<B> {
     NodeInfo(NodeInfo),
     /// `(height, hash)` ascending. Truncated to the responder's page size, and
     /// silently short where it has no block — absence is not an error here.
-    Hashes(Vec<(u64, String)>),
+    Hashes(Vec<(u64, Hash32)>),
     /// Answer to [`SyncRequest::Certificate`]. `record` is a bincode-encoded
     /// finality certificate, opaque here so this crate stays free of chain
     /// crypto types; `None` means the responder has no certificate at that
@@ -157,7 +158,7 @@ pub struct NodeInfo {
     pub wire_version: u32,
     pub tip_height: u64,
     /// Content hash at `tip_height`. `None` only if the tip can't be read.
-    pub tip_hash: Option<String>,
+    pub tip_hash: Option<Hash32>,
     /// Highest height holding a finality certificate (2/3+ of that height's
     /// validator set precommitted), or `None` on a chain that doesn't run
     /// finality voting.

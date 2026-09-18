@@ -4,6 +4,7 @@
 use crate::action::{Action, RawAction, SignatureError};
 use crate::address::Address;
 use crate::consensus::RoundCertificate;
+use crate::hash32::Hash32;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -82,11 +83,10 @@ impl RawBlock {
     /// unrecognized actions must hash the `RawBlock` it decoded from, never a
     /// truncated `Block<P>` — hashing the truncated struct would silently
     /// produce a hash that doesn't match the real on-chain block.
-    pub fn hash(&self) -> String {
+    pub fn hash(&self) -> Hash32 {
         let bytes = bincode::serde::encode_to_vec(self, crate::wire_config())
             .expect("block encoding should never fail");
-        let digest = Sha256::digest(&bytes);
-        format!("0x{}", hex::encode(digest))
+        Hash32::from_bytes(Sha256::digest(&bytes).into())
     }
 }
 
@@ -134,11 +134,10 @@ impl<P: Serialize> Block<P> {
     }
 
     /// Deterministic hash of this block's content
-    pub fn hash(&self) -> String {
+    pub fn hash(&self) -> Hash32 {
         let bytes = bincode::serde::encode_to_vec(self, crate::wire_config())
             .expect("block encoding should never fail");
-        let digest = Sha256::digest(&bytes);
-        format!("0x{}", hex::encode(digest))
+        Hash32::from_bytes(Sha256::digest(&bytes).into())
     }
 
     /// Deterministic bytes a valid proposer signature must cover — exposed

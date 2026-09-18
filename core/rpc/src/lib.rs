@@ -23,7 +23,9 @@ use subtle::ConstantTimeEq;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
-use xc_primitives::{Action, Address, Asset, AssetRef, Block, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power};
+use xc_primitives::{
+    Action, Address, Asset, AssetRef, Block, Hash32, Limits, QUORUM_POWER, TOTAL_VOTING_POWER, signed_power,
+};
 use xc_storage::{ArxiumDb, StorageError};
 
 /// Bound every chain's payload type must satisfy to be served over this RPC:
@@ -987,7 +989,7 @@ fn state_proof<P: Payload, K: xc_circuit::KeySpec>(
         proof,
         height,
         state_root: block.state_root.clone(),
-        block_hash: block.hash(),
+        block_hash: block.hash().to_string(),
         parent_state_root,
         weight_used: db.get_block_weight(height)?,
         block: serde_json::to_value(&block).unwrap_or(serde_json::Value::Null),
@@ -1566,7 +1568,7 @@ async fn get_finality<P: Payload>(State(state): State<AppState<P>>) -> Response 
         // null rather than absent: a client must be able to tell "nothing has
         // finalized yet" from "this node is too old to have the field".
         "finalized_height": finalized_height,
-        "finalized_hash": record.as_ref().map(|r| r.block_hash.clone()),
+        "finalized_hash": record.as_ref().map(|r| r.block_hash),
         "signers": record.as_ref().map(|r| r.signers.clone()),
         "tip_height": tip_height,
         // How far behind the tip finality is running. Growing steadily means
@@ -1854,6 +1856,13 @@ async fn get_block_by_hash<P: Payload>(
     State(state): State<AppState<P>>,
     Path(hash): Path<String>,
 ) -> Response {
+    // Case/prefix are normalized before the lookup, not compared as raw
+    // strings, so `/blocks/AABBCC...` finds the same block as
+    // `/blocks/aabbcc...`. A string that isn't even a valid 32-byte hash
+    // can't name any block, same as one that doesn't match.
+    let Ok(hash) = hash.parse::<Hash32>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let height = match state.db.get_block_height_by_hash(&hash) {
         Ok(Some(height)) => height,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1954,9 +1963,10 @@ async fn search<P: Payload>(
             .into_response();
     }
 
-    if let Ok(Some(height)) = state.db.get_block_height_by_hash(&q) {
-        return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
-    }
+    if let Ok(hash) = q.parse::<Hash32>()
+        && let Ok(Some(height)) = state.db.get_block_height_by_hash(&hash) {
+            return Json(serde_json::json!({ "kind": "block", "height": height })).into_response();
+        }
 
     if let Ok(Some(height)) = state.db.get_action_block_height(&q) {
         return Json(serde_json::json!({ "kind": "action", "signature": q, "height": height }))
@@ -2575,7 +2585,7 @@ mod tests {
                 let body = json(resp).await;
                 assert_eq!(body["height"], 0);
                 assert_eq!(body["state_root"], genesis.state_root);
-                assert_eq!(body["block_hash"], genesis.hash());
+                assert_eq!(body["block_hash"], genesis.hash().to_string());
                 assert_eq!(body["value"]["balance"].as_u64(), expect_value);
                 let proof: xc_artifact::StateProof = serde_json::from_value(body["proof"].clone()).unwrap();
                 let root: [u8; 32] =
@@ -2707,7 +2717,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["chain_name"], "test-chain");
             assert_eq!(json["tip_height"], 0);
-            assert_eq!(json["tip_hash"], genesis.hash());
+            assert_eq!(json["tip_hash"], genesis.hash().to_string());
             assert_eq!(json["genesis_hash"], genesis.state_root);
         });
     }
@@ -2749,7 +2759,7 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let target_hash = state.db.get_block::<TestPayload>(1).unwrap().unwrap().hash();
-            let resp = get_block_by_hash(State(state.clone()), Path(target_hash)).await;
+            let resp = get_block_by_hash(State(state.clone()), Path(target_hash.to_string())).await;
             assert_eq!(resp.status(), StatusCode::OK);
 
             let resp = get_block_by_hash(State(state.clone()), Path("0xnope".into())).await;

@@ -7,7 +7,7 @@ use xc_circuit::{
     ValidatorStatusKey,
 };
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, ValidatorStatus};
+use xc_primitives::{Address, Hash32, ValidatorStatus};
 use xc_storage::{BlsKeyRegistration, EvidenceMarker, StorageError};
 
 use crate::staking::is_authorized;
@@ -100,11 +100,12 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
 /// keys on two Arxium chains could be slashed here for a fault committed on
 /// the other one.
 /// Genesis hashes are written both ways in this codebase — `0x`-prefixed in
-/// artifacts (`core/evidence`), bare hex in some specs — so compare on the
-/// hex itself, case-insensitively.
+/// artifacts (`core/evidence`), bare hex in some specs — so this decodes both
+/// through [`Hash32`] and compares bytes instead of hand-rolling a
+/// case/prefix-insensitive string comparison. A side that isn't even valid
+/// hex can't be a match.
 fn genesis_hash_matches(a: &str, b: &str) -> bool {
-    let strip = |s: &str| s.strip_prefix("0x").unwrap_or(s).to_ascii_lowercase();
-    strip(a) == strip(b)
+    matches!((Hash32::parse(a), Hash32::parse(b)), (Ok(a), Ok(b)) if a == b)
 }
 
 pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
@@ -825,17 +826,18 @@ mod tests {
     fn execution_fault_from_another_chain_is_rejected() {
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
-        view.put(&GenesisHashKey, &"0xaaaa".to_string()).unwrap();
+        view.put(&GenesisHashKey, &format!("0x{}", "aa".repeat(32))).unwrap();
         let no_bls_owner = |_: &BlsPublicKey| -> Result<Option<Address>, StorageError> { Ok(None) };
 
-        let err = submit_execution_fault(&view, &foreign_artifact_json("0xbbbb"), 1, &no_bls_owner)
-            .unwrap_err();
-        assert!(err.to_string().contains("0xbbbb"), "{err}");
+        let err =
+            submit_execution_fault(&view, &foreign_artifact_json(&format!("0x{}", "bb".repeat(32))), 1, &no_bls_owner)
+                .unwrap_err();
+        assert!(err.to_string().contains(&"bb".repeat(32)), "{err}");
 
         // Same artifact, this chain's genesis (and the `0x`/case spelling
         // artifacts actually use): the genesis check is out of the way and
         // the fault kind itself is what rejects it.
-        let err = submit_execution_fault(&view, &foreign_artifact_json("0xAAAA"), 1, &no_bls_owner)
+        let err = submit_execution_fault(&view, &foreign_artifact_json(&format!("0x{}", "AA".repeat(32))), 1, &no_bls_owner)
             .unwrap_err();
         assert!(
             err.to_string().contains("SubmitEquivocationEvidence"),

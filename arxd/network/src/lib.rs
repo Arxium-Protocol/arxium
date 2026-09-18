@@ -918,7 +918,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                     continue;
                                 }
                                 let local_hash = db.get_block::<P>(height).ok().flatten().map(|block| block.hash());
-                                if local_hash.as_deref() == Some(record.block_hash.as_str()) {
+                                if local_hash == Some(record.block_hash) {
                                     // The peer's certified block is the one we
                                     // hold: nothing to roll back, and the
                                     // certificate is worth keeping. Persisting

@@ -502,6 +502,7 @@ dependencies = [
 name = "arxd-payload"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "serde",
  "xc-primitives",
 ]
@@ -5435,6 +5436,7 @@ name = "xc-wire"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "xc-primitives",
 ]
 
 [[package]]

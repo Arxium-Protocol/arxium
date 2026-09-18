@@ -8,12 +8,14 @@ mod address;
 mod asset_ref;
 mod block;
 mod consensus;
+mod hash32;
 pub mod keyfile;
 mod state;
 mod validator_set;
 
 pub use action::{Action, RawAction, SignatureError};
 pub use address::{Address, AddressError};
+pub use hash32::{Hash32, Hash32Error};
 pub use asset_ref::{AssetRef, AssetRefError};
 pub use block::{Block, RawBlock};
 pub use consensus::{

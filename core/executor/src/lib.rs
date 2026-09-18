@@ -8,7 +8,7 @@ use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::collections::BTreeMap;
 use xc_primitives::{
-    Action, Address, Block, MAX_FUTURE_DRIFT_SECS, QUORUM_POWER, RoundCertificate, SignatureError, VotingPower,
+    Action, Address, Block, Hash32, MAX_FUTURE_DRIFT_SECS, QUORUM_POWER, RoundCertificate, SignatureError, VotingPower,
     eligible_proposer, round_timeout_signing_bytes, signed_power,
 };
 use xc_primitives::Asset;
@@ -195,11 +195,11 @@ pub enum AcceptBlockError {
     )]
     ContradictsCertificate {
         height: u64,
-        certified: String,
-        offered: String,
+        certified: Hash32,
+        offered: Hash32,
     },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
-    ParentMismatch { local: String, expected: String },
+    ParentMismatch { local: Hash32, expected: String },
     #[error(
         "block {height} timestamp {timestamp} does not advance past its parent's {parent_timestamp}"
     )]
@@ -441,7 +441,12 @@ where
     let parent: Block<P> = db
         .get_block(tip_height)?
         .expect("tip block must exist if tip_height set");
-    if block.parent_hash != parent.hash() {
+    // Decoded before comparing, not compared as strings: a peer's block
+    // naming the real parent in a different case/prefix must not be
+    // rejected as if it named a different parent (same class of bug as
+    // `arxd_runtime::consensus::genesis_hash_matches`). A `parent_hash`
+    // that isn't even valid hex is definitely not a match.
+    if Hash32::parse(&block.parent_hash).map_or(true, |declared| declared != parent.hash()) {
         return Err(AcceptBlockError::ParentMismatch {
             local: parent.hash(),
             expected: block.parent_hash.clone(),
@@ -1144,7 +1149,7 @@ mod tests {
 
         let block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: 1,
             actions: vec![signed_join(&bob_key, &bob, 0)],
             tx_root: [0u8; 32],
@@ -1165,7 +1170,7 @@ mod tests {
         assert_eq!(db.validator_addresses_at(2).unwrap(), vec![alice.clone()]);
         let block2 = Block {
             height: 2,
-            parent_hash: accepted.hash(),
+            parent_hash: accepted.hash().to_string(),
             timestamp: 2,
             actions: vec![],
             tx_root: [0u8; 32],
@@ -1389,7 +1394,7 @@ mod tests {
 
         let block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: 1,
             actions: vec![signed_stake(&alice_key, &alice, 0, &validator, 400)],
             tx_root: [0u8; 32],
@@ -1472,7 +1477,7 @@ mod tests {
 
         let block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: 1,
             // Without the unbonding-resolves-first ordering, this would hit
             // `AlreadyUnbonding` since the allocation above is still mid-unbond.
@@ -1529,7 +1534,7 @@ mod tests {
             circuit_staking::apply_block_reward(&db, &addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: block1_timestamp,
             actions: vec![],
             tx_root: [0u8; 32],
@@ -1565,7 +1570,7 @@ mod tests {
             circuit_staking::apply_block_reward(db, addr, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block = Block {
             height: parent.height + 1,
-            parent_hash: parent.hash(),
+            parent_hash: parent.hash().to_string(),
             timestamp,
             actions: vec![],
             tx_root: [0u8; 32],
@@ -1722,7 +1727,7 @@ mod tests {
             circuit_staking::apply_block_reward(&db, &addr1, 0, circuit_staking::REWARD_PER_BLOCK).unwrap();
         let mut block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: now_secs(),
             actions: vec![],
             tx_root: [0u8; 32],
@@ -1827,7 +1832,7 @@ mod tests {
         for bad_height in [1u64, 3, 100] {
             let mut block2 = Block {
                 height: bad_height,
-                parent_hash: block1.hash(),
+                parent_hash: block1.hash().to_string(),
                 timestamp: block1.timestamp + 1,
                 actions: vec![],
                 tx_root: [0u8; 32],
@@ -1858,7 +1863,7 @@ mod tests {
 
         let mut block2 = Block {
             height: 2,
-            parent_hash: block1.hash(),
+            parent_hash: block1.hash().to_string(),
             timestamp: block1.timestamp + 1,
             actions: vec![],
             tx_root: [0u8; 32],
@@ -1873,7 +1878,7 @@ mod tests {
         // A certificate naming a different block at height 2.
         db.write_batch(&xc_storage::FinalityRecord {
             height: 2,
-            block_hash: "0xsomeotherblock".to_string(),
+            block_hash: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".parse().unwrap(),
             signers: vec![addr.clone()],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
             ep: [0u8; 32],
@@ -1944,7 +1949,7 @@ mod tests {
         let tx_root = xc_poe::tx_root(&actions).unwrap();
         let mut block1 = Block {
             height: 1,
-            parent_hash: genesis.hash(),
+            parent_hash: genesis.hash().to_string(),
             timestamp: 1,
             actions,
             tx_root,

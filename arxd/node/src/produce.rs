@@ -236,7 +236,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
 
     let mut new_block = Block {
         height: next_height,
-        parent_hash: parent.hash(),
+        parent_hash: parent.hash().to_string(),
         timestamp,
         actions: applied,
         tx_root,

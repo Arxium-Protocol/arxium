@@ -18,6 +18,7 @@
 //! pre-existing behaviour and is always safe.
 
 use std::time::{Duration, Instant};
+use xc_primitives::Hash32;
 
 /// Minimum gap between two automatic reverts. Without it a peer that can
 /// trigger a revert can trigger them back to back and stall this node
@@ -36,8 +37,8 @@ pub(crate) const REVERT_COOLDOWN: Duration = Duration::from_secs(60);
 /// there is nothing to roll back to. A height the peer reported that this node
 /// doesn't have is not a disagreement either: it's just the peer being ahead.
 pub(crate) fn first_divergent_height(
-    remote: &[(u64, String)],
-    local_hash: impl Fn(u64) -> Option<String>,
+    remote: &[(u64, Hash32)],
+    local_hash: impl Fn(u64) -> Option<Hash32>,
 ) -> Option<u64> {
     remote
         .iter()
@@ -110,31 +111,35 @@ pub(crate) fn allow_revert(last: &mut Option<Instant>, now: Instant) -> bool {
 mod tests {
     use super::*;
 
-    fn page(entries: &[(u64, &str)]) -> Vec<(u64, String)> {
-        entries.iter().map(|(h, s)| (*h, s.to_string())).collect()
+    fn h(byte: u8) -> Hash32 {
+        Hash32::from_bytes([byte; 32])
+    }
+
+    fn page(entries: &[(u64, u8)]) -> Vec<(u64, Hash32)> {
+        entries.iter().map(|(height, byte)| (*height, h(*byte))).collect()
     }
 
     #[test]
     fn agreement_everywhere_is_not_a_divergence() {
-        let remote = page(&[(10, "a"), (11, "b"), (12, "c")]);
+        let remote = page(&[(10, 0xaa), (11, 0xbb), (12, 0xcc)]);
         assert_eq!(
-            first_divergent_height(&remote, |h| Some(["a", "b", "c"][h as usize - 10].into())),
+            first_divergent_height(&remote, |height| Some(h([0xaa, 0xbb, 0xcc][height as usize - 10]))),
             None
         );
     }
 
     #[test]
     fn finds_the_first_mismatch_not_the_last() {
-        let remote = page(&[(10, "a"), (11, "X"), (12, "Y")]);
-        let local = |h: u64| Some(["a", "b", "c"][h as usize - 10].to_string());
+        let remote = page(&[(10, 0xaa), (11, 0xee), (12, 0xff)]);
+        let local = |height: u64| Some(h([0xaa, 0xbb, 0xcc][height as usize - 10]));
         assert_eq!(first_divergent_height(&remote, local), Some(11));
     }
 
     #[test]
     fn heights_we_dont_have_are_the_peer_being_ahead_not_a_fork() {
-        let remote = page(&[(10, "a"), (11, "b")]);
+        let remote = page(&[(10, 0xaa), (11, 0xbb)]);
         assert_eq!(
-            first_divergent_height(&remote, |h| (h == 10).then(|| "a".to_string())),
+            first_divergent_height(&remote, |height| (height == 10).then(|| h(0xaa))),
             None
         );
     }

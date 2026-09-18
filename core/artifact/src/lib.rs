@@ -796,7 +796,14 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
                 return Err(VerifyError::DissentTargetsDifferentBlock);
             }
 
-            if proposed.header.state_root == dissent.state_root {
+            // Decoded to bytes before comparing, not compared as strings: a
+            // proposer and a dissenter formatting the same root with
+            // different case/prefix must never be read as a disagreement
+            // (see `arxd_runtime::consensus::genesis_hash_matches`, the same
+            // class of bug for `genesis_hash`).
+            if decode_hex_32("state_root", &proposed.header.state_root)?
+                == decode_hex_32("state_root", &dissent.state_root)?
+            {
                 return Err(VerifyError::NoDisagreement);
             }
 
@@ -1053,7 +1060,7 @@ mod tests {
             timestamp: 1234,
             tx_root: format!("0x{}", hex::encode([tx_root; 32])),
             proposer: proposer.to_string(),
-            state_root: "0xstate".to_string(),
+            state_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             round: 0,
         }
     }
@@ -1321,7 +1328,7 @@ mod tests {
         let disputed_header = header(height, 1, "arx1proposer");
         let proposed = attestation(proposer_key, disputed_header.clone());
         let dissent =
-            dissent_attestation(voter_sk, voter_pubkey, height, "0xdifferentstate", &disputed_header);
+            dissent_attestation(voter_sk, voter_pubkey, height, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &disputed_header);
         EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
@@ -1449,8 +1456,8 @@ mod tests {
         let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let disputed_header = header(5, 1, "arx1proposer");
         let proposed = attestation(&proposer, disputed_header.clone());
-        // Dissenter's claimed state_root matches the proposer's ("0xstate", set by `header()`).
-        let dissent = dissent_attestation(&voter_sk, &voter_pk, 5, "0xstate", &disputed_header);
+        // Dissenter's claimed state_root matches the proposer's (set by `header()`).
+        let dissent = dissent_attestation(&voter_sk, &voter_pk, 5, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", &disputed_header);
         let art = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),

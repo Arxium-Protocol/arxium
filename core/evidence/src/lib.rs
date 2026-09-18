@@ -664,7 +664,7 @@ mod tests {
         let proposed = signed_block(&key, 5, 100);
         let dissent = DissentAttestation {
             height: 5,
-            block_hash: format!("0x{}", hex::encode(proposed.hash())),
+            block_hash: proposed.hash().to_string(),
             state_root: "0xdisputed".to_string(),
             header_commitment: format!("0x{}", hex::encode([4u8; 32])),
             ep: format!("0x{}", hex::encode([1u8; 32])),

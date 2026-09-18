@@ -32,6 +32,8 @@ use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block};
+#[cfg(test)]
+use xc_primitives::Hash32;
 use xc_rpc::{IngestConfig, spawn_http_ingest};
 use xc_storage::{ArxiumDb, DissentRecord};
 
@@ -95,7 +97,7 @@ mod reject_severity_tests {
     #[test]
     fn parent_mismatch_is_not_routine() {
         let err = AcceptBlockError::ParentMismatch {
-            local: "a".into(),
+            local: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".parse().unwrap(),
             expected: "b".into(),
         };
         assert!(!is_routine_reject(&err));
@@ -215,7 +217,7 @@ mod dissent_evidence_bridge_tests {
         (ArxiumDb::open(&dir).expect("open test db"), dir)
     }
 
-    fn sample_record(height: u64, block_hash: String, voter: Address) -> DissentRecord {
+    fn sample_record(height: u64, block_hash: Hash32, voter: Address) -> DissentRecord {
         DissentRecord {
             height,
             block_hash,
@@ -269,7 +271,7 @@ mod dissent_evidence_bridge_tests {
     fn skips_without_panicking_when_the_disputed_block_is_not_held_locally() {
         let (db, dir) = open_test_db();
         let voter = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let record = sample_record(5, "0xnotheld".to_string(), voter);
+        let record = sample_record(5, Hash32::from_bytes([0xdd; 32]), voter);
 
         assert!(
             dissent_record_to_evidence_event::<()>(&db, record).is_none(),
@@ -432,7 +434,7 @@ fn dissent_record_to_evidence_event<P: serde::de::DeserializeOwned>(
     };
     let attestation = DissentAttestation {
         height: record.height,
-        block_hash: record.block_hash,
+        block_hash: record.block_hash.to_string(),
         state_root: record.state_root,
         header_commitment: format!("0x{}", hex::encode(record.header_commitment)),
         ep: format!("0x{}", hex::encode(record.ep)),
@@ -673,7 +675,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                 };
                 let attest = |vote: &PrecommitVote| PrecommitAttestation {
                     height: vote.height,
-                    block_hash: vote.block_hash.clone(),
+                    block_hash: vote.block_hash.to_string(),
                     ep: format!("0x{}", hex::encode(vote.ep)),
                     signature: format!("0x{}", hex::encode(vote.signature.0)),
                 };
@@ -935,7 +937,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     let msg = dissent_signing_bytes(
                                         &genesis_hash,
                                         height,
-                                        &block_hash,
+                                        &block_hash.to_string(),
                                         &state_root,
                                         &header_commitment,
                                         &ep,
@@ -957,7 +959,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                                     if let Ok(Some(pubkey)) = db.get_bls_pubkey(address) {
                                         let attestation = DissentAttestation {
                                             height: dissent.height,
-                                            block_hash: dissent.block_hash.clone(),
+                                            block_hash: dissent.block_hash.to_string(),
                                             state_root: dissent.state_root.clone(),
                                             header_commitment: format!(
                                                 "0x{}",
@@ -1259,8 +1261,11 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         let hex_pubkey = hex::encode(pubkey.0);
         println!("{hex_pubkey}");
         if *qr {
-            let code = qrcode::QrCode::new(&hex_pubkey)
-                .context("failed to render BLS pubkey as a QR code")?;
+            // pubkey ‖ pop in one code: the app's JoinValidator/RegisterBlsKey
+            // both need the proof of possession, and scanning twice is worse.
+            let payload = format!("{hex_pubkey}{}", hex::encode(xc_bls::prove_possession(&secret).0));
+            let code = qrcode::QrCode::new(&payload)
+                .context("failed to render BLS key as a QR code")?;
             let image = code
                 .render::<qrcode::render::unicode::Dense1x2>()
                 .dark_color(qrcode::render::unicode::Dense1x2::Light)
@@ -1559,7 +1564,14 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
         snapshot_trust: config
             .snapshot_trust
             .clone()
-            .map(|(height, block_hash)| arxd_network::SnapshotTrust { height, block_hash }),
+            .map(|(height, block_hash)| {
+                Ok::<_, xc_primitives::Hash32Error>(arxd_network::SnapshotTrust {
+                    height,
+                    block_hash: block_hash.parse()?,
+                })
+            })
+            .transpose()
+            .context("--snapshot-trust-hash is not a valid 32-byte hash")?,
     })?;
 
     produce::produce_loop::<R>(

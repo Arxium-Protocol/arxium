@@ -253,7 +253,8 @@ mod tests {
     fn commit(db: &ArxiumDb, height: u64, holder: u8, balance: u128) -> Block<()> {
         let updates = accounts(&[(holder, balance)]);
         let state_root = db.compute_state_root(&[&updates]).unwrap();
-        let parent_hash = db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash()).unwrap_or_default();
+        let parent_hash =
+            db.get_block::<()>(height.saturating_sub(1)).unwrap().map(|b| b.hash().to_string()).unwrap_or_default();
         let block = Block::<()> {
             height,
             parent_hash,
