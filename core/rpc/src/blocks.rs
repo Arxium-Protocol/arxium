@@ -97,12 +97,15 @@ fn block_with_finality<P: Payload>(
         // `P` at all. Additive — `payload` stays for clients that already
         // decode it. Bump this crate's version when either shape changes;
         // `/status` reports it and readers refuse an older node.
-        object.insert("hash".into(), serde_json::Value::String(block.hash().to_string()));
+        object.insert(
+            "hash".into(),
+            serde_json::Value::String(block.hash().to_string()),
+        );
         if let Some(actions) = object.get_mut("actions").and_then(|a| a.as_array_mut()) {
             for (json, action) in actions.iter_mut().zip(&block.actions) {
                 if let Some(json) = json.as_object_mut() {
-                    let payload = serde_json::to_value(&action.payload)
-                        .unwrap_or(serde_json::Value::Null);
+                    let payload =
+                        serde_json::to_value(&action.payload).unwrap_or(serde_json::Value::Null);
                     json.insert("payload_json".into(), payload);
                 }
             }
@@ -135,6 +138,21 @@ pub(super) async fn get_block_by_height<P: Payload>(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let block = state.db.get_block::<P>(height)?.ok_or(ApiError::NotFound)?;
     Ok(Json(block_with_finality(&state.db, &block)?))
+}
+
+/// What block `height` changed — the state rows it wrote plus, on the node
+/// that produced it, the actions it rejected. 404 for an unknown height and
+/// for blocks written before the effects record existed (older DB).
+pub(super) async fn get_block_effects<P: Payload>(
+    State(state): State<AppState<P>>,
+    Path(height): Path<u64>,
+) -> Result<Json<xc_storage::BlockEffects>, ApiError> {
+    Ok(Json(
+        state
+            .db
+            .get_block_effects(height)?
+            .ok_or(ApiError::NotFound)?,
+    ))
 }
 
 pub(super) async fn get_block_by_hash<P: Payload>(

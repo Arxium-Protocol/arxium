@@ -15,8 +15,9 @@ use xc_primitives::{
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
-    BatchWritable, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker, HolderStateUpdates,
-    OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot, ValidatorStatusUpdates,
+    BatchWritable, BlockEffects, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker,
+    HolderStateUpdates, OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
+    ValidatorStatusUpdates,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -771,6 +772,20 @@ where
         weight_used,
     };
     writables.push(&block_weight);
+    // Dropped actions are the producer's knowledge, not the block's — a
+    // follower re-executing a block sees only what landed.
+    let effects = BlockEffects::collect(
+        block.height,
+        &account_updates,
+        &stake_updates,
+        &asset_updates,
+        &holder_states,
+        &validator_statuses,
+        new_validator_set.as_ref().map(|s| &s.validators),
+        &asset_registrations,
+        &[],
+    );
+    writables.push(&effects);
     writables.push(&block);
     // One batch, and the undo record for it: the block, its state changes, and
     // the ability to roll all of it back have to land together or not at all.

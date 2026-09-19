@@ -431,6 +431,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/actions/{signature}", get(get_action_status::<P>))
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
+                .route("/blocks/{height}/effects", get(get_block_effects::<P>))
                 .route("/blocks/by-hash/{hash}", get(get_block_by_hash::<P>))
                 .route("/evidence", get(get_evidence_list::<P>))
                 .route("/evidence/{id}", get(get_evidence_by_id::<P>))
@@ -1693,6 +1694,34 @@ mod tests {
                 .await
                 .into_response();
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+            // No effects row for height 1 yet → 404; write one → JSON with
+            // string-keyed account map (Address serializes as a string).
+            let resp = get_block_effects(State(state.clone()), Path(1))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let mut effects = xc_storage::BlockEffects {
+                height: 1,
+                ..Default::default()
+            };
+            let addr = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+            effects.accounts.insert(addr.clone(), Default::default());
+            effects.dropped.push(xc_storage::DroppedAction {
+                signature: "sig".into(),
+                reason: "nonce".into(),
+            });
+            state.db.write_batch(&effects).unwrap();
+            let resp = get_block_effects(State(state.clone()), Path(1))
+                .await
+                .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["accounts"][addr.to_string()]["balance"], 0);
+            assert_eq!(json["dropped"][0]["reason"], "nonce");
 
             let target_hash = state
                 .db

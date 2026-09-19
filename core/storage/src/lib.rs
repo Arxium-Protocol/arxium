@@ -575,6 +575,19 @@ impl ArxiumDb {
         }
     }
 
+    /// What block `height` changed — `None` for a block written before the
+    /// effects record existed (or no such block).
+    pub fn get_block_effects(&self, height: u64) -> Result<Option<BlockEffects>, StorageError> {
+        match self.get(&block_effects_key(height))? {
+            Some(bytes) => {
+                let (effects, _) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+                Ok(Some(effects))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Get the current tip height from the DB.
     pub fn get_tip_height(&self) -> Result<Option<u64>, StorageError> {
         match self.get(b"meta:tip_height")? {

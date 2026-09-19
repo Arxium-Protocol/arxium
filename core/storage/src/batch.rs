@@ -387,6 +387,132 @@ impl BatchWritable for OperatorUpdates {
     }
 }
 
+/// Everything block `height` changed, as one readable record: the same
+/// rows the block's write batch carries, flattened to JSON-friendly lists
+/// (tuple map keys don't serialize) plus the producer's `dropped` list.
+/// `CF_META` — an index over state, not state, so it never moves the root
+/// and an old DB without it still opens; it simply answers 404 for blocks
+/// written before it existed. Consumed by `GET /blocks/{height}/effects`,
+/// which is what lets an indexer keep account/holder/validator state
+/// without re-executing the runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BlockEffects {
+    pub height: u64,
+    pub accounts: BTreeMap<Address, AccountEntry>,
+    pub asset_balances: Vec<AssetBalanceEffect>,
+    pub holder_states: Vec<HolderStateEffect>,
+    pub stakes: Vec<StakeEffect>,
+    pub validator_statuses: BTreeMap<Address, Option<ValidatorStatus>>,
+    /// Set only at an epoch boundary: the set effective from `height + 1`.
+    pub validator_set: Option<BTreeMap<Address, VotingPower>>,
+    pub asset_registrations: Vec<Asset>,
+    /// `(signature, reason)` for every action the producer tried and
+    /// rejected while building this block. Only the producing node knows
+    /// these; every other node stores an empty list here.
+    pub dropped: Vec<DroppedAction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetBalanceEffect {
+    pub asset: AssetRef,
+    pub owner: Address,
+    pub balance: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HolderStateEffect {
+    pub asset: AssetRef,
+    pub holder: Address,
+    pub state: HolderState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StakeEffect {
+    pub master: Address,
+    pub validator: Address,
+    /// `None` = allocation removed (fully resolved or slashed).
+    pub allocation: Option<StakeAllocation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DroppedAction {
+    pub signature: String,
+    pub reason: String,
+}
+
+impl BlockEffects {
+    /// Builds the record from the update sets a block is about to commit —
+    /// one call site each in `accept_block` and `produce_block`, so the two
+    /// can't drift on what counts as an effect.
+    // ponytail: operators, BLS keys, evidence and attestors are not here; add
+    // them when an indexer needs them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn collect(
+        height: u64,
+        accounts: &AccountUpdates,
+        stakes: &StakeUpdates,
+        assets: &AssetBalanceUpdates,
+        holder_states: &HolderStateUpdates,
+        validator_statuses: &ValidatorStatusUpdates,
+        validator_set: Option<&BTreeMap<Address, VotingPower>>,
+        asset_registrations: &[Asset],
+        dropped: &[(String, String)],
+    ) -> Self {
+        Self {
+            height,
+            accounts: accounts.0.clone(),
+            asset_balances: assets
+                .0
+                .iter()
+                .map(|((asset, owner), balance)| AssetBalanceEffect {
+                    asset: asset.clone(),
+                    owner: owner.clone(),
+                    balance: *balance,
+                })
+                .collect(),
+            holder_states: holder_states
+                .0
+                .iter()
+                .map(|((asset, holder), state)| HolderStateEffect {
+                    asset: asset.clone(),
+                    holder: holder.clone(),
+                    state: state.clone(),
+                })
+                .collect(),
+            stakes: stakes
+                .allocations
+                .iter()
+                .map(|((master, validator), allocation)| StakeEffect {
+                    master: master.clone(),
+                    validator: validator.clone(),
+                    allocation: allocation.clone(),
+                })
+                .collect(),
+            validator_statuses: validator_statuses.0.clone(),
+            validator_set: validator_set.cloned(),
+            asset_registrations: asset_registrations.to_vec(),
+            dropped: dropped
+                .iter()
+                .map(|(signature, reason)| DroppedAction {
+                    signature: signature.clone(),
+                    reason: reason.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+pub(crate) fn block_effects_key(height: u64) -> Vec<u8> {
+    format!("meta:block_effects:{height:020}").into_bytes()
+}
+
+impl BatchWritable for BlockEffects {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        let value = bincode::serde::encode_to_vec(self, bincode::config::standard())?;
+        Ok(vec![(block_effects_key(self.height), value)])
+    }
+}
+
 /// `weight_used` of block `height` (`xc_executor::ExecutionOutcome`), kept
 /// beside the block so an attester can hash the same PoE `resources_used`
 /// the producer did (`xc_poe::block_ep`) without re-executing. `CF_META`:

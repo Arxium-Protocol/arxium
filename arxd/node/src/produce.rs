@@ -311,6 +311,18 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         weight_used,
     };
     writables.push(&block_weight);
+    let effects = xc_storage::BlockEffects::collect(
+        next_height,
+        &account_updates,
+        &stake_updates,
+        &asset_updates,
+        &holder_states,
+        &validator_statuses,
+        snapshot.as_ref().map(|s| &s.validators),
+        &asset_registrations,
+        &dropped,
+    );
+    writables.push(&effects);
     writables.push(&new_block);
     // Undo-logged like the accept path — a proposer diverges from the network
     // exactly as easily as a follower does, so it needs the same rollback.
@@ -703,6 +715,15 @@ mod tests {
             weight,
             "metered weight is persisted beside the block"
         );
+        // The effects record carries both touched accounts and the drop —
+        // what an indexer reads instead of re-executing.
+        let effects = db.get_block_effects(1).unwrap().expect("effects row");
+        assert_eq!(effects.accounts[&bob].balance, 400);
+        assert_eq!(effects.accounts[&alice].balance, 20_000_000 - 400 - fee);
+        assert_eq!(effects.dropped.len(), 1);
+        assert_eq!(effects.dropped[0].signature, dropped[0].0);
+        assert!(effects.validator_set.is_none());
+        assert!(db.get_block_effects(2).unwrap().is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
