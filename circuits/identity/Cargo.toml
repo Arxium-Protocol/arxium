@@ -1,0 +1,21 @@
+[package]
+name = "circuit-identity"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+hex = { workspace = true }
+xc-storage = { workspace = true }
+xc-primitives = { workspace = true }
+xc-circuit = { workspace = true }
+circuit-identity-zk = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+
+[dev-dependencies]
+ark-std = { workspace = true }
+
+[lints]
+workspace = true

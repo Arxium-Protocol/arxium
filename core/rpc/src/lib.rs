@@ -1709,6 +1709,7 @@ mod tests {
             effects.accounts.insert(addr.clone(), Default::default());
             effects.dropped.push(xc_storage::DroppedAction {
                 signature: "sig".into(),
+                sender: addr.clone(),
                 reason: "nonce".into(),
             });
             state.db.write_batch(&effects).unwrap();
@@ -1722,6 +1723,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["accounts"][addr.to_string()]["balance"], 0);
             assert_eq!(json["dropped"][0]["reason"], "nonce");
+            assert_eq!(json["dropped"][0]["sender"], addr.to_string());
 
             let target_hash = state
                 .db

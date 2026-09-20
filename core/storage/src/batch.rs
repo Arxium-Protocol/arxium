@@ -406,9 +406,9 @@ pub struct BlockEffects {
     /// Set only at an epoch boundary: the set effective from `height + 1`.
     pub validator_set: Option<BTreeMap<Address, VotingPower>>,
     pub asset_registrations: Vec<Asset>,
-    /// `(signature, reason)` for every action the producer tried and
-    /// rejected while building this block. Only the producing node knows
-    /// these; every other node stores an empty list here.
+    /// Every action the producer tried and rejected while building this
+    /// block. Only the producing node knows these; every other node stores
+    /// an empty list here.
     pub dropped: Vec<DroppedAction>,
 }
 
@@ -437,6 +437,9 @@ pub struct StakeEffect {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DroppedAction {
     pub signature: String,
+    /// Carried because a dropped action never reaches a block, so nothing
+    /// else records who sent it — and "my failed actions" is the query.
+    pub sender: Address,
     pub reason: String,
 }
 
@@ -456,7 +459,7 @@ impl BlockEffects {
         validator_statuses: &ValidatorStatusUpdates,
         validator_set: Option<&BTreeMap<Address, VotingPower>>,
         asset_registrations: &[Asset],
-        dropped: &[(String, String)],
+        dropped: &[DroppedAction],
     ) -> Self {
         Self {
             height,
@@ -491,13 +494,7 @@ impl BlockEffects {
             validator_statuses: validator_statuses.0.clone(),
             validator_set: validator_set.cloned(),
             asset_registrations: asset_registrations.to_vec(),
-            dropped: dropped
-                .iter()
-                .map(|(signature, reason)| DroppedAction {
-                    signature: signature.clone(),
-                    reason: reason.clone(),
-                })
-                .collect(),
+            dropped: dropped.to_vec(),
         }
     }
 }

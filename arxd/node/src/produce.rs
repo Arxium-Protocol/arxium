@@ -54,7 +54,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     proposer: Option<(&Address, &SigningKey)>,
 ) -> Result<(
     Block<R::Payload>,
-    Vec<(String, String)>,
+    Vec<xc_storage::DroppedAction>,
     Vec<Action<R::Payload>>,
 )> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
@@ -531,7 +531,7 @@ pub fn produce_loop<R: ChainRuntime>(
             std::result::Result::Ok((block, dropped, deferred)) => {
                 if !dropped.is_empty() || !deferred.is_empty() {
                     let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
-                    mempool.note_dropped(dropped);
+                    mempool.note_dropped(dropped.into_iter().map(|d| (d.signature, d.reason)));
                     mempool.requeue_front(deferred);
                 }
                 info!(
@@ -697,11 +697,12 @@ mod tests {
         .unwrap();
         assert_eq!(block.actions.len(), 1);
         assert_eq!(dropped.len(), 1);
-        assert_eq!(dropped[0].0, replay.signature.unwrap());
+        assert_eq!(dropped[0].signature, replay.signature.unwrap());
+        assert_eq!(dropped[0].sender, alice);
         assert!(
-            dropped[0].1.contains("nonce"),
+            dropped[0].reason.contains("nonce"),
             "reason names the cause: {}",
-            dropped[0].1
+            dropped[0].reason
         );
 
         assert_eq!(block.height, 1);
@@ -721,7 +722,7 @@ mod tests {
         assert_eq!(effects.accounts[&bob].balance, 400);
         assert_eq!(effects.accounts[&alice].balance, 20_000_000 - 400 - fee);
         assert_eq!(effects.dropped.len(), 1);
-        assert_eq!(effects.dropped[0].signature, dropped[0].0);
+        assert_eq!(effects.dropped[0].signature, dropped[0].signature);
         assert!(effects.validator_set.is_none());
         assert!(db.get_block_effects(2).unwrap().is_none());
 

@@ -15,9 +15,9 @@ use xc_primitives::{
 };
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
-    BatchWritable, BlockEffects, BlockView, BlockWeight, BlsKeyRegistration, EvidenceMarker,
-    HolderStateUpdates, OperatorUpdates, StakeUpdates, StorageError, ValidatorSetSnapshot,
-    ValidatorStatusUpdates,
+    BatchWritable, BlockEffects, BlockView, BlockWeight, BlsKeyRegistration, DroppedAction,
+    EvidenceMarker, HolderStateUpdates, OperatorUpdates, StakeUpdates, StorageError,
+    ValidatorSetSnapshot, ValidatorStatusUpdates,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -48,10 +48,9 @@ pub struct ExecutionOutcome<P> {
     /// Every Merkleized key read or written, but only when the caller asked
     /// for it via `record_touched_keys`; otherwise empty.
     pub touched_keys: Vec<Vec<u8>>,
-    /// `(signature, reason)` for every input action that was not applied,
-    /// so a producer can tell a polling client *why* — the block itself
-    /// only lists what landed.
-    pub dropped: Vec<(String, String)>,
+    /// Every input action that was not applied, with why, so a producer can
+    /// tell a polling client — the block itself only lists what landed.
+    pub dropped: Vec<DroppedAction>,
     /// Sum of `meter` weights over `applied` — PoE's `resources_used`.
     pub weight_used: u64,
     /// Sum of `meter` fees over `applied` — what `on_block_sealed` pays out.
@@ -912,10 +911,11 @@ where
     while let Some(action) = actions.next() {
         if let Err(err) = action.verify_signature() {
             warn!("dropping action from {}: {err}", action.sender);
-            dropped.push((
-                action.signature.clone().unwrap_or_default(),
-                err.to_string(),
-            ));
+            dropped.push(DroppedAction {
+                signature: action.signature.clone().unwrap_or_default(),
+                sender: action.sender.clone(),
+                reason: err.to_string(),
+            });
             continue;
         }
         let (weight, fee) = meter(&action);
@@ -981,10 +981,11 @@ where
             }
             Err(err) => {
                 warn!("dropping action from {}: {err}", action.sender);
-                dropped.push((
-                    action.signature.clone().unwrap_or_default(),
-                    err.to_string(),
-                ));
+                dropped.push(DroppedAction {
+                    signature: action.signature.clone().unwrap_or_default(),
+                    sender: action.sender.clone(),
+                    reason: err.to_string(),
+                });
             }
         }
 
