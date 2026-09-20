@@ -21,7 +21,6 @@ members = [
     "core/poe",
     #
     "arxd/node",
-    "arxd/payload",
     "arxd/runtime",
     "arxd/network",
     "arxd/finality",
@@ -86,7 +85,6 @@ xc-evidence = { path = "core/evidence" }
 xc-artifact = { path = "core/artifact" }
 xc-poe = { path = "core/poe" }
 arxd-node = { path = "arxd/node" }
-arxd-payload = { path = "arxd/payload" }
 arxd-runtime = { path = "arxd/runtime" }
 arxd-network = { path = "arxd/network" }
 arxd-finality = { path = "arxd/finality" }

@@ -1,8 +1,7 @@
-//! CoreChain's action payload, and nothing else — the one type an
-//! out-of-process reader (Retracer, an indexer) needs to decode blocks.
-//! Leaf crate on purpose: depends only on `xc-primitives` + serde, so a
-//! consumer can pin it without pulling in circuits, storage or the
-//! runtime. Variant order is the wire format; append, never reorder.
+//! CoreChain's action payload. Variant order is the wire format; append,
+//! never reorder. Out-of-process readers (Retracer) get each action's
+//! decoded payload as `payload_json` from `xc-rpc`, so nothing outside this
+//! crate decodes these bytes.
 use serde::{Deserialize, Serialize};
 use xc_primitives::{
     Action, Address, AssetMetadata, AssetRef, ClaimTopic, CountryCode, GovernanceAction,

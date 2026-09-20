@@ -22,6 +22,7 @@ mod governance;
 mod identity;
 pub mod metering;
 mod pair;
+pub mod payload;
 mod specs;
 mod staking;
 
@@ -32,7 +33,7 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address, ChainParams};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
-pub use arxd_payload::{ActionPayload, ChainAction, ChainBlock};
+pub use payload::{ActionPayload, ChainAction, ChainBlock};
 
 /// CoreChain's `ChainRuntime` implementation — see `xc_runtime_api::ChainRuntime`
 /// for what this makes `arxd/node` generic over.

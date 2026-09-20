@@ -498,15 +498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arxd-payload"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "serde",
- "xc-primitives",
-]
-
-[[package]]
 name = "arxd-runtime"
 version = "0.1.0"
 dependencies = [
@@ -515,7 +506,6 @@ dependencies = [
  "ark-serialize",
  "ark-std",
  "arxd-genesis",
- "arxd-payload",
  "bincode",
  "blst",
  "circuit-account",
