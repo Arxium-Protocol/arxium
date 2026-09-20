@@ -520,6 +520,7 @@ dependencies = [
  "bincode",
  "blst",
  "circuit-account",
+ "circuit-identity",
  "circuit-identity-zk",
  "circuit-rwa-asset",
  "circuit-staking",
@@ -1038,6 +1039,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "circuit-identity"
+version = "0.1.0"
+dependencies = [
+ "ark-bls12-381",
+ "ark-serialize",
+ "ark-std",
+ "circuit-identity-zk",
+ "hex",
+ "thiserror 2.0.19",
+ "xc-circuit",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
 name = "circuit-identity-zk"
 version = "0.1.0"
 dependencies = [
@@ -1057,6 +1073,7 @@ name = "circuit-rwa-asset"
 version = "0.1.0"
 dependencies = [
  "circuit-account",
+ "circuit-identity",
  "thiserror 2.0.19",
  "xc-circuit",
  "xc-primitives",

@@ -51,6 +51,12 @@ pub struct AccountEntry {
     /// rejects unknown rather than treating it as permitted.
     #[serde(default)]
     pub jurisdiction: Option<CountryCode>,
+    /// Height of the block that granted the current attestation — the clock
+    /// `Asset.max_attestation_age` runs against. `None` until re-attested
+    /// after this field landed (a devnet genesis reset, see the note on
+    /// `zk_identity_verified`), which an age-limited asset treats as expired.
+    #[serde(default)]
+    pub attested_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +251,21 @@ pub struct Asset {
     /// undone by re-minting into the room it freed under `max_supply` —
     /// the same guarantee as revoking a mint authority elsewhere.
     pub issuance_locked: bool,
+    /// Prospectus-style investor cap: the number of distinct non-issuer
+    /// addresses that may hold a positive balance at once. `None` means
+    /// unlimited. Set via `SetAssetLimits`; enforced by `circuit-rwa-asset`
+    /// on every compliant path that can create a new holder.
+    pub max_holders: Option<u32>,
+    /// Concentration limit: the largest balance any non-issuer holder may
+    /// reach through a compliant transfer or issuance. `None` = unlimited.
+    pub max_balance_per_holder: Option<u128>,
+    /// How many blocks after `AccountEntry.attested_at` an attestation is
+    /// still good enough to hold this asset. `None` = never expires.
+    pub max_attestation_age: Option<u64>,
+    /// Distinct non-issuer addresses with a positive balance, maintained by
+    /// `circuit-rwa-asset` wherever a balance crosses zero. The issuer's own
+    /// treasury balance is not a holder for cap purposes.
+    pub holder_count: u32,
 }
 
 /// The issuer-supplied half of an `Asset`: everything `RegisterAsset` carries
@@ -296,6 +317,10 @@ impl Asset {
             symbol: String::new(),
             name: String::new(),
             issuance_locked: false,
+            max_holders: None,
+            max_balance_per_holder: None,
+            max_attestation_age: None,
+            holder_count: 0,
         }
     }
 
@@ -328,6 +353,10 @@ impl Asset {
             symbol: metadata.symbol,
             name: metadata.name,
             issuance_locked: false,
+            max_holders: None,
+            max_balance_per_holder: None,
+            max_attestation_age: None,
+            holder_count: 0,
         }
     }
 }
@@ -349,6 +378,11 @@ pub struct HolderState {
     /// Units of the balance that cannot be spent by a compliant transfer.
     /// Forced transfers and recovery ignore it.
     pub frozen_amount: u128,
+    /// Height at which `frozen_amount` stops binding on its own — a
+    /// self-expiring lock-up (`LockHolderAmountUntil`). `None` means the
+    /// lock holds until the issuer unlocks it. Reads treat the lock as zero
+    /// once `current_height >= lock_expires_at`; the record isn't rewritten.
+    pub lock_expires_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

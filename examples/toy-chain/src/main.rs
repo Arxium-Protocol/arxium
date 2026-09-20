@@ -62,13 +62,16 @@ fn dispatch(
         RwaPayload::Issue { amount } => {
             circuit_rwa_asset::apply_issue(view, &mut asset, &action.sender, action.nonce, *amount)?
         }
+        // ponytail: fixed in-memory asset, so the height only matters for
+        // limits the toy asset never sets.
         RwaPayload::Transfer { to, amount } => circuit_rwa_asset::apply_compliant_transfer(
             view,
-            &asset,
+            &mut asset,
             &action.sender,
             action.nonce,
             to,
             *amount,
+            0,
         )?,
     };
     Ok((accounts, assets))

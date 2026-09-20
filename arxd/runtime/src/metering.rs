@@ -60,7 +60,9 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         | UnfreezeAsset { .. }
         | SetHolderFrozen { .. }
         | LockHolderAmount { .. }
+        | LockHolderAmountUntil { .. }
         | UnlockHolderAmount { .. }
+        | SetAssetLimits { .. }
         | LockIssuance { .. }
         | TransferIssuer { .. }
         | SetAssetMetadataUri { .. } => 100,

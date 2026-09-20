@@ -30,7 +30,7 @@ thiserror = { workspace = true }
 
 circuit-account = { workspace = true }
 circuit-staking = { workspace = true }
-circuit-identity-zk = { workspace = true }
+circuit-identity = { workspace = true }
 circuit-rwa-asset = { workspace = true }
 
 ark-bls12-381 = { workspace = true }
@@ -38,6 +38,7 @@ ark-serialize = { workspace = true }
 
 [dev-dependencies]
 ark-std = { workspace = true }
+circuit-identity-zk = { workspace = true }
 arxd-genesis = { workspace = true }
 sha2 = { workspace = true }
 

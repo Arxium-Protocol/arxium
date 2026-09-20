@@ -4,6 +4,7 @@ members = [
     "circuits/rwa-asset",
     "circuits/staking",
     "circuits/identity-zk",
+    "circuits/identity",
     #
     "core/primitives",
     "core/wire",
@@ -77,6 +78,7 @@ circuit-account = { path = "circuits/account" }
 circuit-rwa-asset = { path = "circuits/rwa-asset" }
 circuit-staking = { path = "circuits/staking" }
 circuit-identity-zk = { path = "circuits/identity-zk" }
+circuit-identity = { path = "circuits/identity" }
 xc-executor = { path = "core/executor" }
 xc-cli = { path = "core/cli" }
 xc-chain-spec = { path = "core/chain-spec" }

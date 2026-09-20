@@ -127,11 +127,7 @@ fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
     // `None` (unrestricted). Rejecting it would make `None` and empty behave
     // the same, which is exactly the confusion the two-state field avoids.
     for code in metadata.allowed_jurisdictions.iter().flatten() {
-        if code.len() != 2 || !code.chars().all(|c| c.is_ascii_uppercase()) {
-            anyhow::bail!(
-                "jurisdiction {code:?} is not a 2-letter uppercase ISO-3166-1 alpha-2 code"
-            );
-        }
+        circuit_identity::validate_jurisdiction_code(code)?;
     }
     Ok(())
 }
@@ -203,25 +199,30 @@ pub(crate) fn issue_asset<V: KvRead<Error = StorageError>>(
     })
 }
 
+/// Writes the asset record back for `holder_count` — same upsert channel as
+/// `issue_asset`.
 pub(crate) fn transfer_asset<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     asset: &AssetRef,
     to: &Address,
     amount: u128,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    let asset = resolve_asset(view, asset)?;
+    let mut asset = resolve_asset(view, asset)?;
     let (accounts, assets) = circuit_rwa_asset::apply_compliant_transfer(
         view,
-        &asset,
+        &mut asset,
         &action.sender,
         action.nonce,
         to,
         amount,
+        current_height,
     )?;
     Ok(BlockUpdates {
         accounts,
         assets,
+        asset_registration: Some(asset),
         ..Default::default()
     })
 }
@@ -286,10 +287,11 @@ pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
     crate::identity::require_admin(view, action, AdminRole::Recovery)
         .map_err(|_| anyhow::anyhow!("only the recovery admin may force a transfer"))?;
 
-    let asset = resolve_asset(view, asset)?;
-    let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
+    let mut asset = resolve_asset(view, asset)?;
+    let assets = circuit_rwa_asset::apply_forced_transfer(view, &mut asset, from, to, amount)?;
     Ok(BlockUpdates {
         assets,
+        asset_registration: Some(asset),
         ..Default::default()
     })
 }
@@ -351,12 +353,27 @@ pub(crate) fn lock_holder_amount<V: KvRead<Error = StorageError>>(
     holder: &Address,
     amount: u128,
     lock: bool,
+    expires_at: Option<u64>,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let asset = require_issuer(view, action, asset)?;
     if amount == 0 {
         anyhow::bail!("lock amount must be positive");
     }
-    let holder_states = circuit_rwa_asset::apply_lock_amount(view, &asset, holder, amount, lock)?;
+    if let Some(until) = expires_at
+        && until <= current_height
+    {
+        anyhow::bail!("lock expiry {until} is not after the current height {current_height}");
+    }
+    let holder_states = circuit_rwa_asset::apply_lock_amount(
+        view,
+        &asset,
+        holder,
+        amount,
+        lock,
+        expires_at,
+        current_height,
+    )?;
     Ok(BlockUpdates {
         holder_states,
         ..Default::default()
@@ -375,10 +392,11 @@ pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
     reason: &str,
 ) -> anyhow::Result<BlockUpdates> {
     check_reason(reason, "a forced transfer")?;
-    let asset = require_issuer(view, action, asset)?;
-    let assets = circuit_rwa_asset::apply_forced_transfer(view, &asset, from, to, amount)?;
+    let mut asset = require_issuer(view, action, asset)?;
+    let assets = circuit_rwa_asset::apply_forced_transfer(view, &mut asset, from, to, amount)?;
     Ok(BlockUpdates {
         assets,
+        asset_registration: Some(asset),
         ..Default::default()
     })
 }
@@ -389,12 +407,13 @@ pub(crate) fn issue_asset_to<V: KvRead<Error = StorageError>>(
     asset: &AssetRef,
     to: &Address,
     amount: u128,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let mut asset = require_issuer(view, action, asset)?;
     if amount == 0 {
         anyhow::bail!("issue amount must be positive");
     }
-    let assets = circuit_rwa_asset::apply_issue_to(view, &mut asset, to, amount)?;
+    let assets = circuit_rwa_asset::apply_issue_to(view, &mut asset, to, amount, current_height)?;
     Ok(BlockUpdates {
         assets,
         asset_registration: Some(asset),
@@ -453,21 +472,46 @@ pub(crate) fn set_metadata_uri<V: KvRead<Error = StorageError>>(
     })
 }
 
+/// `SetAssetLimits`: issuer-only. `None` clears. A cap below the current
+/// `holder_count` is accepted — it blocks new holders without evicting any.
+pub(crate) fn set_limits<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    max_holders: Option<u32>,
+    max_balance_per_holder: Option<u128>,
+    max_attestation_age: Option<u64>,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    if max_balance_per_holder == Some(0) {
+        anyhow::bail!("max_balance_per_holder of 0 would make the asset unholdable");
+    }
+    asset.max_holders = max_holders;
+    asset.max_balance_per_holder = max_balance_per_holder;
+    asset.max_attestation_age = max_attestation_age;
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
 pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     asset: &AssetRef,
     lost: &Address,
     replacement: &Address,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     if lost == replacement {
         anyhow::bail!("recovery needs a different replacement address");
     }
-    let asset = require_issuer(view, action, asset)?;
+    let mut asset = require_issuer(view, action, asset)?;
     let (assets, holder_states) =
-        circuit_rwa_asset::apply_recover(view, &asset, lost, replacement)?;
+        circuit_rwa_asset::apply_recover(view, &mut asset, lost, replacement, current_height)?;
     Ok(BlockUpdates {
         assets,
+        asset_registration: Some(asset),
         holder_states,
         ..Default::default()
     })

@@ -136,7 +136,9 @@ impl AccountAssetBalance {
     ) -> Result<Self, StorageError> {
         let issuer_attested = issuer_attested(db, &asset.issuer)?;
         let holder_state = db.get_holder_state(&asset.asset_ref, address)?;
-        let eligibility = circuit_rwa_asset::transfer_eligibility(db, &asset, address, balance)?;
+        let tip = db.get_tip_height()?.unwrap_or(0);
+        let eligibility =
+            circuit_rwa_asset::transfer_eligibility(db, &asset, address, balance, tip)?;
         Ok(Self {
             asset_ref: asset.asset_ref,
             asset_id: asset.asset_id,

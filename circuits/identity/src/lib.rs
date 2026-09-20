@@ -17,7 +17,7 @@ use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use thiserror::Error;
 use xc_circuit::{AccountKey, AttestorRecordKey, KvRead};
-use xc_primitives::{AccountEntry, Address, AttestorRecord, ClaimTopic};
+use xc_primitives::{Address, AttestorRecord, ClaimTopic};
 use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
 
 #[derive(Error, Debug)]
@@ -220,18 +220,21 @@ pub fn apply_verify_credential<V: KvRead<Error = StorageError>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xc_storage::{ArxiumDb, BatchWritable};
+    use xc_storage::ArxiumDb;
 
     fn addr(byte: u8) -> Address {
         Address::from_pubkey_bytes(&[byte; 32]).unwrap()
     }
 
     fn db_with_attestor(attestor: &Address) -> ArxiumDb {
-        let dir = tempfile::tempdir().unwrap();
-        let db = ArxiumDb::open(dir.path()).unwrap();
-        std::mem::forget(dir);
-        let reg = apply_register_attestor(&db, attestor, "test", 0).unwrap();
-        db.write_batch(&reg.batch_entries().unwrap()).unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("arxium-test-identity-{nanos}"));
+        let db = ArxiumDb::open(&path).unwrap();
+        db.write_batch(&apply_register_attestor(&db, attestor, "test", 0).unwrap())
+            .unwrap();
         db
     }
 
@@ -256,7 +259,7 @@ mod tests {
         assert_eq!(entry.jurisdiction.as_deref(), Some("CH"));
         assert_eq!(entry.attested_by.as_ref(), Some(&attestor));
         assert_eq!(entry.attested_at, Some(7));
-        db.write_batch(&updates.batch_entries().unwrap()).unwrap();
+        db.write_batch(&updates).unwrap();
         assert!(is_attested(&db, &alice).unwrap());
 
         let updates = apply_grant_attestation(
@@ -270,17 +273,24 @@ mod tests {
         )
         .unwrap();
         let entry = &updates.0[&alice];
-        assert_eq!(entry.claims, vec![ClaimTopic::Kyc], "re-grant replaces, never merges");
+        assert_eq!(
+            entry.claims,
+            vec![ClaimTopic::Kyc],
+            "re-grant replaces, never merges"
+        );
         assert_eq!(entry.jurisdiction.as_deref(), Some("DE"));
-        db.write_batch(&updates.batch_entries().unwrap()).unwrap();
+        db.write_batch(&updates).unwrap();
 
         let updates = apply_revoke_attestation(&db, &attestor, &alice).unwrap();
         let entry = &updates.0[&alice];
         assert!(entry.identity_hash.is_none());
         assert!(entry.attested_at.is_none());
-        assert!(entry.claims.is_empty(), "a revoked attestation must leave no claims standing");
+        assert!(
+            entry.claims.is_empty(),
+            "a revoked attestation must leave no claims standing"
+        );
         assert!(entry.jurisdiction.is_none());
-        db.write_batch(&updates.batch_entries().unwrap()).unwrap();
+        db.write_batch(&updates).unwrap();
         assert!(!is_attested(&db, &alice).unwrap());
     }
 
@@ -294,11 +304,11 @@ mod tests {
             IdentityError::NotAttestor(_)
         ));
         let grant = apply_grant_attestation(&db, &attestor, &alice, "h", &[], None, 0).unwrap();
-        db.write_batch(&grant.batch_entries().unwrap()).unwrap();
+        db.write_batch(&grant).unwrap();
         assert!(is_attested(&db, &alice).unwrap());
 
         let dereg = apply_deregister_attestor(&db, &attestor).unwrap();
-        db.write_batch(&dereg.batch_entries().unwrap()).unwrap();
+        db.write_batch(&dereg).unwrap();
         assert!(!is_attested(&db, &alice).unwrap());
     }
 
@@ -308,10 +318,14 @@ mod tests {
         let alice = addr(1);
         let db = db_with_attestor(&attestor);
         for bad in ["ch", "CHE", "C", "C1"] {
-            assert!(matches!(
-                apply_grant_attestation(&db, &attestor, &alice, "h", &[], Some(bad), 0).unwrap_err(),
-                IdentityError::InvalidJurisdiction(_)
-            ), "code {bad:?}");
+            assert!(
+                matches!(
+                    apply_grant_attestation(&db, &attestor, &alice, "h", &[], Some(bad), 0)
+                        .unwrap_err(),
+                    IdentityError::InvalidJurisdiction(_)
+                ),
+                "code {bad:?}"
+            );
         }
         assert!(apply_grant_attestation(&db, &attestor, &alice, "h", &[], Some("CH"), 0).is_ok());
         assert!(apply_grant_attestation(&db, &attestor, &alice, "h", &[], None, 0).is_ok());
@@ -337,7 +351,7 @@ mod tests {
         let hash_hex = hex::encode(&hash_bytes);
         for who in [&alice, &bob] {
             let g = apply_grant_attestation(&db, &attestor, who, &hash_hex, &[], None, 0).unwrap();
-            db.write_batch(&g.batch_entries().unwrap()).unwrap();
+            db.write_batch(&g).unwrap();
         }
 
         let mut rng = StdRng::seed_from_u64(7);

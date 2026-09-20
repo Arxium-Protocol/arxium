@@ -472,6 +472,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             hash,
             topics,
             jurisdiction.as_deref(),
+            current_height,
         ),
         ActionPayload::RevokeAttestation { subject } => {
             identity::revoke_attestation(view, action, subject)
@@ -532,12 +533,58 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             asset,
             holder,
             amount,
-        } => asset::lock_holder_amount(view, action, asset, holder, *amount, true),
+        } => asset::lock_holder_amount(
+            view,
+            action,
+            asset,
+            holder,
+            *amount,
+            true,
+            None,
+            current_height,
+        ),
+        ActionPayload::LockHolderAmountUntil {
+            asset,
+            holder,
+            amount,
+            until_height,
+        } => asset::lock_holder_amount(
+            view,
+            action,
+            asset,
+            holder,
+            *amount,
+            true,
+            Some(*until_height),
+            current_height,
+        ),
+        ActionPayload::SetAssetLimits {
+            asset,
+            max_holders,
+            max_balance_per_holder,
+            max_attestation_age,
+        } => asset::set_limits(
+            view,
+            action,
+            asset,
+            *max_holders,
+            *max_balance_per_holder,
+            *max_attestation_age,
+        ),
         ActionPayload::UnlockHolderAmount {
             asset,
             holder,
             amount,
-        } => asset::lock_holder_amount(view, action, asset, holder, *amount, false),
+        } => asset::lock_holder_amount(
+            view,
+            action,
+            asset,
+            holder,
+            *amount,
+            false,
+            None,
+            current_height,
+        ),
         ActionPayload::IssuerForcedTransfer {
             asset,
             from,
@@ -549,12 +596,12 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             asset,
             lost,
             replacement,
-        } => asset::recover_holder(view, action, asset, lost, replacement),
+        } => asset::recover_holder(view, action, asset, lost, replacement, current_height),
         ActionPayload::IssueAssetTo { asset, to, amount } => {
-            asset::issue_asset_to(view, action, asset, to, *amount)
+            asset::issue_asset_to(view, action, asset, to, *amount, current_height)
         }
         ActionPayload::TransferAsset { asset, to, amount } => {
-            asset::transfer_asset(view, action, asset, to, *amount)
+            asset::transfer_asset(view, action, asset, to, *amount, current_height)
         }
         ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
             view,

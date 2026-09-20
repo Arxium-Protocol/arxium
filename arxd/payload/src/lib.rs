@@ -351,6 +351,26 @@ pub enum ActionPayload {
         asset: AssetRef,
         metadata_uri: Option<String>,
     },
+    /// Issuer sets the prospectus-style limits on `asset`: investor cap,
+    /// per-holder concentration limit, and how stale an attestation may be
+    /// (in blocks) before a holder no longer qualifies. `None` clears a
+    /// limit. Tightening a cap below the current `holder_count` is allowed —
+    /// it stops new holders, it doesn't evict existing ones. Variant 31.
+    SetAssetLimits {
+        asset: AssetRef,
+        max_holders: Option<u32>,
+        max_balance_per_holder: Option<u128>,
+        max_attestation_age: Option<u64>,
+    },
+    /// `LockHolderAmount` with an expiry: the lock releases itself at
+    /// `until_height` without a further issuer action — the on-chain shape of
+    /// a holding period. Variant 32.
+    LockHolderAmountUntil {
+        asset: AssetRef,
+        holder: Address,
+        amount: u128,
+        until_height: u64,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -365,7 +385,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 31] = [
+        const EXPECTED: [&str; 33] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -397,6 +417,8 @@ mod tests {
             "LockIssuance",
             "TransferIssuer",
             "SetAssetMetadataUri",
+            "SetAssetLimits",
+            "LockHolderAmountUntil",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

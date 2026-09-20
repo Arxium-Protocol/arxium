@@ -278,7 +278,13 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `UnexpectedEnd` and every block fails. The row is in `CF_GOVERNANCE`
 /// (merkleized since 12), so re-encoding it would move certified roots —
 /// devnet reset, which also seeds the new reward pool from the spec.
-pub const SCHEMA_VERSION: u32 = 14;
+///
+/// Bumped 14 -> 15: `Asset` gained `max_holders`, `max_balance_per_holder`,
+/// `max_attestation_age` and `holder_count` (`SetAssetLimits`, variant 31);
+/// `HolderState` gained `lock_expires_at` (`LockHolderAmountUntil`, variant
+/// 32); `AccountEntry` gained `attested_at`. All three are positional
+/// bincode in merkleized column families — devnet reset.
+pub const SCHEMA_VERSION: u32 = 15;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";

@@ -1535,6 +1535,7 @@ mod tests {
                 HolderState {
                     frozen: false,
                     frozen_amount: u128::MAX,
+                    lock_expires_at: None,
                 },
             )]));
             let index = state
