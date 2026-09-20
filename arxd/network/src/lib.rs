@@ -8,6 +8,7 @@ mod recovery;
 mod snapshot_sync;
 mod sync;
 mod transport;
+pub mod wire;
 
 pub use snapshot_sync::SnapshotTrust;
 

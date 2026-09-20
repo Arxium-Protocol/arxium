@@ -8,7 +8,6 @@ members = [
     "circuits/governance",
     #
     "core/primitives",
-    "core/wire",
     "core/bls",
     "core/circuit",
     "core/storage",
@@ -68,7 +67,6 @@ dbg_macro = "deny"
 [workspace.dependencies]
 # internal packages
 xc-primitives = { path = "core/primitives" }
-xc-wire = { path = "core/wire" }
 xc-bls = { path = "core/bls" }
 xc-circuit = { path = "core/circuit" }
 xc-storage = { path = "core/storage" }

@@ -456,7 +456,6 @@ dependencies = [
  "xc-mempool",
  "xc-primitives",
  "xc-storage",
- "xc-wire",
  "zeroize",
 ]
 
@@ -5449,14 +5448,6 @@ dependencies = [
  "xc-bls",
  "xc-circuit",
  "xc-poe",
- "xc-primitives",
-]
-
-[[package]]
-name = "xc-wire"
-version = "0.1.0"
-dependencies = [
- "serde",
  "xc-primitives",
 ]
 

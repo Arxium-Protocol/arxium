@@ -16,7 +16,7 @@ libfuzzer-sys = "0.4"
 
 serde_json = "1"
 xc-primitives = { path = "../core/primitives" }
-xc-wire = { path = "../core/wire" }
+arxd-network = { path = "../arxd/network" }
 xc-artifact = { path = "../core/artifact" }
 arxd-runtime = { path = "../arxd/runtime" }
 

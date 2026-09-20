@@ -16,10 +16,9 @@ use crate::transport::Behaviour;
 /// block over gossip. Same acceptance path as gossiped blocks — this only
 /// adds a second delivery mechanism, not new validation.
 ///
-/// The shapes themselves live in `xc-wire` so external consumers compile
-/// against the same definitions instead of copying them; see that crate for the
+/// The shapes themselves live in [`crate::wire`]; see its module doc for the
 /// variant-compatibility rules.
-pub(crate) use xc_wire::sync_protocol;
+pub(crate) use crate::wire::sync_protocol;
 /// How often a connected peer is re-asked for its tip, to catch a peer
 /// falling behind mid-connection (not just "was offline, just reconnected") —
 /// e.g. a gossiped block silently dropped rather than erroring, which the
@@ -35,7 +34,7 @@ pub(crate) const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 /// (a real reconnect) or any successful sync response clears the count.
 pub(crate) const MAX_CONSECUTIVE_SYNC_FAILURES: u32 = 5;
 
-pub(crate) use xc_wire::{NodeInfo, SyncRequest, SyncResponse};
+pub(crate) use crate::wire::{NodeInfo, SyncRequest, SyncResponse};
 
 pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
     db.get_tip_height().ok().flatten().unwrap_or(0)
@@ -121,7 +120,7 @@ pub(crate) fn build_sync_response<P: Payload>(
                 .ok()
                 .and_then(|blocks| blocks.first().map(|b| b.hash()));
             SyncResponse::<Block<P>>::NodeInfo(NodeInfo {
-                wire_version: xc_wire::WIRE_VERSION,
+                wire_version: crate::wire::WIRE_VERSION,
                 tip_height,
                 tip_hash,
                 finalized_height: db.get_finalized_height().unwrap_or_else(|err| {

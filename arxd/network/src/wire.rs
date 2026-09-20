@@ -3,11 +3,10 @@
 
 //! Wire types for the Arxium peer-to-peer block sync protocol.
 //!
-//! Shared by `arxd/network` and by external indexers, so both sides compile
-//! against one definition rather than hand-maintained copies of each other's
-//! structs. bincode encodes positionally and carries no version tag: a field
-//! added on one side and not the other decodes as garbage rather than failing,
-//! which is exactly the failure mode this crate removes.
+//! `pub` so the fuzz targets decode the exact shapes the node does. bincode
+//! encodes positionally and carries no version tag: a field added on one side
+//! and not the other decodes as garbage rather than failing, so the rules
+//! below matter for every peer on the network.
 //!
 //! ## Compatibility rules
 //!

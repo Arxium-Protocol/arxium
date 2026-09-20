@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use xc_circuit::{BlsKeyKey, ChainParamsKey, GenesisHashKey, KeySpec, ValidatorSetKey};
 use xc_primitives::{Block, Hash32, quorum_reached, validator_set_effective_height};
 use xc_storage::{ArxiumDb, FinalityRecord, StorageError, snapshot_chunks};
-use xc_wire::{SnapshotEntry, SnapshotManifest, SyncRequest};
+use crate::wire::{SnapshotEntry, SnapshotManifest, SyncRequest};
 
 use crate::gossip::Payload;
 

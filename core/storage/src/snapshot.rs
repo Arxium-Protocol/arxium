@@ -3,7 +3,7 @@
 
 //! Snapshot sync, storage side: exporting the raw state as of a past height
 //! (server), and importing one after verifying it (client). The wire shapes
-//! live in `xc-wire`; the network loop in `arxd/network` drives both ends.
+//! live in `arxd/network`'s `wire` module, whose network loop drives both ends.
 //!
 //! The server never keeps per-height snapshots. State at `H` is the current
 //! state with the per-block undo records for `(H, tip]` applied — the exact

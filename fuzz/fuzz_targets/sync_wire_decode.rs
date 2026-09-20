@@ -12,7 +12,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use xc_wire::{SyncRequest, SyncResponse};
+use arxd_network::wire::{SyncRequest, SyncResponse};
 
 type ChainBlock = xc_primitives::Block<arxd_runtime::ActionPayload>;
 
