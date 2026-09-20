@@ -10,23 +10,20 @@ separate binary per role.
 
 ## What lives here
 
-| Path               | Responsibility                                                                                                                                                                                                                                                                                                        |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `arxd/src/main.rs` | Binary entrypoint. Sets up tracing/logging, calls `node::run()`. Nothing else — keep this file thin.                                                                                                                                                                                                                  |
-| `arxd/node/`       | The orchestration crate (`node`). Owns the block-production loop and role decision (`lib.rs`), validator key management (`validator.rs`), and CoreChain's own payload type + dispatch table (`payload.rs`, public — `ActionPayload`, `ChainAction`/`ChainBlock` type aliases, `dispatch`). This is the only crate allowed to decide "what role am I" and act on it, and the only place that decides what a CoreChain `ActionPayload::Transfer` means.        |
-| `arxd/evidence/`   | The `evidence` crate. Detects equivocation — a validator signing two different blocks at one height — verifies the evidence, and applies the resulting slash. Reacts to a single `EvidenceEvent` today; more fault-detection responsibilities (state-root registry, cross-chain conflict resolution) land here as they are built.                    |
-| `arxd/network/`    | The `network` crate. libp2p transport, mDNS and bootnode discovery, gossipsub for action/block/precommit propagation, and `request_response` block sync. Generic over the chain's payload type `P`.                                                                          |
-| `arxd/finality/`   | The `finality` crate. Signs a BLS precommit for each observed block, tallies peer precommits against the validator set at that height, and writes a finality record once an aggregate reaches 2/3+1.                                                                          |
+| Path | Responsibility |
+| --- | --- |
+| `arxd/src/main.rs` | Binary entrypoint. Sets up tracing/logging, calls `arxd_node::run::<CoreChainRuntime>()`. Nothing else — keep this file thin. |
+| `arxd/node/` | The orchestration crate (`arxd-node`), generic over `ChainRuntime` so `examples/toy-chain` reuses it whole. Owns the produce loop and role decision (`lib.rs`, `produce.rs`), subsystem wiring (`components.rs`), the clap surface (`cli.rs`), the `arxd <subcommand>` handlers (`commands.rs`) and validator key management (`validator.rs`). The only crate allowed to decide "what role am I" and act on it. |
+| `arxd/runtime/` | CoreChain's `ChainRuntime` (`arxd-runtime`): the payload enum (`payload.rs` — `ActionPayload`, `ChainAction`/`ChainBlock`; variant order is the wire format), the dispatch table, staking/asset/identity/governance state transitions, metering, and the proof-backed fault adjudicator `arx-verify` re-exports. The only place that decides what a CoreChain `ActionPayload::Transfer` means. |
+| `arxd/genesis/` | `arxd-genesis`: BLS validator registration and the Plain/Raw `ChainSpec` a node boots from. Shared by `arxd-node`, `arxd-runtime` and `tools/spec-builder`. |
+| `arxd/network/` | `arxd-network`: libp2p transport, mDNS and bootnode discovery, gossipsub for action/block/precommit propagation, `request_response` block and snapshot sync, and the sync protocol's wire types (`wire.rs`). Generic over the chain's payload type `P`. |
+| `arxd/finality/` | `arxd-finality`: signs a BLS precommit for each observed block, tallies peer precommits against the validator set at that height, and writes a finality record once an aggregate reaches 2/3+1. |
 
-`cli.rs`, `genesis.rs`, and `rpc.rs` used to live here but moved to
-`core/cli`, `core/genesis`, and `core/rpc` — none of them, once written,
-turned out to need chain/role knowledge: `Cli` is generic node-operator
-config, genesis bootstrap only needed the embedded JSON string as a
-parameter, and the RPC server only needed the payload type `P` as a
-generic instead of CoreChain's concrete `ActionPayload`. Same story as
-`xc-executor` before them — proven generic by making `examples/toy-chain`
-use the mechanism (`Mempool<P>`, `Action<P>`) even though it doesn't wire
-up its own RPC server today.
+Equivocation detection (`xc-evidence`), the RPC server (`xc-rpc`) and chain-spec
+parsing (`xc-chain-spec`) live under `core/`: none of them needs chain or role
+knowledge, only the payload type `P` as a generic. `cli` and the P2P wire types
+went the other way — they were split out for external consumers that no longer
+exist, so they are back inside the crates that use them.
 
 ## The boundary rule
 
