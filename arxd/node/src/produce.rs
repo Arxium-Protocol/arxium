@@ -94,6 +94,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
+        governance,
         touched_keys: _,
         dropped,
         weight_used,
@@ -182,6 +183,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         for marker in &evidence_markers {
             overlay.push(marker);
         }
+        overlay.push(&governance);
         // Same `CF_GOVERNANCE` rows `accept_block` previews — see its comment.
         for registration in &bls_keys {
             overlay.push(registration);
@@ -306,6 +308,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
+    writables.push(&governance);
     let block_weight = xc_storage::BlockWeight {
         height: next_height,
         weight_used,

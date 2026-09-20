@@ -4,7 +4,9 @@
 //! consumer can pin it without pulling in circuits, storage or the
 //! runtime. Variant order is the wire format; append, never reorder.
 use serde::{Deserialize, Serialize};
-use xc_primitives::{Action, Address, AssetMetadata, AssetRef, ClaimTopic, CountryCode};
+use xc_primitives::{
+    Action, Address, AssetMetadata, AssetRef, ClaimTopic, CountryCode, GovernanceAction,
+};
 
 /// CoreChain's action payload — chain-specific, unlike `Action`/`Block`
 /// themselves. A different chain (e.g. `examples/toy-chain`) defines its
@@ -371,6 +373,22 @@ pub enum ActionPayload {
         amount: u128,
         until_height: u64,
     },
+    /// Opens a governance proposal (`circuit-governance`). Sender must be an
+    /// active validator. `description` is bounded like a `reason`. Variant 33.
+    SubmitProposal {
+        action: GovernanceAction,
+        description: String,
+    },
+    /// One stake-weighted vote per validator per proposal. Variant 34.
+    VoteProposal {
+        proposal: u64,
+        approve: bool,
+    },
+    /// Closes a proposal whose window has ended and applies it if it passed.
+    /// Anyone may send it. Variant 35.
+    ExecuteProposal {
+        proposal: u64,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -385,7 +403,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 33] = [
+        const EXPECTED: [&str; 36] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -419,6 +437,9 @@ mod tests {
             "SetAssetMetadataUri",
             "SetAssetLimits",
             "LockHolderAmountUntil",
+            "SubmitProposal",
+            "VoteProposal",
+            "ExecuteProposal",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

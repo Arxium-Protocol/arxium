@@ -217,6 +217,16 @@ pub struct ChainParams {
     /// validators who have since withdrawn with nothing left to slash.
     #[serde(default = "default_unbonding_blocks")]
     pub unbonding_blocks: u64,
+    /// How long a governance proposal accepts votes, in blocks from
+    /// submission (`circuit-governance`).
+    #[serde(default = "default_voting_period_blocks")]
+    pub voting_period_blocks: u64,
+    /// Yes-power a proposal needs to pass, in basis points of
+    /// `TOTAL_VOTING_POWER` — on top of yes > no. Ties every passing
+    /// proposal to a real share of the set, not just a majority of whoever
+    /// turned up.
+    #[serde(default = "default_proposal_quorum_bps")]
+    pub proposal_quorum_bps: u32,
 }
 
 fn default_epoch_length() -> u64 {
@@ -249,6 +259,15 @@ fn default_unbonding_blocks() -> u64 {
     DEFAULT_UNBONDING_BLOCKS
 }
 
+/// 7 days at 2s slots.
+fn default_voting_period_blocks() -> u64 {
+    7 * 24 * 60 * 60 / 2
+}
+/// Half the set's power must say yes.
+fn default_proposal_quorum_bps() -> u32 {
+    5_000
+}
+
 impl Default for ChainParams {
     fn default() -> Self {
         Self {
@@ -259,8 +278,57 @@ impl Default for ChainParams {
             max_block_weight: default_max_block_weight(),
             reward_per_block: default_reward_per_block(),
             unbonding_blocks: default_unbonding_blocks(),
+            voting_period_blocks: default_voting_period_blocks(),
+            proposal_quorum_bps: default_proposal_quorum_bps(),
         }
     }
+}
+
+/// What a governance proposal does when it passes and is executed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GovernanceAction {
+    /// Replace the whole `chain_params` row. Whole-row rather than per-field
+    /// so the proposal text is exactly the state that results — a supervisor
+    /// reads one record, not a diff against something that may have moved.
+    SetChainParams(ChainParams),
+    /// Rotate one of the genesis-seeded admin roles (`AdminKey`). `role` is
+    /// the `AdminRole` name (`"attestor"`, `"freeze"`, `"recovery"`) — a
+    /// string so this crate needn't depend on `xc-circuit`, which defines
+    /// the enum and depends on this crate.
+    SetAdmin { role: String, address: Address },
+    /// Pay `amount` IUM out of `treasury_account()` to `to`.
+    TreasurySpend { to: Address, amount: u128 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProposalStatus {
+    /// Accepting votes until `voting_ends_at`.
+    Open,
+    /// Window closed, passed, and its action applied.
+    Executed,
+    /// Window closed and it did not pass (or its action failed to apply —
+    /// e.g. the treasury no longer held the amount).
+    Rejected,
+}
+
+/// One governance proposal (`circuit-governance`). Stored at `ProposalKey`
+/// in `CF_GOVERNANCE`, merkleized: whether a param change was legitimately
+/// voted in is exactly what an adjudicator would need to prove.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: u64,
+    pub proposer: Address,
+    pub action: GovernanceAction,
+    /// Free-text rationale, bounded by the runtime. Rides in state so the
+    /// record a supervisor pulls carries the justification with it.
+    pub description: String,
+    pub created_at: u64,
+    pub voting_ends_at: u64,
+    /// Summed `VotingPower` (bps of `TOTAL_VOTING_POWER`) as of the set in
+    /// force when each vote landed.
+    pub yes_power: u32,
+    pub no_power: u32,
+    pub status: ProposalStatus,
 }
 
 /// Where a validator stands with respect to the active set. Written by the

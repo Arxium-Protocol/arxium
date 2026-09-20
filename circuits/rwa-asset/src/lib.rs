@@ -1627,13 +1627,10 @@ mod tests {
             asset.holder_count, 3,
             "forced transfers keep the count honest"
         );
-        assert_eq!(
-            apply_issue_to(&db, &mut asset, &addr(6), 1, 0)
-                .unwrap_err()
-                .to_string()
-                .contains("cap"),
-            true
-        );
+        assert!(matches!(
+            apply_issue_to(&db, &mut asset, &addr(6), 1, 0).unwrap_err(),
+            RwaError::HolderCapReached { .. }
+        ));
     }
 
     #[test]

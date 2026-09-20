@@ -520,6 +520,7 @@ dependencies = [
  "bincode",
  "blst",
  "circuit-account",
+ "circuit-governance",
  "circuit-identity",
  "circuit-identity-zk",
  "circuit-rwa-asset",
@@ -1032,6 +1033,16 @@ name = "circuit-account"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "thiserror 2.0.19",
+ "xc-circuit",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "circuit-governance"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.19",
  "xc-circuit",
  "xc-primitives",

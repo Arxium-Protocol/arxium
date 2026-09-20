@@ -311,6 +311,40 @@ impl KeySpec for ChainParamsKey {
     }
 }
 
+/// A governance proposal by id (`circuit-governance`). `CF_GOVERNANCE`, merkleized.
+pub struct ProposalKey(pub u64);
+impl KeySpec for ProposalKey {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = xc_primitives::Proposal;
+    fn encode(&self) -> Vec<u8> {
+        format!("proposal:{:020}", self.0).into_bytes()
+    }
+}
+
+/// Marks that `voter` has voted on `proposal` — one vote per validator per
+/// proposal; the tally itself lives on the `Proposal`.
+pub struct VoteKey<'a> {
+    pub proposal: u64,
+    pub voter: &'a Address,
+}
+impl KeySpec for VoteKey<'_> {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = bool;
+    fn encode(&self) -> Vec<u8> {
+        format!("proposal_vote:{:020}:{}", self.proposal, self.voter).into_bytes()
+    }
+}
+
+/// Next unused proposal id. Missing means 0.
+pub struct NextProposalIdKey;
+impl KeySpec for NextProposalIdKey {
+    const CF: &'static str = CF_GOVERNANCE;
+    type Value = u64;
+    fn encode(&self) -> Vec<u8> {
+        b"proposal_next_id".to_vec()
+    }
+}
+
 /// The three privileged roles that used to be one `governor` address —
 /// split so the party that decides who may act as a KYC provider, the
 /// party that can halt an instrument, and the party that can move a
@@ -327,6 +361,16 @@ pub enum AdminRole {
 }
 
 impl AdminRole {
+    /// The short form `GovernanceAction::SetAdmin.role` carries.
+    pub fn parse(role: &str) -> Option<Self> {
+        match role {
+            "attestor" => Some(AdminRole::Attestor),
+            "freeze" => Some(AdminRole::Freeze),
+            "recovery" => Some(AdminRole::Recovery),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             AdminRole::Attestor => "attestor admin",

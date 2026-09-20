@@ -18,6 +18,7 @@ mod consensus;
 mod epoch;
 #[cfg(test)]
 mod epoch_tests;
+mod governance;
 mod identity;
 pub mod metering;
 mod pair;
@@ -602,6 +603,16 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         }
         ActionPayload::TransferAsset { asset, to, amount } => {
             asset::transfer_asset(view, action, asset, to, *amount, current_height)
+        }
+        ActionPayload::SubmitProposal {
+            action: proposed,
+            description,
+        } => governance::submit(view, action, proposed, description, current_height),
+        ActionPayload::VoteProposal { proposal, approve } => {
+            governance::vote(view, action, *proposal, *approve, current_height)
+        }
+        ActionPayload::ExecuteProposal { proposal } => {
+            governance::execute(view, *proposal, current_height)
         }
         ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
             view,

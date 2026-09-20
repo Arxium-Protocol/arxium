@@ -859,3 +859,54 @@ impl BatchWritable for AttestorDeregistration {
         Ok(vec![AttestorRecordKey(&self.0).encode()])
     }
 }
+
+/// Raw `CF_GOVERNANCE` rows an action wrote — `Some` puts, `None` deletes,
+/// already bincode-encoded by whoever built them (the governance circuit
+/// encodes via `KeySpec`, so the shape is still typed at the source). One
+/// generic carrier rather than a `BlockUpdates` field per row kind because
+/// executing a proposal can touch proposals, votes, `chain_params` and
+/// `admin:*` in one action, and every new field costs a pass through the
+/// executor, producer, adjudicator and effects log.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GovernanceUpdates(pub BTreeMap<Vec<u8>, Option<Vec<u8>>>);
+
+impl GovernanceUpdates {
+    pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
+        debug_assert_eq!(K::CF, CF_GOVERNANCE);
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+        self.0.insert(key.encode(), Some(bytes));
+        Ok(())
+    }
+
+    pub fn delete<K: KeySpec>(&mut self, key: &K) {
+        debug_assert_eq!(K::CF, CF_GOVERNANCE);
+        self.0.insert(key.encode(), None);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn extend(&mut self, other: GovernanceUpdates) {
+        self.0.extend(other.0);
+    }
+}
+
+impl BatchWritable for GovernanceUpdates {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        Ok(self
+            .0
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|v| (k.clone(), v.clone())))
+            .collect())
+    }
+
+    fn batch_deletes(&self) -> Result<Vec<Vec<u8>>, StorageError> {
+        Ok(self
+            .0
+            .iter()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+}

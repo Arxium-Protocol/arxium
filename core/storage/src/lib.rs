@@ -282,7 +282,9 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// Bumped 14 -> 15: `Asset` gained `max_holders`, `max_balance_per_holder`,
 /// `max_attestation_age` and `holder_count` (`SetAssetLimits`, variant 31);
 /// `HolderState` gained `lock_expires_at` (`LockHolderAmountUntil`, variant
-/// 32); `AccountEntry` gained `attested_at`. All three are positional
+/// 32); `AccountEntry` gained `attested_at`; `ChainParams` gained
+/// `voting_period_blocks` and `proposal_quorum_bps` (`circuit-governance`,
+/// variants 33–35, `proposal*:` rows in `CF_GOVERNANCE`). All positional
 /// bincode in merkleized column families — devnet reset.
 pub const SCHEMA_VERSION: u32 = 15;
 
@@ -413,6 +415,7 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         || key.starts_with(b"operator:")
         || key.starts_with(b"operator_index:")
         || key == b"chain_params"
+        || key.starts_with(b"proposal")
         || key.starts_with(b"blskey:")
         || key.starts_with(b"blskey_owner:")
     {

@@ -561,6 +561,7 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
             .iter()
             .map(|d| d as &dyn xc_storage::BatchWritable),
     );
+    parts.push(&updates.governance);
     let mut entries = Vec::new();
     for part in parts {
         for (key, value) in part

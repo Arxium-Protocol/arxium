@@ -214,6 +214,15 @@ impl<'a> BlockView<'a> {
     pub fn apply_attestor_deregistration(&mut self, deregistration: &AttestorDeregistration) {
         self.delete(&AttestorRecordKey(&deregistration.0))
     }
+
+    /// Folds raw governance rows into the view (already encoded, see
+    /// `GovernanceUpdates`).
+    pub fn apply_governance(&mut self, updates: &GovernanceUpdates) {
+        for (key, value) in &updates.0 {
+            self.record_touched(key);
+            self.entries.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 impl KvRead for BlockView<'_> {

@@ -16,8 +16,8 @@ use xc_primitives::{
 use xc_storage::{
     AccountUpdates, ArxiumDb, AssetBalanceUpdates, AttestorDeregistration, AttestorRegistration,
     BatchWritable, BlockEffects, BlockView, BlockWeight, BlsKeyRegistration, DroppedAction,
-    EvidenceMarker, HolderStateUpdates, OperatorUpdates, StakeUpdates, StorageError,
-    ValidatorSetSnapshot, ValidatorStatusUpdates,
+    EvidenceMarker, GovernanceUpdates, HolderStateUpdates, OperatorUpdates, StakeUpdates,
+    StorageError, ValidatorSetSnapshot, ValidatorStatusUpdates,
 };
 
 /// Everything one block's worth of execution produced, as returned by
@@ -45,6 +45,9 @@ pub struct ExecutionOutcome<P> {
     pub asset_registrations: Vec<Asset>,
     pub attestor_registrations: Vec<AttestorRegistration>,
     pub attestor_deregistrations: Vec<AttestorDeregistration>,
+    /// Raw `CF_GOVERNANCE` rows from `circuit-governance` (proposals, votes,
+    /// a passed `chain_params`/`admin:*` change), last write wins.
+    pub governance: GovernanceUpdates,
     /// Every Merkleized key read or written, but only when the caller asked
     /// for it via `record_touched_keys`; otherwise empty.
     pub touched_keys: Vec<Vec<u8>>,
@@ -100,6 +103,8 @@ pub struct BlockUpdates {
     pub attestor_registration: Option<AttestorRegistration>,
     /// Set only by `DeregisterAttestor` — removes a `CF_ATTESTORS` entry.
     pub attestor_deregistration: Option<AttestorDeregistration>,
+    /// Set by the governance actions — see `ExecutionOutcome::governance`.
+    pub governance: GovernanceUpdates,
 }
 
 /// Resolves every stake allocation whose unbonding batch matured at or
@@ -601,6 +606,7 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
+        governance,
         touched_keys,
         dropped: _,
         weight_used,
@@ -719,6 +725,7 @@ where
             overlay.push(registration);
         }
         overlay.push(&operator_updates);
+        overlay.push(&governance);
         overlay
     };
     let expected_state_root = db.compute_state_root(&state_root_overlay)?;
@@ -766,6 +773,7 @@ where
         writables.push(deregistration);
     }
     writables.push(&operator_updates);
+    writables.push(&governance);
     let block_weight = BlockWeight {
         height: block.height,
         weight_used,
@@ -886,6 +894,7 @@ where
         seed.attestor_registration.into_iter().collect();
     let mut attestor_deregistrations: Vec<AttestorDeregistration> =
         seed.attestor_deregistration.into_iter().collect();
+    let mut governance = seed.governance;
 
     let mut view = if record_touched_keys {
         BlockView::new_recording(db)
@@ -906,6 +915,7 @@ where
     for deregistration in &attestor_deregistrations {
         view.apply_attestor_deregistration(deregistration);
     }
+    view.apply_governance(&governance);
 
     let mut actions = actions.into_iter();
     while let Some(action) = actions.next() {
@@ -975,6 +985,8 @@ where
                     view.apply_attestor_deregistration(deregistration);
                 }
                 attestor_deregistrations.extend(updates.attestor_deregistration);
+                view.apply_governance(&updates.governance);
+                governance.extend(updates.governance);
                 weight_used += weight;
                 fees_collected = fees_collected.saturating_add(fee);
                 applied.push(action);
@@ -1022,6 +1034,7 @@ where
             snapshot_overlay.extend(asset_registrations.iter().map(|a| a as &dyn BatchWritable));
             snapshot_overlay.extend(evidence_markers.iter().map(|m| m as &dyn BatchWritable));
             snapshot_overlay.extend(bls_keys.iter().map(|k| k as &dyn BatchWritable));
+            snapshot_overlay.push(&governance);
             roots.push(db.compute_state_root(&snapshot_overlay)?);
         }
     }
@@ -1046,6 +1059,7 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
+        governance,
         touched_keys: view.touched_keys(),
         weight_used,
         fees_collected,

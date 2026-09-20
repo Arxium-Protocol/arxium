@@ -32,6 +32,7 @@ circuit-account = { workspace = true }
 circuit-staking = { workspace = true }
 circuit-identity = { workspace = true }
 circuit-rwa-asset = { workspace = true }
+circuit-governance = { workspace = true }
 
 ark-bls12-381 = { workspace = true }
 ark-serialize = { workspace = true }

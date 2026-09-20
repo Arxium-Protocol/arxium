@@ -66,6 +66,8 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         | LockIssuance { .. }
         | TransferIssuer { .. }
         | SetAssetMetadataUri { .. } => 100,
+        // A validator-set read plus one or two governance rows.
+        SubmitProposal { .. } | VoteProposal { .. } | ExecuteProposal { .. } => 150,
         // Two block-signature verifies plus the slash.
         SubmitEquivocationEvidence { .. } => 2_000,
         // Verifies the artifact's BLS signatures and replays up to
