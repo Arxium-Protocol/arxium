@@ -921,7 +921,7 @@ mod tests {
             signature: None,
             payload: crate::ActionPayload::JoinValidator {
                 validator: alice.clone(),
-                stake: crate::MIN_VALIDATOR_STAKE,
+                stake: crate::test_support::MIN_VALIDATOR_STAKE,
                 bls_pubkey: {
                     let (_sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
                     pk.0.to_vec()
@@ -1373,7 +1373,7 @@ mod tests {
                 (alice.clone(), alice.clone()),
                 Some(crate::test_support::self_allocation(
                     &alice,
-                    crate::MIN_VALIDATOR_STAKE,
+                    crate::test_support::MIN_VALIDATOR_STAKE,
                 )),
             )]),
             validator_index: std::collections::BTreeMap::from([(
@@ -1384,7 +1384,7 @@ mod tests {
         .unwrap();
         db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
             circuit_staking::stake_subaccount(&alice),
-            entry(crate::MIN_VALIDATOR_STAKE),
+            entry(crate::test_support::MIN_VALIDATOR_STAKE),
         )])))
         .unwrap();
         let pre_root = db.compute_state_root(&[]).unwrap();

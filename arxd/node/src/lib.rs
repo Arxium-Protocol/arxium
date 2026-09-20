@@ -1016,9 +1016,10 @@ fn spawn_subsystems<R: ChainRuntime>(
         gossip_tx: Some(gossip_tx),
         metrics_handle,
         payload_precheck: Some(payload_precheck.clone()),
-        min_stake: R::min_validator_stake(),
-        action_fee: Some(R::action_fee()),
-        weight_fee: R::action_fee_for(1).saturating_sub(R::action_fee_for(0)),
+        fee_hints: Some(xc_rpc::FeeHints {
+            min_stake: R::min_validator_stake,
+            action_fee_for: R::action_fee_for,
+        }),
         evidence_dir: config.base_path.join(chain_name).join("evidence"),
         limits: config.limits.clone(),
     })?;
@@ -1044,11 +1045,18 @@ fn spawn_subsystems<R: ChainRuntime>(
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
             let candidate = block.clone();
+            let params = match db.chain_params() {
+                Ok(params) => params,
+                Err(err) => {
+                    tracing::error!(height, %err, "cannot read chain params, rejecting block");
+                    return false;
+                }
+            };
             match accept_block(
                 &db,
                 block,
                 sync,
-                &crate::produce::meter::<R>,
+                &crate::produce::meter::<R>(params),
                 |action, view, operator_lookup, operator_validators_lookup, validators| {
                     R::dispatch(
                         action,

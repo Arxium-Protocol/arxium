@@ -13,12 +13,6 @@ use xc_storage::{BlsKeyRegistration, StorageError};
 use crate::ChainAction;
 use crate::consensus::{next_epoch_start, validated_bls_pubkey};
 
-/// 100,000 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM). Below
-/// this, `JoinValidator` is rejected before `circuit_staking::apply_stake`
-/// even runs: round-robin proposer selection ignores stake size, so without
-/// a floor "becoming a validator" would be free.
-pub const MIN_VALIDATOR_STAKE: u128 = 100_000 * 1_000_000_000;
-
 /// `sender == validator` covers self-service management, unchanged from
 /// before delegation existed. `sender != validator` is only ever allowed if
 /// `validator` has authorized `sender` as its operator via
@@ -60,8 +54,12 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
         })?
         .map(|a| a.active_amount)
         .unwrap_or(0);
-    if existing_active + stake < MIN_VALIDATOR_STAKE {
-        anyhow::bail!("stake {stake} is below the minimum validator stake {MIN_VALIDATOR_STAKE}");
+    let min_stake = view
+        .get(&xc_circuit::ChainParamsKey)?
+        .unwrap_or_default()
+        .min_validator_stake;
+    if existing_active + stake < min_stake {
+        anyhow::bail!("stake {stake} is below the minimum validator stake {min_stake}");
     }
     let (accounts, stakes) = circuit_staking::apply_stake(
         view,

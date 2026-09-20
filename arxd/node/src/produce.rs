@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 use xc_executor::{ExecutionOutcome, execute_actions, resolve_matured_unbonding};
 use xc_mempool::Mempool;
-use xc_primitives::{Action, Address, Block, QUORUM_POWER, eligible_proposer, signed_power};
+use xc_primitives::{
+    Action, Address, Block, ChainParams, QUORUM_POWER, eligible_proposer, signed_power,
+};
 use xc_runtime_api::ChainRuntime;
 use xc_runtime_api::DispatchCtx;
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
@@ -118,7 +120,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
                 },
             )
         },
-        &meter::<R>,
+        &meter::<R>(db.chain_params()?),
         None,
         false,
     )?;
@@ -334,10 +336,14 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     Ok((new_block, dropped, deferred))
 }
 
-/// `(weight, fee)` of one action, as `xc_executor` wants it.
-pub fn meter<R: ChainRuntime>(action: &Action<R::Payload>) -> (u64, u128) {
-    let weight = R::action_weight(action);
-    (weight, R::action_fee_for(weight))
+/// `(weight, fee)` of one action under `params`, as `xc_executor` wants it.
+/// Built per block from `db.chain_params()` so a governed fee change takes
+/// effect at the next block on producer and follower alike.
+pub fn meter<R: ChainRuntime>(params: ChainParams) -> impl Fn(&Action<R::Payload>) -> (u64, u128) {
+    move |action| {
+        let weight = R::action_weight(action);
+        (weight, R::action_fee_for(&params, weight))
+    }
 }
 
 /// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
@@ -642,7 +648,7 @@ mod tests {
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                 )
             },
-            &meter::<CoreChainRuntime>,
+            &meter::<CoreChainRuntime>(Default::default()),
             None,
             false,
         )
@@ -690,7 +696,7 @@ mod tests {
         // Same nonce twice: the replay is dropped, and the drop is reported
         // by signature so a status poll can say why.
         let replay = transfer.clone();
-        let (weight, fee) = meter::<CoreChainRuntime>(&transfer);
+        let (weight, fee) = meter::<CoreChainRuntime>(Default::default())(&transfer);
         let (block, dropped, _) = produce_block_reporting::<CoreChainRuntime>(
             &db,
             vec![transfer, replay.clone()],
@@ -808,7 +814,7 @@ mod tests {
                     &peer,
                     block,
                     false,
-                    &meter::<CoreChainRuntime>,
+                    &meter::<CoreChainRuntime>(Default::default()),
                     |action, view, operator_lookup, operator_validators_lookup, vals| {
                         dispatch(
                             action,

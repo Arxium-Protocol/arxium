@@ -19,8 +19,8 @@ use xc_storage::{
 };
 
 use crate::CoreChainRuntime;
-use crate::staking::MIN_VALIDATOR_STAKE;
 use crate::test_support::temp_db;
+use xc_primitives::DEFAULT_MIN_VALIDATOR_STAKE as MIN_VALIDATOR_STAKE;
 
 const EPOCH: u64 = 10;
 

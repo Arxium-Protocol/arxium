@@ -291,10 +291,14 @@ fn fault_slash<V: KvRead<Error = StorageError>>(
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
     let total =
         allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
+    let slash_bps = view
+        .get(&xc_circuit::ChainParamsKey)?
+        .unwrap_or_default()
+        .equivocation_slash_bps;
     let (accounts, stakes) = circuit_staking::apply_slash(
         view,
         culprit,
-        xc_evidence::slash_amount(total),
+        xc_evidence::slash_amount(total, slash_bps),
         reason,
         current_height,
     )?;
@@ -428,7 +432,7 @@ mod tests {
         // Whitepaper §9.3: double-sign slashes 100% of stake, so the
         // allocation nets to zero and is removed outright (`None`) rather
         // than left at a reduced balance.
-        assert_eq!(xc_evidence::slash_amount(10_000), 10_000);
+        assert_eq!(xc_evidence::slash_amount(10_000, 10_000), 10_000);
         let allocation = updates
             .stakes
             .allocations

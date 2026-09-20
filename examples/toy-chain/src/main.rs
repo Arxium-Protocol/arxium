@@ -24,7 +24,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address, Asset};
+use xc_primitives::{Action, Address, Asset, ChainParams};
 use xc_runtime_api::ChainRuntime;
 use xc_storage::{AccountUpdates, ArxiumDb, AssetBalanceUpdates, BlockView};
 
@@ -88,11 +88,11 @@ impl ChainRuntime for ToyRuntime {
         &xc_chain_spec::presets::PresetRegistry::EMPTY
     }
 
-    fn action_fee() -> u128 {
+    fn action_fee_for(_params: &ChainParams, _weight: u64) -> u128 {
         0
     }
 
-    fn min_validator_stake() -> Option<u128> {
+    fn min_validator_stake(_params: &ChainParams) -> Option<u128> {
         None
     }
 

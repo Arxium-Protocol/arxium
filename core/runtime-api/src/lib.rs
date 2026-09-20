@@ -30,7 +30,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use xc_chain_spec::presets::PresetRegistry;
 use xc_evidence::EquivocationEvidence;
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address};
+use xc_primitives::{Action, Address, ChainParams};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
 /// Everything `ChainRuntime::dispatch` needs about the block it's executing
@@ -66,10 +66,6 @@ pub trait ChainRuntime: Send + Sync + 'static {
     /// hands it, never a hardcoded registry.
     fn presets() -> &'static PresetRegistry;
 
-    /// Base fee charged per action, in base units. The full fee is
-    /// `action_fee_for(action_weight(action))`.
-    fn action_fee() -> u128;
-
     /// Execution cost of `action` in this chain's weight units — what the
     /// block cap (`ChainParams.max_block_weight`) and the PoE
     /// `resources_used` are summed over. Must be a pure function of the
@@ -79,14 +75,16 @@ pub trait ChainRuntime: Send + Sync + 'static {
         1
     }
 
-    /// Fee for an action of `weight`. Default: the flat `action_fee`.
-    fn action_fee_for(_weight: u64) -> u128 {
-        Self::action_fee()
+    /// Fee for an action of `weight` under `params` — read from state, not
+    /// a constant, so a governance vote can retune it without a release.
+    /// Default: the flat `params.action_fee`.
+    fn action_fee_for(params: &ChainParams, _weight: u64) -> u128 {
+        params.action_fee
     }
 
     /// Minimum self-stake for a validator, if this chain has validator
     /// staking at all. `None` disables the RPC's stake hint.
-    fn min_validator_stake() -> Option<u128>;
+    fn min_validator_stake(params: &ChainParams) -> Option<u128>;
 
     /// Cheap rejection before an action reaches the mempool, so a doomed
     /// action fails at submission with a real reason instead of being

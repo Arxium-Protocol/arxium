@@ -242,4 +242,95 @@ mod tests {
                 ))
         );
     }
+
+    /// A passed `SetChainParams` retunes the fee for the very next action —
+    /// the D-20 point: no release, no restart.
+    #[test]
+    fn a_voted_fee_change_is_charged_on_the_next_action() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET * 4))]),
+            HashMap::new(),
+        );
+        view.put(
+            &ValidatorSetKey(0),
+            &std::collections::BTreeMap::from([(alice.clone(), VotingPower(10_000))]),
+        )
+        .unwrap();
+        let mut params = ChainParams {
+            voting_period_blocks: 1,
+            ..Default::default()
+        };
+        view.put(&ChainParamsKey, &params).unwrap();
+        let act = |nonce, payload| Action {
+            sender: alice.clone(),
+            nonce,
+            signature: None,
+            payload,
+        };
+        params.action_fee *= 10;
+        run(
+            &mut view,
+            act(
+                0,
+                ActionPayload::SubmitProposal {
+                    action: GovernanceAction::SetChainParams(params.clone()),
+                    description: "10x fee".into(),
+                },
+            ),
+            1,
+        )
+        .unwrap();
+        run(
+            &mut view,
+            act(
+                1,
+                ActionPayload::VoteProposal {
+                    proposal: 0,
+                    approve: true,
+                },
+            ),
+            1,
+        )
+        .unwrap();
+        let balance = |view: &BlockView<'_>| {
+            view.get(&xc_circuit::AccountKey(&alice))
+                .unwrap()
+                .unwrap()
+                .balance
+        };
+        let old_fee = crate::metering::action_fee_for(
+            &ChainParams::default(),
+            crate::metering::action_weight(&act(0, ActionPayload::ExecuteProposal { proposal: 0 })),
+        );
+        let b0 = balance(&view);
+        run(
+            &mut view,
+            act(2, ActionPayload::ExecuteProposal { proposal: 0 }),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            b0 - balance(&view),
+            old_fee,
+            "the execute itself pays the old fee"
+        );
+        assert_eq!(view.get(&ChainParamsKey).unwrap().unwrap(), params);
+
+        // The very next action pays the new one.
+        let next = ActionPayload::SubmitProposal {
+            action: GovernanceAction::SetChainParams(params.clone()),
+            description: "again".into(),
+        };
+        let new_fee = crate::metering::action_fee_for(
+            &params,
+            crate::metering::action_weight(&act(0, next.clone())),
+        );
+        let b1 = balance(&view);
+        run(&mut view, act(3, next), 3).unwrap();
+        assert_eq!(b1 - balance(&view), new_fee);
+        assert!(new_fee > old_fee);
+    }
 }

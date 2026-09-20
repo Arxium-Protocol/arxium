@@ -24,8 +24,8 @@ use tower_http::cors::{Any, CorsLayer};
 use tracing::{info, warn};
 use xc_mempool::{AdmissionError, Mempool, MempoolError, PayloadPrecheck, validate_action};
 use xc_primitives::{
-    Action, Address, Asset, AssetRef, Block, Hash32, Limits, QUORUM_POWER, TOTAL_VOTING_POWER,
-    signed_power,
+    Action, Address, Asset, AssetRef, Block, ChainParams, Hash32, Limits, QUORUM_POWER,
+    TOTAL_VOTING_POWER, signed_power,
 };
 use xc_storage::{ArxiumDb, StorageError};
 
@@ -117,14 +117,10 @@ struct AppState<P: Payload> {
     // `validate_action`. `None` for chains with no such rules.
     payload_precheck: Option<PayloadPrecheck<P>>,
     pairing: Arc<PairingStore>,
-    // Chain-specific minimum validator stake (e.g. arxd/node's
-    // `MIN_VALIDATOR_STAKE`), so a client never has to hardcode it. `None`
-    // for chains with no such floor.
-    min_stake: Option<u128>,
-    // Chain-specific flat per-action fee (e.g. arxd/node's `ACTION_FEE`), so
-    // a client can show it before submitting. `None` for chains with no fee.
-    action_fee: Option<u128>,
-    weight_fee: u128,
+    // How this chain derives its fee and stake floor from `ChainParams` —
+    // evaluated against the *current* params on each request so a governed
+    // change shows up immediately. `None` for a chain with neither.
+    fee_hints: Option<FeeHints>,
     // Where `xc_evidence` writes fault artifacts (see `write_equivocation_artifact`
     // / `write_disagreement_artifact`). `GET /evidence*` just lists/serves this
     // directory's contents — no separate storage of its own.
@@ -307,6 +303,15 @@ async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
 /// `Authorization: Bearer` header. Blocks the caller until the listener is
 /// bound (or fails to bind), same as a sync server would, so startup
 /// failures surface immediately instead of on first request.
+/// A chain's fee schedule and stake floor as functions of its `ChainParams`
+/// (`ChainRuntime::action_fee_for` / `min_validator_stake`), so the RPC
+/// reports the governed values rather than whatever they were at startup.
+#[derive(Clone, Copy)]
+pub struct FeeHints {
+    pub min_stake: fn(&ChainParams) -> Option<u128>,
+    pub action_fee_for: fn(&ChainParams, u64) -> u128,
+}
+
 /// `spawn_http_ingest`'s arguments as named fields — `min_stake` and
 /// `action_fee` are both `Option<u128>` and used to sit next to each other in
 /// a twelve-parameter list, where transposing them would have compiled and
@@ -322,10 +327,7 @@ pub struct IngestConfig<P: Payload> {
     pub gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
     pub metrics_handle: PrometheusHandle,
     pub payload_precheck: Option<PayloadPrecheck<P>>,
-    pub min_stake: Option<u128>,
-    pub action_fee: Option<u128>,
-    /// Fee per weight unit on top of `action_fee` — 0 for an unmetered chain.
-    pub weight_fee: u128,
+    pub fee_hints: Option<FeeHints>,
     pub evidence_dir: PathBuf,
     pub limits: Limits,
 }
@@ -341,9 +343,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         gossip_tx,
         metrics_handle,
         payload_precheck,
-        min_stake,
-        action_fee,
-        weight_fee,
+        fee_hints,
         evidence_dir,
         limits,
     } = config;
@@ -370,9 +370,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         metrics_handle,
         payload_precheck,
         pairing: Arc::new(PairingStore::new()),
-        min_stake,
-        action_fee,
-        weight_fee,
+        fee_hints,
         evidence_dir,
     };
 
@@ -637,10 +635,12 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
 /// Chain-specific minimum validator stake (e.g. arxd/node's
 /// `MIN_VALIDATOR_STAKE`), so a client (app, `arxd pair`) never has to
 /// hardcode it. `404` for a chain with no such floor.
-async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response {
-    match state.min_stake {
-        Some(min_stake) => Json(serde_json::json!({ "min_stake": min_stake })).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Result<Response, ApiError> {
+    let hints = state.fee_hints.as_ref().ok_or(ApiError::NotFound)?;
+    let params = state.db.chain_params()?;
+    match (hints.min_stake)(&params) {
+        Some(min_stake) => Ok(Json(serde_json::json!({ "min_stake": min_stake })).into_response()),
+        None => Ok(StatusCode::NOT_FOUND.into_response()),
     }
 }
 
@@ -652,12 +652,14 @@ async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Response
 async fn get_action_fee<P: Payload>(
     State(state): State<AppState<P>>,
 ) -> Result<Response, ApiError> {
-    let action_fee = state.action_fee.ok_or(ApiError::NotFound)?;
-    let max_block_weight = state.db.chain_params()?.max_block_weight;
+    let hints = state.fee_hints.as_ref().ok_or(ApiError::NotFound)?;
+    let params = state.db.chain_params()?;
+    let action_fee = (hints.action_fee_for)(&params, 0);
+    let weight_fee = (hints.action_fee_for)(&params, 1).saturating_sub(action_fee);
     Ok(Json(serde_json::json!({
         "action_fee": action_fee,
-        "weight_fee": state.weight_fee,
-        "max_block_weight": max_block_weight,
+        "weight_fee": weight_fee,
+        "max_block_weight": params.max_block_weight,
     }))
     .into_response())
 }
@@ -816,9 +818,7 @@ mod tests {
                 .handle(),
             payload_precheck: None,
             pairing: Arc::new(PairingStore::new()),
-            min_stake: None,
-            action_fee: None,
-            weight_fee: 0,
+            fee_hints: None,
             evidence_dir: dir.join("evidence"),
         }
     }
@@ -1576,7 +1576,10 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let mut state = state;
-            state.min_stake = Some(1_000);
+            state.fee_hints = Some(FeeHints {
+                min_stake: |_| Some(1_000),
+                action_fee_for: |_, _| 0,
+            });
             let resp = get_min_stake(State(state)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1596,7 +1599,10 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
             let mut state = state;
-            state.action_fee = Some(10);
+            state.fee_hints = Some(FeeHints {
+                min_stake: |_| None,
+                action_fee_for: |_, weight| 10 + 3 * u128::from(weight),
+            });
             let resp = get_action_fee(State(state)).await.into_response();
             assert_eq!(resp.status(), StatusCode::OK);
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1604,6 +1610,7 @@ mod tests {
                 .unwrap();
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(json["action_fee"], 10);
+            assert_eq!(json["weight_fee"], 3);
         });
     }
 

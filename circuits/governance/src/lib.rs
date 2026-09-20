@@ -117,6 +117,24 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
                     "proposal_quorum_bps is over 10_000",
                 ));
             }
+            if p.action_fee == 0 {
+                return Err(GovernanceError::InvalidParams(
+                    "action_fee must be positive",
+                ));
+            }
+            if p.min_validator_stake == 0 {
+                return Err(GovernanceError::InvalidParams(
+                    "min_validator_stake must be positive",
+                ));
+            }
+            if p.equivocation_slash_bps > 10_000 || p.downtime_slash_bps > 10_000 {
+                return Err(GovernanceError::InvalidParams("a slash rate is over 100%"));
+            }
+            if p.fee_proposer_bps.saturating_add(p.fee_treasury_bps) > 10_000 {
+                return Err(GovernanceError::InvalidParams(
+                    "fee_proposer_bps + fee_treasury_bps is over 100%",
+                ));
+            }
         }
         GovernanceAction::SetAdmin { role, address } => {
             AdminRole::parse(role).ok_or_else(|| GovernanceError::UnknownRole(role.clone()))?;
@@ -413,14 +431,31 @@ mod tests {
     #[test]
     fn chain_params_proposals_are_validated_at_submission_and_applied_on_pass() {
         let db = db();
-        let bad = GovernanceAction::SetChainParams(ChainParams {
-            epoch_length: 0,
-            ..Default::default()
-        });
-        assert!(matches!(
-            apply_submit(&db, &addr(1), bad, "", 0).unwrap_err(),
-            GovernanceError::InvalidParams(_)
-        ));
+        for bad in [
+            ChainParams {
+                epoch_length: 0,
+                ..Default::default()
+            },
+            ChainParams {
+                action_fee: 0,
+                ..Default::default()
+            },
+            ChainParams {
+                equivocation_slash_bps: 10_001,
+                ..Default::default()
+            },
+            ChainParams {
+                fee_proposer_bps: 6_000,
+                fee_treasury_bps: 5_000,
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                apply_submit(&db, &addr(1), GovernanceAction::SetChainParams(bad), "", 0)
+                    .unwrap_err(),
+                GovernanceError::InvalidParams(_)
+            ));
+        }
         let new_params = ChainParams {
             reward_per_block: 1,
             voting_period_blocks: 10,

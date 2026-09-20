@@ -1178,19 +1178,27 @@ mod tests {
         validators: &[Address],
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
-        let reward_per_block = view
-            .get(&ChainParamsKey)?
-            .unwrap_or_default()
-            .reward_per_block;
-        let reward_updates =
-            circuit_staking::apply_block_reward(view, proposer, fees_collected, reward_per_block)?;
+        let params = view.get(&ChainParamsKey)?.unwrap_or_default();
+        let reward_updates = circuit_staking::apply_block_reward(
+            view,
+            proposer,
+            fees_collected,
+            params.reward_per_block,
+            params.fee_proposer_bps,
+            params.fee_treasury_bps,
+        )?;
         let mut updates = BlockUpdates {
             accounts: reward_updates,
             ..Default::default()
         };
         if let Some(primary) = expected_proposer(validators, height) {
-            let (downtime_accounts, downtime_stakes) =
-                circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
+            let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
+                view,
+                &primary,
+                proposer,
+                height,
+                params.downtime_slash_bps,
+            )?;
             updates.accounts.0.extend(downtime_accounts.0);
             updates
                 .stakes
@@ -1830,9 +1838,15 @@ mod tests {
 
         // No actions, but the block reward still touches state (see
         // `signed_block_at`'s comment) — the root must account for it.
-        let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr, 0, circuit_staking::REWARD_PER_BLOCK)
-                .unwrap();
+        let reward_updates = circuit_staking::apply_block_reward(
+            &db,
+            &addr,
+            0,
+            circuit_staking::REWARD_PER_BLOCK,
+            3_000,
+            2_000,
+        )
+        .unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash().to_string(),
@@ -1867,9 +1881,15 @@ mod tests {
         // No actions, but `accept_block` still applies a block reward to
         // `addr` regardless — the root must include that overlay too, or a
         // block that should be accepted fails its own StateRootMismatch check.
-        let reward_updates =
-            circuit_staking::apply_block_reward(db, addr, 0, circuit_staking::REWARD_PER_BLOCK)
-                .unwrap();
+        let reward_updates = circuit_staking::apply_block_reward(
+            db,
+            addr,
+            0,
+            circuit_staking::REWARD_PER_BLOCK,
+            3_000,
+            2_000,
+        )
+        .unwrap();
         let mut block = Block {
             height: parent.height + 1,
             parent_hash: parent.hash().to_string(),
@@ -2052,9 +2072,15 @@ mod tests {
 
         // height 1 % 2 validators == 1: sorted[1] is primary at height 1.
         let (key1, addr1) = sorted[1].clone();
-        let reward_updates =
-            circuit_staking::apply_block_reward(&db, &addr1, 0, circuit_staking::REWARD_PER_BLOCK)
-                .unwrap();
+        let reward_updates = circuit_staking::apply_block_reward(
+            &db,
+            &addr1,
+            0,
+            circuit_staking::REWARD_PER_BLOCK,
+            3_000,
+            2_000,
+        )
+        .unwrap();
         let mut block1 = Block {
             height: 1,
             parent_hash: genesis.hash().to_string(),

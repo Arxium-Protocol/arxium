@@ -227,6 +227,32 @@ pub struct ChainParams {
     /// turned up.
     #[serde(default = "default_proposal_quorum_bps")]
     pub proposal_quorum_bps: u32,
+    /// Flat per-action fee in IUM; the full fee is
+    /// `action_fee + weight × weight_fee` (`arxd_runtime::metering`).
+    /// Governable so a fee-market problem is a vote, not a coordinated
+    /// release — two nodes disagreeing on the fee fork the chain.
+    #[serde(default = "default_action_fee")]
+    pub action_fee: u128,
+    /// IUM per weight unit on top of `action_fee`.
+    #[serde(default = "default_weight_fee")]
+    pub weight_fee: u128,
+    /// Smallest self-stake `JoinValidator` accepts, in IUM. Without a floor
+    /// "becoming a validator" would be free.
+    #[serde(default = "default_min_validator_stake")]
+    pub min_validator_stake: u128,
+    /// Share of a double-signer's stake burned, in bps. Whitepaper §9.3:
+    /// the full stake — equivocation is deliberate and attributable.
+    #[serde(default = "default_equivocation_slash_bps")]
+    pub equivocation_slash_bps: u32,
+    /// Share of a validator's stake burned per missed slot, in bps.
+    #[serde(default = "default_downtime_slash_bps")]
+    pub downtime_slash_bps: u32,
+    /// Block-fee split, in bps: the proposer's cut and the treasury's cut;
+    /// the remainder is burned by never being credited.
+    #[serde(default = "default_fee_proposer_bps")]
+    pub fee_proposer_bps: u32,
+    #[serde(default = "default_fee_treasury_bps")]
+    pub fee_treasury_bps: u32,
 }
 
 fn default_epoch_length() -> u64 {
@@ -268,6 +294,36 @@ fn default_proposal_quorum_bps() -> u32 {
     5_000
 }
 
+pub const DEFAULT_ACTION_FEE: u128 = 1_000_000;
+fn default_action_fee() -> u128 {
+    DEFAULT_ACTION_FEE
+}
+/// At CoreChain's weight table a `Transfer` (weight 50) costs
+/// `ACTION_FEE + 50 × WEIGHT_FEE` = 0.0015 ARX.
+pub const DEFAULT_WEIGHT_FEE: u128 = 10_000;
+fn default_weight_fee() -> u128 {
+    DEFAULT_WEIGHT_FEE
+}
+/// 100,000 ARX in IUM.
+pub const DEFAULT_MIN_VALIDATOR_STAKE: u128 = 100_000 * 1_000_000_000;
+fn default_min_validator_stake() -> u128 {
+    DEFAULT_MIN_VALIDATOR_STAKE
+}
+fn default_equivocation_slash_bps() -> u32 {
+    10_000
+}
+/// 0.01% per missed slot — a real deterrent over an epoch, survivable for
+/// one flaky restart.
+fn default_downtime_slash_bps() -> u32 {
+    1
+}
+fn default_fee_proposer_bps() -> u32 {
+    3_000
+}
+fn default_fee_treasury_bps() -> u32 {
+    2_000
+}
+
 impl Default for ChainParams {
     fn default() -> Self {
         Self {
@@ -280,6 +336,13 @@ impl Default for ChainParams {
             unbonding_blocks: default_unbonding_blocks(),
             voting_period_blocks: default_voting_period_blocks(),
             proposal_quorum_bps: default_proposal_quorum_bps(),
+            action_fee: default_action_fee(),
+            weight_fee: default_weight_fee(),
+            min_validator_stake: default_min_validator_stake(),
+            equivocation_slash_bps: default_equivocation_slash_bps(),
+            downtime_slash_bps: default_downtime_slash_bps(),
+            fee_proposer_bps: default_fee_proposer_bps(),
+            fee_treasury_bps: default_fee_treasury_bps(),
         }
     }
 }

@@ -284,8 +284,11 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `HolderState` gained `lock_expires_at` (`LockHolderAmountUntil`, variant
 /// 32); `AccountEntry` gained `attested_at`; `ChainParams` gained
 /// `voting_period_blocks` and `proposal_quorum_bps` (`circuit-governance`,
-/// variants 33–35, `proposal*:` rows in `CF_GOVERNANCE`). All positional
-/// bincode in merkleized column families — devnet reset.
+/// variants 33–35, `proposal*:` rows in `CF_GOVERNANCE`) and then the
+/// formerly compile-time economics — `action_fee`, `weight_fee`,
+/// `min_validator_stake`, `equivocation_slash_bps`, `downtime_slash_bps`,
+/// `fee_proposer_bps`, `fee_treasury_bps` — so a vote can retune them. All
+/// positional bincode in merkleized column families — devnet reset.
 pub const SCHEMA_VERSION: u32 = 15;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";

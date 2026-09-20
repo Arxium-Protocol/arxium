@@ -19,6 +19,10 @@ use xc_primitives::Snapshot;
 /// (`xc-chain-spec`) stays the generic lookup mechanism; this crate stays the
 /// concrete "what genesis state looks like for a BLS-finality CoreChain-shaped
 /// chain" answer.
+// ponytail: `Snapshot` grew past clippy's variant-size threshold as
+// `ChainParams` gained fields; the enum is built once at startup, so the
+// lint is noise here.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "genesis_format", rename_all = "snake_case")]
 pub enum ChainSpec {

@@ -25,13 +25,11 @@ mod pair;
 mod specs;
 mod staking;
 
-pub use staking::MIN_VALIDATOR_STAKE;
-
 use xc_bls::BlsPublicKey;
 use xc_chain_spec::presets::PresetRegistry;
 use xc_circuit::{AccountKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Action, Address};
+use xc_primitives::{Action, Address, ChainParams};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
 pub use arxd_payload::{ActionPayload, ChainAction, ChainBlock};
@@ -47,20 +45,16 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         &specs::CORECHAIN_PRESETS
     }
 
-    fn action_fee() -> u128 {
-        ACTION_FEE
-    }
-
     fn action_weight(action: &ChainAction) -> u64 {
         metering::action_weight(action)
     }
 
-    fn action_fee_for(weight: u64) -> u128 {
-        metering::action_fee_for(weight)
+    fn action_fee_for(params: &ChainParams, weight: u64) -> u128 {
+        metering::action_fee_for(params, weight)
     }
 
-    fn min_validator_stake() -> Option<u128> {
-        Some(MIN_VALIDATOR_STAKE)
+    fn min_validator_stake(params: &ChainParams) -> Option<u128> {
+        Some(params.min_validator_stake)
     }
 
     fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result<()> {
@@ -101,14 +95,21 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             proposer,
             fees_collected,
             params.reward_per_block,
+            params.fee_proposer_bps,
+            params.fee_treasury_bps,
         )?;
         let mut updates = BlockUpdates {
             accounts: reward_updates,
             ..Default::default()
         };
         if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
-            let (downtime_accounts, downtime_stakes) =
-                circuit_staking::apply_downtime_slash(view, &primary, proposer, height)?;
+            let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
+                view,
+                &primary,
+                proposer,
+                height,
+                params.downtime_slash_bps,
+            )?;
             // A missed slot that actually cost stake also jails: out of the
             // set from the next boundary, back the epoch after. Tombstoned
             // stays tombstoned; a jail already running is left alone.
@@ -230,13 +231,14 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
         .map(|e| e.balance)
         .unwrap_or(0);
     let weight = metering::action_weight(action);
-    let max_block_weight = db.chain_params()?.max_block_weight;
+    let params = db.chain_params()?;
+    let max_block_weight = params.max_block_weight;
     if weight > max_block_weight {
         anyhow::bail!(
             "action weight {weight} exceeds max_block_weight {max_block_weight} and can never be included"
         );
     }
-    let fee = metering::action_fee_for(weight);
+    let fee = metering::action_fee_for(&params, weight);
     if balance < fee {
         anyhow::bail!("insufficient balance for the action fee ({fee} IUM)");
     }
@@ -262,10 +264,9 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 .get_stake_allocation(&action.sender, validator)?
                 .map(|a| a.active_amount)
                 .unwrap_or(0);
-            if existing_active + *stake < MIN_VALIDATOR_STAKE {
-                anyhow::bail!(
-                    "stake {stake} is below the minimum validator stake {MIN_VALIDATOR_STAKE}"
-                );
+            let min_stake = params.min_validator_stake;
+            if existing_active + *stake < min_stake {
+                anyhow::bail!("stake {stake} is below the minimum validator stake {min_stake}");
             }
         }
         ActionPayload::LeaveValidator { validator } => {
@@ -300,12 +301,6 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
     }
     Ok(())
 }
-
-/// 0.001 ARX, in IUM (ARX's base unit — 1 ARX = 1_000_000_000 IUM) base
-/// per-action fee. The full fee is `metering::action_fee_for(weight)` —
-/// this plus a per-weight term — charged in `charge_action_fee` below and
-/// paid out through `on_block_sealed`'s `fees_collected`.
-pub const ACTION_FEE: u128 = 1_000_000;
 
 pub fn dispatch<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
@@ -382,7 +377,8 @@ fn charge_action_fee<V: KvRead<Error = StorageError>>(
             )
         })?,
     };
-    let fee = metering::action_fee_for(metering::action_weight(action));
+    let params = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default();
+    let fee = metering::action_fee_for(&params, metering::action_weight(action));
     entry.balance = entry
         .balance
         .checked_sub(fee)
@@ -693,10 +689,15 @@ pub(crate) mod test_support {
     /// Enough to pay any single action's metered fee — what tests fund
     /// "one action's worth" with, since the real fee depends on the variant
     /// and size. Exact post-fee balances use `fee_of`.
-    pub(crate) const FEE_BUDGET: u128 = crate::ACTION_FEE + 1_000_000 * crate::metering::WEIGHT_FEE;
+    pub(crate) const FEE_BUDGET: u128 =
+        xc_primitives::DEFAULT_ACTION_FEE + 1_000_000 * xc_primitives::DEFAULT_WEIGHT_FEE;
+    pub(crate) use xc_primitives::DEFAULT_MIN_VALIDATOR_STAKE as MIN_VALIDATOR_STAKE;
 
     pub(crate) fn fee_of(action: &crate::ChainAction) -> u128 {
-        crate::metering::action_fee_for(crate::metering::action_weight(action))
+        crate::metering::action_fee_for(
+            &xc_primitives::ChainParams::default(),
+            crate::metering::action_weight(action),
+        )
     }
 
     pub(crate) fn funded(balance: u128) -> AccountEntry {

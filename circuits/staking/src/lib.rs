@@ -19,23 +19,15 @@ pub use xc_primitives::{reward_pool_account, stake_subaccount, treasury_account}
 /// which callers pass to `apply_block_reward`.
 pub const REWARD_PER_BLOCK: u128 = xc_primitives::DEFAULT_REWARD_PER_BLOCK;
 
-/// Fee split, whitepaper §9.4: 30% to the block proposer, 20% to treasury,
-/// remaining 50% stays burned (the sender already paid the full fee in
-/// `charge_action_fee`; this module never credits that other 50% anywhere).
-/// Basis points out of 10_000 so the shares are exact integer fractions.
-const FEE_PROPOSER_BPS: u128 = 3_000;
-const FEE_TREASURY_BPS: u128 = 2_000;
+// Fee split (whitepaper §9.4: 30% proposer / 20% treasury / 50% burned by
+// never being credited) and the downtime slash rate live in `ChainParams`
+// now — governed, not constants here. `apply_block_reward` and
+// `apply_downtime_slash` take them as arguments.
 
 /// Whitepaper §9.5: max 10,000,000 ARX delegated to a single validator.
 /// Since this module allows only one master per validator (see
 /// `ValidatorHasOtherMaster` below), this caps that one master's total.
 pub const MAX_DELEGATION_PER_VALIDATOR: u128 = 10_000_000 * 1_000_000_000;
-
-/// Whitepaper §7.3: 0.01% of total stake burned per missed block. Applied
-/// automatically (see `apply_downtime_slash`), not via submitted evidence —
-/// every node deterministically agrees on who missed a slot from the same
-/// stored block, so there's nothing to prove.
-const DOWNTIME_SLASH_BPS: u128 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlashReason {
@@ -119,6 +111,8 @@ pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
     proposer: &Address,
     fees_collected: u128,
     reward_per_block: u128,
+    fee_proposer_bps: u32,
+    fee_treasury_bps: u32,
 ) -> Result<AccountUpdates, StorageError> {
     let pool_account = reward_pool_account();
     let treasury = treasury_account();
@@ -129,8 +123,8 @@ pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
     let block_reward = reward_per_block.min(pool_entry.balance);
     pool_entry.balance -= block_reward;
 
-    let proposer_fee_share = fees_collected * FEE_PROPOSER_BPS / 10_000;
-    let treasury_fee_share = fees_collected * FEE_TREASURY_BPS / 10_000;
+    let proposer_fee_share = fees_collected * u128::from(fee_proposer_bps) / 10_000;
+    let treasury_fee_share = fees_collected * u128::from(fee_treasury_bps) / 10_000;
 
     let mut proposer_entry = view
         .get(&AccountKey(proposer))?
@@ -425,11 +419,16 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
 /// proof. No-ops (rather than erroring) if the primary has nothing staked
 /// left to slash — a missed slot from an already-exiting validator isn't a
 /// block-production failure.
+/// Whitepaper §7.3: `downtime_slash_bps` of total stake burned per missed
+/// block, applied automatically rather than via submitted evidence — every
+/// node deterministically agrees on who missed a slot from the same stored
+/// block, so there's nothing to prove.
 pub fn apply_downtime_slash<V: KvRead<Error = StorageError>>(
     view: &V,
     primary: &Address,
     actual_proposer: &Address,
     now_height: u64,
+    downtime_slash_bps: u32,
 ) -> Result<(AccountUpdates, StakeUpdates), StorageError> {
     if primary == actual_proposer {
         return Ok(Default::default());
@@ -446,7 +445,7 @@ pub fn apply_downtime_slash<V: KvRead<Error = StorageError>>(
         return Ok(Default::default());
     };
     let total = existing.active_amount + existing.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
-    let amount = total * DOWNTIME_SLASH_BPS / 10_000;
+    let amount = total * u128::from(downtime_slash_bps) / 10_000;
     if amount == 0 {
         return Ok(Default::default());
     }
@@ -838,7 +837,8 @@ mod tests {
         let pool_before = supply(&db);
 
         // 10 actions at 1_000_000 IUM fee each == 10_000_000 collected.
-        let updates = apply_block_reward(&db, &proposer, 10_000_000, REWARD_PER_BLOCK).unwrap();
+        let updates =
+            apply_block_reward(&db, &proposer, 10_000_000, REWARD_PER_BLOCK, 3_000, 2_000).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -877,7 +877,8 @@ mod tests {
         let proposer = addr(9);
         write_balance(&db, &reward_pool_account(), 1_000_000); // far less than REWARD_PER_BLOCK
 
-        let updates = apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK).unwrap();
+        let updates =
+            apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK, 3_000, 2_000).unwrap();
         db.write_batch(&updates).unwrap();
 
         assert_eq!(
@@ -894,7 +895,8 @@ mod tests {
         );
 
         // Pool empty: further blocks mint nothing further, forever.
-        let updates = apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK).unwrap();
+        let updates =
+            apply_block_reward(&db, &proposer, 0, REWARD_PER_BLOCK, 3_000, 2_000).unwrap();
         db.write_batch(&updates).unwrap();
         assert_eq!(
             db.get_account(&proposer).unwrap().unwrap().balance,
@@ -961,7 +963,7 @@ mod tests {
         let (accounts, stakes) = apply_stake(&db, &master, 0, &validator, 500, 1).unwrap();
         commit(&db, accounts, stakes);
 
-        let (accounts, stakes) = apply_downtime_slash(&db, &validator, &validator, 2).unwrap();
+        let (accounts, stakes) = apply_downtime_slash(&db, &validator, &validator, 2, 1).unwrap();
         assert!(accounts.0.is_empty());
         assert!(stakes.allocations.is_empty());
         let sub = stake_subaccount(&validator);
@@ -982,7 +984,7 @@ mod tests {
         let (accounts, stakes) = apply_stake(&db, &master, 0, &primary, 1_000_000_000, 1).unwrap();
         commit(&db, accounts, stakes);
 
-        let (accounts, stakes) = apply_downtime_slash(&db, &primary, &actual, 2).unwrap();
+        let (accounts, stakes) = apply_downtime_slash(&db, &primary, &actual, 2, 1).unwrap();
         commit(&db, accounts, stakes);
 
         let allocation = db.get_stake_allocation(&master, &primary).unwrap().unwrap();
@@ -998,7 +1000,7 @@ mod tests {
         let primary = addr(9);
         let actual = addr(3);
 
-        let (accounts, stakes) = apply_downtime_slash(&db, &primary, &actual, 2).unwrap();
+        let (accounts, stakes) = apply_downtime_slash(&db, &primary, &actual, 2, 1).unwrap();
         assert!(accounts.0.is_empty());
         assert!(stakes.allocations.is_empty());
     }

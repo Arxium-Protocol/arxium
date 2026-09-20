@@ -28,10 +28,11 @@ pub use state::{
     stake_subaccount, treasury_account,
 };
 pub use validator_set::{
-    ChainParams, DEFAULT_REWARD_PER_BLOCK, DEFAULT_UNBONDING_BLOCKS, GovernanceAction, Proposal,
-    ProposalStatus, QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower,
-    assign_voting_power, boundary_of, epoch_of, is_boundary, power_cap, quorum_reached,
-    signed_power, validator_set_effective_height,
+    ChainParams, DEFAULT_ACTION_FEE, DEFAULT_MIN_VALIDATOR_STAKE, DEFAULT_REWARD_PER_BLOCK,
+    DEFAULT_UNBONDING_BLOCKS, DEFAULT_WEIGHT_FEE, GovernanceAction, Proposal, ProposalStatus,
+    QUORUM_POWER, TOTAL_VOTING_POWER, ValidatorStatus, VotingPower, assign_voting_power,
+    boundary_of, epoch_of, is_boundary, power_cap, quorum_reached, signed_power,
+    validator_set_effective_height,
 };
 
 /// Ceiling for any single bincode-decoded value read from untrusted bytes

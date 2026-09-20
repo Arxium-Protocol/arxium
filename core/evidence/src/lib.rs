@@ -19,14 +19,10 @@ use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
 use xc_storage::ArxiumDb;
 
-/// Whitepaper §9.3: double-sign slashes the full stake. Full BPS (10_000)
-/// rather than a partial rate — equivocation is deliberate/attributable, so
-/// the deterrent is maximal, unlike the graduated downtime rate
-/// (`circuits/staking::DOWNTIME_SLASH_BPS`).
-pub const EQUIVOCATION_SLASH_BPS: u128 = 10_000;
-
-pub fn slash_amount(total_stake: u128) -> u128 {
-    total_stake * EQUIVOCATION_SLASH_BPS / 10_000
+/// `ChainParams.equivocation_slash_bps` of `total_stake` — the rate is a
+/// governed chain param, not a constant here.
+pub fn slash_amount(total_stake: u128, slash_bps: u32) -> u128 {
+    total_stake * u128::from(slash_bps) / 10_000
 }
 
 /// Two blocks a validator signed for the same height — necessarily full

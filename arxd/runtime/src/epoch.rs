@@ -17,8 +17,6 @@ use xc_primitives::{
 };
 use xc_storage::{BlockView, StorageError};
 
-use crate::staking::MIN_VALIDATOR_STAKE;
-
 /// Runs inside `on_block_sealed`. Off a boundary it does nothing. On one it
 /// always returns a set (and the status rows it changed): the next one, or,
 /// when fewer than `min_validator_set` qualify, the previous one re-written
@@ -49,7 +47,7 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
         let Some(stake) = total_stake(view, address)? else {
             continue;
         };
-        if stake < MIN_VALIDATOR_STAKE {
+        if stake < params.min_validator_stake {
             continue;
         }
         if params.validator_attestation_required && !circuit_rwa_asset::is_attested(view, address)?
