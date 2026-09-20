@@ -1,6 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
+mod cli;
 mod components;
 mod produce;
 mod validator;
@@ -27,7 +28,7 @@ use arxd_finality::{
 };
 use arxd_network::{P2pConfig, identity, spawn_p2p_node};
 use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault, PrecommitAttestation};
-use xc_cli::{Cli, Command};
+use cli::{Cli, Command};
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;

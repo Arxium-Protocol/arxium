@@ -470,6 +470,7 @@ dependencies = [
  "arxd-network",
  "arxd-runtime",
  "clap",
+ "dirs",
  "ed25519-dalek",
  "hex",
  "metrics",
@@ -486,7 +487,6 @@ dependencies = [
  "xc-bls",
  "xc-chain-spec",
  "xc-circuit",
- "xc-cli",
  "xc-evidence",
  "xc-executor",
  "xc-mempool",
@@ -5312,15 +5312,6 @@ dependencies = [
  "hex",
  "serde",
  "xc-bls",
- "xc-primitives",
-]
-
-[[package]]
-name = "xc-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dirs",
  "xc-primitives",
 ]
 

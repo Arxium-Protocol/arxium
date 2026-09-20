@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true }
+dirs = { workspace = true }
 anyhow = { workspace = true }
 zeroize = { workspace = true }
 ed25519-dalek = { workspace = true }
@@ -27,7 +28,6 @@ xc-storage = { workspace = true }
 xc-circuit = { workspace = true }
 xc-executor = { workspace = true }
 xc-mempool = { workspace = true }
-xc-cli = { workspace = true }
 xc-chain-spec = { workspace = true }
 arxd-genesis = { workspace = true }
 xc-rpc = { workspace = true }
@@ -47,7 +47,6 @@ arxd-runtime = { workspace = true }
 
 [features]
 fault-injection = [
-    "xc-cli/fault-injection",
     "arxd-network/fault-injection",
     "arxd-finality/fault-injection",
 ]

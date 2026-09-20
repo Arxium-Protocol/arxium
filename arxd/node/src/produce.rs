@@ -23,7 +23,7 @@ use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 /// Height this node is armed to corrupt its own state_root at, set once
 /// (if at all) from `run()`'s devnet-only fault-injection flag. Only
 /// compiled in with `--features fault-injection`; see
-/// `xc_cli::RunArgs::inject_fault_at_height`'s doc comment.
+/// `cli::RunArgs::inject_fault_at_height`'s doc comment.
 #[cfg(feature = "fault-injection")]
 pub(crate) static INJECT_FAULT_AT_HEIGHT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
