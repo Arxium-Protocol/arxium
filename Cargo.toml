@@ -28,7 +28,7 @@ members = [
     "arxd/network",
     "arxd/finality",
     "arxd/genesis",
-    "arxd/spec-builder",
+    "tools/spec-builder",
     "arxd",
     #
     "scripts/send-tx",
@@ -95,7 +95,7 @@ arxd-runtime = { path = "arxd/runtime" }
 arxd-network = { path = "arxd/network" }
 arxd-finality = { path = "arxd/finality" }
 arxd-genesis = { path = "arxd/genesis" }
-arxd-spec-builder = { path = "arxd/spec-builder" }
+arxd-spec-builder = { path = "tools/spec-builder" }
 
 # external packages
 clap = { version = "4.4", features = ["derive", "env"] }

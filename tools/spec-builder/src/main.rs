@@ -18,8 +18,14 @@ use xc_chain_spec::presets::PresetRegistry;
 /// on CoreChain. Kept in sync with `arxd/runtime/src/specs.rs` by hand; the two
 /// crates deliberately don't share a dependency edge.
 static CORECHAIN_PRESETS: PresetRegistry = PresetRegistry::new(&[
-    ("devnet", include_str!("../../runtime/specs/devnet.json")),
-    ("local", include_str!("../../runtime/specs/local.json")),
+    (
+        "devnet",
+        include_str!("../../../arxd/runtime/specs/devnet.json"),
+    ),
+    (
+        "local",
+        include_str!("../../../arxd/runtime/specs/local.json"),
+    ),
 ]);
 
 #[derive(Parser)]
