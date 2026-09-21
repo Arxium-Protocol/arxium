@@ -172,7 +172,18 @@ fn decode_wire<T: serde::de::DeserializeOwned + serde::Serialize>(
 /// topic (e.g. an indexer that only follows blocks), harmless since the
 /// message was still accepted and committed locally. Anything else is a
 /// real fault.
+/// Counted as well as logged: a `MessageTooLarge` here is the only symptom
+/// of a block over `MAX_GOSSIP_TRANSMIT_SIZE` (peers still get it via sync,
+/// just late), and a log line alone was how that went unnoticed.
 fn log_publish_error(kind: &str, err: &gossipsub::PublishError) {
+    let reason = match err {
+        gossipsub::PublishError::NoPeersSubscribedToTopic => "no_peers",
+        gossipsub::PublishError::MessageTooLarge => "too_large",
+        gossipsub::PublishError::Duplicate => "duplicate",
+        _ => "other",
+    };
+    counter!("arxium_gossip_publish_failed_total", "kind" => kind.to_string(), "reason" => reason)
+        .increment(1);
     if matches!(err, gossipsub::PublishError::NoPeersSubscribedToTopic) {
         info!("no peers subscribed to receive the gossiped {kind}, skipping");
     } else {
