@@ -511,10 +511,55 @@ automatically on-chain via `apply_downtime_slash` — this manual tool is only
 for cases that need an out-of-band decision, e.g. confirmed double-sign
 evidence.
 
-**Disk full / DB won't open on startup.** Not yet exercised or scripted —
-no documented procedure exists. At minimum: don't delete anything under
-`--base-path` without a backup first (see Backups above); RocksDB corruption
-recovery is DB-specific troubleshooting, not covered here.
+**Disk full.** Exercised 2026-09-21 on a 24 MiB volume after the live
+`server1` incident of the same day. What it looks like:
+
+- *Before the fix* (binaries ≤ schema 15): the node stays up for hours
+  looking alive — `WARN rejected gossiped block: … IO error: No space left
+  on device`, then every later write says `IO error: Writer has previous
+  error` (RocksDB latches its writer off permanently after the first
+  ENOSPC — freeing space does **not** un-latch it, only a restart does).
+  The sync path misreads its own rejects as a peer serving bad blocks
+  (`local tip stuck at N after 5 sync rounds … attempting divergence
+  recovery`), finality logs `failed to process precommit vote`, tip stops.
+- *Now*: the first `IO error` under RocksDB is fatal — the process prints
+  `FATAL storage I/O error, exiting 18: …` to stderr and exits **18**
+  (`xc_storage::IO_FATAL_EXIT_CODE`; 17 is the self-proven HALT). Under
+  systemd (`Restart=always`, 5s) it then flaps: each restart fails the same
+  way at `open` while the disk is full. Alert on the unit restarting /
+  `journalctl -u arxd | grep 'exiting 18'`, not on it being inactive.
+
+Recovery, in order:
+
+1. `df -h <base-path>` to confirm, then `du -sh <base-path>/*` to see
+   what's eating it. Usual suspects: `backups/` from `backup-node.sh`
+   living on the same disk (see Backups — move them off-host), journald
+   (`journalctl --disk-usage`; `journalctl --vacuum-size=500M`), or plain
+   chain growth.
+2. Free space **without touching `<base-path>/<chain>/`**: delete old
+   backups, vacuum journald, remove unrelated files. Nothing inside the
+   RocksDB directory is safe to delete by hand — the WAL `*.log` files that
+   look like logs are the write-ahead log.
+3. Chain growth itself: `arxd prune --base-path … --chain … --retain-blocks
+   N` with the node **stopped** drops block bodies older than N behind the
+   tip (state and trie untouched; a fresh peer can no longer replay from
+   genesis off this node, so `snapshot` first if you serve syncs).
+4. `systemctl restart arxd` (or just let the unit's next retry succeed).
+   Startup re-verifies the tip block and the store resumes from its last
+   committed height — RocksDB writes are atomic per batch, so an ENOSPC
+   mid-write loses that batch, never a partial one. Verified: tip resumed
+   exactly where the crash left it and kept producing.
+5. Confirm `GET /status` tip_height climbs, and the first `produced block`
+   / `accepted gossiped block` line after restart.
+
+**DB won't open on startup (not disk-related).** `open` fails closed on
+purpose in two cases and says which: a schema-version mismatch (see
+"Schema bumps" below — wrong binary for this store, not corruption) and a
+tip block whose signature doesn't verify. Anything else from RocksDB
+(`Corruption:` …) is real damage: stop, take a copy of the directory as-is,
+restore the newest backup (Backups above), and sync the gap. Don't run
+RocksDB repair tools on the live directory — a restore is faster and the
+result is trusted.
 
 ## Restarts & upgrades
 

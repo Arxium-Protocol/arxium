@@ -61,10 +61,39 @@ fn record_scan(scan: &'static str, rows: u64, started: std::time::Instant) {
         .record(started.elapsed().as_secs_f64());
 }
 
+/// Exit code for an unrecoverable I/O failure underneath RocksDB (disk
+/// full, medium error). Distinct from `arxd_network::HALT_EXIT_CODE` (17)
+/// so a supervisor can tell "this node proved itself wrong" from "this
+/// disk is broken".
+pub const IO_FATAL_EXIT_CODE: u8 = 18;
+
+/// Every RocksDB error routes through here. An `IOError` is fatal for the
+/// process, not for the one call that hit it: RocksDB latches its writer
+/// into a permanent background-error state (`Writer has previous error`)
+/// and nothing writes again until the process restarts. Live incident
+/// 2026-09-21 (`server1`, disk full): the node stayed up for hours
+/// rejecting every gossiped block and precommit with that error, which the
+/// sync path then misread as a peer serving a bad block and tried
+/// divergence recovery against. Exiting is the only honest state — the
+/// supervisor restarts, `open` fails closed while the disk is still full,
+/// and the unit flaps visibly instead of looking alive.
+impl From<rocksdb::Error> for StorageError {
+    fn from(err: rocksdb::Error) -> Self {
+        if err.kind() == rocksdb::ErrorKind::IOError {
+            eprintln!(
+                "FATAL storage I/O error, exiting {IO_FATAL_EXIT_CODE}: {err} — check disk \
+                 space under --base-path (see docs/runbook.md, \"Disk full\")"
+            );
+            std::process::exit(IO_FATAL_EXIT_CODE.into());
+        }
+        StorageError::Rocks(err)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum StorageError {
     #[error("RocksDB underlying error: {0}")]
-    Rocks(#[from] rocksdb::Error),
+    Rocks(rocksdb::Error),
 
     /// `import_snapshot` refused its input — nothing was written.
     #[error("snapshot rejected: {0}")]
@@ -289,7 +318,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `min_validator_stake`, `equivocation_slash_bps`, `downtime_slash_bps`,
 /// `fee_proposer_bps`, `fee_treasury_bps` — so a vote can retune them. All
 /// positional bincode in merkleized column families — devnet reset.
-pub const SCHEMA_VERSION: u32 = 15;
+///
+/// Bumped 15 -> 16: `ChainParams` gained `block_interval_secs` (block
+/// cadence became a chain param). Positional bincode in `CF_GOVERNANCE`,
+/// same trap as 8 -> 9 and 13 -> 14: a version-15 row decodes as
+/// `UnexpectedEnd` on the producer's first tick — devnet reset.
+pub const SCHEMA_VERSION: u32 = 16;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
