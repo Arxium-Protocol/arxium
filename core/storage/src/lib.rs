@@ -322,7 +322,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// Bumped 15 -> 16: `ChainParams` gained `block_interval_secs` (block
 /// cadence became a chain param). Positional bincode in `CF_GOVERNANCE`,
 /// same trap as 8 -> 9 and 13 -> 14: a version-15 row decodes as
-/// `UnexpectedEnd` on the producer's first tick — devnet reset.
+/// `UnexpectedEnd` on the producer's first tick — devnet reset. Same
+/// release: `BlockEffects` (`CF_META`, positional bincode) gained
+/// `evidence`, `bls_keys`, `operators`, `attestor_registrations` and
+/// `attestor_deregistrations` so an indexer can track attestors and BLS
+/// keys from effects alone; a version-15 effects row would otherwise fail
+/// to decode instead of answering 404.
 pub const SCHEMA_VERSION: u32 = 16;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";

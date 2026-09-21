@@ -325,6 +325,11 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         &validator_statuses,
         snapshot.as_ref().map(|s| &s.validators),
         &asset_registrations,
+        &evidence_markers,
+        &bls_keys,
+        &operator_updates,
+        &attestor_registrations,
+        &attestor_deregistrations,
         &dropped,
     );
     writables.push(&effects);

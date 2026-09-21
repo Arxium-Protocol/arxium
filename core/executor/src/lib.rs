@@ -790,6 +790,11 @@ where
         &validator_statuses,
         new_validator_set.as_ref().map(|s| &s.validators),
         &asset_registrations,
+        &evidence_markers,
+        &bls_keys,
+        &operator_updates,
+        &attestor_registrations,
+        &attestor_deregistrations,
         &[],
     );
     writables.push(&effects);

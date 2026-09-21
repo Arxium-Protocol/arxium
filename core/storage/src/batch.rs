@@ -264,7 +264,7 @@ impl<P: Serialize> BatchWritable for Block<P> {
 /// so `ArxiumDb::evidence_processed` can reject a resubmission. Written
 /// alongside the slash's `AccountUpdates`/`StakeUpdates` in the same atomic
 /// batch — see `evidence_processed`.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvidenceMarker {
     pub height: u64,
     pub proposer: Address,
@@ -299,7 +299,7 @@ impl BatchWritable for EvidenceMarker {
 /// `BlsPubkeyOwnerKey` index can be deleted for the old pubkey at the same
 /// time the new one is written, freeing it for reuse exactly like the linear
 /// scan `bls_pubkey_owner` used to do implicitly.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlsKeyRegistration {
     pub address: Address,
     pub pubkey: BlsPublicKey,
@@ -343,7 +343,7 @@ impl BatchWritable for BlsKeyRegistration {
 /// operator whose list changed as a result — same "caller computes the full
 /// new value via a lookup closure, storage just writes it, `None`/empty
 /// means delete" shape as `StakeUpdates`.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OperatorUpdates {
     /// `validator -> Some(operator)` to authorize, `validator -> None` to revoke.
     pub authorization: std::collections::BTreeMap<Address, Option<Address>>,
@@ -406,6 +406,15 @@ pub struct BlockEffects {
     /// Set only at an epoch boundary: the set effective from `height + 1`.
     pub validator_set: Option<BTreeMap<Address, VotingPower>>,
     pub asset_registrations: Vec<Asset>,
+    /// Equivocation evidence this block processed (one slash each).
+    pub evidence: Vec<EvidenceMarker>,
+    /// BLS keys registered by this block, effective from `height + 1`.
+    pub bls_keys: Vec<BlsKeyRegistration>,
+    /// Operator authorizations granted/revoked, plus the resulting reverse
+    /// index — same `None`/empty-means-delete shape as the write itself.
+    pub operators: OperatorUpdates,
+    pub attestor_registrations: Vec<AttestorRegistration>,
+    pub attestor_deregistrations: Vec<AttestorDeregistration>,
     /// Every action the producer tried and rejected while building this
     /// block. Only the producing node knows these; every other node stores
     /// an empty list here.
@@ -447,8 +456,6 @@ impl BlockEffects {
     /// Builds the record from the update sets a block is about to commit —
     /// one call site each in `accept_block` and `produce_block`, so the two
     /// can't drift on what counts as an effect.
-    // ponytail: operators, BLS keys, evidence and attestors are not here; add
-    // them when an indexer needs them.
     #[allow(clippy::too_many_arguments)]
     pub fn collect(
         height: u64,
@@ -459,6 +466,11 @@ impl BlockEffects {
         validator_statuses: &ValidatorStatusUpdates,
         validator_set: Option<&BTreeMap<Address, VotingPower>>,
         asset_registrations: &[Asset],
+        evidence: &[EvidenceMarker],
+        bls_keys: &[BlsKeyRegistration],
+        operators: &OperatorUpdates,
+        attestor_registrations: &[AttestorRegistration],
+        attestor_deregistrations: &[AttestorDeregistration],
         dropped: &[DroppedAction],
     ) -> Self {
         Self {
@@ -494,6 +506,11 @@ impl BlockEffects {
             validator_statuses: validator_statuses.0.clone(),
             validator_set: validator_set.cloned(),
             asset_registrations: asset_registrations.to_vec(),
+            evidence: evidence.to_vec(),
+            bls_keys: bls_keys.to_vec(),
+            operators: operators.clone(),
+            attestor_registrations: attestor_registrations.to_vec(),
+            attestor_deregistrations: attestor_deregistrations.to_vec(),
             dropped: dropped.to_vec(),
         }
     }
@@ -828,7 +845,7 @@ impl BatchWritable for Asset {
 
 /// One `RegisterAttestor` write — a single `CF_ATTESTORS` record, merkleized
 /// via `is_state_key` (unlike `Asset`'s `CF_META` registry row).
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestorRegistration {
     pub attestor: Address,
     pub record: AttestorRecord,
@@ -847,7 +864,7 @@ impl BatchWritable for AttestorRegistration {
 /// record rather than flagging it inactive, same as any other merkleized
 /// state key; deletions are already routed through the state root via
 /// `batch_deletes`.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestorDeregistration(pub Address);
 
 impl BatchWritable for AttestorDeregistration {
@@ -908,5 +925,62 @@ impl BatchWritable for GovernanceUpdates {
             .filter(|(_, v)| v.is_none())
             .map(|(k, _)| k.clone())
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod effects_tests {
+    use super::*;
+
+    /// The effects row is positional bincode in `CF_META`; the validator
+    /// bookkeeping (evidence, BLS keys, operators, attestors) has to survive
+    /// the round trip an indexer reads through `get_block_effects`.
+    #[test]
+    fn validator_bookkeeping_survives_the_effects_round_trip() {
+        let a = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let b = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let mut operators = OperatorUpdates::default();
+        operators.authorization.insert(a.clone(), Some(b.clone()));
+        operators.operator_index.insert(b.clone(), vec![a.clone()]);
+
+        let effects = BlockEffects::collect(
+            7,
+            &AccountUpdates::default(),
+            &StakeUpdates::default(),
+            &AssetBalanceUpdates::default(),
+            &HolderStateUpdates::default(),
+            &ValidatorStatusUpdates::default(),
+            None,
+            &[],
+            &[EvidenceMarker {
+                height: 3,
+                proposer: a.clone(),
+            }],
+            &[BlsKeyRegistration {
+                address: a.clone(),
+                pubkey: BlsPublicKey([9u8; 48]),
+                effective_height: 8,
+                previous_pubkey: None,
+            }],
+            &operators,
+            &[AttestorRegistration {
+                attestor: b.clone(),
+                record: AttestorRecord {
+                    name: "att".into(),
+                    registered_at: 7,
+                },
+            }],
+            &[AttestorDeregistration(a.clone())],
+            &[],
+        );
+
+        let bytes = effects.batch_entries().unwrap().remove(0).1;
+        let (back, _): (BlockEffects, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert_eq!(back.evidence[0].proposer, a);
+        assert_eq!(back.bls_keys[0].effective_height, 8);
+        assert_eq!(back.operators.authorization[&a], Some(b.clone()));
+        assert_eq!(back.attestor_registrations[0].record.name, "att");
+        assert_eq!(back.attestor_deregistrations[0].0, a);
     }
 }
