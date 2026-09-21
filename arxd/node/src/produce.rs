@@ -45,6 +45,9 @@ pub fn produce_block<R: ChainRuntime>(
     produce_block_reporting::<R>(db, actions, timestamp, proposer).map(|(block, _, _)| block)
 }
 
+/// `(block, dropped, deferred)` — see `produce_block_reporting`.
+pub type Produced<P> = (Block<P>, Vec<xc_storage::DroppedAction>, Vec<Action<P>>);
+
 /// `produce_block` plus the `(signature, reason)` of every action that was
 /// drained but not applied — what `produce_loop` hands the mempool so a
 /// status poll can name the rejection — and the tail that did not fit under
@@ -54,11 +57,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     actions: Vec<Action<R::Payload>>,
     timestamp: u64,
     proposer: Option<(&Address, &SigningKey)>,
-) -> Result<(
-    Block<R::Payload>,
-    Vec<xc_storage::DroppedAction>,
-    Vec<Action<R::Payload>>,
-)> {
+) -> Result<Produced<R::Payload>> {
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     let next_height = tip_height + 1;
     let parent: Block<R::Payload> = db

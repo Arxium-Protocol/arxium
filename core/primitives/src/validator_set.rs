@@ -72,7 +72,7 @@ pub fn validator_set_effective_height(height: u64, epoch_length: u64) -> u64 {
 
 /// Whether `height` is the last block of its epoch.
 pub fn is_boundary(height: u64, epoch_length: u64) -> bool {
-    (height + 1) % epoch_length.max(1) == 0
+    (height + 1).is_multiple_of(epoch_length.max(1))
 }
 
 /// Per-validator power cap: twice the equal share, never below 10% and

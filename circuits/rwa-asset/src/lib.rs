@@ -669,7 +669,7 @@ pub fn apply_lock_amount<V: KvRead<Error = StorageError>>(
                 owner: holder,
             })?
             .unwrap_or(0);
-        let resulting = state.frozen_amount.checked_add(amount).unwrap_or(u128::MAX);
+        let resulting = state.frozen_amount.saturating_add(amount);
         if resulting > balance {
             return Err(RwaError::LockExceedsBalance {
                 asset: asset.asset_ref.clone(),
