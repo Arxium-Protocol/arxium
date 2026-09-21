@@ -967,28 +967,16 @@ check its own derivation against.
 
 ## Known limitations worth an operator's awareness
 
-From `TODO.md`, not yet fixed — not urgent for a single-validator devnet,
-but relevant once this runs multi-node or faces adversarial peers:
+- **A two-validator chain cannot outvote a faulty validator.** Two equal
+  validators hold 5,000 each against a 6,667 quorum, so a node that
+  rejects its peer's block has no way to make progress — arithmetic, not a
+  missing feature. Run at least 4 validators (honest majority, quorum
+  outvotes the faulty node); see the fault harness section above for what
+  n=4 did and didn't settle.
 
-- **Two-validator chains cannot outvote a faulty validator (not a bug —
-  two equal validators hold 5,000 each against a 6,667 quorum).** With only 2 validators, quorum requires both, so a
-  node that rejects its peer's block has no way to make progress no matter
-  what machinery exists — this is arithmetic, not a missing feature. Confirmed
-  live via `scripts/two-node-fault-harness.sh`; see above for what running at
-  4 validators (honest majority, quorum outvotes the faulty node) did and
-  didn't settle. Whether an honest quorum majority can itself recover from a
-  rejected proposal via round/view-change (as opposed to reorg/rollback of an
-  already-committed block, which doesn't apply here — nothing was committed)
-  is still open, blocked on an unrelated libp2p crash found during the n=4
-  re-run (see above) and the evidence-resubmission dedup gap in
-  `core/evidence/src/lib.rs:383` (item 3 in the implementation log).
-- Reconnecting a peer clears its bad-gossip/sync-failure penalty counters —
-  a peer that's about to hit the ban threshold can reconnect and keep
-  spamming indefinitely (ban is per-connection, not per-`PeerId`).
-- No explicit gossipsub message-size ceiling is set — relying on the
-  library default (~64KB); a block that grows past it would be silently
-  dropped on the gossip fast path (sync would eventually catch it up, but
-  it'd look like blocks "never arrive" via gossip).
-- Network observability is a peer-count gauge only — no counters for
-  gossip accept/reject rates or bad-gossip disconnects, so exploitation of
-  the above would show up in logs before it shows up in any metric.
+Everything else once listed here (bad-gossip ban resetting on reconnect,
+no gossipsub message-size ceiling, no gossip accept/reject metrics,
+evidence-resubmission dedup) has since been fixed in `arxd/network` and
+`core/evidence`. Open work is tracked on the
+[Arxium Development board](https://trello.com/b/6aad35f6/arxium-development),
+not in this file.
