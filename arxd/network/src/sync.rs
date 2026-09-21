@@ -303,6 +303,7 @@ mod tests {
             .hash();
         db.write_batch(&xc_storage::FinalityRecord {
             height,
+            round: 0,
             block_hash,
             signers: vec![],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),

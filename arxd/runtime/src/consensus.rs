@@ -457,6 +457,7 @@ mod tests {
             let ep = [1u8; 32];
             xc_artifact::PrecommitAttestation {
                 height: 5,
+                round: 0,
                 block_hash: block_hash.to_string(),
                 ep: format!("0x{}", hex::encode(ep)),
                 signature: format!(
@@ -464,7 +465,13 @@ mod tests {
                     hex::encode(
                         xc_bls::sign(
                             &sk,
-                            &xc_artifact::precommit_signing_bytes(&[0xa1; 32], 5, block_hash, &ep)
+                            &xc_artifact::precommit_signing_bytes(
+                                &[0xa1; 32],
+                                5,
+                                0,
+                                block_hash,
+                                &ep
+                            )
                         )
                         .0
                     )

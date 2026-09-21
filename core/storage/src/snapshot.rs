@@ -390,6 +390,7 @@ mod tests {
         let block: Block<()> = source.get_block(3).unwrap().unwrap();
         let finality = FinalityRecord {
             height: 3,
+            round: 0,
             block_hash: block.hash(),
             signers: vec![],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),

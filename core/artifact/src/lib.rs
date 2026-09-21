@@ -191,7 +191,7 @@ pub fn dissent_signing_bytes(
     buf
 }
 
-const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v2";
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v3";
 
 /// One BLS-signed precommit vote, in the shape `verify()` can check on its
 /// own: the signing bytes are recomputed from `height`/`block_hash`/`ep`
@@ -202,6 +202,11 @@ const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v2";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecommitAttestation {
     pub height: u64,
+    /// Round of `height` the vote was cast in. Two votes at one height are
+    /// only equivocation if they share a round — voting again at a later
+    /// round is the legitimate move after the earlier round is certified
+    /// as timed out (`docs/consensus-safety.md` §3).
+    pub round: u32,
     /// Opaque, chain-internal block hash. Unlike `DissentAttestation`'s, this
     /// one *is* load-bearing: it is covered by the signature, so a verifier
     /// recomputes the signed bytes from it and two votes differing here are
@@ -223,6 +228,7 @@ pub struct PrecommitAttestation {
 pub fn precommit_signing_bytes(
     genesis: &[u8; 32],
     height: u64,
+    round: u32,
     block_hash: &str,
     ep: &[u8; 32],
 ) -> Vec<u8> {
@@ -230,6 +236,7 @@ pub fn precommit_signing_bytes(
     push_field(&mut buf, DOMAIN_PRECOMMIT);
     push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, &round.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, ep);
     buf
@@ -1004,8 +1011,13 @@ fn verify_precommit_equivocation(
             .try_into()
             .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
 
-        let bytes =
-            precommit_signing_bytes(genesis, precommit.height, &precommit.block_hash, &ep_bytes);
+        let bytes = precommit_signing_bytes(
+            genesis,
+            precommit.height,
+            precommit.round,
+            &precommit.block_hash,
+            &ep_bytes,
+        );
         xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
             .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
         signed.push(bytes);
@@ -1234,10 +1246,11 @@ mod tests {
         let ep = [ep; 32];
         let signature = xc_bls::sign(
             sk,
-            &precommit_signing_bytes(&GENESIS, height, block_hash, &ep),
+            &precommit_signing_bytes(&GENESIS, height, 0, block_hash, &ep),
         );
         PrecommitAttestation {
             height,
+            round: 0,
             block_hash: block_hash.to_string(),
             ep: format!("0x{}", hex::encode(ep)),
             signature: format!("0x{}", hex::encode(signature.0)),
@@ -1557,10 +1570,11 @@ mod tests {
         let ep = [2u8; 32];
         let sig = xc_bls::sign(
             &sk,
-            &precommit_signing_bytes(&other_genesis, 5, "0xblock_on_b", &ep),
+            &precommit_signing_bytes(&other_genesis, 5, 0, "0xblock_on_b", &ep),
         );
         let on_b = PrecommitAttestation {
             height: 5,
+            round: 0,
             block_hash: "0xblock_on_b".to_string(),
             ep: format!("0x{}", hex::encode(ep)),
             signature: format!("0x{}", hex::encode(sig.0)),

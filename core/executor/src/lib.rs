@@ -303,6 +303,59 @@ impl AcceptBlockError {
 /// round/parent. Distinctness matters — without it a validator holding a
 /// single real vote could list itself N times and aggregate its own
 /// signature N times over, faking quorum out of one signer.
+/// Dead-tip replacement, block side (`docs/consensus-safety.md` §3). A
+/// block at the tip's own height from a *later* round carries a certificate
+/// that the tip's round timed out, which proves the tip can never finalize
+/// (§2). Verify that certificate against this height's validator set, then
+/// unwind the tip so `accept_block` judges this block as an ordinary
+/// `tip + 1` candidate — every other check still applies to it. Same round
+/// or earlier is left for `NotNextHeight`: an equal-round competitor is
+/// equivocation-shaped, and an earlier round is the dead one. A finalized
+/// tip is never unwound (checked here, and `revert_to`'s watermark floor is
+/// the backstop). `arxd_finality::unwind_dead_tip` is the same rule fired
+/// from the certificate this node tallies itself.
+fn supersede_dead_tip<P>(db: &ArxiumDb, block: &Block<P>) -> Result<(), AcceptBlockError>
+where
+    P: Serialize + DeserializeOwned,
+{
+    let Some(tip_height) = db.get_tip_height()? else {
+        return Ok(());
+    };
+    if block.height != tip_height || tip_height == 0 {
+        return Ok(());
+    }
+    if db.get_finality_record(tip_height)?.is_some() {
+        return Ok(());
+    }
+    let Some(tip) = db.get_block::<P>(tip_height)? else {
+        return Ok(());
+    };
+    if block.round <= tip.round {
+        return Ok(());
+    }
+    let Some(cert) = &block.round_certificate else {
+        return Ok(());
+    };
+    let validator_set = db.get_validator_set_at(block.height)?;
+    verify_round_certificate(
+        db,
+        cert,
+        block.height,
+        block.round,
+        &block.parent_hash,
+        &validator_set,
+    )?;
+    warn!(
+        "block {} at round {} supersedes this node's unfinalized round-{} tip: that round is certified timed out, unwinding to {}",
+        block.height,
+        block.round,
+        tip.round,
+        tip_height - 1
+    );
+    db.revert_to::<P>(tip_height - 1)?;
+    Ok(())
+}
+
 fn verify_round_certificate(
     db: &ArxiumDb,
     cert: &RoundCertificate,
@@ -445,6 +498,7 @@ where
         });
     }
 
+    supersede_dead_tip(db, &block)?;
     let tip_height = db.get_tip_height()?.unwrap_or(0);
     if block.height != tip_height + 1 {
         return Err(AcceptBlockError::NotNextHeight {
@@ -2239,6 +2293,7 @@ mod tests {
         // A certificate naming a different block at height 2.
         db.write_batch(&xc_storage::FinalityRecord {
             height: 2,
+            round: 0,
             block_hash: "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
                 .parse()
                 .unwrap(),
@@ -2260,6 +2315,7 @@ mod tests {
         // leaves empty.
         db.write_batch(&xc_storage::FinalityRecord {
             height: 2,
+            round: 0,
             block_hash: block2.hash(),
             signers: vec![addr],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
@@ -2411,5 +2467,104 @@ mod tests {
             ),
             "got {err:?}",
         );
+    }
+
+    /// B1c dead-tip replacement, block side (`docs/consensus-safety.md`
+    /// §3): three validators, an unfinalized round-0 block at height 1, and
+    /// a round-1 block for the same height carrying a real certificate that
+    /// round 0 timed out. The round-0 tip is unwound so the candidate can
+    /// land; without a certificate, at the same round, or once the tip is
+    /// finalized, nothing moves.
+    #[test]
+    fn a_higher_round_block_with_a_certificate_supersedes_an_unfinalized_tip() {
+        use xc_primitives::round_timeout_signing_bytes;
+        let db = temp_db();
+        let keys: Vec<(Address, xc_bls::BlsSecretKey)> = (1u8..=3)
+            .map(|i| {
+                let addr = Address::from_pubkey_bytes(&[i; 32]).unwrap();
+                let (sk, pk) = xc_bls::keygen_from_seed(&[i + 50; 32]).unwrap();
+                db.write_batch(&xc_storage::BlsKeyRegistration {
+                    address: addr.clone(),
+                    pubkey: pk,
+                    effective_height: 0,
+                    previous_pubkey: None,
+                })
+                .unwrap();
+                (addr, sk)
+            })
+            .collect();
+        let validators: Vec<Address> = keys.iter().map(|(a, _)| a.clone()).collect();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
+            .unwrap();
+
+        // Two blocks written the way the accept path writes them (with undo
+        // records), so the tip is revertible; `revert_to` re-checks the
+        // trie against the target's `state_root`, so carry the real one.
+        let root = db.compute_state_root(&[]).unwrap();
+        let mut genesis: Block<TestPayload> = Block::genesis(0);
+        genesis.state_root = root.clone();
+        db.write_block_batches(0, &[&genesis], true).unwrap();
+        let mut tip: Block<TestPayload> = Block::genesis(10);
+        tip.height = 1;
+        tip.parent_hash = genesis.hash().to_string();
+        tip.state_root = root.clone();
+        tip.round = 0;
+        db.write_block_batches(1, &[&tip], true).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+
+        let genesis_hash = db.genesis_hash_bytes().unwrap();
+        let cert = |round: u32| {
+            let msg =
+                round_timeout_signing_bytes(&genesis_hash, 1, round, &genesis.hash().to_string());
+            let sigs: Vec<_> = keys.iter().map(|(_, sk)| xc_bls::sign(sk, &msg)).collect();
+            RoundCertificate {
+                height: 1,
+                round,
+                signers: validators.clone(),
+                aggregate_signature: xc_bls::aggregate(&sigs).unwrap(),
+            }
+        };
+        let candidate = |round: u32, cert: Option<RoundCertificate>| {
+            let mut b: Block<TestPayload> = Block::genesis(20);
+            b.height = 1;
+            b.parent_hash = genesis.hash().to_string();
+            b.state_root = root.clone();
+            b.round = round;
+            b.round_certificate = cert;
+            b
+        };
+
+        // Same round, no certificate: not a supersession.
+        supersede_dead_tip(&db, &candidate(0, None)).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        // Higher round but no certificate: nothing to verify, nothing moves.
+        supersede_dead_tip(&db, &candidate(1, None)).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        // Higher round with a certificate for the wrong round: rejected.
+        let err = supersede_dead_tip(&db, &candidate(2, Some(cert(0)))).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::RoundCertificateMismatch { .. }),
+            "{err:?}"
+        );
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+
+        // Unfinalized tip, higher round, valid certificate that round 0
+        // timed out: the tip goes so the candidate can be accepted.
+        supersede_dead_tip(&db, &candidate(1, Some(cert(0)))).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(0), "dead tip unwound");
+
+        // Finalized tip: untouchable even with a valid certificate.
+        db.write_block_batches(1, &[&tip], true).unwrap();
+        db.write_batch(&xc_storage::FinalityRecord {
+            height: 1,
+            round: 0,
+            block_hash: tip.hash(),
+            signers: vec![],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+            ep: [0u8; 32],
+        })
+        .unwrap();
+        supersede_dead_tip(&db, &candidate(1, Some(cert(0)))).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1), "finalized tip stays");
     }
 }

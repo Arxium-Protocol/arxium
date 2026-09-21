@@ -559,6 +559,10 @@ impl BatchWritable for BlockWeight {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityRecord {
     pub height: u64,
+    /// Round the certified block was proposed in — part of every signed
+    /// precommit (see `docs/consensus-safety.md` §2), so a verifier needs
+    /// it to rebuild the signed message.
+    pub round: u32,
     pub block_hash: Hash32,
     pub signers: Vec<Address>,
     pub aggregate_signature: BlsSignature,
@@ -580,6 +584,7 @@ pub struct FinalityRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecommitVoteRecord {
     pub height: u64,
+    pub round: u32,
     pub block_hash: Hash32,
     pub voter: Address,
     pub signature: BlsSignature,
@@ -589,8 +594,8 @@ pub struct PrecommitVoteRecord {
 impl BatchWritable for PrecommitVoteRecord {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
         let key = format!(
-            "meta:precommit:{:020}:{}:{}",
-            self.height, self.block_hash, self.voter
+            "meta:precommit:{:020}:{}:{}:{}",
+            self.height, self.round, self.block_hash, self.voter
         )
         .into_bytes();
         let config = bincode::config::standard();

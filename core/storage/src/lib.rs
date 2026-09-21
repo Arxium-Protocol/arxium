@@ -79,7 +79,19 @@ pub const IO_FATAL_EXIT_CODE: u8 = 18;
 /// and the unit flaps visibly instead of looking alive.
 impl From<rocksdb::Error> for StorageError {
     fn from(err: rocksdb::Error) -> Self {
-        if err.kind() == rocksdb::ErrorKind::IOError {
+        // `ErrorKind::IOError` alone is too broad — a LOCK held by another
+        // process (a second `open` on the same path) is reported as one
+        // too, and that is an ordinary error for the caller, not a dead
+        // disk. Match the OS-level failures that leave RocksDB latched.
+        const FATAL: [&str; 3] = [
+            "No space left on device",
+            "Input/output error",
+            "Read-only file system",
+        ];
+        let message = err.to_string();
+        if err.kind() == rocksdb::ErrorKind::IOError
+            && FATAL.iter().any(|needle| message.contains(needle))
+        {
             eprintln!(
                 "FATAL storage I/O error, exiting {IO_FATAL_EXIT_CODE}: {err} — check disk \
                  space under --base-path (see docs/runbook.md, \"Disk full\")"
@@ -323,6 +335,9 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// cadence became a chain param). Positional bincode in `CF_GOVERNANCE`,
 /// same trap as 8 -> 9 and 13 -> 14: a version-15 row decodes as
 /// `UnexpectedEnd` on the producer's first tick — devnet reset. Same
+/// release, B1c (`docs/consensus-safety.md`): `FinalityRecord` and
+/// `PrecommitVoteRecord` gained `round` (and the precommit key gained a
+/// round segment), precommit signing bytes moved to `arxium/precommit/v3`. Same
 /// release: `BlockEffects` (`CF_META`, positional bincode) gained
 /// `evidence`, `bls_keys`, `operators`, `attestor_registrations` and
 /// `attestor_deregistrations` so an indexer can track attestors and BLS
@@ -3260,6 +3275,7 @@ mod divergence_recovery_tests {
     fn certify_hash(db: &ArxiumDb, height: u64, block_hash: &Hash32) {
         db.write_batch(&FinalityRecord {
             height,
+            round: 0,
             block_hash: *block_hash,
             signers: vec![addr(9)],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),

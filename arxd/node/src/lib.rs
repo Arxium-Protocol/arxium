@@ -147,8 +147,8 @@ mod dissent_cross_crate_tests {
         let genesis = [1u8; 32];
         let ep = [7u8; 32];
         assert_eq!(
-            arxd_finality::precommit_signing_bytes(&genesis, 5, "0xblock", &ep),
-            xc_artifact::precommit_signing_bytes(&genesis, 5, "0xblock", &ep),
+            arxd_finality::precommit_signing_bytes(&genesis, 5, 0, "0xblock", &ep),
+            xc_artifact::precommit_signing_bytes(&genesis, 5, 0, "0xblock", &ep),
         );
     }
 
@@ -924,6 +924,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                 };
                 let attest = |vote: &PrecommitVote| PrecommitAttestation {
                     height: vote.height,
+                    round: vote.round,
                     block_hash: vote.block_hash.to_string(),
                     ep: format!("0x{}", hex::encode(vote.ep)),
                     signature: format!("0x{}", hex::encode(vote.signature.0)),

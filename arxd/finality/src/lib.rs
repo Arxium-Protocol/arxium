@@ -18,18 +18,21 @@ use xc_storage::{
     RoundTimeoutVoteRecord,
 };
 
-/// Precommit signatures being accumulated, keyed height -> (voter set id,
-/// block hash) -> voter -> signature. Nested rather than flattened because
-/// quorum is counted per (height, block) and pruning is per height, so both
-/// of the hot operations are a single map lookup.
-type VoteTallies = HashMap<u64, HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>>;
+/// Precommit signatures being accumulated, keyed (height, round) -> (block
+/// hash, ep) -> voter -> signature. Nested rather than flattened because
+/// quorum is counted per (height, round, block) and pruning is per height,
+/// so both of the hot operations are a single map lookup. Round is part of
+/// the key because a validator legitimately votes once per *round* of a
+/// height (`docs/consensus-safety.md` §2, S1) — two votes at different
+/// rounds are not equivocation and never share a tally.
+type VoteTallies = HashMap<(u64, u32), HashMap<(String, [u8; 32]), HashMap<Address, BlsSignature>>>;
 
 // Domain tags, mixed into what gets signed, so a signature over a precommit
 // can never be replayed as a dissent (or a round-timeout vote, or vice versa)
 // even though they can share fields (height). The chain's genesis hash
 // follows the tag so it can't be replayed on another Arxium chain either
 // (`ArxiumDb::genesis_hash_bytes` is where every site here gets it).
-const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v2";
+const DOMAIN_PRECOMMIT: &[u8] = b"arxium/precommit/v3";
 const DOMAIN_DISSENT: &[u8] = b"arxium/dissent/v3";
 
 fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
@@ -41,6 +44,7 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 pub fn precommit_signing_bytes(
     genesis: &[u8; 32],
     height: u64,
+    round: u32,
     block_hash: &str,
     ep: &[u8; 32],
 ) -> Vec<u8> {
@@ -48,6 +52,7 @@ pub fn precommit_signing_bytes(
     push_field(&mut buf, DOMAIN_PRECOMMIT);
     push_field(&mut buf, genesis);
     push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, &round.to_le_bytes());
     push_field(&mut buf, block_hash.as_bytes());
     push_field(&mut buf, ep);
     buf
@@ -106,6 +111,7 @@ pub fn verify_finality_record(db: &ArxiumDb, record: &FinalityRecord) -> bool {
     let msg = precommit_signing_bytes(
         &genesis,
         record.height,
+        record.round,
         &record.block_hash.to_string(),
         &record.ep,
     );
@@ -222,6 +228,11 @@ const VOTE_REBROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 #[derive(Clone, Serialize, serde::Deserialize)]
 pub struct PrecommitVote {
     pub height: u64,
+    /// Round of `height` this vote is for — the block's own `round`. Signed,
+    /// tallied per `(height, round)`, and what makes a second vote at a
+    /// later round legitimate rather than equivocation
+    /// (`docs/consensus-safety.md` §2–3).
+    pub round: u32,
     pub block_hash: Hash32,
     pub voter: Address,
     pub signature: BlsSignature,
@@ -389,7 +400,7 @@ where
 
         // This node's own not-yet-finalized votes, kept so they can be
         // re-sent on VOTE_REBROADCAST_INTERVAL — see the constant's doc.
-        let mut my_votes: HashMap<u64, PrecommitVote> = HashMap::new();
+        let mut my_votes: HashMap<(u64, u32), PrecommitVote> = HashMap::new();
 
         // (height, round) -> voter -> signature; mirrors `tallies` above but
         // keyed by round too, since more than one round of a single height
@@ -430,7 +441,7 @@ where
                         continue;
                     }
                     tallies
-                        .entry(record.height)
+                        .entry((record.height, record.round))
                         .or_default()
                         .entry((record.block_hash.to_string(), record.ep))
                         .or_default()
@@ -512,7 +523,15 @@ where
                                     db.get_round_certificate(next_height, round),
                                     Ok(Some(_))
                                 );
+                                // S2 (`docs/consensus-safety.md` §2): a
+                                // round this node precommitted in is one it
+                                // must never also declare timed out — that
+                                // pair of signatures is what the safety
+                                // argument forbids an honest validator.
+                                let precommitted_this_round =
+                                    my_votes.contains_key(&(next_height, round));
                                 if !already_certified
+                                    && !precommitted_this_round
                                     && !my_round_timeout_votes.contains_key(&(next_height, round))
                                 {
                                     match db.get_block::<P>(next_height.saturating_sub(1)) {
@@ -538,6 +557,7 @@ where
                                             // timeout vote before gossip.
                                             if let Err(err) = tally_round_timeout::<P>(
                                                 &db,
+                                                &chain_lock,
                                                 &mut round_timeout_tallies,
                                                 &mut my_round_timeout_votes,
                                                 vote.clone(),
@@ -592,14 +612,23 @@ where
             {
                 last_progress = (block.height, Instant::now());
             }
+            // The tip can move *down* — `unwind_dead_tip`, `enforce_certificate`,
+            // divergence recovery — and the timeout clock must follow it, or
+            // this node keeps timing out `old_tip + 1` while the network is
+            // re-doing `old_tip` at the next round.
+            if let Ok(Some(tip)) = db.get_tip_height()
+                && tip < last_progress.0
+            {
+                last_progress = (tip, Instant::now());
+            }
             // Bounded on every event rather than only on finalization, which
             // is the case that may never come.
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
             for height in tallies
                 .keys()
-                .copied()
+                .map(|(h, _)| *h)
                 .filter(|h| *h < cutoff)
-                .collect::<Vec<_>>()
+                .collect::<std::collections::BTreeSet<_>>()
             {
                 if let Err(err) = db.delete_precommit_votes(height) {
                     warn!(
@@ -616,8 +645,8 @@ where
                 // so unbounded retention isn't the unbounded-growth risk that
                 // motivated pruning votes in the first place.
             }
-            tallies.retain(|height, _| *height >= cutoff);
-            my_votes.retain(|height, _| *height >= cutoff);
+            tallies.retain(|(height, _), _| *height >= cutoff);
+            my_votes.retain(|(height, _), _| *height >= cutoff);
             for key in round_timeout_tallies
                 .keys()
                 .copied()
@@ -639,6 +668,19 @@ where
                     let Some((address, secret_key)) = &bls_identity else {
                         continue;
                     };
+                    // S2 (`docs/consensus-safety.md` §2), the other
+                    // direction: having declared this round timed out,
+                    // this node may not precommit in it. The block is
+                    // still committed provisionally — it simply gets no
+                    // vote from here, and a later round replaces it if
+                    // the timeout certifies.
+                    if my_round_timeout_votes.contains_key(&(block.height, block.round)) {
+                        info!(
+                            "finality: not precommitting block {} at round {}: this node already voted that round timed out",
+                            block.height, block.round
+                        );
+                        continue;
+                    }
                     let hash = block.hash();
                     // ponytail: parent lookup failure (or genesis) falls back
                     // to an empty parent state root rather than dropping the
@@ -671,17 +713,23 @@ where
                         &block.state_root,
                         weight_used,
                     );
-                    let msg =
-                        precommit_signing_bytes(&genesis, block.height, &hash.to_string(), &ep);
+                    let msg = precommit_signing_bytes(
+                        &genesis,
+                        block.height,
+                        block.round,
+                        &hash.to_string(),
+                        &ep,
+                    );
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {
                         height: block.height,
+                        round: block.round,
                         block_hash: hash,
                         voter: address.clone(),
                         signature,
                         ep,
                     };
-                    my_votes.insert(vote.height, vote.clone());
+                    my_votes.insert((vote.height, vote.round), vote.clone());
 
                     // Count our own signed vote locally before gossiping it.
                     // Gossipsub publication is not a local loopback mechanism,
@@ -723,6 +771,7 @@ where
                 FinalityEvent::RoundTimeoutObserved(vote) => {
                     if let Err(err) = tally_round_timeout::<P>(
                         &db,
+                        &chain_lock,
                         &mut round_timeout_tallies,
                         &mut my_round_timeout_votes,
                         vote,
@@ -739,7 +788,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     db: &ArxiumDb,
     chain_lock: &Mutex<()>,
     tallies: &mut VoteTallies,
-    my_votes: &mut HashMap<u64, PrecommitVote>,
+    my_votes: &mut HashMap<(u64, u32), PrecommitVote>,
     equivocation_tx: &Sender<PrecommitEquivocation>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
@@ -762,6 +811,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     let msg = precommit_signing_bytes(
         &db.genesis_hash_bytes()?,
         vote.height,
+        vote.round,
         &vote.block_hash.to_string(),
         &vote.ep,
     );
@@ -790,11 +840,13 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     // only ever stopped this node double-voting locally; nothing looked at
     // peers until now.
     //
-    // Scans this height's other `(block_hash, ep)` buckets for the same
-    // voter. O(buckets) per vote, and an honest height has exactly one
-    // bucket — a height with enough buckets for this to cost anything is
-    // one where the scan is doing its job.
-    let prior = tallies.get(&vote.height).and_then(|by_key| {
+    // Scans this (height, round)'s other `(block_hash, ep)` buckets for
+    // the same voter — same round only: a vote at a later round is the
+    // legitimate re-vote after a timeout certificate (S1). O(buckets) per
+    // vote, and an honest round has exactly one bucket — a round with
+    // enough buckets for this to cost anything is one where the scan is
+    // doing its job.
+    let prior = tallies.get(&(vote.height, vote.round)).and_then(|by_key| {
         by_key
             .iter()
             // Same message: an ordinary duplicate or rebroadcast, not a fault.
@@ -809,14 +861,15 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     });
     if let Some((prior_hash, prior_ep, prior_signature)) = prior {
         warn!(
-            "finality: {} precommitted twice at height {}, reporting equivocation",
-            vote.voter, vote.height
+            "finality: {} precommitted twice at height {} round {}, reporting equivocation",
+            vote.voter, vote.height, vote.round
         );
         metrics::counter!("arxium_precommit_equivocations_detected_total").increment(1);
         let _ = equivocation_tx.send(PrecommitEquivocation {
             votes: [
                 PrecommitVote {
                     height: vote.height,
+                    round: vote.round,
                     block_hash: prior_hash
                         .parse()
                         .expect("tally key is always a Hash32::to_string()"),
@@ -831,6 +884,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
 
     let vote_record = PrecommitVoteRecord {
         height: vote.height,
+        round: vote.round,
         block_hash: vote.block_hash,
         voter: vote.voter.clone(),
         signature: vote.signature.clone(),
@@ -838,7 +892,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     };
 
     let signers = tallies
-        .entry(vote.height)
+        .entry((vote.height, vote.round))
         .or_default()
         .entry((vote.block_hash.to_string(), vote.ep))
         .or_default();
@@ -874,6 +928,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
 
     let record = FinalityRecord {
         height: vote.height,
+        round: vote.round,
         block_hash: vote.block_hash,
         signers: signers.keys().cloned().collect(),
         aggregate_signature,
@@ -886,8 +941,9 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
             vote.height
         );
     }
-    tallies.remove(&vote.height);
-    my_votes.remove(&vote.height);
+    // Every round of this height is settled once one of them certifies.
+    tallies.retain(|(h, _), _| *h != vote.height);
+    my_votes.retain(|(h, _), _| *h != vote.height);
     info!(
         "finality: block {} finalized with {} signers",
         vote.height,
@@ -953,6 +1009,7 @@ fn enforce_certificate<P: Serialize + DeserializeOwned>(
 /// (see `xc_storage::ArxiumDb::current_round`).
 fn tally_round_timeout<P: Serialize + DeserializeOwned>(
     db: &ArxiumDb,
+    chain_lock: &Mutex<()>,
     tallies: &mut HashMap<(u64, u32), HashMap<Address, BlsSignature>>,
     my_votes: &mut HashMap<(u64, u32), RoundTimeoutVote>,
     vote: RoundTimeoutVote,
@@ -1060,7 +1117,48 @@ fn tally_round_timeout<P: Serialize + DeserializeOwned>(
         vote.height,
         record.signers.len()
     );
+    unwind_dead_tip::<P>(db, chain_lock, &record)?;
     Ok(())
+}
+
+/// Dead-tip replacement, certificate side (`docs/consensus-safety.md` §3).
+/// A round certificate for `(h, r)` proves no round-`r` block at `h` can
+/// ever finalize (§2). If that is exactly the block this node holds as its
+/// provisional tip, keeping it would make the node build on, vote for and
+/// serve a chain the network has already moved past — and reject the
+/// round-`r + 1` candidate as `NotNextHeight`. Unwind to `h - 1` so the
+/// next round's block can land; `accept_block` does the same on its side
+/// when that block arrives before this node tallied the certificate itself.
+///
+/// Never touches a finalized height: a finalized tip has a
+/// `FinalityRecord`, and `revert_to`'s watermark floor is the backstop.
+fn unwind_dead_tip<P: Serialize + DeserializeOwned>(
+    db: &ArxiumDb,
+    chain_lock: &Mutex<()>,
+    cert: &RoundCertificate,
+) -> Result<(), xc_storage::StorageError> {
+    let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if db.get_tip_height()? != Some(cert.height) {
+        return Ok(());
+    }
+    if db.get_finality_record(cert.height)?.is_some() {
+        return Ok(());
+    }
+    let Some(tip) = db.get_block::<P>(cert.height)? else {
+        return Ok(());
+    };
+    if tip.round != cert.round {
+        return Ok(());
+    }
+    warn!(
+        "finality: round {} at height {} timed out but this node holds a round-{} block there — unwinding to {} for the next round",
+        cert.round,
+        cert.height,
+        tip.round,
+        cert.height.saturating_sub(1)
+    );
+    metrics::counter!("arxium_dead_tips_unwound_total").increment(1);
+    db.revert_to::<P>(cert.height.saturating_sub(1))
 }
 
 /// Verifies a dissent's signature and validator membership, enforces one
@@ -1223,6 +1321,7 @@ mod tests {
     fn certificate(height: u64, block_hash: &str) -> FinalityRecord {
         FinalityRecord {
             height,
+            round: 0,
             block_hash: block_hash.parse().unwrap(),
             signers: vec![],
             aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
@@ -1288,6 +1387,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn round_cert(height: u64, round: u32) -> RoundCertificate {
+        RoundCertificate {
+            height,
+            round,
+            signers: vec![],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        }
+    }
+
+    /// B1c dead-tip replacement, certificate side (`docs/consensus-safety.md`
+    /// §3): a round certificate for exactly the round this node's unfinalized
+    /// tip was proposed in proves that tip can never finalize, so it goes.
+    #[test]
+    fn a_round_certificate_for_the_tips_own_round_unwinds_it() {
+        let (db, dir, one) = chain_of_two();
+        assert_eq!(one.round, 0);
+        unwind_dead_tip::<()>(&db, &Mutex::new(()), &round_cert(1, 0)).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A certificate for some *other* round (an earlier one that timed out
+    /// before this block was proposed) says nothing about this tip.
+    #[test]
+    fn a_round_certificate_for_another_round_leaves_the_tip_alone() {
+        let (db, dir, _) = chain_of_two();
+        unwind_dead_tip::<()>(&db, &Mutex::new(()), &round_cert(1, 3)).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Finalized means finalized: a round certificate cannot unwind a height
+    /// that already carries a finality certificate, whatever it says.
+    #[test]
+    fn a_round_certificate_never_unwinds_a_finalized_tip() {
+        let (db, dir, one) = chain_of_two();
+        db.write_batch(&certificate(1, &one.hash().to_string()))
+            .unwrap();
+        unwind_dead_tip::<()>(&db, &Mutex::new(()), &round_cert(1, 0)).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// S1 as stated in `docs/consensus-safety.md` §2: one vote per (height,
+    /// round). The same validator voting two different hashes at the same
+    /// height is equivocation only if the rounds match; at different rounds
+    /// it is the legitimate re-vote after a timeout certificate.
+    #[test]
+    fn votes_at_different_rounds_are_not_equivocation() {
+        let (db, dir) = open_test_db();
+        // Two validators so one vote is never a quorum — this is about the
+        // equivocation check, not finalization.
+        let keys = round_timeout_validators(&db, 2);
+        let (addr, sk) = keys[0].clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tallies = HashMap::new();
+        let mut my_votes = HashMap::new();
+        let ep = [1u8; 32];
+        let vote = |round: u32, hash: &str| PrecommitVote {
+            height: 5,
+            round,
+            block_hash: hash.parse().unwrap(),
+            voter: addr.clone(),
+            signature: xc_bls::sign(&sk, &precommit_signing_bytes(&GENESIS, 5, round, hash, &ep)),
+            ep,
+        };
+        const A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const C: &str = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let lock = Mutex::new(());
+        // Round 0: A. Round 1: B. Legitimate.
+        tally_vote::<()>(&db, &lock, &mut tallies, &mut my_votes, &tx, vote(0, A)).unwrap();
+        tally_vote::<()>(&db, &lock, &mut tallies, &mut my_votes, &tx, vote(1, B)).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "different rounds must not be reported"
+        );
+        // Round 1 again, different hash: that *is* equivocation.
+        tally_vote::<()>(&db, &lock, &mut tallies, &mut my_votes, &tx, vote(1, C)).unwrap();
+        let reported = rx
+            .try_recv()
+            .expect("same-round double vote is equivocation");
+        assert_eq!(reported.votes[0].round, 1);
+        assert_eq!(reported.votes[1].round, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A certificate can arrive before the block it names. There is nothing
     /// to unwind, and `accept_block`'s own gate is what keeps the wrong
     /// block from landing at that height afterwards.
@@ -1337,9 +1523,13 @@ mod tests {
         let ep = [1u8; 32];
         let vote = |block_hash: &str| PrecommitVote {
             height: 5,
+            round: 0,
             block_hash: block_hash.parse().unwrap(),
             voter: addr.clone(),
-            signature: xc_bls::sign(&sk, &precommit_signing_bytes(&GENESIS, 5, block_hash, &ep)),
+            signature: xc_bls::sign(
+                &sk,
+                &precommit_signing_bytes(&GENESIS, 5, 0, block_hash, &ep),
+            ),
             ep,
         };
         let mut tally = |v: PrecommitVote| {
@@ -1375,7 +1565,7 @@ mod tests {
         );
         // Reporting does not drop the vote: withholding it from the tally
         // would let an equivocator stall a height instead of losing stake.
-        assert_eq!(tallies[&5].len(), 2);
+        assert_eq!(tallies[&(5, 0)].len(), 2);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1427,11 +1617,12 @@ mod tests {
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
+                round: 0,
                 block_hash: block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
-                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                    &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
                 ),
                 ep,
             };
@@ -1450,11 +1641,12 @@ mod tests {
         let (addr, sk) = &addrs_and_keys[2];
         let vote = PrecommitVote {
             height: 5,
+            round: 0,
             block_hash: block_hash,
             voter: addr.clone(),
             signature: xc_bls::sign(
                 sk,
-                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
             ),
             ep,
         };
@@ -1514,11 +1706,12 @@ mod tests {
         for (addr, sk) in addrs_and_keys.iter().take(2) {
             let vote = PrecommitVote {
                 height: 5,
+                round: 0,
                 block_hash: block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
-                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                    &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
                 ),
                 ep,
             };
@@ -1537,7 +1730,7 @@ mod tests {
         let mut reloaded: VoteTallies = HashMap::new();
         for record in db.get_precommit_votes_from(0).unwrap() {
             reloaded
-                .entry(record.height)
+                .entry((record.height, record.round))
                 .or_default()
                 .entry((record.block_hash.to_string(), record.ep))
                 .or_default()
@@ -1546,7 +1739,7 @@ mod tests {
         let mut reloaded_my_votes = HashMap::new();
         assert_eq!(
             reloaded
-                .get(&5)
+                .get(&(5, 0))
                 .unwrap()
                 .get(&(block_hash.to_string(), ep))
                 .unwrap()
@@ -1560,11 +1753,12 @@ mod tests {
         let (addr, sk) = &addrs_and_keys[2];
         let vote = PrecommitVote {
             height: 5,
+            round: 0,
             block_hash: block_hash,
             voter: addr.clone(),
             signature: xc_bls::sign(
                 sk,
-                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
             ),
             ep,
         };
@@ -1628,11 +1822,12 @@ mod tests {
             let ep = if i < 2 { ep_a } else { ep_b };
             let vote = PrecommitVote {
                 height: 5,
+                round: 0,
                 block_hash: block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
-                    &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                    &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
                 ),
                 ep,
             };
@@ -1653,7 +1848,7 @@ mod tests {
         );
         assert_eq!(
             tallies
-                .get(&5)
+                .get(&(5, 0))
                 .unwrap()
                 .get(&(block_hash.to_string(), ep_a))
                 .unwrap()
@@ -1662,7 +1857,7 @@ mod tests {
         );
         assert_eq!(
             tallies
-                .get(&5)
+                .get(&(5, 0))
                 .unwrap()
                 .get(&(block_hash.to_string(), ep_b))
                 .unwrap()
@@ -2095,6 +2290,7 @@ mod tests {
         event_tx
             .send(FinalityEvent::VoteObserved(PrecommitVote {
                 height: u64::MAX,
+                round: 0,
                 block_hash: "0".repeat(64).parse().unwrap(),
                 voter: Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
                 signature: xc_bls::sign(&attacker_sk, b"not a precommit"),
@@ -2127,10 +2323,10 @@ mod tests {
         for height in 0..(TALLY_RETENTION_HEIGHTS * 4) {
             highest_seen = highest_seen.max(height);
             let cutoff = highest_seen.saturating_sub(TALLY_RETENTION_HEIGHTS);
-            tallies.retain(|h, _| *h >= cutoff);
+            tallies.retain(|(h, _), _| *h >= cutoff);
             // A vote arrives for this height and never reaches quorum.
             tallies
-                .entry(height)
+                .entry((height, 0))
                 .or_default()
                 .entry(("0xdeadbeef".into(), [0u8; 32]))
                 .or_default();
@@ -2145,7 +2341,7 @@ mod tests {
         // And it keeps the recent ones, rather than bounding by dropping
         // everything.
         assert!(
-            tallies.contains_key(&(TALLY_RETENTION_HEIGHTS * 4 - 1)),
+            tallies.contains_key(&(TALLY_RETENTION_HEIGHTS * 4 - 1, 0)),
             "the most recent height must survive pruning",
         );
     }
@@ -2250,11 +2446,12 @@ mod tests {
         let ep = [1u8; 32];
         let vote = |i: usize| PrecommitVote {
             height: 5,
+            round: 0,
             block_hash: block_hash,
             voter: keys[i].0.clone(),
             signature: xc_bls::sign(
                 &keys[i].1,
-                &precommit_signing_bytes(&GENESIS, 5, &block_hash.to_string(), &ep),
+                &precommit_signing_bytes(&GENESIS, 5, 0, &block_hash.to_string(), &ep),
             ),
             ep,
         };
@@ -2314,6 +2511,7 @@ mod tests {
         for (addr, sk) in &keys[4..20] {
             tally_round_timeout::<()>(
                 &db,
+                &Mutex::new(()),
                 &mut tallies,
                 &mut my_votes,
                 round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
@@ -2327,6 +2525,7 @@ mod tests {
         let (addr, sk) = &keys[0];
         tally_round_timeout::<()>(
             &db,
+            &Mutex::new(()),
             &mut tallies,
             &mut my_votes,
             round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
@@ -2357,6 +2556,7 @@ mod tests {
         for (addr, sk) in &addrs_and_keys[..2] {
             tally_round_timeout::<()>(
                 &db,
+                &Mutex::new(()),
                 &mut tallies,
                 &mut my_votes,
                 round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
@@ -2371,6 +2571,7 @@ mod tests {
         let (addr, sk) = &addrs_and_keys[2];
         tally_round_timeout::<()>(
             &db,
+            &Mutex::new(()),
             &mut tallies,
             &mut my_votes,
             round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
@@ -2402,6 +2603,7 @@ mod tests {
         let (addr1, sk1) = &addrs_and_keys[1];
         tally_round_timeout::<()>(
             &db,
+            &Mutex::new(()),
             &mut tallies,
             &mut my_votes,
             round_timeout_vote(addr0, sk0, 5, 0, &parent.hash().to_string()),
@@ -2409,6 +2611,7 @@ mod tests {
         .unwrap();
         tally_round_timeout::<()>(
             &db,
+            &Mutex::new(()),
             &mut tallies,
             &mut my_votes,
             round_timeout_vote(addr1, sk1, 5, 1, &parent.hash().to_string()),
@@ -2441,6 +2644,7 @@ mod tests {
         for (addr, sk) in &addrs_and_keys {
             tally_round_timeout::<()>(
                 &db,
+                &Mutex::new(()),
                 &mut tallies,
                 &mut my_votes,
                 round_timeout_vote(addr, sk, 5, 0, &parent.hash().to_string()),
@@ -2455,6 +2659,7 @@ mod tests {
         let (late_sk, _pk) = xc_bls::keygen_from_seed(&[99u8; 32]).unwrap();
         tally_round_timeout::<()>(
             &db,
+            &Mutex::new(()),
             &mut tallies,
             &mut my_votes,
             round_timeout_vote(&late_addr, &late_sk, 5, 0, &parent.hash().to_string()),

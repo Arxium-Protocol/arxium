@@ -231,7 +231,15 @@ mod tests {
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("arxium-test-identity-{nanos}"));
+        // Counter, not just nanos: parallel test threads can read the same
+        // clock value and land on one RocksDB path (see `open_test_db` in
+        // `arxd/finality`).
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "arxium-test-identity-{}-{nanos}-{n}",
+            std::process::id()
+        ));
         let db = ArxiumDb::open(&path).unwrap();
         db.write_batch(&apply_register_attestor(&db, attestor, "test", 0).unwrap())
             .unwrap();

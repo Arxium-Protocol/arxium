@@ -20,6 +20,7 @@
 //! recomputes the state root and refuses anything that does not hash to the
 //! trusted block's `state_root`. Cosmos's trust-height/trust-hash model.
 
+use crate::wire::{SnapshotEntry, SnapshotManifest, SyncRequest};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,7 +28,6 @@ use tracing::{info, warn};
 use xc_circuit::{BlsKeyKey, ChainParamsKey, GenesisHashKey, KeySpec, ValidatorSetKey};
 use xc_primitives::{Block, Hash32, quorum_reached, validator_set_effective_height};
 use xc_storage::{ArxiumDb, FinalityRecord, StorageError, snapshot_chunks};
-use crate::wire::{SnapshotEntry, SnapshotManifest, SyncRequest};
 
 use crate::gossip::Payload;
 
@@ -348,6 +348,7 @@ fn verify_certificate_against<P: Payload>(
     let msg = arxd_finality::precommit_signing_bytes(
         &genesis,
         record.height,
+        record.round,
         &record.block_hash.to_string(),
         &record.ep,
     );
@@ -431,9 +432,10 @@ mod tests {
         }
         let ep = [0u8; 32];
         let msg =
-            arxd_finality::precommit_signing_bytes(&GENESIS, 3, &block.hash().to_string(), &ep);
+            arxd_finality::precommit_signing_bytes(&GENESIS, 3, 0, &block.hash().to_string(), &ep);
         let record = FinalityRecord {
             height: 3,
+            round: 0,
             block_hash: block.hash(),
             signers: vec![validator],
             aggregate_signature: xc_bls::sign(&sk, &msg),

@@ -1012,6 +1012,13 @@ check its own derivation against.
 
 ## Known limitations worth an operator's awareness
 
+**Forks.** The provisional tip can diverge under partition; the finalized
+chain cannot, and a validator stuck on a candidate that will never
+finalize now recovers at the next round (B1c). The invariants, the safety
+argument and the one scenario that used to deadlock are in
+[`consensus-safety.md`](consensus-safety.md) — read that before answering
+an auditor.
+
 - **A two-validator chain cannot outvote a faulty validator.** Two equal
   validators hold 5,000 each against a 6,667 quorum, so a node that
   rejects its peer's block has no way to make progress — arithmetic, not a

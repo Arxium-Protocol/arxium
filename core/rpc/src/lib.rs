@@ -2014,6 +2014,7 @@ mod tests {
                 .db
                 .write_batch(&xc_storage::FinalityRecord {
                     height: 0,
+                    round: 0,
                     block_hash: genesis.hash(),
                     signers: vec![Address::from_pubkey_bytes(&[9u8; 32]).unwrap()],
                     aggregate_signature: xc_bls::BlsSignature([3u8; 96]),
