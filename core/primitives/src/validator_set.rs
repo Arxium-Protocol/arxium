@@ -178,6 +178,12 @@ pub fn assign_voting_power(stakes: &BTreeMap<Address, u128>) -> BTreeMap<Address
 /// inspectable configuration and not by a magic number.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainParams {
+    /// Seconds between block-production ticks. Every validator reads it from
+    /// state, so a chain running a different cadence is a spec field, not a
+    /// rebuilt binary. Only `min_validator_set`-style sanity, no floor: a
+    /// test chain may legitimately want 1s.
+    #[serde(default = "default_block_interval_secs")]
+    pub block_interval_secs: u64,
     /// Blocks per epoch. The validator set only changes at epoch boundaries.
     #[serde(default = "default_epoch_length")]
     pub epoch_length: u64,
@@ -255,6 +261,9 @@ pub struct ChainParams {
     pub fee_treasury_bps: u32,
 }
 
+fn default_block_interval_secs() -> u64 {
+    2
+}
 fn default_epoch_length() -> u64 {
     1_800
 }
@@ -327,6 +336,7 @@ fn default_fee_treasury_bps() -> u32 {
 impl Default for ChainParams {
     fn default() -> Self {
         Self {
+            block_interval_secs: default_block_interval_secs(),
             epoch_length: default_epoch_length(),
             validator_attestation_required: false,
             min_validator_set: default_min_validator_set(),

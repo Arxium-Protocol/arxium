@@ -1,7 +1,7 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{BLOCK_INTERVAL, SKIP_LOG_INTERVAL, STALL_SUSPECT_AFTER, now_secs};
+use crate::{SKIP_LOG_INTERVAL, STALL_SUSPECT_AFTER_INTERVALS, now_secs};
 use anyhow::{Ok, Result};
 use arxd_finality::FinalityEvent;
 use ed25519_dalek::SigningKey;
@@ -346,7 +346,7 @@ pub fn meter<R: ChainRuntime>(params: ChainParams) -> impl Fn(&Action<R::Payload
     }
 }
 
-/// Ticks every `BLOCK_INTERVAL`, producing a signed block when this node is
+/// Ticks every `ChainParams::block_interval_secs`, producing a signed block when this node is
 /// the validator whose turn it is. A non-validator node (`identity: None`)
 /// never produces — it only accepts blocks gossiped/synced from peers (see
 /// `accept_block`). Runs until `arxd_network::shutdown_code()` is non-zero —
@@ -366,15 +366,19 @@ pub fn produce_loop<R: ChainRuntime>(
     // a window.
     let mut last_skip_log: Option<Instant> = None;
 
-    // A plain `thread::sleep(BLOCK_INTERVAL)` at the top of the loop makes
-    // the real period `BLOCK_INTERVAL + work_time`, compounding every single
+    // A plain `thread::sleep(interval)` at the top of the loop makes the
+    // real period `interval + work_time`, compounding every single
     // iteration — production drifts later and later under load. Ticking off
     // a monotonic deadline instead makes the period converge to
-    // `max(BLOCK_INTERVAL, work_time)`.
+    // `max(interval, work_time)`.
     let mut next_tick = Instant::now();
 
     loop {
-        thread::sleep(next_sleep(&mut next_tick, Instant::now(), BLOCK_INTERVAL));
+        // Re-read each tick, same as the fee params in `meter`, so a
+        // governed cadence change takes effect without a restart.
+        let block_interval_secs = db.chain_params()?.block_interval_secs;
+        let interval = Duration::from_secs(block_interval_secs);
+        thread::sleep(next_sleep(&mut next_tick, Instant::now(), interval));
 
         match arxd_network::shutdown_code() {
             0 => {}
@@ -488,7 +492,7 @@ pub fn produce_loop<R: ChainRuntime>(
                             // height, how long the chain has been silent,
                             // which round that put us in, who that round
                             // belongs to, and who this node is.
-                            if elapsed >= STALL_SUSPECT_AFTER.as_secs() {
+                            if elapsed >= STALL_SUSPECT_AFTER_INTERVALS * block_interval_secs {
                                 warn!(
                                     "not producing height {next_height}: {elapsed}s since the \
                                      parent block (round {round}) — expected proposer is \

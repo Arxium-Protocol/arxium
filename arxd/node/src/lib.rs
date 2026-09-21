@@ -40,14 +40,6 @@ use xc_primitives::{Action, Address, Block};
 use xc_rpc::{IngestConfig, spawn_http_ingest};
 use xc_storage::{ArxiumDb, DissentRecord};
 
-// ponytail: fixed cadence; make configurable via NodeConfig/CLI if validators need to tune it
-const BLOCK_INTERVAL: Duration = Duration::from_secs(2);
-
-// A validator's primary slot lasts this long before the next validator in
-// rotation becomes eligible to stand in — double BLOCK_INTERVAL so one
-// missed tick from ordinary network jitter doesn't trigger a takeover.
-const SLOT_DURATION: Duration = Duration::from_secs(BLOCK_INTERVAL.as_secs() * 2);
-
 /// A block strictly behind our tip (`block_height < tip_height`) is an
 /// ordinary, expected race — already applied via the other delivery path
 /// (gossip vs. sync) while this one was in flight — not evidence of
@@ -302,11 +294,12 @@ fn now_secs() -> u64 {
 /// count, the log only has to make the situation visible.
 pub(crate) const SKIP_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Silence beyond which a skip stops being routine. A full rotation takes
-/// `validators * SLOT_DURATION`, so several rotations with nobody producing
-/// means it isn't simply someone else's turn — that is the stall shape, and
-/// it escalates the log line from info to warn.
-pub(crate) const STALL_SUSPECT_AFTER: Duration = Duration::from_secs(SLOT_DURATION.as_secs() * 10);
+/// Silence beyond which a skip stops being routine, in block intervals. A
+/// slot is two intervals (one missed tick from jitter must not look like a
+/// takeover), a full rotation is `validators` slots, so this many intervals
+/// with nobody producing means it isn't simply someone else's turn — that is
+/// the stall shape, and it escalates the log line from info to warn.
+pub(crate) const STALL_SUSPECT_AFTER_INTERVALS: u64 = 20;
 
 /// Both tip gauges, always set together — three separate sites advance the
 /// tip (startup, a produced block, an accepted block) and they must not
