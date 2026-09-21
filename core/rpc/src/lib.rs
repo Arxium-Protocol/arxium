@@ -430,6 +430,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/blocks", get(get_blocks::<P>))
                 .route("/blocks/{height}", get(get_block_by_height::<P>))
                 .route("/blocks/{height}/effects", get(get_block_effects::<P>))
+                .route("/effects", get(get_effects_range::<P>))
                 .route("/blocks/by-hash/{hash}", get(get_block_by_hash::<P>))
                 .route("/evidence", get(get_evidence_list::<P>))
                 .route("/evidence/{id}", get(get_evidence_by_id::<P>))
@@ -1732,6 +1733,29 @@ mod tests {
             assert_eq!(json["accounts"][addr.to_string()]["balance"], 0);
             assert_eq!(json["dropped"][0]["reason"], "nonce");
             assert_eq!(json["dropped"][0]["sender"], addr.to_string());
+
+            // The range endpoint skips heights without a row (only 1 has
+            // one here) instead of 404ing the page, and rejects from > to.
+            let resp = get_effects_range(
+                State(state.clone()),
+                Query(BlockRangeQuery { from: 0, to: 2 }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json.as_array().unwrap().len(), 1);
+            assert_eq!(json[0]["height"], 1);
+            let resp = get_effects_range(
+                State(state.clone()),
+                Query(BlockRangeQuery { from: 2, to: 1 }),
+            )
+            .await
+            .into_response();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
             let target_hash = state
                 .db

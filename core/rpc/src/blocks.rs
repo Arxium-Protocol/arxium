@@ -155,6 +155,24 @@ pub(super) async fn get_block_effects<P: Payload>(
     ))
 }
 
+/// `GET /effects?from=&to=` — the effects rows for a height range in one
+/// round trip, capped at `MAX_PAGE_SIZE` like `/blocks`. Heights with no
+/// row are absent from the list rather than 404ing the whole page; each
+/// entry's `height` says which it is. Exists for Retracer's backfill,
+/// which pages `/blocks` and would otherwise fetch effects one height at
+/// a time.
+pub(super) async fn get_effects_range<P: Payload>(
+    State(state): State<AppState<P>>,
+    Query(range): Query<BlockRangeQuery>,
+) -> Result<Json<Vec<xc_storage::BlockEffects>>, ApiError> {
+    if range.from > range.to {
+        return Err(ApiError::BadRequest("from must be <= to".to_string()));
+    }
+    Ok(Json(
+        state.db.get_block_effects_range(range.from, range.to)?,
+    ))
+}
+
 pub(super) async fn get_block_by_hash<P: Payload>(
     State(state): State<AppState<P>>,
     Path(hash): Path<String>,

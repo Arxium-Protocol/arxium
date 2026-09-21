@@ -600,6 +600,25 @@ impl ArxiumDb {
         }
     }
 
+    /// Effects for `from..=to`, capped at `MAX_PAGE_SIZE` like
+    /// `get_block_range`. Heights without an effects row (written before
+    /// the record existed) are skipped, not errors — each entry carries its
+    /// own `height`, so a reader can tell which were missing.
+    pub fn get_block_effects_range(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<Vec<BlockEffects>, StorageError> {
+        let to = to.min(from.saturating_add(MAX_PAGE_SIZE as u64 - 1));
+        let mut out = Vec::new();
+        for height in from..=to {
+            if let Some(effects) = self.get_block_effects(height)? {
+                out.push(effects);
+            }
+        }
+        Ok(out)
+    }
+
     /// Get the current tip height from the DB.
     pub fn get_tip_height(&self) -> Result<Option<u64>, StorageError> {
         match self.get(b"meta:tip_height")? {
