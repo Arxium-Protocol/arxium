@@ -346,6 +346,12 @@ pub fn meter<R: ChainRuntime>(params: ChainParams) -> impl Fn(&Action<R::Payload
     }
 }
 
+/// Byte budget for one block's actions: the gossip/sync ceiling less
+/// headroom for the block header, seal and bincode framing, so a produced
+/// block is always publishable. Over the ceiling, `gossipsub.publish` refuses
+/// it and peers only get it via sync — "blocks never arrive" from outside.
+const MAX_BLOCK_ACTION_BYTES: usize = xc_primitives::MAX_WIRE_MESSAGE_SIZE - 64 * 1024;
+
 /// Ticks every `ChainParams::block_interval_secs`, producing a signed block when this node is
 /// the validator whose turn it is. A non-validator node (`identity: None`)
 /// never produces — it only accepts blocks gossiped/synced from peers (see
@@ -533,7 +539,7 @@ pub fn produce_loop<R: ChainRuntime>(
         let pending = mempool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .drain_pending(100);
+            .drain_pending_within(100, MAX_BLOCK_ACTION_BYTES);
         // Empty blocks still get produced — height must keep advancing on
         // schedule so `expected_proposer` round-robin doesn't stall waiting
         // for someone to submit an action.

@@ -279,7 +279,28 @@ impl<P: Serialize> Mempool<P> {
     }
 
     pub fn drain_pending(&mut self, max: usize) -> Vec<Action<P>> {
-        let n = max.min(self.pending.len());
+        self.drain_pending_within(max, usize::MAX)
+    }
+
+    /// `drain_pending`, but also stops before the drained actions' encoded
+    /// bytes would exceed `max_bytes`. The producer uses it so a block it
+    /// builds always fits under `MAX_WIRE_MESSAGE_SIZE`: `max_block_weight`
+    /// bounds execution time, not bytes, and 100 actions at the 64 KiB RPC
+    /// body cap is well past the 1 MiB gossip ceiling — such a block was
+    /// refused by `gossipsub.publish` and only reached peers via sync.
+    /// The first action is always taken even if it alone is over budget,
+    /// so one oversized entry cannot wedge the queue.
+    pub fn drain_pending_within(&mut self, max: usize, max_bytes: usize) -> Vec<Action<P>> {
+        let mut n = 0;
+        let mut bytes = 0;
+        for action in self.pending.iter().take(max) {
+            let size = Self::encoded_size(action);
+            if n > 0 && bytes + size > max_bytes {
+                break;
+            }
+            n += 1;
+            bytes += size;
+        }
         let drained: Vec<Action<P>> = self
             .pending
             .drain(..n)
@@ -534,5 +555,31 @@ mod tests {
             mempool.push(action(addr(1), 2)),
             Err(MempoolError::Full)
         ));
+    }
+}
+
+#[cfg(test)]
+mod drain_within_tests {
+    use super::*;
+
+    #[test]
+    fn drain_within_stops_at_byte_budget_but_always_takes_one() {
+        let mut mempool: Mempool<Vec<u8>> = Mempool::new();
+        for nonce in 0..5 {
+            mempool
+                .push(Action {
+                    sender: Address::from_pubkey_bytes(&[1; 32]).unwrap(),
+                    nonce,
+                    signature: Some(format!("sig-{nonce}")),
+                    payload: vec![0u8; 1000],
+                })
+                .unwrap();
+        }
+        let one = Mempool::<Vec<u8>>::encoded_size(&mempool.pending[0]);
+        // Budget fits exactly two.
+        assert_eq!(mempool.drain_pending_within(10, one * 2).len(), 2);
+        // Budget below a single action still yields one.
+        assert_eq!(mempool.drain_pending_within(10, 1).len(), 1);
+        assert_eq!(mempool.len(), 2);
     }
 }
