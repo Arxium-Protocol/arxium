@@ -23,9 +23,9 @@ pub use consensus::{
 };
 pub use hash32::{Hash32, Hash32Error};
 pub use state::{
-    AccountEntry, Asset, AssetClass, AssetMetadata, AttestorRecord, ClaimTopic, CountryCode,
-    HolderState, Snapshot, StakeAllocation, Unbonding, ValidatorEntry, reward_pool_account,
-    stake_subaccount, treasury_account,
+    AccountEntry, Asset, AssetClass, AssetMetadata, AttestorRecord, CapTable, ClaimTopic,
+    CountryCode, HolderState, Snapshot, StakeAllocation, Unbonding, ValidatorEntry,
+    reward_pool_account, stake_subaccount, treasury_account,
 };
 pub use validator_set::{
     ChainParams, DEFAULT_ACTION_FEE, DEFAULT_MIN_VALIDATOR_STAKE, DEFAULT_REWARD_PER_BLOCK,

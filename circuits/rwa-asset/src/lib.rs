@@ -4,9 +4,15 @@
 use std::collections::BTreeMap;
 
 use thiserror::Error;
-use xc_circuit::{AccountKey, AssetBalanceKey, AssetHolderStateKey, KvRead};
-use xc_primitives::{AccountEntry, Address, Asset, AssetRef, ClaimTopic, CountryCode, HolderState};
-use xc_storage::{AccountUpdates, AssetBalanceUpdates, HolderStateUpdates, StorageError};
+use xc_circuit::{
+    AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, KeySpec, KvRead,
+};
+use xc_primitives::{
+    AccountEntry, Address, Asset, AssetRef, CapTable, ClaimTopic, CountryCode, HolderState,
+};
+use xc_storage::{
+    AccountUpdates, AssetBalanceUpdates, BatchWritable, HolderStateUpdates, StorageError,
+};
 
 #[derive(Error, Debug)]
 pub enum RwaError {
@@ -119,6 +125,26 @@ pub enum RwaError {
         resulting: u128,
         limit: u128,
     },
+    #[error("pro-rata arithmetic for {asset} overflows u128")]
+    ShareOverflow { asset: AssetRef },
+}
+
+impl RwaError {
+    /// The party a compliance-family error is about, when it is about one
+    /// party: what a distribution keys on to withhold one holder's share
+    /// instead of failing every holder's.
+    fn ineligible_party(&self) -> Option<&Address> {
+        match self {
+            Self::NotCompliant { address }
+            | Self::HolderFrozen { address, .. }
+            | Self::MissingClaim { address, .. }
+            | Self::JurisdictionNotAllowed { address, .. }
+            | Self::AttestationExpired { address, .. }
+            | Self::HolderCapReached { address, .. }
+            | Self::HolderLimitExceeded { address, .. } => Some(address),
+            _ => None,
+        }
+    }
 }
 
 /// Sender-side result used by wallets before a recipient and amount have
@@ -449,17 +475,7 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     amount: u128,
     current_height: u64,
 ) -> Result<(AccountUpdates, AssetBalanceUpdates), RwaError> {
-    // First gate, ahead of compliance and balance: a freeze is meant to stop
-    // circulation outright, so it must not be bypassable by a transfer that
-    // would have failed a later check anyway for a different reason.
-    if asset.frozen {
-        return Err(RwaError::AssetFrozen {
-            asset: asset.asset_ref.clone(),
-        });
-    }
-
-    check_party(view, asset, sender, current_height)?;
-    check_recipient(view, asset, to, amount, current_height)?;
+    check_move(view, asset, sender, to, amount, current_height)?;
 
     let mut sender_account = view.get(&AccountKey(sender))?.unwrap_or(AccountEntry {
         balance: 0,
@@ -474,21 +490,71 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
     }
     sender_account.nonce += 1;
 
-    // Partially frozen units stay put under a compliant transfer; only a
-    // forced transfer or recovery moves them.
-    let locked = holder_state(view, asset, sender, current_height)?.frozen_amount;
+    let accounts = AccountUpdates(BTreeMap::from([(sender.clone(), sender_account)]));
+    let assets = move_checked(view, asset, sender, to, amount, current_height)?;
+    Ok((accounts, assets))
+}
+
+/// Every gate of a compliant transfer except the sender's nonce, then the
+/// move. The nonce-less shape is what the corporate actions loop over — one
+/// signed action, many compliant moves.
+pub fn apply_compliant_move<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    current_height: u64,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    check_move(view, asset, from, to, amount, current_height)?;
+    move_checked(view, asset, from, to, amount, current_height)
+}
+
+/// The compliance half of a compliant transfer. First gate is the freeze,
+/// ahead of compliance and balance: a freeze is meant to stop circulation
+/// outright, so it must not be bypassable by a transfer that would have
+/// failed a later check anyway for a different reason.
+fn check_move<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    current_height: u64,
+) -> Result<(), RwaError> {
+    if asset.frozen {
+        return Err(RwaError::AssetFrozen {
+            asset: asset.asset_ref.clone(),
+        });
+    }
+    check_party(view, asset, from, current_height)?;
+    check_recipient(view, asset, to, amount, current_height)?;
+    Ok(())
+}
+
+/// The balance half: partially frozen units stay put under a compliant
+/// transfer (only a forced transfer or recovery moves them), then the move.
+fn move_checked<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    current_height: u64,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    let locked = holder_state(view, asset, from, current_height)?.frozen_amount;
     if locked > 0 {
         let balance = view
             .get(&AssetBalanceKey {
                 asset: &asset.asset_ref,
-                owner: sender,
+                owner: from,
             })?
             .unwrap_or(0);
         let available = balance.saturating_sub(locked);
         if amount > available {
             return Err(RwaError::AmountLocked {
                 asset: asset.asset_ref.clone(),
-                sender: sender.clone(),
+                sender: from.clone(),
                 balance,
                 locked,
                 available,
@@ -496,10 +562,7 @@ pub fn apply_compliant_transfer<V: KvRead<Error = StorageError>>(
             });
         }
     }
-
-    let accounts = AccountUpdates(BTreeMap::from([(sender.clone(), sender_account)]));
-    let assets = apply_forced_transfer(view, asset, sender, to, amount)?;
-    Ok((accounts, assets))
+    apply_forced_transfer(view, asset, from, to, amount)
 }
 
 /// Supply created straight into a verified investor's
@@ -813,6 +876,214 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     ])))
 }
 
+/// Read-through overlay for one action that makes several balance moves:
+/// staged writes shadow `base`, so the second move sees the first one's
+/// debit instead of re-reading the pre-action balance. The same trick
+/// `BlockView` plays across actions, one level down.
+struct Staged<'a, V> {
+    base: &'a V,
+    entries: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+impl<'a, V: KvRead<Error = StorageError>> Staged<'a, V> {
+    fn new(base: &'a V) -> Self {
+        Self {
+            base,
+            entries: BTreeMap::new(),
+        }
+    }
+
+    fn stage(&mut self, updates: &AssetBalanceUpdates) -> Result<(), StorageError> {
+        self.entries.extend(updates.batch_entries()?);
+        Ok(())
+    }
+
+    /// Everything staged, as one `AssetBalanceUpdates` — decoded back from
+    /// the raw rows so the caller gets the same type every mover returns.
+    fn into_updates(self) -> Result<AssetBalanceUpdates, StorageError> {
+        let mut out = BTreeMap::new();
+        for (key, value) in self.entries {
+            let key = String::from_utf8(key).map_err(|_| StorageError::CorruptedMeta)?;
+            let rest = key
+                .strip_prefix("asset_balance:")
+                .ok_or(StorageError::CorruptedMeta)?;
+            let (asset, owner) = rest.rsplit_once(':').ok_or(StorageError::CorruptedMeta)?;
+            let asset = AssetRef::parse(asset).map_err(|_| StorageError::CorruptedMeta)?;
+            let owner = Address::parse(owner).map_err(|_| StorageError::CorruptedMeta)?;
+            let (balance, _): (u128, _) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            out.insert((asset, owner), balance);
+        }
+        Ok(AssetBalanceUpdates(out))
+    }
+}
+
+impl<V: KvRead<Error = StorageError>> KvRead for Staged<'_, V> {
+    type Error = StorageError;
+
+    fn get<K: KeySpec>(&self, key: &K) -> Result<Option<K::Value>, StorageError> {
+        match self.entries.get(&key.encode()) {
+            Some(bytes) => {
+                let (value, _) =
+                    bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+                Ok(Some(value))
+            }
+            None => self.base.get(key),
+        }
+    }
+}
+
+/// `SnapshotHolders`: records the cap table as of `current_height` on the
+/// asset — every non-issuer address in the holders index with a positive
+/// balance, read back through `view` so this block's earlier transfers
+/// count. Replaces any previous snapshot.
+// ponytail: the holders index (`meta:asset_holders`) is written at commit, so
+// an address that first became a holder earlier in this same block is not
+// listed yet. Take the snapshot one block after the last issuance if that
+// matters. The index is unprovable state, so the adjudicator reports this
+// action as unprovable rather than replaying it.
+pub fn apply_snapshot<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    current_height: u64,
+) -> Result<(), RwaError> {
+    let mut holders = Vec::new();
+    let mut total: u128 = 0;
+    for holder in view
+        .get(&AssetHoldersKey(&asset.asset_ref))?
+        .unwrap_or_default()
+    {
+        if holder == asset.issuer {
+            continue;
+        }
+        let balance = view
+            .get(&AssetBalanceKey {
+                asset: &asset.asset_ref,
+                owner: &holder,
+            })?
+            .unwrap_or(0);
+        if balance == 0 {
+            continue;
+        }
+        total = total
+            .checked_add(balance)
+            .ok_or_else(|| RwaError::SupplyOverflow {
+                asset: asset.asset_ref.clone(),
+            })?;
+        holders.push((holder, balance));
+    }
+    holders.sort();
+    asset.snapshot = Some(CapTable {
+        height: current_height,
+        total,
+        holders,
+    });
+    Ok(())
+}
+
+/// `holding * total / table.total`, the floor.
+fn pro_rata(
+    asset: &AssetRef,
+    table: &CapTable,
+    holding: u128,
+    total: u128,
+) -> Result<u128, RwaError> {
+    holding
+        .checked_mul(total)
+        .map(|n| n / table.total)
+        .ok_or_else(|| RwaError::ShareOverflow {
+            asset: asset.clone(),
+        })
+}
+
+/// `DistributeToHolders`: pays `total` of `payout` from `issuer` to every
+/// holder in `table`, pro rata to their snapshot balance, as a sequence of
+/// compliant moves of `payout`. A holder that fails `payout`'s own
+/// compliance (frozen, stale KYC, over a limit) is withheld — its share stays
+/// with the issuer to settle out of band — rather than failing everyone's.
+/// Anything else (a frozen payout asset, the issuer short of balance or
+/// locked) fails the whole action. Floor rounding leaves the dust with the
+/// issuer.
+pub fn apply_distribution<V: KvRead<Error = StorageError>>(
+    view: &V,
+    payout: &mut Asset,
+    issuer: &Address,
+    table: &CapTable,
+    total: u128,
+    current_height: u64,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    let mut staged = Staged::new(view);
+    for (holder, holding) in &table.holders {
+        let share = pro_rata(&payout.asset_ref, table, *holding, total)?;
+        if share == 0 {
+            continue;
+        }
+        match apply_compliant_move(&staged, payout, issuer, holder, share, current_height) {
+            Ok(updates) => staged.stage(&updates)?,
+            Err(err) if err.ineligible_party() == Some(holder) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(staged.into_updates()?)
+}
+
+/// `RedeemHolders`: every snapshot balance of `asset` pulled back into the
+/// issuer's treasury by forced transfer — no compliance gate, the units are
+/// leaving circulation, and the asset may well be frozen for the record
+/// period. The proceeds are a `DistributeToHolders` against the same
+/// snapshot, kept separate so each action writes back one asset record. A
+/// holder whose balance moved below its snapshot since the record date
+/// fails the action: freeze the asset between snapshot and redemption. The
+/// recovered units are the issuer's to burn.
+pub fn apply_redemption<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    table: &CapTable,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    let mut staged = Staged::new(view);
+    let issuer = asset.issuer.clone();
+    for (holder, holding) in &table.holders {
+        staged.stage(&apply_forced_transfer(
+            &staged, asset, holder, &issuer, *holding,
+        )?)?;
+    }
+    asset.snapshot = None;
+    Ok(staged.into_updates()?)
+}
+
+/// `SplitAsset`: every snapshot holding `b` becomes `b * numerator /
+/// denominator`. Growth is minted straight to the holder (`apply_issue_to`,
+/// so the cap, issuance lock and the holder's compliance all apply — a split
+/// is uniform or it doesn't happen); shrinkage is forced back to the issuer's
+/// treasury, which it may then burn. The treasury itself is not scaled.
+pub fn apply_split<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    table: &CapTable,
+    numerator: u128,
+    denominator: u128,
+    current_height: u64,
+) -> Result<AssetBalanceUpdates, RwaError> {
+    let mut staged = Staged::new(view);
+    let issuer = asset.issuer.clone();
+    for (holder, holding) in &table.holders {
+        let scaled = holding
+            .checked_mul(numerator)
+            .map(|n: u128| n / denominator)
+            .ok_or_else(|| RwaError::ShareOverflow {
+                asset: asset.asset_ref.clone(),
+            })?;
+        let updates = if scaled > *holding {
+            apply_issue_to(&staged, asset, holder, scaled - holding, current_height)?
+        } else {
+            apply_forced_transfer(&staged, asset, holder, &issuer, holding - scaled)?
+        };
+        staged.stage(&updates)?;
+    }
+    asset.snapshot = None;
+    Ok(staged.into_updates()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -845,6 +1116,88 @@ mod tests {
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
         asset
+    }
+
+    /// Writes balances and the cap-table index the way a block commit would.
+    fn commit(db: &ArxiumDb, assets: &AssetBalanceUpdates) {
+        let index = db.asset_index_updates(&[], assets).unwrap();
+        db.write_batch(assets).unwrap();
+        db.write_batch(&index).unwrap();
+    }
+
+    /// One dividend, one split, one redemption, all off one record-date
+    /// snapshot: each is a loop of the existing movers over a staged view,
+    /// so the second move must see the first one's debit.
+    #[test]
+    fn corporate_actions_compose_from_the_movers_over_one_snapshot() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let (a, b, c) = (addr(2), addr(3), addr(4));
+        let mut bond = seeded_open_asset(&db, &issuer, 1_000);
+        let mut usd = Asset::new("usd", addr(9), true);
+        for who in [&issuer, &a, &b, &c] {
+            attest(&db, who, &[], None);
+        }
+        // 60 / 30 / 10 of the bond in circulation; the issuer's treasury
+        // holds 900 and is not a holder.
+        let mut balances = AssetBalanceUpdates(BTreeMap::new());
+        for (who, amount) in [(&a, 60), (&b, 30), (&c, 10)] {
+            balances.0.extend(
+                apply_forced_transfer(&db, &mut bond, &issuer, who, amount)
+                    .unwrap()
+                    .0,
+            );
+            db.write_batch(&balances).unwrap();
+        }
+        commit(&db, &balances);
+        let (_, usd_treasury) = apply_issue(&db, &mut usd, &addr(9), 0, 10_000).unwrap();
+        db.write_batch(&usd_treasury).unwrap();
+        commit(
+            &db,
+            &apply_forced_transfer(&db, &mut usd, &addr(9), &issuer, 1_000).unwrap(),
+        );
+
+        apply_snapshot(&db, &mut bond, 7).unwrap();
+        let table = bond.snapshot.clone().unwrap();
+        assert_eq!(table.total, 100);
+        assert_eq!(table.holders.len(), 3);
+
+        // Dividend of 1,000 USD: 600 / 300 / 100 — but `c` is frozen for USD,
+        // so its 100 is withheld and stays with the issuer.
+        db.write_batch(&apply_set_holder_frozen(&db, &usd, &c, true).unwrap())
+            .unwrap();
+        let paid = apply_distribution(&db, &mut usd, &issuer, &table, 1_000, 8).unwrap();
+        let bal = |who: &Address| paid.0.get(&(usd.asset_ref.clone(), who.clone())).copied();
+        assert_eq!(bal(&a), Some(600));
+        assert_eq!(bal(&b), Some(300));
+        assert_eq!(bal(&c), None);
+        assert_eq!(bal(&issuer), Some(100), "staged debits accumulate");
+        // An issuer short of the payout is the whole action's failure, not a
+        // withheld holder.
+        let err = apply_distribution(&db, &mut usd, &issuer, &table, 5_000, 8).unwrap_err();
+        assert!(
+            matches!(err, RwaError::InsufficientBalance { .. }),
+            "got: {err}"
+        );
+
+        // 3:2 split: 60/30/10 -> 90/45/15, minted, supply follows.
+        let split = apply_split(&db, &mut bond, &table, 3, 2, 8).unwrap();
+        let bal = |who: &Address| split.0.get(&(bond.asset_ref.clone(), who.clone())).copied();
+        assert_eq!((bal(&a), bal(&b), bal(&c)), (Some(90), Some(45), Some(15)));
+        assert_eq!(bond.total_supply, 1_050);
+        assert!(bond.snapshot.is_none(), "a split invalidates the snapshot");
+
+        // Redemption pulls every snapshot balance back to the treasury.
+        let redeemed = apply_redemption(&db, &mut bond, &table).unwrap();
+        let bal = |who: &Address| {
+            redeemed
+                .0
+                .get(&(bond.asset_ref.clone(), who.clone()))
+                .copied()
+        };
+        assert_eq!((bal(&a), bal(&b), bal(&c)), (Some(0), Some(0), Some(0)));
+        assert_eq!(bal(&issuer), Some(1_000));
+        assert_eq!(bond.holder_count, 0);
     }
 
     #[test]

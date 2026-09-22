@@ -388,6 +388,46 @@ pub enum ActionPayload {
     ExecuteProposal {
         proposal: u64,
     },
+    /// Issuer records the record-date cap table of `asset` on the asset
+    /// record (`Asset.snapshot`): every non-issuer holder and its balance as
+    /// of this block. The corporate actions below name it by height. One live
+    /// snapshot per asset; a new one replaces the old. Variant 36.
+    SnapshotHolders {
+        asset: AssetRef,
+    },
+    /// Dividend / coupon: pays `total` of `payout_asset` from the issuer's
+    /// balance to every holder in `asset`'s snapshot at `snapshot_height`,
+    /// pro rata to their snapshot balance, as compliant transfers of
+    /// `payout_asset`. Holders failing the payout asset's compliance are
+    /// withheld (their share stays with the issuer); dust from floor rounding
+    /// stays too. `payout_asset == asset` is a stock dividend. Variant 37.
+    DistributeToHolders {
+        asset: AssetRef,
+        snapshot_height: u64,
+        payout_asset: AssetRef,
+        total: u128,
+    },
+    /// Redemption / buyback at maturity: every snapshot balance of `asset`
+    /// forced back into the issuer's treasury (to burn, or not). The
+    /// proceeds are a `DistributeToHolders` against the same snapshot, sent
+    /// first. Freeze `asset` between snapshot and redemption — a holder
+    /// whose balance dropped below its snapshot fails the action. Clears
+    /// the snapshot. Variant 38.
+    RedeemHolders {
+        asset: AssetRef,
+        snapshot_height: u64,
+    },
+    /// Split (`numerator > denominator`) or consolidation: each snapshot
+    /// holding `b` becomes `b * numerator / denominator`. Growth is minted to
+    /// the holder under every issuance rule; shrinkage is forced back to the
+    /// issuer's treasury. The treasury itself is not scaled. Clears the
+    /// snapshot. Variant 39.
+    SplitAsset {
+        asset: AssetRef,
+        snapshot_height: u64,
+        numerator: u128,
+        denominator: u128,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -402,7 +442,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 36] = [
+        const EXPECTED: [&str; 40] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -439,6 +479,10 @@ mod tests {
             "SubmitProposal",
             "VoteProposal",
             "ExecuteProposal",
+            "SnapshotHolders",
+            "DistributeToHolders",
+            "RedeemHolders",
+            "SplitAsset",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

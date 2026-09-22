@@ -11,6 +11,7 @@ xc-primitives = { workspace = true }
 xc-circuit = { workspace = true }
 circuit-account = { workspace = true }
 circuit-identity = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

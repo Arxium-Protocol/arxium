@@ -266,6 +266,27 @@ pub struct Asset {
     /// `circuit-rwa-asset` wherever a balance crosses zero. The issuer's own
     /// treasury balance is not a holder for cap purposes.
     pub holder_count: u32,
+    /// The record-date cap table (`SnapshotHolders`, variant 36) that the
+    /// corporate actions (`DistributeToHolders`/`RedeemHolders`/`SplitAsset`)
+    /// pay or scale against. One live snapshot per asset; taking another
+    /// replaces it, and the actions that move the balances it describes
+    /// (redeem, split) clear it.
+    // ponytail: rides on the asset record, so every transfer of the asset
+    // rewrites it while it exists. Fine under `max_holders`-sized cap tables;
+    // give it its own merkleized key if snapshots of thousands of holders
+    // start showing up in transfer cost.
+    pub snapshot: Option<CapTable>,
+}
+
+/// A cap table frozen at `height`: every non-issuer holder with a positive
+/// balance, sorted by address, plus their sum. The issuer's treasury is not
+/// a holder here for the same reason it is not one in `holder_count` — it
+/// pays the dividend, it doesn't receive it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapTable {
+    pub height: u64,
+    pub total: u128,
+    pub holders: Vec<(Address, u128)>,
 }
 
 /// The issuer-supplied half of an `Asset`: everything `RegisterAsset` carries
@@ -321,6 +342,7 @@ impl Asset {
             max_balance_per_holder: None,
             max_attestation_age: None,
             holder_count: 0,
+            snapshot: None,
         }
     }
 
@@ -357,6 +379,7 @@ impl Asset {
             max_balance_per_holder: None,
             max_attestation_age: None,
             holder_count: 0,
+            snapshot: None,
         }
     }
 }

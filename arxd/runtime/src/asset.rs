@@ -3,7 +3,7 @@
 
 use xc_circuit::{AdminRole, AssetKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, Asset, AssetMetadata, AssetRef};
+use xc_primitives::{Address, Asset, AssetMetadata, AssetRef, CapTable};
 use xc_storage::StorageError;
 
 use crate::ChainAction;
@@ -513,6 +513,119 @@ pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
         assets,
         asset_registration: Some(asset),
         holder_states,
+        ..Default::default()
+    })
+}
+
+pub(crate) fn snapshot_holders<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    circuit_rwa_asset::apply_snapshot(view, &mut asset, current_height)?;
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+/// The snapshot the corporate action names, or a clean rejection: a stale
+/// height is the one mistake an issuer paying out weeks after the record
+/// date is most likely to make.
+fn snapshot_at(asset: &Asset, height: u64) -> anyhow::Result<CapTable> {
+    match &asset.snapshot {
+        Some(table) if table.height == height => Ok(table.clone()),
+        Some(table) => anyhow::bail!(
+            "{}'s snapshot is at height {}, not {height}",
+            asset.asset_ref,
+            table.height
+        ),
+        None => anyhow::bail!("{} has no holder snapshot", asset.asset_ref),
+    }
+}
+
+pub(crate) fn distribute<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    snapshot_height: u64,
+    payout_asset: &AssetRef,
+    total: u128,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let asset = require_issuer(view, action, asset)?;
+    let table = snapshot_at(&asset, snapshot_height)?;
+    if total == 0 || table.total == 0 {
+        anyhow::bail!("nothing to distribute");
+    }
+    // A stock dividend pays in the asset itself: one record, not two copies
+    // of it racing to be written back.
+    let mut payout = if payout_asset == &asset.asset_ref {
+        asset
+    } else {
+        resolve_asset(view, payout_asset)?
+    };
+    let assets = circuit_rwa_asset::apply_distribution(
+        view,
+        &mut payout,
+        &action.sender,
+        &table,
+        total,
+        current_height,
+    )?;
+    Ok(BlockUpdates {
+        assets,
+        asset_registration: Some(payout),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn redeem<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    snapshot_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    let table = snapshot_at(&asset, snapshot_height)?;
+    if table.total == 0 {
+        anyhow::bail!("nothing to redeem");
+    }
+    let assets = circuit_rwa_asset::apply_redemption(view, &mut asset, &table)?;
+    Ok(BlockUpdates {
+        assets,
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+pub(crate) fn split<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    snapshot_height: u64,
+    numerator: u128,
+    denominator: u128,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    if numerator == 0 || denominator == 0 {
+        anyhow::bail!("split ratio needs a positive numerator and denominator");
+    }
+    let table = snapshot_at(&asset, snapshot_height)?;
+    let assets = circuit_rwa_asset::apply_split(
+        view,
+        &mut asset,
+        &table,
+        numerator,
+        denominator,
+        current_height,
+    )?;
+    Ok(BlockUpdates {
+        assets,
+        asset_registration: Some(asset),
         ..Default::default()
     })
 }

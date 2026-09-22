@@ -343,7 +343,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `attestor_deregistrations` so an indexer can track attestors and BLS
 /// keys from effects alone; a version-15 effects row would otherwise fail
 /// to decode instead of answering 404.
-pub const SCHEMA_VERSION: u32 = 16;
+///
+/// Bumped 16 -> 17: `Asset` gained `snapshot` (the record-date cap table
+/// behind `SnapshotHolders`/`DistributeToHolders`/`RedeemHolders`/
+/// `SplitAsset`, variants 36–39). Positional bincode on a merkleized
+/// `asset_record:` row — devnet reset.
+pub const SCHEMA_VERSION: u32 = 17;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -952,8 +957,16 @@ impl ArxiumDb {
             by_asset.entry(asset).or_default().push((owner, *balance));
         }
         for (asset, rows) in by_asset {
-            let mut holders = self.get_asset_holders(asset)?;
-            let before = holders.clone();
+            // A pre-index asset (no row yet) gets its backfilled list
+            // written even when this block changes nothing in it, so the
+            // consensus readers of the row (`circuit_rwa_asset::apply_snapshot`)
+            // stop depending on the scan fallback.
+            let indexed = KvRead::get(self, &AssetHoldersKey(asset))?;
+            let mut holders = match &indexed {
+                Some(holders) => holders.clone(),
+                None => self.get_asset_holders(asset)?,
+            };
+            let before = indexed;
             for (owner, balance) in rows {
                 let listed = holders.iter().position(|h| h == owner);
                 match (listed, balance > 0) {
@@ -964,7 +977,7 @@ impl ArxiumDb {
                     _ => {}
                 }
             }
-            if holders != before {
+            if before.as_ref() != Some(&holders) {
                 updates.holders.insert(asset.clone(), holders);
             }
         }

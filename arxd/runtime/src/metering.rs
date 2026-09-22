@@ -64,6 +64,13 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         | LockIssuance { .. }
         | TransferIssuer { .. }
         | SetAssetMetadataUri { .. } => 100,
+        // ponytail: flat, though the real cost is one move per snapshot
+        // holder. Weight must be a pure function of the action, so a
+        // per-holder term would need the count carried in the payload.
+        SnapshotHolders { .. }
+        | DistributeToHolders { .. }
+        | RedeemHolders { .. }
+        | SplitAsset { .. } => 1_000,
         // A validator-set read plus one or two governance rows.
         SubmitProposal { .. } | VoteProposal { .. } | ExecuteProposal { .. } => 150,
         // Two block-signature verifies plus the slash.

@@ -611,6 +611,41 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::ExecuteProposal { proposal } => {
             governance::execute(view, *proposal, current_height)
         }
+        ActionPayload::SnapshotHolders { asset } => {
+            asset::snapshot_holders(view, action, asset, current_height)
+        }
+        ActionPayload::DistributeToHolders {
+            asset,
+            snapshot_height,
+            payout_asset,
+            total,
+        } => asset::distribute(
+            view,
+            action,
+            asset,
+            *snapshot_height,
+            payout_asset,
+            *total,
+            current_height,
+        ),
+        ActionPayload::RedeemHolders {
+            asset,
+            snapshot_height,
+        } => asset::redeem(view, action, asset, *snapshot_height),
+        ActionPayload::SplitAsset {
+            asset,
+            snapshot_height,
+            numerator,
+            denominator,
+        } => asset::split(
+            view,
+            action,
+            asset,
+            *snapshot_height,
+            *numerator,
+            *denominator,
+            current_height,
+        ),
         ActionPayload::SubmitExecutionFault { artifact_json } => consensus::submit_execution_fault(
             view,
             artifact_json,
