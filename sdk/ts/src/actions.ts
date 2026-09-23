@@ -7,6 +7,7 @@ export const ACTION_VARIANT = {
   registerAsset: 12, issueAsset: 13, transferAsset: 14, freezeAsset: 18, unfreezeAsset: 19,
   burnAsset: 21, setHolderFrozen: 22, lockHolderAmount: 23, unlockHolderAmount: 24,
   issuerForcedTransfer: 25, recoverHolder: 26, issueAssetTo: 27,
+  setAssetLimits: 31,
 } as const;
 const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5 } as const;
 const TOPIC = { kyc: 0, aml: 1, accredited: 2, jurisdiction: 3 } as const;
@@ -35,6 +36,8 @@ export function encodeLockHolderAmount(asset: string, holder: string, amount: bi
 export function encodeIssuerForcedTransfer(asset: string, from: string, to: string, amount: bigint, reason: string): Uint8Array { return new Writer().varint(ACTION_VARIANT.issuerForcedTransfer).string(asset).string(from).string(to).varint(amount).string(reason).bytes(); }
 export function encodeRecoverHolder(asset: string, lost: string, replacement: string): Uint8Array { return new Writer().varint(ACTION_VARIANT.recoverHolder).string(asset).string(lost).string(replacement).bytes(); }
 export function encodeIssueAssetTo(asset: string, to: string, amount: bigint): Uint8Array { return new Writer().varint(ACTION_VARIANT.issueAssetTo).string(asset).string(to).varint(amount).bytes(); }
+/** Sets issuer-controlled investor, concentration, and attestation-age limits. `null` clears each limit. */
+export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
 export function signingBytes(sender: string, nonce: number | bigint, payload: Uint8Array): Uint8Array { return new Writer().string(sender).varint(nonce).raw(payload).bytes(); }
 export async function signAction(privateKey: CryptoKey, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return toHex(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, asBuffer(signingBytes(sender, nonce, payload))))); }
 export type SignedAction = { sender: string; nonce: number; signature: string; payload: number[] };
