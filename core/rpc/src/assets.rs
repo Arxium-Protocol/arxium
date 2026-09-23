@@ -24,6 +24,7 @@ pub(super) struct AssetHolderRow {
     balance: u128,
     frozen: bool,
     frozen_amount: u128,
+    attested_at: Option<u64>,
 }
 
 /// The cap table — every address with a non-zero balance (from the
@@ -39,11 +40,16 @@ pub(super) async fn get_asset_holders<P: Payload>(
     for address in holders {
         let balance = state.db.get_asset_balance(&asset_ref, &address)?;
         let holder_state = state.db.get_holder_state(&asset_ref, &address)?;
+        let attested_at = state
+            .db
+            .get_account(&address)?
+            .and_then(|account| account.attested_at);
         rows.push(AssetHolderRow {
             address,
             balance,
             frozen: holder_state.frozen,
             frozen_amount: holder_state.frozen_amount,
+            attested_at,
         });
     }
     Ok(Json(rows))

@@ -1346,7 +1346,7 @@ mod tests {
     /// the alias route derives the ref for an unclaimed slug.
     #[test]
     fn asset_endpoints_resolve_by_ref_not_slug() {
-        use xc_storage::AssetBalanceUpdates;
+        use xc_storage::{AccountUpdates, AssetBalanceUpdates};
 
         async fn json(resp: Response) -> serde_json::Value {
             let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -1375,6 +1375,14 @@ mod tests {
                 .db
                 .write_batches(&[&alice_gold, &bob_gold, &balances, &index])
                 .unwrap();
+            let accounts = AccountUpdates(BTreeMap::from([(
+                bob.clone(),
+                xc_primitives::AccountEntry {
+                    attested_at: Some(123),
+                    ..Default::default()
+                },
+            )]));
+            state.db.write_batch(&accounts).unwrap();
 
             let resp = get_asset(State(state.clone()), Path(alice_gold.asset_ref.to_string()))
                 .await
@@ -1387,6 +1395,19 @@ mod tests {
             assert_eq!(body["issuer"], alice.to_string());
             assert_eq!(body["issuer_attested"], false);
             assert_eq!(body["holders"], 1);
+
+            let holders = match get_asset_holders::<TestPayload>(
+                State(state.clone()),
+                Path(alice_gold.asset_ref.to_string()),
+            )
+            .await
+            {
+                Ok(response) => response.0,
+                Err(_) => panic!("asset holders request failed"),
+            };
+            let holders = serde_json::to_value(holders).unwrap();
+            assert_eq!(holders[0]["address"], bob.to_string());
+            assert_eq!(holders[0]["attested_at"], 123);
 
             // The slug is not a route: a non-ref path segment is a 400.
             let resp = get_asset(State(state.clone()), Path("gold".into()))
