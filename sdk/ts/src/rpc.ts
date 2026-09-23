@@ -1,7 +1,6 @@
 import { signAction, signingBytes, submitBody, type SignedAction } from "./actions.js";
 import { decodeAddress } from "./bech32.js";
-import { fromHex } from "./bincode.js";
-const asBuffer = (bytes: Uint8Array): ArrayBuffer => bytes.slice().buffer as ArrayBuffer;
+import { asBuffer, fromHex } from "./bincode.js";
 
 export type RpcOptions = { rpc: string; token?: string; fetch?: typeof globalThis.fetch };
 export type ActionStatus = { status: "pending" } | { status: "confirmed"; height: number; block_hash: string; sender: string; nonce: number } | { status: "dropped"; reason: string } | { status: "unknown" };
@@ -12,7 +11,7 @@ export class ArxiumRpc {
   readonly rpc: string;
   private readonly token?: string;
   private readonly requestFetch: typeof globalThis.fetch;
-  constructor(options: RpcOptions) { this.rpc = options.rpc.replace(/\/+$/, ""); this.token = options.token; this.requestFetch = options.fetch ?? globalThis.fetch; }
+  constructor(options: RpcOptions) { this.rpc = options.rpc.replace(/\/+$/, ""); this.token = options.token; this.requestFetch = options.fetch ?? ((input, init) => globalThis.fetch(input, init)); } // browsers and Workers throw "Illegal invocation" if fetch is called with `this` = ArxiumRpc
   private async request<T>(path: string, init?: RequestInit): Promise<T> { const response = await this.requestFetch(`${this.rpc}${path}`, { ...init, headers: { ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}), ...init?.headers } }); const text = await response.text(); if (!response.ok) throw new RpcError(response.status, text || `${response.status} ${response.statusText}`); return text ? JSON.parse(text) as T : undefined as T; }
   status<T = Record<string, unknown>>(): Promise<T> { return this.request("/status"); }
   account<T = Record<string, unknown>>(address: string): Promise<T> { return this.request(`/accounts/${encodeURIComponent(address)}`); }

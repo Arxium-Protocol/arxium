@@ -1,5 +1,4 @@
-import { Writer, toHex } from "./bincode.js";
-const asBuffer = (bytes: Uint8Array): ArrayBuffer => bytes.slice().buffer as ArrayBuffer;
+import { Writer, asBuffer, toHex } from "./bincode.js";
 
 /** These indices are ActionPayload's positional bincode discriminants. Never derive them. */
 export const ACTION_VARIANT = {

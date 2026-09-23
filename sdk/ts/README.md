@@ -4,18 +4,21 @@ TypeScript SDK and `arx` CLI for the private Arxium network. It has zero runtime
 
 ## Install
 
-Create `.npmrc` with a GitHub Packages token that has `read:packages` access to `Arxium-Protocol`:
-
-```ini
-@arxium-protocol:registry=https://npm.pkg.github.com
-//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}
-```
-
-Then install the private package:
+Until mainnet the package isn't on any registry. Consumers commit the packed tarball and depend on it as a file:
 
 ```sh
-npm install @arxium-protocol/sdk
+# release checks (what .github/workflows/sdk.yml runs)
+cd Arxium && cargo test -p arxd-runtime writes_typescript_signed_action_fixtures && git diff --exit-code sdk/ts/fixtures
+cd sdk/ts && npm test
+# pack into the consumer, e.g. Console
+npm pack --pack-destination ../../../Console/vendor
 ```
+
+```json
+"@arxium-protocol/sdk": "file:vendor/arxium-protocol-sdk-0.1.0.tgz"
+```
+
+For a new version: bump `version` here, pack, update the file name in the consumer's `package.json`, run `npm install`, and delete the old tarball.
 
 ## SDK quickstart
 
@@ -58,9 +61,10 @@ Global configuration: `--rpc`, `--token`, `--key`, and `--json` have `ARX_RPC`, 
 arx keys new
 arx keys import --file arxium-devnet-key-abc.json
 printf '%s' "$SEED_HEX" | arx keys import
-arx keys show --key arxium-devnet-key-abc.json
+arx keys show --key arxium-devnet-key-abc.json   # no passphrase needed
 
-arx sign transfer arx1recipient 1500000000 --key key.json
+arx sign transfer arx1recipient 1500000000 --key key.json             # nonce fetched from --rpc
+arx sign transfer arx1recipient 1500000000 --key key.json --nonce 7   # fully offline
 arx submit signed-action.json
 arx send transfer arx1recipient 1500000000 --key key.json
 

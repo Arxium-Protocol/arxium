@@ -8,7 +8,7 @@ const U128_MAX = (1n << 128n) - 1n;
 export class Writer {
   private chunks: number[] = [];
   bytes(): Uint8Array { return Uint8Array.from(this.chunks); }
-  raw(bytes: Uint8Array | number[]): this { this.chunks.push(...bytes); return this; }
+  raw(bytes: Uint8Array | number[]): this { for (const byte of bytes) this.chunks.push(byte); return this; } // not push(...bytes): spreading overflows the call stack past ~100k bytes
   u8(value: number): this {
     if (!Number.isInteger(value) || value < 0 || value > 255) throw new RangeError(`u8 out of range: ${value}`);
     this.chunks.push(value); return this;
@@ -28,5 +28,7 @@ export class Writer {
   option<T>(value: T | null | undefined, write: (writer: Writer, value: T) => void): this { if (value == null) return this.u8(0); this.u8(1); write(this, value); return this; }
   vec<T>(values: readonly T[], write: (writer: Writer, value: T) => void): this { this.varint(values.length); for (const value of values) write(this, value); return this; }
 }
+/** A fresh ArrayBuffer holding exactly `bytes`. Not `bytes.slice().buffer`: Node's Buffer.slice() is a view, so `.buffer` would be the whole shared pool. */
+export const asBuffer = (bytes: Uint8Array): ArrayBuffer => new Uint8Array(bytes).buffer;
 export function toHex(bytes: Uint8Array): string { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
 export function fromHex(hex: string): Uint8Array { if (hex.length % 2 || !/^[0-9a-f]*$/i.test(hex)) throw new Error("invalid hex"); return Uint8Array.from(hex.match(/../g)?.map((byte) => Number.parseInt(byte, 16)) ?? []); }
