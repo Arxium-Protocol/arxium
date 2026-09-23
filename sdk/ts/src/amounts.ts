@@ -1,0 +1,3 @@
+export const IUM_PER_ARX = 1_000_000_000n;
+export function arxToIum(value: string): bigint { if (!/^(0|[1-9]\d*)(\.\d{1,9})?$/.test(value)) throw new Error("amount must be a non-negative decimal with at most 9 places"); const [whole, fraction = ""] = value.split("."); return BigInt(whole) * IUM_PER_ARX + BigInt((fraction + "000000000").slice(0, 9)); }
+export function iumToArx(value: bigint): string { if (value < 0n) throw new RangeError("amount cannot be negative"); const whole = value / IUM_PER_ARX, fraction = (value % IUM_PER_ARX).toString().padStart(9, "0").replace(/0+$/, ""); return fraction ? `${whole}.${fraction}` : whole.toString(); }

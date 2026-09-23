@@ -1347,3 +1347,346 @@ mod client_signing_vectors {
     const SET_ASSET_METADATA_URI_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021e436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a7565783671653837337161010c697066733a2f2f7465726d73";
     const ISSUE_ASSET_TO_VECTOR: &str = "3e61727831333279773868743570386365746c326a6d766b6e65776a6177743978777a646c726b327079786c6e776a797172647130646177716171366c737a021b436172786173736574317a3864346a743879743078746a6d366c766b38756d633972656c6567727771347875393238657178796a6663736e6a75657836716538373371613e617278317379756877723467303574343734347232336e76786e7237656e39636d7a35336b6e687230676a6137633834687237666b7732717067686a6b35fbe803";
 }
+
+/// Golden action fixtures consumed by the TypeScript SDK tests. They are
+/// generated from the runtime's actual bincode and signing implementations.
+#[cfg(test)]
+mod sdk_golden_fixtures {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::{Value, json};
+    use std::fs;
+    use xc_primitives::{AssetClass, AssetMetadata, AssetRef, ClaimTopic};
+
+    fn fixture(
+        name: &str,
+        input: Value,
+        sender: &Address,
+        key: &SigningKey,
+        nonce: u64,
+        payload: ActionPayload,
+    ) -> Value {
+        let mut action = Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload,
+        };
+        let signing_bytes = action.signing_bytes();
+        let signature = key.sign(&signing_bytes);
+        action.signature = Some(hex::encode(signature.to_bytes()));
+        action
+            .verify_signature()
+            .expect("generated signature verifies");
+        json!({
+            "name": name,
+            "input": input,
+            "sender": sender.to_string(),
+            "nonce": nonce,
+            "payload": hex::encode(bincode::serde::encode_to_vec(&action.payload, xc_primitives::wire_config()).unwrap()),
+            "signing_bytes": hex::encode(signing_bytes),
+            "signature": action.signature,
+        })
+    }
+
+    #[test]
+    fn writes_typescript_signed_action_fixtures() {
+        let seed = [7u8; 32];
+        let key = SigningKey::from_bytes(&seed);
+        let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let recipient = Address::from_pubkey_bytes(
+            SigningKey::from_bytes(&[8u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let validator = Address::from_pubkey_bytes(
+            SigningKey::from_bytes(&[9u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let asset = AssetRef::derive(&sender, "gold").unwrap();
+        let bls_pubkey = test_support::test_bls_pubkey(3);
+        let bls_pop = test_support::test_bls_pop(3);
+        let nonce = 42;
+        let amount = 1_000_000u128;
+        let metadata = AssetMetadata {
+            asset_class: AssetClass::Bond,
+            decimals: 6,
+            required_claims: vec![ClaimTopic::Kyc, ClaimTopic::Accredited],
+            allowed_jurisdictions: Some(vec!["CH".into(), "DE".into()]),
+            max_supply: Some(1_000_000),
+            metadata_uri: Some("ipfs://gold".into()),
+            symbol: "GOLD".into(),
+            name: "Gold Bond".into(),
+        };
+        let b = |bytes: &[u8]| Value::Array(bytes.iter().map(|byte| json!(byte)).collect());
+        let fixtures = vec![
+            fixture(
+                "transfer",
+                json!({"to": recipient, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Transfer {
+                    to: recipient.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "joinValidator",
+                json!({"validator": validator, "stake": amount.to_string(), "blsPubkey": b(&bls_pubkey), "blsPop": b(&bls_pop)}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::JoinValidator {
+                    validator: validator.clone(),
+                    stake: amount,
+                    bls_pubkey: bls_pubkey.clone(),
+                    bls_pop: bls_pop.clone(),
+                },
+            ),
+            fixture(
+                "leaveValidator",
+                json!({"validator": validator}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::LeaveValidator {
+                    validator: validator.clone(),
+                },
+            ),
+            fixture(
+                "stake",
+                json!({"validator": validator, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Stake {
+                    validator: validator.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "unstake",
+                json!({"validator": validator, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Unstake {
+                    validator: validator.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "registerBlsKey",
+                json!({"validator": validator, "pubkey": b(&bls_pubkey), "pop": b(&bls_pop)}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::RegisterBlsKey {
+                    validator: validator.clone(),
+                    pubkey: bls_pubkey.clone(),
+                    pop: bls_pop.clone(),
+                },
+            ),
+            fixture(
+                "authorizeOperator",
+                json!({"operator": recipient}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::AuthorizeOperator {
+                    operator: recipient.clone(),
+                },
+            ),
+            fixture(
+                "revokeOperator",
+                json!({}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::RevokeOperator,
+            ),
+            fixture(
+                "grantAttestation",
+                json!({"subject": recipient, "hash": "identity-hash", "topics": ["kyc", "accredited"], "jurisdiction": "CH"}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::GrantAttestation {
+                    subject: recipient.clone(),
+                    hash: "identity-hash".into(),
+                    topics: vec![ClaimTopic::Kyc, ClaimTopic::Accredited],
+                    jurisdiction: Some("CH".into()),
+                },
+            ),
+            fixture(
+                "revokeAttestation",
+                json!({"subject": recipient}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::RevokeAttestation {
+                    subject: recipient.clone(),
+                },
+            ),
+            fixture(
+                "registerAsset",
+                json!({"assetId": "gold", "complianceRequired": true, "metadata": {"asset_class": "bond", "decimals": 6, "required_claims": ["kyc", "accredited"], "allowed_jurisdictions": ["CH", "DE"], "max_supply": "1000000", "metadata_uri": "ipfs://gold", "symbol": "GOLD", "name": "Gold Bond"}}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::RegisterAsset {
+                    asset_id: "gold".into(),
+                    compliance_required: true,
+                    metadata,
+                },
+            ),
+            fixture(
+                "issueAsset",
+                json!({"asset": asset, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::IssueAsset {
+                    asset: asset.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "transferAsset",
+                json!({"asset": asset, "to": recipient, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::TransferAsset {
+                    asset: asset.clone(),
+                    to: recipient.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "freezeAsset",
+                json!({"asset": asset, "frozen": true, "reason": "court-order"}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::FreezeAsset {
+                    asset: asset.clone(),
+                    reason: "court-order".into(),
+                },
+            ),
+            fixture(
+                "unfreezeAsset",
+                json!({"asset": asset, "frozen": false, "reason": "court-order"}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::UnfreezeAsset {
+                    asset: asset.clone(),
+                    reason: "court-order".into(),
+                },
+            ),
+            fixture(
+                "burnAsset",
+                json!({"asset": asset, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::BurnAsset {
+                    asset: asset.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "setHolderFrozen",
+                json!({"asset": asset, "holder": recipient, "frozen": true}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::SetHolderFrozen {
+                    asset: asset.clone(),
+                    holder: recipient.clone(),
+                    frozen: true,
+                },
+            ),
+            fixture(
+                "lockHolderAmount",
+                json!({"asset": asset, "holder": recipient, "amount": amount.to_string(), "lock": true}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::LockHolderAmount {
+                    asset: asset.clone(),
+                    holder: recipient.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "unlockHolderAmount",
+                json!({"asset": asset, "holder": recipient, "amount": amount.to_string(), "lock": false}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::UnlockHolderAmount {
+                    asset: asset.clone(),
+                    holder: recipient.clone(),
+                    amount,
+                },
+            ),
+            fixture(
+                "issuerForcedTransfer",
+                json!({"asset": asset, "from": recipient, "to": sender, "amount": amount.to_string(), "reason": "court-order"}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::IssuerForcedTransfer {
+                    asset: asset.clone(),
+                    from: recipient.clone(),
+                    to: sender.clone(),
+                    amount,
+                    reason: "court-order".into(),
+                },
+            ),
+            fixture(
+                "recoverHolder",
+                json!({"asset": asset, "lost": recipient, "replacement": sender}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::RecoverHolder {
+                    asset: asset.clone(),
+                    lost: recipient.clone(),
+                    replacement: sender.clone(),
+                },
+            ),
+            fixture(
+                "issueAssetTo",
+                json!({"asset": asset, "to": recipient, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::IssueAssetTo {
+                    asset,
+                    to: recipient,
+                    amount,
+                },
+            ),
+        ];
+        let document = json!({
+            "private_key_seed": hex::encode(seed),
+            "public_key": hex::encode(key.verifying_key().as_bytes()),
+            "fixtures": fixtures,
+        });
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/ts/fixtures/signed-actions.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            path,
+            format!("{}\n", serde_json::to_string_pretty(&document).unwrap()),
+        )
+        .unwrap();
+    }
+}
