@@ -189,3 +189,40 @@ tests:
               severity: warning
             exp_annotations:
               summary: "1500 actions have been pending for at least 5 minutes"
+
+  # Retracer DB growing 72 MB/h from 1 GB: projected ~13.6 GB in a week,
+  # over the 12 GB budget (and under the old 20 GB placeholder, which is
+  # exactly the case the placeholder missed).
+  - interval: 10m
+    input_series:
+      - series: 'retracer_database_size_bytes'
+        values: '1e9+12e6x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: RetracerDiskGrowth
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Retracer's database is projected to exceed its disk budget within a week"
+              description: "Linear projection of retracer_database_size_bytes over the last 6 hours crosses the 12 GB budget within the next 7 days. The database shares the root disk with the node's chain data.\n"
+
+  # Slow growth (30 MB/h) projects to ~6 GB: must stay quiet.
+  - interval: 10m
+    input_series:
+      - series: 'retracer_database_size_bytes'
+        values: '1e9+5e6x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: RetracerDiskGrowth
+        exp_alerts: []
+
+  # A flat database (today's ~110 MiB) must stay quiet.
+  - interval: 10m
+    input_series:
+      - series: 'retracer_database_size_bytes'
+        values: '110e6x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: RetracerDiskGrowth
+        exp_alerts: []
