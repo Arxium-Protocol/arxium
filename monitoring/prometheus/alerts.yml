@@ -117,10 +117,12 @@ groups:
             seconds behind wall-clock time for five minutes, even though
             retracer_blocks_behind may still read zero.
 
-      # The 20 GB budget is a placeholder — set it to this host's actual
-      # disk allowance for the Postgres volume before trusting this alert.
+      # Budget: 12 GB. Retracer's Postgres shares VPS A's 40 GB root disk
+      # with the node's chain data, so the old 20 GB placeholder equalled
+      # all the free space: by the time it fired, the disk was already gone.
+      # 12 GB leaves room to react.
       - alert: RetracerDiskGrowth
-        expr: predict_linear(retracer_database_size_bytes[6h], 7 * 24 * 3600) > 20e9
+        expr: predict_linear(retracer_database_size_bytes[6h], 7 * 24 * 3600) > 12e9
         for: 30m
         labels:
           severity: warning
@@ -128,4 +130,5 @@ groups:
           summary: "Retracer's database is projected to exceed its disk budget within a week"
           description: >
             Linear projection of retracer_database_size_bytes over the last
-            6 hours crosses the configured budget within the next 7 days.
+            6 hours crosses the 12 GB budget within the next 7 days. The
+            database shares the root disk with the node's chain data.
