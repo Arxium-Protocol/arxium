@@ -46,6 +46,8 @@ mod validators;
 use validators::*;
 mod blocks;
 use blocks::*;
+mod identity;
+use identity::*;
 
 /// `Address::parse`, mapped to the 400 every handler already gave it.
 fn parse_address(s: &str) -> Result<Address, ApiError> {
@@ -125,6 +127,7 @@ struct AppState<P: Payload> {
     // / `write_disagreement_artifact`). `GET /evidence*` just lists/serves this
     // directory's contents — no separate storage of its own.
     evidence_dir: PathBuf,
+    identity_roots: Arc<Mutex<IdentityRoots>>,
 }
 
 /// Fixed window, per-IP, in this process's memory only. Deliberately a
@@ -372,6 +375,7 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
         pairing: Arc::new(PairingStore::new()),
         fee_hints,
         evidence_dir,
+        identity_roots: Arc::new(Mutex::new(IdentityRoots::default())),
     };
 
     thread::spawn(move || {
@@ -415,6 +419,12 @@ pub fn spawn_http_ingest<P: Payload>(config: IngestConfig<P>) -> Result<()> {
                 .route("/assets/{asset_ref}/holders", get(get_asset_holders::<P>))
                 .route("/attestors", get(get_attestors::<P>))
                 .route("/attestors/{address}", get(get_attestor::<P>))
+                .route("/identity/verify", post(verify_identity::<P>))
+                .route("/identity/scope", get(identity_scope::<P>))
+                .route("/identity/context", get(identity_context::<P>))
+                .route("/identity/group/validate", post(validate_group::<P>))
+                .route("/identity/root", get(identity_root::<P>))
+                .route("/identity/leaves", get(identity_leaves::<P>))
                 .route("/validators", get(get_validators::<P>))
                 .route("/validators/{address}", get(get_validator::<P>))
                 .route("/validators/{address}/proof", get(get_validator_proof::<P>))
@@ -788,11 +798,11 @@ mod tests {
     use xc_primitives::{AccountEntry, HolderState, Snapshot};
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
-    enum TestPayload {
+    pub(super) enum TestPayload {
         Transfer { to: Address, amount: u128 },
     }
 
-    fn test_state() -> AppState<TestPayload> {
+    pub(super) fn test_state() -> AppState<TestPayload> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -821,6 +831,7 @@ mod tests {
             pairing: Arc::new(PairingStore::new()),
             fee_hints: None,
             evidence_dir: dir.join("evidence"),
+            identity_roots: Arc::new(Mutex::new(IdentityRoots::default())),
         }
     }
 

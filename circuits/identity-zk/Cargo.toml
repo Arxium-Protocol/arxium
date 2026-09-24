@@ -14,6 +14,7 @@ ark-snark = { workspace = true }
 ark-ff = { workspace = true }
 ark-std = { workspace = true }
 ark-serialize = { workspace = true }
+sha2 = { workspace = true }
 
 [[example]]
 name = "generate_keys"

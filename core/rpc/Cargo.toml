@@ -26,13 +26,18 @@ xc-circuit = { workspace = true }
 xc-poe = { workspace = true }
 xc-artifact = { workspace = true }
 circuit-rwa-asset = { workspace = true }
+circuit-identity-zk = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
-ed25519-dalek = { workspace = true }
 # Only to construct BLS types in tests — xc-storage already exposes them in
 # its public API (BlsKeyRegistration, FinalityRecord).
 xc-bls = { workspace = true }
 tower = { workspace = true }
+ark-std = { workspace = true }
 
 [lints]
 workspace = true

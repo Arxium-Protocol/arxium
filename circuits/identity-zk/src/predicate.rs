@@ -1,0 +1,444 @@
+//! Claim proof against a live anonymity root. An extra `age_cutoff_days`
+//! public input carries the exact Gregorian date N years before `today_days`;
+//! the node must derive it, never trust a wallet-supplied value. A constant
+//! N*365 cutoff would incorrectly admit under-age users around leap years.
+
+use super::*;
+use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
+use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget};
+use ark_r1cs_std::boolean::Boolean;
+use ark_r1cs_std::fields::FieldVar;
+use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
+use ark_r1cs_std::prelude::{UInt16, UInt32};
+use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+use ark_snark::SNARK;
+use std::cmp::Ordering;
+
+pub const KYC: u32 = 1;
+pub const AML: u32 = 2;
+pub const ACCREDITED: u32 = 4;
+pub const AGE: u32 = 8;
+pub const RESIDENCY: u32 = 16;
+pub const MEMBERSHIP: u32 = 32;
+
+#[derive(Clone, Copy)]
+pub struct Public {
+    pub sub: Fr,
+    pub scope: Fr,
+    pub nonce: Fr,
+    pub claims_mask: u32,
+    pub age_n: u32,
+    pub country_set_hash: Fr,
+    pub group_root: Fr,
+    pub merkle_root: Fr,
+    pub today_days: u32,
+    pub age_cutoff_days: u32,
+}
+
+impl Public {
+    pub fn inputs(&self) -> Vec<Fr> {
+        vec![
+            self.sub,
+            self.scope,
+            self.nonce,
+            Fr::from(self.claims_mask),
+            Fr::from(self.age_n),
+            self.country_set_hash,
+            self.group_root,
+            self.merkle_root,
+            Fr::from(self.today_days),
+            Fr::from(self.age_cutoff_days),
+        ]
+    }
+}
+
+#[derive(Clone)]
+pub struct Witness {
+    pub id_secret: Fr,
+    pub opening: CredentialOpening,
+    pub leaf_path: [Fr; ATTESTED_TREE_DEPTH],
+    pub leaf_index: u32,
+    pub membership_path: [Fr; ATTESTED_TREE_DEPTH],
+    pub membership_index: u32,
+    /// Ten sorted, deduplicated country codes, padded with zeros.
+    pub countries: [u16; 10],
+}
+
+#[derive(Clone)]
+pub struct PredicateCircuit {
+    pub params: PoseidonConfig<Fr>,
+    pub public: Option<Public>,
+    pub witness: Option<Witness>,
+}
+
+impl ConstraintSynthesizer<Fr> for PredicateCircuit {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> ark_relations::gr1cs::Result<()> {
+        let p = self.public;
+        let w = self.witness;
+        let input = |value: Option<Fr>| {
+            FpVar::new_input(cs.clone(), || {
+                value.ok_or(SynthesisError::AssignmentMissing)
+            })
+        };
+        let sub = input(p.map(|p| p.sub))?;
+        let scope = input(p.map(|p| p.scope))?;
+        let nonce = input(p.map(|p| p.nonce))?;
+        let mask = input(p.map(|p| Fr::from(p.claims_mask)))?;
+        let age = input(p.map(|p| Fr::from(p.age_n)))?;
+        let countries_hash = input(p.map(|p| p.country_set_hash))?;
+        let group_root = input(p.map(|p| p.group_root))?;
+        let root = input(p.map(|p| p.merkle_root))?;
+        let today = input(p.map(|p| Fr::from(p.today_days)))?;
+        let cutoff = input(p.map(|p| Fr::from(p.age_cutoff_days)))?;
+        let secret = FpVar::new_witness(cs.clone(), || {
+            w.as_ref()
+                .map(|w| w.id_secret)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let nonce_copy = FpVar::new_witness(cs.clone(), || {
+            p.map(|p| p.nonce).ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        nonce_copy.enforce_equal(&nonce)?;
+
+        let flags: Vec<Boolean<Fr>> = (0..6)
+            .map(|bit| {
+                Boolean::new_witness(cs.clone(), || {
+                    p.map(|p| p.claims_mask & (1 << bit) != 0)
+                        .ok_or(SynthesisError::AssignmentMissing)
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let combined = flags
+            .iter()
+            .enumerate()
+            .fold(FpVar::constant(Fr::from(0u64)), |sum, (i, flag)| {
+                sum + FpVar::from(flag.clone()) * Fr::from(1u64 << i)
+            });
+        combined.enforce_equal(&mask)?;
+        let requested = flags.iter().fold(Boolean::FALSE, |acc, flag| &acc | flag);
+
+        let params = CRHParametersVar::new_constant(cs.clone(), self.params)?;
+        let id_commitment = CRHGadget::<Fr>::evaluate(&params, &[secret.clone()])?;
+        CRHGadget::<Fr>::evaluate(&params, &[secret, scope])?.enforce_equal(&sub)?;
+        let opening = w.as_ref().map(|w| &w.opening);
+        let flag =
+            |f: fn(&CredentialOpening) -> bool| -> ark_relations::gr1cs::Result<Boolean<Fr>> {
+                Boolean::new_witness(cs.clone(), || {
+                    opening.map(f).ok_or(SynthesisError::AssignmentMissing)
+                })
+            };
+        let kyc = flag(|o| o.kyc)?;
+        let aml = flag(|o| o.aml)?;
+        let accredited = flag(|o| o.accredited)?;
+        for (need, has) in [
+            (&flags[0], &kyc),
+            (&flags[1], &aml),
+            (&flags[2], &accredited),
+        ] {
+            (need & &!has).enforce_equal(&Boolean::FALSE)?;
+        }
+        let birth_bits = UInt32::<Fr>::new_witness(cs.clone(), || {
+            opening
+                .map(|o| o.birth_date_days)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let expiry_bits = UInt32::<Fr>::new_witness(cs.clone(), || {
+            opening
+                .map(|o| o.expiry_days)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let country_bits = UInt16::<Fr>::new_witness(cs.clone(), || {
+            opening
+                .map(|o| u16::from_be_bytes(o.country_code))
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let birth = Boolean::le_bits_to_fp(&birth_bits.to_bits_le()?)?;
+        let expiry = Boolean::le_bits_to_fp(&expiry_bits.to_bits_le()?)?;
+        let country = Boolean::le_bits_to_fp(&country_bits.to_bits_le()?)?;
+        let membership_root = FpVar::new_witness(cs.clone(), || {
+            opening
+                .map(|o| o.membership_root)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let salt = FpVar::new_witness(cs.clone(), || {
+            opening
+                .map(|o| o.salt)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let leaf = CRHGadget::<Fr>::evaluate(
+            &params,
+            &[
+                FpVar::constant(Fr::from(1u64)),
+                id_commitment.clone(),
+                FpVar::from(kyc),
+                FpVar::from(aml),
+                FpVar::from(accredited),
+                birth.clone(),
+                country.clone(),
+                membership_root.clone(),
+                expiry.clone(),
+                salt,
+            ],
+        )?;
+
+        let path = w.as_ref().map(|w| &w.leaf_path);
+        let index = w.as_ref().map(|w| w.leaf_index);
+        let computed = merkle_gadget(cs.clone(), &params, leaf, path, index)?;
+        ((computed - root) * FpVar::from(requested.clone())).enforce_equal(&FpVar::zero())?;
+
+        let live = expiry.is_cmp(&today, Ordering::Greater, true)?;
+        (&requested & &!live).enforce_equal(&Boolean::FALSE)?;
+        let mut age_valid = Boolean::FALSE;
+        for n in [13, 16, 18, 21] {
+            age_valid = &age_valid | &age.is_eq(&FpVar::constant(Fr::from(n)))?;
+        }
+        (&flags[3] & &!age_valid).enforce_equal(&Boolean::FALSE)?;
+        let old_enough = birth.is_cmp(&cutoff, Ordering::Less, true)?;
+        (&flags[3] & &!old_enough).enforce_equal(&Boolean::FALSE)?;
+
+        let country_vars: Vec<_> = (0..10)
+            .map(|i| {
+                let bits = UInt16::<Fr>::new_witness(cs.clone(), || {
+                    w.as_ref()
+                        .map(|w| w.countries[i])
+                        .ok_or(SynthesisError::AssignmentMissing)
+                })?;
+                Boolean::le_bits_to_fp(&bits.to_bits_le()?)
+            })
+            .collect::<ark_relations::gr1cs::Result<_>>()?;
+        let set_hash = CRHGadget::<Fr>::evaluate(&params, &country_vars)?;
+        ((set_hash - countries_hash) * FpVar::from(flags[4].clone()))
+            .enforce_equal(&FpVar::zero())?;
+        let mut allowed = Boolean::FALSE;
+        for candidate in &country_vars {
+            let nonzero = !candidate.is_eq(&FpVar::zero())?;
+            allowed = &allowed | &(&candidate.is_eq(&country)? & &nonzero);
+        }
+        (&flags[4] & &!allowed).enforce_equal(&Boolean::FALSE)?;
+
+        ((membership_root - &group_root) * FpVar::from(flags[5].clone()))
+            .enforce_equal(&FpVar::zero())?;
+        let member_path = w.as_ref().map(|w| &w.membership_path);
+        let member_index = w.as_ref().map(|w| w.membership_index);
+        let computed_group = merkle_gadget(cs, &params, id_commitment, member_path, member_index)?;
+        ((computed_group - group_root) * FpVar::from(flags[5].clone()))
+            .enforce_equal(&FpVar::zero())
+    }
+}
+
+fn merkle_gadget(
+    cs: ConstraintSystemRef<Fr>,
+    params: &CRHParametersVar<Fr>,
+    mut node: FpVar<Fr>,
+    path: Option<&[Fr; ATTESTED_TREE_DEPTH]>,
+    index: Option<u32>,
+) -> ark_relations::gr1cs::Result<FpVar<Fr>> {
+    for depth in 0..ATTESTED_TREE_DEPTH {
+        let sibling = FpVar::new_witness(cs.clone(), || {
+            path.map(|p| p[depth])
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let right = Boolean::new_witness(cs.clone(), || {
+            index
+                .map(|i| i & (1 << depth) != 0)
+                .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let left = FpVar::conditionally_select(&right, &sibling, &node)?;
+        let right_node = FpVar::conditionally_select(&right, &node, &sibling)?;
+        node = CRHGadget::<Fr>::evaluate(params, &[left, right_node])?;
+    }
+    Ok(node)
+}
+
+pub fn country_set_hash(params: &PoseidonConfig<Fr>, countries: &[u16; 10]) -> Fr {
+    CRH::<Fr>::evaluate(
+        params,
+        countries.iter().map(|c| Fr::from(*c)).collect::<Vec<_>>(),
+    )
+    .expect("country set")
+}
+
+pub fn setup_predicate<R: RngCore + ark_std::rand::CryptoRng>(
+    rng: &mut R,
+) -> (ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>) {
+    ark_groth16::Groth16::<Bls12_381>::circuit_specific_setup(
+        PredicateCircuit {
+            params: poseidon_params(),
+            public: None,
+            witness: None,
+        },
+        rng,
+    )
+    .expect("predicate setup")
+}
+
+pub fn prove_predicate<R: RngCore + ark_std::rand::CryptoRng>(
+    public: Public,
+    witness: Witness,
+    pk: &ProvingKey<Bls12_381>,
+    rng: &mut R,
+) -> Result<Proof<Bls12_381>, SynthesisError> {
+    ark_groth16::Groth16::<Bls12_381>::prove(
+        pk,
+        PredicateCircuit {
+            params: poseidon_params(),
+            public: Some(public),
+            witness: Some(witness),
+        },
+        rng,
+    )
+}
+
+pub fn verify_predicate(
+    public: Public,
+    proof: &Proof<Bls12_381>,
+    vk: &VerifyingKey<Bls12_381>,
+) -> bool {
+    ark_groth16::Groth16::<Bls12_381>::verify(vk, &public.inputs(), proof).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ark_relations::gr1cs::ConstraintSystem;
+    use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+    use ark_std::rand::{SeedableRng, rngs::StdRng};
+
+    fn fixture() -> (Public, Witness) {
+        let params = poseidon_params();
+        let secret = Fr::from(123u64);
+        let commitment = CRH::<Fr>::evaluate(&params, vec![secret]).unwrap();
+        let group = AttestedTree::from_leaves(&params, &[commitment]).unwrap();
+        let opening = CredentialOpening {
+            kyc: true,
+            aml: true,
+            accredited: true,
+            birth_date_days: 8000,
+            country_code: *b"CH",
+            membership_root: group.root(),
+            expiry_days: 30000,
+            salt: Fr::from(55u64),
+        };
+        let leaf = credential_leaf(&params, commitment, &opening);
+        let live = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
+        let countries = [u16::from_be_bytes(*b"CH"), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let scope = asker_scope(&params, "acct_shop");
+        let p = Public {
+            sub: derive_sub(&params, secret, scope),
+            scope,
+            nonce: Fr::from(17u64),
+            claims_mask: 0,
+            age_n: 18,
+            country_set_hash: country_set_hash(&params, &countries),
+            group_root: group.root(),
+            merkle_root: live.root(),
+            today_days: 20000,
+            age_cutoff_days: 13000,
+        };
+        let w = Witness {
+            id_secret: secret,
+            opening,
+            leaf_path: live.path(0).unwrap(),
+            leaf_index: 0,
+            membership_path: group.path(0).unwrap(),
+            membership_index: 0,
+            countries,
+        };
+        (p, w)
+    }
+
+    fn satisfies(p: Public, w: Witness) -> (bool, usize) {
+        let cs = ConstraintSystem::new_ref();
+        PredicateCircuit {
+            params: poseidon_params(),
+            public: Some(p),
+            witness: Some(w),
+        }
+        .generate_constraints(cs.clone())
+        .unwrap();
+        (cs.is_satisfied().unwrap(), cs.num_constraints())
+    }
+
+    #[test]
+    fn each_claim_is_constrained() {
+        for mask in [
+            KYC,
+            AML,
+            ACCREDITED,
+            AGE,
+            RESIDENCY,
+            MEMBERSHIP,
+            KYC | AGE | RESIDENCY | MEMBERSHIP,
+        ] {
+            let (mut p, w) = fixture();
+            p.claims_mask = mask;
+            let (valid, count) = satisfies(p, w.clone());
+            assert!(valid, "mask={mask}");
+            assert!(count < 30_000, "{count} constraints");
+            if mask == KYC | AGE | RESIDENCY | MEMBERSHIP {
+                eprintln!("predicate circuit: {count} constraints");
+            }
+            let mut wrong = w;
+            if mask & KYC != 0 {
+                wrong.opening.kyc = false;
+            } else if mask & AML != 0 {
+                wrong.opening.aml = false;
+            } else if mask & ACCREDITED != 0 {
+                wrong.opening.accredited = false;
+            } else if mask & AGE != 0 {
+                wrong.opening.birth_date_days = 15000;
+            } else if mask & RESIDENCY != 0 {
+                wrong.opening.country_code = *b"DE";
+            } else {
+                wrong.membership_path[0] += Fr::from(1u64);
+            }
+            assert!(
+                !satisfies(p, wrong).0,
+                "mask={mask} must reject a bad witness"
+            );
+        }
+        let (mut p, mut w) = fixture();
+        p.claims_mask = KYC;
+        w.opening.expiry_days = 100;
+        assert!(!satisfies(p, w).0, "expired credential");
+        let (mut p, w) = fixture();
+        p.claims_mask = KYC;
+        p.scope = asker_scope(&poseidon_params(), "acct_other");
+        assert!(!satisfies(p, w).0, "other asker's scope");
+    }
+
+    #[test]
+    fn checked_in_keys_verify_only_the_bound_nonce_scope_root_and_sub() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let pk = ProvingKey::<Bls12_381>::deserialize_compressed(
+            include_bytes!("../predicate_pk.bin").as_slice(),
+        )
+        .unwrap();
+        let vk = VerifyingKey::<Bls12_381>::deserialize_compressed(PREDICATE_VK_BYTES).unwrap();
+        let (mut public, witness) = fixture();
+        public.claims_mask = KYC | AGE | RESIDENCY | MEMBERSHIP;
+        let started = std::time::Instant::now();
+        let proof = prove_predicate(public, witness, &pk, &mut rng).unwrap();
+        let proving_time = started.elapsed();
+        let mut encoded = Vec::new();
+        proof.serialize_compressed(&mut encoded).unwrap();
+        eprintln!(
+            "predicate proof: {} bytes, {} ms on this host",
+            encoded.len(),
+            proving_time.as_millis()
+        );
+        assert!(verify_predicate(public, &proof, &vk));
+        let mut forged = public;
+        forged.nonce += Fr::from(1u64);
+        assert!(!verify_predicate(forged, &proof, &vk));
+        forged = public;
+        forged.scope = asker_scope(&poseidon_params(), "acct_other");
+        assert!(!verify_predicate(forged, &proof, &vk));
+        forged = public;
+        forged.sub += Fr::from(1u64);
+        assert!(!verify_predicate(forged, &proof, &vk));
+        forged = public;
+        forged.merkle_root += Fr::from(1u64);
+        assert!(!verify_predicate(forged, &proof, &vk));
+    }
+}

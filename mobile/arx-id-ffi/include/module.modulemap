@@ -1,0 +1,4 @@
+module ArxIDKit {
+  header "ArxIDKit.h"
+  export *
+}

@@ -811,6 +811,36 @@ impl ArxiumDb {
         Ok(attestors)
     }
 
+    /// Live attested hashes in account-key order. This read-only view is used
+    /// to reconstruct the off-chain anonymity tree after a node restart. It
+    /// includes legacy hashes: they cannot satisfy the v1 opening constraint,
+    /// but they are still live attestations and contribute to anonymity.
+    pub fn live_identity_hashes(&self) -> Result<Vec<String>, StorageError> {
+        let registered: BTreeSet<Address> =
+            self.list_attestors()?.into_iter().map(|(a, _)| a).collect();
+        let mut hashes = Vec::new();
+        for item in self
+            .db
+            .iterator_cf(self.cf(CF_ACCOUNTS), IteratorMode::Start)
+        {
+            let (key, value) = item?;
+            if !key.starts_with(b"account:") {
+                continue;
+            }
+            let (entry, _): (AccountEntry, _) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            if let Some(hash) = entry.identity_hash
+                && entry
+                    .attested_by
+                    .as_ref()
+                    .is_none_or(|a| registered.contains(a))
+            {
+                hashes.push(hash);
+            }
+        }
+        Ok(hashes)
+    }
+
     /// A registered asset's registry record (`issuer`/`compliance_required`),
     /// if `asset` has been registered via `RegisterAsset`.
     pub fn get_asset(&self, asset: &AssetRef) -> Result<Option<Asset>, StorageError> {

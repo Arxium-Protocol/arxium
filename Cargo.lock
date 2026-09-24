@@ -374,6 +374,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "arx-id-ffi"
+version = "0.1.0"
+dependencies = [
+ "ark-bls12-381",
+ "ark-ff",
+ "ark-serialize",
+ "ark-std",
+ "circuit-identity-zk",
+ "hex",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "zeroize",
+]
+
+[[package]]
 name = "arx-verify"
 version = "0.1.0"
 dependencies = [
@@ -1067,6 +1083,7 @@ dependencies = [
  "ark-serialize",
  "ark-snark",
  "ark-std",
+ "sha2 0.11.0",
 ]
 
 [[package]]
@@ -3716,6 +3733,7 @@ version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "22f6172bdec972074665ed81ed53b71da00bfc44b65a753cfde883ec4c702a1a"
 dependencies = [
+ "libc",
  "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
@@ -3766,6 +3784,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"
@@ -5390,8 +5411,12 @@ name = "xc-rpc"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "ark-bls12-381",
+ "ark-serialize",
+ "ark-std",
  "axum",
  "bincode",
+ "circuit-identity-zk",
  "circuit-rwa-asset",
  "ed25519-dalek",
  "hex",
@@ -5400,6 +5425,7 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "tokio",
  "tower",

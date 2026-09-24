@@ -9,7 +9,8 @@
 
 use ark_serialize::CanonicalSerialize;
 use ark_std::rand::{SeedableRng, rngs::StdRng};
-use circuit_identity_zk::setup;
+use circuit_identity_zk::predicate::setup_predicate;
+use circuit_identity_zk::{setup, setup_sign_in};
 
 fn main() {
     let mut rng = StdRng::seed_from_u64(42);
@@ -25,6 +26,26 @@ fn main() {
     vk.serialize_compressed(&mut vk_bytes)
         .expect("serialize verifying key");
     std::fs::write(format!("{dir}/vk.bin"), vk_bytes).expect("write vk.bin");
+
+    let (pk, vk) = setup_sign_in(&mut rng);
+    let mut pk_bytes = Vec::new();
+    pk.serialize_compressed(&mut pk_bytes)
+        .expect("serialize sign-in proving key");
+    std::fs::write(format!("{dir}/sign_in_pk.bin"), pk_bytes).expect("write sign_in_pk.bin");
+    let mut vk_bytes = Vec::new();
+    vk.serialize_compressed(&mut vk_bytes)
+        .expect("serialize sign-in verifying key");
+    std::fs::write(format!("{dir}/sign_in_vk.bin"), vk_bytes).expect("write sign_in_vk.bin");
+
+    let (pk, vk) = setup_predicate(&mut rng);
+    let mut pk_bytes = Vec::new();
+    pk.serialize_compressed(&mut pk_bytes)
+        .expect("serialize predicate proving key");
+    std::fs::write(format!("{dir}/predicate_pk.bin"), pk_bytes).expect("write predicate_pk.bin");
+    let mut vk_bytes = Vec::new();
+    vk.serialize_compressed(&mut vk_bytes)
+        .expect("serialize predicate verifying key");
+    std::fs::write(format!("{dir}/predicate_vk.bin"), vk_bytes).expect("write predicate_vk.bin");
 
     println!("wrote devnet pk.bin/vk.bin to {dir}");
 }

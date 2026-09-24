@@ -4,6 +4,7 @@ members = [
     "circuits/rwa-asset",
     "circuits/staking",
     "circuits/identity-zk",
+    "mobile/arx-id-ffi",
     "circuits/identity",
     "circuits/governance",
     #

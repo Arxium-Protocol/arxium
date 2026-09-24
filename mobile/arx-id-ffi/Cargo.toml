@@ -1,0 +1,25 @@
+[package]
+name = "arx-id-ffi"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+circuit-identity-zk = { workspace = true }
+ark-bls12-381 = { workspace = true }
+ark-serialize = { workspace = true }
+ark-ff = { workspace = true }
+ark-std = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+zeroize = { workspace = true }
+rand = { version = "0.8", features = ["std", "std_rng", "getrandom"] }
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
