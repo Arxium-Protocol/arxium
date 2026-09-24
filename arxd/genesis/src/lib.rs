@@ -23,8 +23,8 @@ use anyhow::{Context, Result, bail};
 use chain_spec::{GenesisEntry, RawGenesis, artifact_entries};
 use std::collections::{BTreeMap, HashSet};
 use xc_bls::BlsPublicKey;
-use xc_primitives::{Address, Block, Snapshot, ValidatorEntry};
-use xc_storage::{AccountUpdates, ArxiumDb, cf_for_key};
+use xc_primitives::{AccountEntry, Address, Block, Snapshot, ValidatorEntry};
+use xc_storage::{AccountUpdates, ArxiumDb, BatchWritable, BlockEffects, cf_for_key};
 
 pub use chain_spec::{ChainSpec, RAW_FORMAT_VERSION};
 
@@ -137,6 +137,13 @@ pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
         .expect("just verified/written above")
         .state_root;
     seed_genesis_hash(db, &root)?;
+    seed_genesis_effects(
+        db,
+        snapshot
+            .batch_entries()?
+            .iter()
+            .map(|(k, v)| (k.as_slice(), v.as_slice())),
+    )?;
     Ok(root)
 }
 
@@ -189,6 +196,11 @@ pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
         .get_block::<()>(0)?
         .context("raw chain spec installed but block 0 is missing from its entries")?;
     seed_genesis_hash(db, &block_zero.state_root)?;
+    let entries = artifact_entries(raw);
+    seed_genesis_effects(
+        db,
+        entries.iter().map(|(_, k, v)| (k.as_slice(), v.as_slice())),
+    )?;
     Ok(())
 }
 
@@ -201,6 +213,39 @@ fn seed_genesis_hash(db: &ArxiumDb, root: &str) -> Result<()> {
     if db.genesis_hash()?.is_none() {
         db.write_batch(&xc_storage::GenesisHash(root.to_string()))?;
     }
+    Ok(())
+}
+
+/// Records block 0's effects — every genesis account's balance — so an
+/// indexer following `GET /blocks/{height}/effects` sees genesis allocations.
+/// Without it genesis had no effects row and Retracer only learned an
+/// account's balance once a later block touched it: wallets and the explorer
+/// read 0 ARX until the first transfer. Built from the genesis entries, not
+/// the live DB, so a node already past height 0 backfills it on restart.
+/// Not a state key, so the genesis hash is unaffected.
+///
+/// ponytail: accounts only; genesis stakes/validator status still reach an
+/// indexer only once touched — add them here if the explorer needs them.
+fn seed_genesis_effects<'a>(
+    db: &ArxiumDb,
+    entries: impl Iterator<Item = (&'a [u8], &'a [u8])>,
+) -> Result<()> {
+    if db.get_block_effects(0)?.is_some() {
+        return Ok(());
+    }
+    let mut effects = BlockEffects::default();
+    for (key, value) in entries {
+        let Some(address) = key.strip_prefix(b"account:") else {
+            continue;
+        };
+        let address = Address::parse(std::str::from_utf8(address)?)
+            .map_err(|e| anyhow::anyhow!("genesis account key: {e}"))?;
+        let (entry, _): (AccountEntry, _) =
+            bincode::serde::decode_from_slice(value, bincode::config::standard())?;
+        // Later entries win, same as the RocksDB batch they were written in.
+        effects.accounts.insert(address, entry);
+    }
+    db.write_batch(&effects)?;
     Ok(())
 }
 
@@ -358,6 +403,37 @@ mod tests {
 
         let (db, dir) = scratch_db();
         write_raw(&db, &raw).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Genesis balances must reach `/blocks/0/effects`, or an indexer shows
+    /// 0 ARX until the account's first transaction. Covers a raw spec built
+    /// before the effects row existed: `write_raw` backfills it from entries.
+    #[test]
+    fn genesis_effects_carry_genesis_balances() {
+        let mut snapshot: Snapshot = serde_json::from_str(SPEC).unwrap();
+        let rich = Address::from_pubkey_bytes(&[7; 32]).unwrap();
+        snapshot.accounts.insert(
+            rich.clone(),
+            AccountEntry {
+                balance: 1_000,
+                ..Default::default()
+            },
+        );
+
+        let (db, dir) = scratch_db();
+        write_plain(&db, &snapshot).unwrap();
+        let effects = db.get_block_effects(0).unwrap().unwrap();
+        assert_eq!(effects.accounts[&rich].balance, 1_000);
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut raw = derive_raw(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let effects_key = hex::encode(b"meta:block_effects:");
+        raw.entries.retain(|e| !e.key_hex.starts_with(&effects_key));
+        let (db, dir) = scratch_db();
+        write_raw(&db, &raw).unwrap();
+        let effects = db.get_block_effects(0).unwrap().unwrap();
+        assert_eq!(effects.accounts[&rich].balance, 1_000);
         std::fs::remove_dir_all(&dir).ok();
     }
 
