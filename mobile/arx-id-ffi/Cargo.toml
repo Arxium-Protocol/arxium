@@ -12,12 +12,13 @@ circuit-identity-zk = { workspace = true }
 ark-bls12-381 = { workspace = true }
 ark-serialize = { workspace = true }
 ark-ff = { workspace = true }
-ark-std = { workspace = true }
+# `getrandom` turns on OsRng in the rand 0.8 arkworks already pulls in; the
+# rest of the workspace is on 0.9, which arkworks' traits do not accept.
+ark-std = { workspace = true, features = ["getrandom"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
-rand = { version = "0.8", features = ["std", "std_rng", "getrandom"] }
 
 [lints.clippy]
 todo = "deny"

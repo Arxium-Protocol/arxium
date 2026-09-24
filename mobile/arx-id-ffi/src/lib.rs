@@ -9,7 +9,32 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use circuit_identity_zk::{self as zk, predicate};
 use serde::Deserialize;
 use std::ffi::{CStr, CString, c_char};
+use std::sync::OnceLock;
 use zeroize::Zeroize;
+
+/// Decompressing a proving key takes seconds on a phone, so each is done once
+/// per process. `None` means the bundled bytes are corrupt.
+fn sign_in_key() -> Option<&'static zk::ProvingKey<Bls12_381>> {
+    static KEY: OnceLock<Option<zk::ProvingKey<Bls12_381>>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        zk::ProvingKey::deserialize_compressed(
+            include_bytes!("../../../circuits/identity-zk/sign_in_pk.bin").as_slice(),
+        )
+        .ok()
+    })
+    .as_ref()
+}
+
+fn predicate_key() -> Option<&'static zk::ProvingKey<Bls12_381>> {
+    static KEY: OnceLock<Option<zk::ProvingKey<Bls12_381>>> = OnceLock::new();
+    KEY.get_or_init(|| {
+        zk::ProvingKey::deserialize_compressed(
+            include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
+        )
+        .ok()
+    })
+    .as_ref()
+}
 
 #[derive(Deserialize)]
 struct Opening {
@@ -133,11 +158,8 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
     }
     let mut rng = ark_std::rand::rngs::OsRng;
     let proof = if context.claims_mask == 0 {
-        let pk = zk::ProvingKey::<Bls12_381>::deserialize_compressed(
-            include_bytes!("../../../circuits/identity-zk/sign_in_pk.bin").as_slice(),
-        )
-        .map_err(|_| "invalid bundled sign-in key")?;
-        zk::prove_sign_in(secret, scope, nonce, &pk, &mut rng)
+        let pk = sign_in_key().ok_or("invalid bundled sign-in key")?;
+        zk::prove_sign_in(secret, scope, nonce, pk, &mut rng)
     } else {
         if context.claims_mask > 63 {
             return Err("invalid claim mask".into());
@@ -203,11 +225,8 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
             membership_index: input.membership_index.unwrap_or(0),
             countries,
         };
-        let pk = zk::ProvingKey::<Bls12_381>::deserialize_compressed(
-            include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
-        )
-        .map_err(|_| "invalid bundled predicate key")?;
-        predicate::prove_predicate(public, witness, &pk, &mut rng)
+        let pk = predicate_key().ok_or("invalid bundled predicate key")?;
+        predicate::prove_predicate(public, witness, pk, &mut rng)
             .map_err(|_| "claim not satisfied")?
     };
     let mut bytes = Vec::new();

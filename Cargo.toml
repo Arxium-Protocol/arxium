@@ -53,8 +53,9 @@ repository = "https://github.com/Arxium-Protocol/Arxium"
 # the rules the rest of the workspace is held to; thresholds live in
 # `clippy.toml` alongside.
 [workspace.lints.rust]
-# Nothing in this workspace needs raw pointers or FFI. The one exception is
-# `std::env::set_var` in tests, which carries a local `#[allow]`.
+# Nothing in this workspace needs raw pointers or FFI, except
+# `mobile/arx-id-ffi` (the iOS C ABI), which does not inherit these lints,
+# and `std::env::set_var` in tests, which carries a local `#[allow]`.
 unsafe_code = "deny"
 
 [workspace.lints.clippy]

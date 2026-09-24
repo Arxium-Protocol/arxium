@@ -383,7 +383,6 @@ dependencies = [
  "ark-std",
  "circuit-identity-zk",
  "hex",
- "rand 0.8.7",
  "serde",
  "serde_json",
  "zeroize",

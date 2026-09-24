@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Path, Query, Request, State};
-use axum::http::{Method, StatusCode, header};
+use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -239,7 +239,9 @@ async fn guard<P: Payload>(
         || UNMATCHED_PATH.to_string(),
         |matched| matched.as_str().to_string(),
     );
-    let is_write = req.method() != Method::GET;
+    // HEAD and OPTIONS read nothing a GET would not; only mutating methods
+    // spend the smaller write budget.
+    let is_write = !req.method().is_safe();
 
     if let Some(token) = &state.rpc_token {
         let expected = format!("Bearer {token}");
