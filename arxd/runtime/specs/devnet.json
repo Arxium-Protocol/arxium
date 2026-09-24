@@ -45,10 +45,16 @@
       "stake": 110000000000000,
       "bls_pubkey": "a5f5caeac95d067b2b9aedc894c1644b3b9b037069bb92e9b8e3f5d1d91aa2a49ae9cd429ea8c0fd9bc6228859517d51",
       "bls_pop": "8c2b4dc00cb4c8fae44c3e980eb54a124ef89bd1fa499464ef1a855bb21f64cd7e586981254705bcbdf9c2d1368861ce08e00fce570da7b1c4c6dfdd50d70298f24d49cf3a4a2b7f23f8edab0d814abe3bd78cabe219d8464c707b9b41d3909a"
+    },
+    "arx1muspf4k6crcrs2xcfw6tr68qlz7cwhxx7j0dm7pr6x0pqnwl060qg5p4sp": {
+      "stake": 110000000000000,
+      "bls_pubkey": "a7e304a1e6421c74cb504a60bbb3434c02182782dac9b2d132f6a2041e2913bdd29bed9ceb8aa4d28d36e155e48b1c2d",
+      "bls_pop": "91747e85a48eb3d11c2174a54ff6d33c7fbb4a78823e284b2612c00f58edc971d434837664198f4dad912274046ce67e036b565c6c856aaf4c3f221c01ed172e63d624640e5789bf768a04290b6e526ea8d4300b1ab76c9d0c3ffef0690a1a36"
     }
   },
   "boot_nodes": [
     "/ip4/184.94.215.207/tcp/30334/p2p/12D3KooWJGC5tBv8pC7XzcCay9xk91seKwfspsoda7G7mK9TaMXw",
-    "/ip4/104.207.82.157/tcp/30334/p2p/12D3KooWKinzoEvpaVmy5rr85gge9rrZxm9vjiSHXnxaUVzDYYUi"
+    "/ip4/104.207.82.157/tcp/30334/p2p/12D3KooWKinzoEvpaVmy5rr85gge9rrZxm9vjiSHXnxaUVzDYYUi",
+    "/ip4/141.94.246.217/tcp/30334/p2p/12D3KooWSoGZV7b9a4tKgr76acyf3F1FbsAHchTQ76QyqUoV2Qdn"
   ]
 }
