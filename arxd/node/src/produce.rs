@@ -440,6 +440,16 @@ pub fn produce_loop<R: ChainRuntime>(
                 } else {
                     now.saturating_sub(parent.timestamp)
                 };
+                // Every validator ticks on its own clock phase, so whoever
+                // is next can fire well under an interval after the parent.
+                // `produce_block` then stamps `parent + 1`, and at more than
+                // a block a second the timestamps run ahead of wall time
+                // until they sit just under MAX_FUTURE_DRIFT_SECS (seen on
+                // the 3-validator devnet: ~27s in the future, permanently).
+                if !slot_due(now, parent.timestamp, parent.height, block_interval_secs) {
+                    drop(guard);
+                    continue;
+                }
                 let validators = db.get_validator_set_at(next_height)?;
 
                 // How much of the set can actually vote on finality. A
@@ -582,6 +592,13 @@ pub fn produce_loop<R: ChainRuntime>(
     }
 }
 
+/// Whether a full `interval` has passed since the parent's stamped time, so
+/// the next block may be produced. Genesis (height 0) carries a synthetic
+/// timestamp of 0 and is always due.
+fn slot_due(now: u64, parent_timestamp: u64, parent_height: u64, interval: u64) -> bool {
+    parent_height == 0 || now >= parent_timestamp.saturating_add(interval)
+}
+
 /// Advances `*next_tick` by one `interval` and returns how long to sleep
 /// before it arrives. If the deadline already passed (the previous
 /// iteration's body took longer than `interval`), resyncs `*next_tick` to
@@ -634,6 +651,19 @@ mod tests {
 
         assert_eq!(sleep, Duration::ZERO);
         assert_eq!(next_tick, now);
+    }
+
+    /// A proposer ticking under an interval after its parent waits, so
+    /// stamped timestamps can't run ahead of wall time.
+    #[test]
+    fn slot_due_waits_a_full_interval_after_the_parent() {
+        assert!(slot_due(100, 0, 0, 2), "first block after genesis is always due");
+        assert!(!slot_due(100, 100, 5, 2));
+        assert!(!slot_due(101, 100, 5, 2));
+        assert!(slot_due(102, 100, 5, 2));
+        // A parent stamped ahead of this clock holds production until wall
+        // time catches up, instead of stamping further ahead.
+        assert!(!slot_due(100, 127, 5, 2));
     }
 
     #[test]
