@@ -28,15 +28,15 @@ groups:
             not detect this application-liveness failure.
 
       - alert: ArxiumFinalityUnreachable
-        expr: arxium_validators_with_bls_key < arxium_finality_quorum
+        expr: arxium_voting_power_with_bls_key < arxium_finality_quorum
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Finality quorum is unreachable"
           description: >
-            Fewer validators hold BLS keys than the current finality quorum
-            requires. Register the missing validator keys.
+            Validators holding BLS keys carry {{ $value }} voting power, below
+            the finality quorum. Register the missing validator keys.
 
       - alert: ArxiumBlocksRejected
         expr: increase(arxium_blocks_rejected_total[10m]) > 0

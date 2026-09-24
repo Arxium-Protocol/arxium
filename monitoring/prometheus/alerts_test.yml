@@ -132,13 +132,13 @@ tests:
               summary: "Arxium node metrics are unavailable"
               description: "Prometheus has been unable to scrape arxd for one minute. Check systemctl status arxd and curl http://127.0.0.1:30333/metrics.\n"
 
-  # Quorum is unreachable when fewer validators hold BLS keys than required.
+  # Quorum is unreachable when the keyed validators' power is below it.
   - interval: 1m
     input_series:
-      - series: 'arxium_validators_with_bls_key'
-        values: '2x5'
+      - series: 'arxium_voting_power_with_bls_key'
+        values: '3334x5'
       - series: 'arxium_finality_quorum'
-        values: '3x5'
+        values: '6667x5'
     alert_rule_test:
       - eval_time: 3m
         alertname: ArxiumFinalityUnreachable
@@ -147,15 +147,31 @@ tests:
               severity: critical
             exp_annotations:
               summary: "Finality quorum is unreachable"
-              description: "Fewer validators hold BLS keys than the current finality quorum requires. Register the missing validator keys.\n"
+              description: "Validators holding BLS keys carry 3334 voting power, below the finality quorum. Register the missing validator keys.\n"
 
-  # Enough keys for quorum must not fire.
+  # Enough keyed power for quorum must not fire.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_voting_power_with_bls_key'
+        values: '6667x5'
+      - series: 'arxium_finality_quorum'
+        values: '6667x5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumFinalityUnreachable
+        exp_alerts: []
+
+  # Regression: the live devnet has 2 keyed validators holding all 10000
+  # power. Comparing the head count (2) to the quorum power (6667) made this
+  # rule fire forever; the power comparison must stay quiet.
   - interval: 1m
     input_series:
       - series: 'arxium_validators_with_bls_key'
-        values: '4x5'
+        values: '2x5'
+      - series: 'arxium_voting_power_with_bls_key'
+        values: '10000x5'
       - series: 'arxium_finality_quorum'
-        values: '3x5'
+        values: '6667x5'
     alert_rule_test:
       - eval_time: 3m
         alertname: ArxiumFinalityUnreachable
