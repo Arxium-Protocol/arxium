@@ -32,3 +32,24 @@ export class Writer {
 export const asBuffer = (bytes: Uint8Array): ArrayBuffer => new Uint8Array(bytes).buffer;
 export function toHex(bytes: Uint8Array): string { return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""); }
 export function fromHex(hex: string): Uint8Array { if (hex.length % 2 || !/^[0-9a-f]*$/i.test(hex)) throw new Error("invalid hex"); return Uint8Array.from(hex.match(/../g)?.map((byte) => Number.parseInt(byte, 16)) ?? []); }
+/** Reads what `Writer` writes. Pair every decode with a re-encode check (see `decodePayload`) rather than trusting it to reject non-canonical input. */
+export class Reader {
+  private at = 0;
+  constructor(private readonly data: Uint8Array) {}
+  u8(): number { if (this.at >= this.data.length) throw new RangeError("unexpected end of payload"); return this.data[this.at++]; }
+  bool(): boolean { const value = this.u8(); if (value > 1) throw new RangeError(`invalid bool: ${value}`); return value === 1; }
+  varint(): bigint {
+    const tag = this.u8();
+    if (tag <= 250) return BigInt(tag);
+    const width = ({ 0xfb: 2, 0xfc: 4, 0xfd: 8, 0xfe: 16 } as Record<number, number>)[tag];
+    if (!width) throw new RangeError(`invalid varint tag: ${tag}`);
+    let value = 0n;
+    for (let i = 0; i < width; i++) value |= BigInt(this.u8()) << BigInt(i * 8);
+    return value;
+  }
+  length(): number { const len = this.varint(); if (len > BigInt(this.data.length - this.at)) throw new RangeError("length past end of payload"); return Number(len); }
+  string(): string { const len = this.length(), text = new TextDecoder("utf-8", { fatal: true }).decode(this.data.subarray(this.at, this.at + len)); this.at += len; return text; }
+  option<T>(read: (reader: Reader) => T): T | null { return this.bool() ? read(this) : null; }
+  vec<T>(read: (reader: Reader) => T): T[] { return Array.from({ length: this.length() }, () => read(this)); }
+  done(): void { if (this.at !== this.data.length) throw new RangeError("trailing bytes after payload"); }
+}

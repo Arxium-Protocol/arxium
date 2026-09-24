@@ -1,6 +1,6 @@
 {
   "name": "@arxium-protocol/sdk",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Arxium TypeScript SDK and arx CLI",
   "type": "module",
   "private": false,

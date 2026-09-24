@@ -19,38 +19,14 @@ type Fixture = { name: string; input: Record<string, unknown>; sender: string; n
 type MultisigFixture = { threshold: number; member_seeds: string[]; members: string[]; signers: number[]; sender: string; nonce: number; to: string; amount: string; signature: string; asset_ref: string };
 type FixtureDocument = { private_key_seed: string; public_key: string; fixtures: Fixture[]; multisig: MultisigFixture };
 const golden = JSON.parse(readFileSync(new URL("../fixtures/signed-actions.json", import.meta.url), "utf8")) as FixtureDocument;
-const encode = (fixture: Fixture): Uint8Array => {
-  const input = fixture.input as Record<string, any>;
-  switch (fixture.name) {
-    case "transfer": return actions.encodeTransfer(input.to, BigInt(input.amount));
-    case "joinValidator": return actions.encodeJoinValidator(input.validator, BigInt(input.stake), Uint8Array.from(input.blsPubkey), Uint8Array.from(input.blsPop));
-    case "leaveValidator": return actions.encodeLeaveValidator(input.validator);
-    case "stake": return actions.encodeStake(input.validator, BigInt(input.amount));
-    case "unstake": return actions.encodeUnstake(input.validator, BigInt(input.amount));
-    case "registerBlsKey": return actions.encodeRegisterBlsKey(input.validator, Uint8Array.from(input.pubkey), Uint8Array.from(input.pop));
-    case "authorizeOperator": return actions.encodeAuthorizeOperator(input.operator);
-    case "revokeOperator": return actions.encodeRevokeOperator();
-    case "grantAttestation": return actions.encodeGrantAttestation(input.subject, input.hash, input.topics, input.jurisdiction);
-    case "revokeAttestation": return actions.encodeRevokeAttestation(input.subject);
-    case "registerAsset": return actions.encodeRegisterAsset(input.assetId, input.complianceRequired, input.metadata);
-    case "issueAsset": return actions.encodeIssueAsset(input.asset, BigInt(input.amount));
-    case "transferAsset": return actions.encodeTransferAsset(input.asset, input.to, BigInt(input.amount));
-    case "freezeAsset": case "unfreezeAsset": return actions.encodeFreezeAsset(input.asset, input.frozen, input.reason);
-    case "burnAsset": return actions.encodeBurnAsset(input.asset, BigInt(input.amount));
-    case "setHolderFrozen": return actions.encodeSetHolderFrozen(input.asset, input.holder, input.frozen);
-    case "lockHolderAmount": case "unlockHolderAmount": return actions.encodeLockHolderAmount(input.asset, input.holder, BigInt(input.amount), input.lock);
-    case "issuerForcedTransfer": return actions.encodeIssuerForcedTransfer(input.asset, input.from, input.to, BigInt(input.amount), input.reason);
-    case "recoverHolder": return actions.encodeRecoverHolder(input.asset, input.lost, input.replacement);
-    case "issueAssetTo": return actions.encodeIssueAssetTo(input.asset, input.to, BigInt(input.amount));
-    default: throw new Error(`unsupported fixture encoder: ${fixture.name}`);
-  }
-};
+const encode = (fixture: Fixture): Uint8Array => actions.encodePayload({ name: fixture.name as actions.DecodedPayload["name"], input: fixture.input });
 const privateKey = await importSeed(golden.private_key_seed);
 const publicKey = await crypto.subtle.importKey("raw", asBuffer(fromHex(golden.public_key)), "Ed25519", false, ["verify"]);
 for (const fixture of golden.fixtures) {
   const payload = encode(fixture);
   const signing = actions.signingBytes(fixture.sender, fixture.nonce, payload);
   assert.equal(toHex(payload), fixture.payload, `${fixture.name} payload`);
+  assert.deepEqual(actions.decodePayload(fromHex(fixture.payload)), { name: fixture.name, input: fixture.input }, `${fixture.name} decodes`);
   assert.equal(toHex(signing), fixture.signing_bytes, `${fixture.name} signing bytes`);
   assert.equal(await actions.signAction(privateKey, fixture.sender, fixture.nonce, payload), fixture.signature, `${fixture.name} signature`);
   assert.equal(await crypto.subtle.verify("Ed25519", publicKey, asBuffer(fromHex(fixture.signature)), asBuffer(signing)), true, `${fixture.name} signature verifies`);
@@ -65,6 +41,15 @@ for (const fixture of golden.fixtures) {
   assert.equal(await verifySignedAction(signed), true, "multisig verifies");
   assert.equal(await verifySignedAction({ ...signed, nonce: ms.nonce + 1 }), false, "multisig bound to nonce");
   assert.equal(await verifySignedAction({ ...signed, signature: actions.multisigSignature(ms.threshold, members, sigs.slice(0, 1)) }), false, "multisig below threshold");
+}
+{
+  const limits = actions.encodeSetAssetLimits("arxasset1x", 5, null, 86_400n);
+  assert.deepEqual(actions.decodePayload(limits), { name: "setAssetLimits", input: { asset: "arxasset1x", maxHolders: 5, maxBalancePerHolder: null, maxAttestationAge: "86400" } });
+  const transfer = actions.encodeTransfer(ALICE, 5n);
+  assert.throws(() => actions.decodePayload(Uint8Array.from([...transfer, 0])), /trailing/);
+  assert.throws(() => actions.decodePayload(Uint8Array.from([0xfb, 0x00, 0x00, ...transfer.slice(1)])), /canonical/);
+  assert.throws(() => actions.decodePayload(Uint8Array.from([99])), /unknown action variant/);
+  assert.throws(() => actions.decodePayload(transfer.slice(0, -1)), /end of payload/);
 }
 console.log("sdk codec tests passed");
 

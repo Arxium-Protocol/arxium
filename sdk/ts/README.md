@@ -43,6 +43,8 @@ const signature = multisigSignature(2, [pkA, pkB, pkC], [[pkA, sigA], [pkC, sigC
 await rpc.submit(submitBody(sender, nonce, signature, payload));
 ```
 
+A co-signer should see what they're signing before they sign it. `decodePayload(bytes)` returns `{ name, input }` for every action the SDK can encode. It re-encodes the result and throws unless the bytes match exactly.
+
 Set the resulting address as an admin role (genesis or `SetAdmin`) or as an asset issuer (`TransferIssuer`). To rotate members, move the role to a new multisig address.
 
 ## Key files

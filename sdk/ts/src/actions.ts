@@ -1,5 +1,5 @@
 import { MULTISIG_TAG, decodeAddress, encodeAddress } from "./bech32.js";
-import { Writer, asBuffer, fromHex, toHex } from "./bincode.js";
+import { Reader, Writer, asBuffer, fromHex, toHex } from "./bincode.js";
 
 /** These indices are ActionPayload's positional bincode discriminants. Never derive them. */
 export const ACTION_VARIANT = {
@@ -39,6 +39,75 @@ export function encodeRecoverHolder(asset: string, lost: string, replacement: st
 export function encodeIssueAssetTo(asset: string, to: string, amount: bigint): Uint8Array { return new Writer().varint(ACTION_VARIANT.issueAssetTo).string(asset).string(to).varint(amount).bytes(); }
 /** Sets issuer-controlled investor, concentration, and attestation-age limits. `null` clears each limit. */
 export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
+
+/** `{ name, input }` names and shapes match `fixtures/signed-actions.json`: amounts are decimal strings, byte fields are number arrays. */
+export type DecodedPayload = { name: keyof typeof ACTION_VARIANT; input: Record<string, any> };
+const nullableBig = (value: unknown): bigint | null => value == null ? null : BigInt(value as string);
+export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
+  switch (name) {
+    case "transfer": return encodeTransfer(input.to, BigInt(input.amount));
+    case "joinValidator": return encodeJoinValidator(input.validator, BigInt(input.stake), Uint8Array.from(input.blsPubkey), Uint8Array.from(input.blsPop));
+    case "leaveValidator": return encodeLeaveValidator(input.validator);
+    case "stake": return encodeStake(input.validator, BigInt(input.amount));
+    case "unstake": return encodeUnstake(input.validator, BigInt(input.amount));
+    case "registerBlsKey": return encodeRegisterBlsKey(input.validator, Uint8Array.from(input.pubkey), Uint8Array.from(input.pop));
+    case "authorizeOperator": return encodeAuthorizeOperator(input.operator);
+    case "revokeOperator": return encodeRevokeOperator();
+    case "grantAttestation": return encodeGrantAttestation(input.subject, input.hash, input.topics, input.jurisdiction);
+    case "revokeAttestation": return encodeRevokeAttestation(input.subject);
+    case "registerAsset": return encodeRegisterAsset(input.assetId, input.complianceRequired, input.metadata);
+    case "issueAsset": return encodeIssueAsset(input.asset, BigInt(input.amount));
+    case "transferAsset": return encodeTransferAsset(input.asset, input.to, BigInt(input.amount));
+    case "freezeAsset": case "unfreezeAsset": return encodeFreezeAsset(input.asset, input.frozen, input.reason);
+    case "burnAsset": return encodeBurnAsset(input.asset, BigInt(input.amount));
+    case "setHolderFrozen": return encodeSetHolderFrozen(input.asset, input.holder, input.frozen);
+    case "lockHolderAmount": case "unlockHolderAmount": return encodeLockHolderAmount(input.asset, input.holder, BigInt(input.amount), input.lock);
+    case "issuerForcedTransfer": return encodeIssuerForcedTransfer(input.asset, input.from, input.to, BigInt(input.amount), input.reason);
+    case "recoverHolder": return encodeRecoverHolder(input.asset, input.lost, input.replacement);
+    case "issueAssetTo": return encodeIssueAssetTo(input.asset, input.to, BigInt(input.amount));
+    case "setAssetLimits": return encodeSetAssetLimits(input.asset, input.maxHolders, nullableBig(input.maxBalancePerHolder), nullableBig(input.maxAttestationAge));
+  }
+}
+const invert = <K extends string>(table: Record<K, number>): Record<number, K> => Object.fromEntries(Object.entries(table).map(([key, value]) => [value, key])) as Record<number, K>;
+const VARIANT_NAME = invert(ACTION_VARIANT), CLASS_NAME = invert(CLASS), TOPIC_NAME = invert(TOPIC);
+const known = <T>(value: T | undefined, what: string): T => { if (value === undefined) throw new Error(`unknown ${what}`); return value; };
+/**
+ * Decodes a payload the SDK can encode, then re-encodes it and throws unless the bytes match, so what
+ * a co-signer is shown is exactly what they sign. Unknown variants throw rather than display partially.
+ */
+export function decodePayload(payload: Uint8Array): DecodedPayload {
+  const r = new Reader(payload), name = known(VARIANT_NAME[Number(r.varint())], "action variant");
+  const str = () => r.string(), amount = () => r.varint().toString(), bytes = () => r.vec((rr) => rr.u8()), topics = () => r.vec((rr) => known(TOPIC_NAME[Number(rr.varint())], "claim topic"));
+  const read: Record<DecodedPayload["name"], () => Record<string, unknown>> = {
+    transfer: () => ({ to: str(), amount: amount() }),
+    joinValidator: () => ({ validator: str(), stake: amount(), blsPubkey: bytes(), blsPop: bytes() }),
+    leaveValidator: () => ({ validator: str() }),
+    stake: () => ({ validator: str(), amount: amount() }),
+    unstake: () => ({ validator: str(), amount: amount() }),
+    registerBlsKey: () => ({ validator: str(), pubkey: bytes(), pop: bytes() }),
+    authorizeOperator: () => ({ operator: str() }),
+    revokeOperator: () => ({}),
+    grantAttestation: () => ({ subject: str(), hash: str(), topics: topics(), jurisdiction: r.option(str) }),
+    revokeAttestation: () => ({ subject: str() }),
+    registerAsset: () => ({ assetId: str(), complianceRequired: r.bool(), metadata: { asset_class: known(CLASS_NAME[Number(r.varint())], "asset class"), decimals: r.u8(), required_claims: topics(), allowed_jurisdictions: r.option((rr) => rr.vec(str)), max_supply: r.option(amount), metadata_uri: r.option(str), symbol: str(), name: str() } }),
+    issueAsset: () => ({ asset: str(), amount: amount() }),
+    transferAsset: () => ({ asset: str(), to: str(), amount: amount() }),
+    freezeAsset: () => ({ asset: str(), frozen: true, reason: str() }),
+    unfreezeAsset: () => ({ asset: str(), frozen: false, reason: str() }),
+    burnAsset: () => ({ asset: str(), amount: amount() }),
+    setHolderFrozen: () => ({ asset: str(), holder: str(), frozen: r.bool() }),
+    lockHolderAmount: () => ({ asset: str(), holder: str(), amount: amount(), lock: true }),
+    unlockHolderAmount: () => ({ asset: str(), holder: str(), amount: amount(), lock: false }),
+    issuerForcedTransfer: () => ({ asset: str(), from: str(), to: str(), amount: amount(), reason: str() }),
+    recoverHolder: () => ({ asset: str(), lost: str(), replacement: str() }),
+    issueAssetTo: () => ({ asset: str(), to: str(), amount: amount() }),
+    setAssetLimits: () => ({ asset: str(), maxHolders: r.option((rr) => Number(rr.varint())), maxBalancePerHolder: r.option(amount), maxAttestationAge: r.option(amount) }),
+  };
+  const decoded = { name, input: read[name]() };
+  r.done();
+  if (toHex(encodePayload(decoded)) !== toHex(payload)) throw new Error("payload is not in canonical form");
+  return decoded;
+}
 export function signingBytes(sender: string, nonce: number | bigint, payload: Uint8Array): Uint8Array { return new Writer().string(sender).varint(nonce).raw(payload).bytes(); }
 export async function signAction(privateKey: CryptoKey, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return toHex(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, asBuffer(signingBytes(sender, nonce, payload))))); }
 export type SignedAction = { sender: string; nonce: number; signature: string; payload: number[] };
