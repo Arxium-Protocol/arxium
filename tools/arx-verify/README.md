@@ -1,7 +1,7 @@
 # arx-verify
 
-Standalone verifier for Arxium fault evidence artifacts. It depends only on
-`xc-artifact` — no chain code, no storage, no network — so it builds and
+Standalone verifier for Arxium fault evidence artifacts and state proofs. It uses
+`xc-artifact` and pure hashing from `xc-poe` — no storage or network — so it builds and
 runs on a machine that has never talked to an Arxium node.
 
 ## What it proves — and what it doesn't
@@ -48,11 +48,36 @@ cargo build --release -p arx-verify
 
 ```sh
 arx-verify <evidence.json>
+arx-verify state-proof <proof.json>
 ```
 
 Prints a verdict to stdout and exits `0` if the artifact verifies, `1`
 otherwise (bad path, malformed JSON, or a signature/consistency check
 that fails).
+
+### Browser verifier
+
+The Website's `/verify` page accepts local evidence artifacts and state-proof
+RPC responses. The browser loads the same verifier as a WASM module from the
+Website, then reads the selected file locally. No artifact is uploaded and no
+RPC call is made. Once the page and WASM have loaded, verification works without
+a network connection. State-proof verification checks the Merkle path and the
+PoE commitment to the certificate, **not** its BLS aggregate or validator set.
+
+To rebuild the Website's checked-in WASM bundle from the `arxium` workspace root:
+
+```sh
+rustup target add wasm32-unknown-unknown
+# Install wasm-bindgen-cli matching the version in Cargo.lock (currently 0.2.108).
+cargo install wasm-bindgen-cli --version 0.2.108 --locked
+# blst uses portable C (no assembly) for wasm32; use a clang with a wasm target.
+CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang \
+  sh tools/arx-verify/build-web.sh ../Arxium-Website/public/verify-wasm
+```
+
+The build script runs CLI-vs-WASM parity checks on both `examples/` artifacts
+and prints the gzipped WASM size in bytes (budget: 1,000,000 bytes). The Website
+serves the generated files under `/verify-wasm/`.
 
 ### `VALID` — equivocation, culprit identified
 

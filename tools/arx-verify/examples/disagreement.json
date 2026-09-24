@@ -11,21 +11,21 @@
       "timestamp": 1234,
       "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
       "proposer": "arx1proposer",
-      "state_root": "0xstate",
+      "state_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "round": 0
     },
-    "signature": "0x4bb76b93729f46566912f943770711e59e6be3a02889515d89978ab8c2244c85ba597cee8f1b551b452659519bec6f3482411b7ce4f524317753fa7c091b4504"
+    "signature": "0x55f4b65acebef21ab7df9be118dab6a0a0a39d6380c79a06059b6d9477b0d048ca77d16cffe7a20cdcf7225610279b8e0b51c03c1511cf3633d032306c95df08"
   },
   "dissent": {
     "height": 5,
     "block_hash": "0xblockhash",
-    "state_root": "0xdifferentstate",
-    "header_commitment": "0x8235e6a3b90561e0861bfe285ba70143ed103dee3d947e29010af02fd76f87eb",
+    "state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "header_commitment": "0x79beea8a831f77af10b8b577d866687cda5dec0a0a8b9399f56a570982eda680",
     "ep": "0x0303030303030303030303030303030303030303030303030303030303030303",
     "reason": "state_root_mismatch",
     "voter": "arx1voter",
     "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b",
-    "signature": "0x97a9484c0aa6cd1ac1e7fbc2c69d6ed68c5e2339d58bb89dafd6730b5cb7f516080be2beced7c99128c47a73bacabd880de6d09fd3829880fb61beac4eb2abc72b793f9d4edfa35aa2f19484d356f5bcdb54af10513a7b4c883f2030b3fe2c10"
+    "signature": "0x861aa332c166720f87a738a292bd7b5dc7136436509c3e6112f76463f1923754e738f921b16d843af4435e813cb86f70147331aefbd294fd115f682f90d820c57e15568919ddae7b00f08cfa737da7ccb320cc9b32a1e0b24dee1562666f920c"
   },
   "human_readable": {
     "note": "devnet soak run, height 5"

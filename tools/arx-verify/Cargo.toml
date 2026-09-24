@@ -8,6 +8,9 @@ license.workspace = true
 name = "arx-verify"
 path = "src/main.rs"
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [features]
 # Payload-aware re-execution adjudicator for CoreChain's `ActionPayload` —
 # resolves `Fault::ActionDivergence` to a named culprit for the action types
@@ -43,6 +46,9 @@ xc-executor = { workspace = true, optional = true }
 xc-bls = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 thiserror = { workspace = true, optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
