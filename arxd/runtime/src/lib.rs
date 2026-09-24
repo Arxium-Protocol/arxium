@@ -1389,6 +1389,42 @@ mod sdk_golden_fixtures {
         })
     }
 
+    /// 2-of-3 over seeds 7/8/9, signed by 7 and 9 — pins the TS SDK's
+    /// multisig address, witness encoding and issuer asset ref to Rust's.
+    fn multisig_fixture() -> Value {
+        let keys = [7u8, 8, 9].map(|seed| SigningKey::from_bytes(&[seed; 32]));
+        let members = keys.clone().map(|k| k.verifying_key().to_bytes());
+        let sender = xc_primitives::multisig_address(2, &members).unwrap();
+        let recipient = Address::from_pubkey_bytes(&members[1]).unwrap();
+        let mut action = Action {
+            sender: sender.clone(),
+            nonce: 3,
+            signature: None,
+            payload: ActionPayload::Transfer {
+                to: recipient.clone(),
+                amount: 5,
+            },
+        };
+        let msg = action.signing_bytes();
+        let sigs = [0, 2].map(|i| (members[i], keys[i].sign(&msg).to_bytes()));
+        action.signature = Some(xc_primitives::multisig_signature(2, &members, &sigs).unwrap());
+        action
+            .verify_signature()
+            .expect("multisig fixture verifies");
+        json!({
+            "threshold": 2,
+            "member_seeds": keys.map(|k| hex::encode(k.to_bytes())),
+            "members": members.map(hex::encode),
+            "signers": [0, 2],
+            "sender": sender,
+            "nonce": 3,
+            "to": recipient,
+            "amount": "5",
+            "signature": action.signature,
+            "asset_ref": AssetRef::derive(&sender, "gold").unwrap(),
+        })
+    }
+
     #[test]
     fn writes_typescript_signed_action_fixtures() {
         let seed = [7u8; 32];
@@ -1679,6 +1715,7 @@ mod sdk_golden_fixtures {
             "private_key_seed": hex::encode(seed),
             "public_key": hex::encode(key.verifying_key().as_bytes()),
             "fixtures": fixtures,
+            "multisig": multisig_fixture(),
         });
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../sdk/ts/fixtures/signed-actions.json");

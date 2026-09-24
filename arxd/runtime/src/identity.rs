@@ -10,9 +10,10 @@ use crate::ChainAction;
 
 /// Authorization check for the privileged roles — `action.sender` must be
 /// the genesis-seeded holder of `role` (`AdminKey`, see
-/// `Snapshot.{attestor,freeze,recovery}_admin`). One address per role on
-/// chain; M-of-N approval is the custody behind that key, not a protocol
-/// feature. Stays in the runtime: which address holds a role is chain
+/// `Snapshot.{attestor,freeze,recovery}_admin`). One address per role; for
+/// on-chain M-of-N, that address is a multisig one
+/// (`xc_primitives::multisig_address`) and the threshold is enforced by
+/// `Action::verify_signature` before this runs. Stays in the runtime: which address holds a role is chain
 /// configuration, not identity logic.
 pub(crate) fn require_admin<V: KvRead<Error = StorageError>>(
     view: &V,

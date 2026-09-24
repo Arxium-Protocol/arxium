@@ -13,7 +13,9 @@ pub mod keyfile;
 mod state;
 mod validator_set;
 
-pub use action::{Action, RawAction, SignatureError};
+pub use action::{
+    Action, MAX_MULTISIG_MEMBERS, RawAction, SignatureError, multisig_address, multisig_signature,
+};
 pub use address::{Address, AddressError};
 pub use asset_ref::{AssetRef, AssetRefError};
 pub use block::{Block, RawBlock};

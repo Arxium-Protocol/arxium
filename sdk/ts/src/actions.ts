@@ -1,4 +1,5 @@
-import { Writer, asBuffer, toHex } from "./bincode.js";
+import { MULTISIG_TAG, decodeAddress, encodeAddress } from "./bech32.js";
+import { Writer, asBuffer, fromHex, toHex } from "./bincode.js";
 
 /** These indices are ActionPayload's positional bincode discriminants. Never derive them. */
 export const ACTION_VARIANT = {
@@ -42,3 +43,14 @@ export function signingBytes(sender: string, nonce: number | bigint, payload: Ui
 export async function signAction(privateKey: CryptoKey, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return toHex(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, asBuffer(signingBytes(sender, nonce, payload))))); }
 export type SignedAction = { sender: string; nonce: number; signature: string; payload: number[] };
 export function submitBody(sender: string, nonce: number, signature: string, payload: Uint8Array): SignedAction { return { sender, nonce, signature, payload: Array.from(payload) }; }
+
+/** M-of-N sender, mirrors `xc_primitives::multisig_address`. Every member signs with plain `signAction(key, multisigAddress, nonce, payload)`; `multisigSignature` combines exactly `threshold` of them into the action's `signature` field. */
+export const MAX_MULTISIG_MEMBERS = 16;
+const compareBytes = (a: Uint8Array, b: Uint8Array): number => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; };
+function multisigPolicy(threshold: number, members: Uint8Array[]): Uint8Array[] { const sorted = [...members].sort(compareBytes); if (!sorted.length || sorted.length > MAX_MULTISIG_MEMBERS) throw new Error("member count must be 1..=16"); if (!Number.isInteger(threshold) || threshold < 1 || threshold > sorted.length) throw new Error("threshold must be 1..=members"); if (sorted.some((m, i) => m.length !== 32 || (i > 0 && compareBytes(sorted[i - 1], m) >= 0))) throw new Error("members must be unique 32-byte keys"); return sorted; }
+async function policyHash(threshold: number, sorted: Uint8Array[]): Promise<Uint8Array> { const domain = new TextEncoder().encode("arxium-multisig-v1"), input = new Uint8Array(domain.length + 2 + 32 * sorted.length); input.set(domain); input.set([threshold, sorted.length], domain.length); sorted.forEach((m, i) => input.set(m, domain.length + 2 + 32 * i)); return new Uint8Array(await crypto.subtle.digest("SHA-256", input)); }
+export async function multisigAddress(threshold: number, members: Uint8Array[]): Promise<string> { const hash = await policyHash(threshold, multisigPolicy(threshold, members)); return encodeAddress(Uint8Array.from([MULTISIG_TAG, ...hash])); }
+/** `signatures`: [member public key, that member's hex signature]. */
+export function multisigSignature(threshold: number, members: Uint8Array[], signatures: [Uint8Array, string][]): string { const sorted = multisigPolicy(threshold, members); const indexed = signatures.map(([key, sig]) => { const index = sorted.findIndex((m) => compareBytes(m, key) === 0); if (index < 0) throw new Error("signer is not a member"); return [index, fromHex(sig)] as const; }).sort((a, b) => a[0] - b[0]); const out = new Writer().raw(Uint8Array.from([threshold, sorted.length])); sorted.forEach((m) => out.raw(m)); indexed.forEach(([index, sig]) => out.raw(Uint8Array.from([index])).raw(sig)); return toHex(out.bytes()); }
+/** Same checks as `Action::verify_signature` for a multisig sender. */
+export async function verifyMultisig(sender: string, signature: string, message: Uint8Array): Promise<boolean> { const sent = decodeAddress(sender), witness = fromHex(signature), [threshold, n] = witness; if (sent.length !== 33 || witness.length !== 2 + 32 * n + 65 * threshold) return false; const members = Array.from({ length: n }, (_, i) => witness.slice(2 + 32 * i, 34 + 32 * i)); const hash = await policyHash(threshold, multisigPolicy(threshold, members)); if (compareBytes(hash, sent.slice(1)) !== 0) return false; let last = -1; for (let at = 2 + 32 * n; at < witness.length; at += 65) { const index = witness[at]; if (index >= n || index <= last) return false; last = index; const key = await crypto.subtle.importKey("raw", asBuffer(members[index]), "Ed25519", false, ["verify"]); if (!await crypto.subtle.verify("Ed25519", key, asBuffer(witness.slice(at + 1, at + 65)), asBuffer(message))) return false; } return true; }

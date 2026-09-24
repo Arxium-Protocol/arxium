@@ -446,8 +446,8 @@ pub struct Snapshot {
     pub freeze_admin: Option<Address>,
     /// Address allowed to `ForcedTransfer`. The three admin fields may be
     /// the same address (soft rollout); the protocol checks each on its own.
-    /// Each is a single address on-chain: M-of-N is the custody behind the
-    /// key, not a protocol feature.
+    /// Each is one address, which may be a multisig one
+    /// (`multisig_address`): the M-of-N is then checked on chain.
     #[serde(default)]
     pub recovery_admin: Option<Address>,
     /// Epoch length, attestation gate, minimum set — see `ChainParams`.

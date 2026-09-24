@@ -25,7 +25,8 @@ use crate::{ActionPayload, ChainAction};
 
 /// Weight per encoded byte, so an action's size is paid for regardless of
 /// variant — an `artifact_json` or `metadata_uri` cannot be free just because
-/// its variant is cheap.
+/// its variant is cheap. It also prices a multisig sender: each extra member
+/// signature is ~130 hex bytes of witness, above one ed25519 verify.
 const WEIGHT_PER_BYTE: u64 = 1;
 
 /// Fixed cost per variant, excluding the per-byte term. Every action already

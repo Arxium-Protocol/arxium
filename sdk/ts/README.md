@@ -31,6 +31,20 @@ const payload = encodeTransfer("arx1...", arxToIum("1.5"));
 
 All token amounts are `bigint`: `1 ARX = 1_000_000_000 IUM`.
 
+### Multisig senders
+
+An M-of-N address (up to 16 members) is derived from its policy. Each member signs the action exactly as a single-key sender would. You then combine exactly `threshold` of those signatures:
+
+```ts
+const sender = await multisigAddress(2, [pkA, pkB, pkC]);          // member order doesn't matter
+const sigA = await signAction(keyA, sender, nonce, payload);       // on A's machine
+const sigC = await signAction(keyC, sender, nonce, payload);       // on C's machine
+const signature = multisigSignature(2, [pkA, pkB, pkC], [[pkA, sigA], [pkC, sigC]]);
+await rpc.submit(submitBody(sender, nonce, signature, payload));
+```
+
+Set the resulting address as an admin role (genesis or `SetAdmin`) or as an asset issuer (`TransferIssuer`). To rotate members, move the role to a new multisig address.
+
 ## Key files
 
 `arx` reads and writes Console's encrypted export JSON unchanged:

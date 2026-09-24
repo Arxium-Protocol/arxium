@@ -6,6 +6,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 
 /// `P` is the chain-specific action payload (e.g. CoreChain's `ActionPayload`
 /// or a spoke chain's own enum) — `Action` itself only knows about the
@@ -104,6 +105,8 @@ pub enum SignatureError {
     BadPubkey(#[from] crate::AddressError),
     #[error("signature does not verify against sender and action contents")]
     Invalid,
+    #[error("malformed multisig witness: {0}")]
+    BadMultisig(&'static str),
 }
 
 impl<P: Serialize> Action<P> {
@@ -123,27 +126,146 @@ impl<P: Serialize> Action<P> {
     /// `verify`: addresses are raw pubkeys, and the small-order points
     /// (`arx1qqq…` among them) pass cofactored verification for any
     /// message — a funded one would be everyone's to spend.
+    ///
+    /// A multisig sender (see [`multisig_address`]) carries its policy and
+    /// exactly `threshold` member signatures in the same hex `signature`
+    /// field, so the wire shape (and `tx_root`, `RawAction`, indexers) is
+    /// unchanged. Every `require_admin`/`require_issuer` style check compares
+    /// `sender` only, so it gets M-of-N for free once this passes.
     pub fn verify_signature(&self) -> Result<(), SignatureError> {
         let sig_hex = self.signature.as_deref().ok_or(SignatureError::Missing)?;
         let sig_bytes = hex::decode(sig_hex).map_err(|_| SignatureError::InvalidHex)?;
-        let sig_bytes: [u8; 64] = sig_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SignatureError::WrongLength(sig_bytes.len()))?;
-        let signature = Signature::from_bytes(&sig_bytes);
-
-        let pubkey_bytes = self.sender.pubkey_bytes()?;
-        let pubkey_bytes: [u8; 32] = pubkey_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| SignatureError::WrongLength(pubkey_bytes.len()))?;
-        let verifying_key =
-            VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| SignatureError::Invalid)?;
-
-        verifying_key
-            .verify_strict(&self.signing_bytes(), &signature)
-            .map_err(|_| SignatureError::Invalid)
+        let sender_bytes = self.sender.pubkey_bytes()?;
+        if sender_bytes.len() == 33 && sender_bytes[0] == MULTISIG_TAG {
+            return verify_multisig(&sender_bytes[1..], &sig_bytes, &self.signing_bytes());
+        }
+        verify_one(&sender_bytes, &sig_bytes, &self.signing_bytes())
     }
+}
+
+fn verify_one(pubkey: &[u8], sig: &[u8], message: &[u8]) -> Result<(), SignatureError> {
+    let sig: [u8; 64] = sig
+        .try_into()
+        .map_err(|_| SignatureError::WrongLength(sig.len()))?;
+    let pubkey: [u8; 32] = pubkey
+        .try_into()
+        .map_err(|_| SignatureError::WrongLength(pubkey.len()))?;
+    VerifyingKey::from_bytes(&pubkey)
+        .map_err(|_| SignatureError::Invalid)?
+        .verify_strict(message, &Signature::from_bytes(&sig))
+        .map_err(|_| SignatureError::Invalid)
+}
+
+/// First byte of a multisig address's 33 bech32 data bytes. A plain address
+/// is 32 bytes, so the two can never collide.
+const MULTISIG_TAG: u8 = 0x01;
+/// Caps both the witness size and the verify work one action can demand.
+pub const MAX_MULTISIG_MEMBERS: usize = 16;
+const MULTISIG_DOMAIN: &[u8] = b"arxium-multisig-v1";
+
+/// `sha256(domain ‖ threshold ‖ n ‖ members…)` — members must already be
+/// strictly ascending, so one member set has exactly one address.
+fn policy_hash(threshold: u8, members: &[[u8; 32]]) -> Result<[u8; 32], SignatureError> {
+    if members.is_empty() || members.len() > MAX_MULTISIG_MEMBERS {
+        return Err(SignatureError::BadMultisig("member count must be 1..=16"));
+    }
+    if threshold == 0 || usize::from(threshold) > members.len() {
+        return Err(SignatureError::BadMultisig("threshold must be 1..=members"));
+    }
+    if members.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(SignatureError::BadMultisig(
+            "members must be unique and ascending",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(MULTISIG_DOMAIN);
+    hasher.update([threshold, members.len() as u8]);
+    for m in members {
+        hasher.update(m);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn sorted(members: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let mut members = members.to_vec();
+    members.sort_unstable();
+    members
+}
+
+/// The `threshold`-of-`members` address. Member order doesn't matter.
+pub fn multisig_address(threshold: u8, members: &[[u8; 32]]) -> Result<Address, SignatureError> {
+    let hash = policy_hash(threshold, &sorted(members))?;
+    let mut bytes = vec![MULTISIG_TAG];
+    bytes.extend_from_slice(&hash);
+    Ok(Address::from_pubkey_bytes(&bytes)?)
+}
+
+/// Assembles the `signature` field for a multisig sender:
+/// `threshold ‖ n ‖ members(32·n) ‖ threshold × (member index ‖ sig(64))`,
+/// hex. `signatures` are (member pubkey, signature over `signing_bytes`),
+/// each member signing exactly as a single-key sender would.
+pub fn multisig_signature(
+    threshold: u8,
+    members: &[[u8; 32]],
+    signatures: &[([u8; 32], [u8; 64])],
+) -> Result<String, SignatureError> {
+    let members = sorted(members);
+    policy_hash(threshold, &members)?;
+    let mut indexed = signatures
+        .iter()
+        .map(|(pk, sig)| {
+            let i = members
+                .iter()
+                .position(|m| m == pk)
+                .ok_or(SignatureError::BadMultisig("signer is not a member"))?;
+            Ok((i as u8, *sig))
+        })
+        .collect::<Result<Vec<_>, SignatureError>>()?;
+    indexed.sort_unstable_by_key(|(i, _)| *i);
+    let mut out = vec![threshold, members.len() as u8];
+    members.iter().for_each(|m| out.extend_from_slice(m));
+    for (i, sig) in indexed {
+        out.push(i);
+        out.extend_from_slice(&sig);
+    }
+    Ok(hex::encode(out))
+}
+
+/// Exactly `threshold` signatures, indices strictly ascending: a relayer
+/// can't pad or reorder a witness into a second valid encoding (and a second
+/// action id) without a member's key.
+fn verify_multisig(policy: &[u8], witness: &[u8], message: &[u8]) -> Result<(), SignatureError> {
+    let [threshold, n, rest @ ..] = witness else {
+        return Err(SignatureError::BadMultisig("witness too short"));
+    };
+    let (t, n) = (usize::from(*threshold), usize::from(*n));
+    if rest.len() != 32 * n + 65 * t {
+        return Err(SignatureError::BadMultisig(
+            "witness length does not match its policy",
+        ));
+    }
+    let (member_bytes, sigs) = rest.split_at(32 * n);
+    let members: Vec<[u8; 32]> = member_bytes
+        .chunks_exact(32)
+        .map(|c| c.try_into().expect("chunks_exact(32)"))
+        .collect();
+    if policy_hash(*threshold, &members)?[..] != *policy {
+        return Err(SignatureError::BadMultisig(
+            "policy does not match sender address",
+        ));
+    }
+    let mut last = None;
+    for entry in sigs.chunks_exact(65) {
+        let i = usize::from(entry[0]);
+        if i >= n || last.is_some_and(|l| i <= l) {
+            return Err(SignatureError::BadMultisig(
+                "signer indices must be ascending members",
+            ));
+        }
+        last = Some(i);
+        verify_one(&members[i], &entry[1..], message)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,6 +320,70 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn member(seed: u8) -> (ed25519_dalek::SigningKey, [u8; 32]) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
+        let pk = key.verifying_key().to_bytes();
+        (key, pk)
+    }
+
+    /// 2-of-3: any two members pass; one, a repeated one, three, a
+    /// non-member, or a policy that isn't the sender's all fail.
+    #[test]
+    fn multisig_needs_exactly_threshold_distinct_members() {
+        use ed25519_dalek::Signer;
+        let keys = [member(1), member(2), member(3)];
+        let pks: Vec<[u8; 32]> = keys.iter().map(|(_, pk)| *pk).collect();
+        let mut action = test_action();
+        action.sender = multisig_address(2, &pks).unwrap();
+        // Member order is irrelevant to the address.
+        let reversed: Vec<_> = pks.iter().rev().copied().collect();
+        assert_eq!(multisig_address(2, &reversed).unwrap(), action.sender);
+
+        let msg = action.signing_bytes();
+        let sig = |i: usize| (keys[i].1, keys[i].0.sign(&msg).to_bytes());
+        let with = |sigs: &[([u8; 32], [u8; 64])]| {
+            let mut a = action.clone();
+            a.signature = Some(multisig_signature(2, &pks, sigs).unwrap());
+            a.verify_signature()
+        };
+        assert!(with(&[sig(0), sig(2)]).is_ok());
+        assert!(with(&[sig(2), sig(1)]).is_ok());
+        assert!(with(&[sig(0)]).is_err());
+        assert!(with(&[sig(0), sig(0)]).is_err());
+        assert!(with(&[sig(0), sig(1), sig(2)]).is_err());
+
+        let (outsider, outsider_pk) = member(9);
+        assert!(
+            multisig_signature(
+                2,
+                &pks,
+                &[sig(0), (outsider_pk, outsider.sign(&msg).to_bytes())]
+            )
+            .is_err()
+        );
+
+        // A valid 1-of-3 witness over the same members doesn't unlock the 2-of-3 address.
+        action.signature = Some(multisig_signature(1, &pks, &[sig(0)]).unwrap());
+        assert!(action.verify_signature().is_err());
+
+        // A member's signature over a different nonce doesn't carry over.
+        let mut replay = action.clone();
+        replay.signature = Some(multisig_signature(2, &pks, &[sig(0), sig(1)]).unwrap());
+        replay.nonce += 1;
+        assert!(replay.verify_signature().is_err());
+    }
+
+    #[test]
+    fn multisig_policy_bounds() {
+        let pks: Vec<[u8; 32]> = (1..=3).map(|i| member(i).1).collect();
+        assert!(multisig_address(0, &pks).is_err());
+        assert!(multisig_address(4, &pks).is_err());
+        assert!(multisig_address(1, &[pks[0], pks[0]]).is_err());
+        let many: Vec<[u8; 32]> = (1..=17).map(|i| member(i).1).collect();
+        assert!(multisig_address(1, &many).is_err());
+        assert!(multisig_address(1, &many[..16]).is_ok());
     }
 
     #[test]

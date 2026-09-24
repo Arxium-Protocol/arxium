@@ -28,8 +28,11 @@ is right and this file is stale — fix the file.
   `max_holders`, `max_balance_per_holder`, `max_supply`, plus the
   `frozen` / `issuance_locked` switches.
 - **Roles.** Three chain-wide admin addresses seeded at genesis — attestor
-  admin, freeze admin, recovery admin — one address per role; M-of-N is the
-  custody behind the key, not a protocol feature. Per asset: the issuer.
+  admin, freeze admin, recovery admin — one address per role. Per asset: the
+  issuer. Any of these may be a multisig address (up to 16 ed25519 members,
+  threshold 1..=N; `xc_primitives::multisig_address`, SDK `multisigAddress`),
+  in which case every action from it must carry exactly `threshold` member
+  signatures — checked on chain in `Action::verify_signature`.
   Attestors are a registry, many at once. `arxd/runtime/src/identity.rs`
   (`require_admin`), `asset.rs` (`require_issuer`).
 - **Reasons.** Every admin-gated action (forced transfers, freeze/unfreeze,

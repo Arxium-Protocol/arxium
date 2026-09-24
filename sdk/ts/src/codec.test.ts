@@ -5,7 +5,7 @@ import { Writer, asBuffer, fromHex, toHex } from "./bincode.js";
 import * as actions from "./actions.js";
 import { arxToIum, iumToArx } from "./amounts.js";
 import { PKCS8_ED25519_PREFIX, generateKey, importSeed, isKeyFile, rewrapKey, toKeyFile, unlockKey, verifyKeyFile, wrapPkcs8 } from "./keys.js";
-import { ArxiumRpc } from "./rpc.js";
+import { ArxiumRpc, verifySignedAction } from "./rpc.js";
 
 const ALICE = "arx132yw8ht5p8cetl2jmvknewjawt9xwzdlrk2pyxlnwjyqrdq0dawqaq6lsz";
 const BOB = "arx1syuhwr4g05t4744r23nvxnr7en9cmz53knhr0gja7c84hr7fkw2qpghjk5";
@@ -16,7 +16,8 @@ assert.equal(arxToIum("1.25"), 1_250_000_000n);
 assert.equal(iumToArx(1_250_000_000n), "1.25");
 
 type Fixture = { name: string; input: Record<string, unknown>; sender: string; nonce: number; payload: string; signing_bytes: string; signature: string };
-type FixtureDocument = { private_key_seed: string; public_key: string; fixtures: Fixture[] };
+type MultisigFixture = { threshold: number; member_seeds: string[]; members: string[]; signers: number[]; sender: string; nonce: number; to: string; amount: string; signature: string; asset_ref: string };
+type FixtureDocument = { private_key_seed: string; public_key: string; fixtures: Fixture[]; multisig: MultisigFixture };
 const golden = JSON.parse(readFileSync(new URL("../fixtures/signed-actions.json", import.meta.url), "utf8")) as FixtureDocument;
 const encode = (fixture: Fixture): Uint8Array => {
   const input = fixture.input as Record<string, any>;
@@ -53,6 +54,17 @@ for (const fixture of golden.fixtures) {
   assert.equal(toHex(signing), fixture.signing_bytes, `${fixture.name} signing bytes`);
   assert.equal(await actions.signAction(privateKey, fixture.sender, fixture.nonce, payload), fixture.signature, `${fixture.name} signature`);
   assert.equal(await crypto.subtle.verify("Ed25519", publicKey, asBuffer(fromHex(fixture.signature)), asBuffer(signing)), true, `${fixture.name} signature verifies`);
+}
+{
+  const ms = golden.multisig, members = ms.members.map(fromHex), payload = actions.encodeTransfer(ms.to, BigInt(ms.amount));
+  assert.equal(await actions.multisigAddress(ms.threshold, [...members].reverse()), ms.sender, "multisig address");
+  assert.equal(await deriveAssetRef(ms.sender, "gold"), ms.asset_ref, "multisig issuer asset ref");
+  const sigs = await Promise.all(ms.signers.map(async (i) => [members[i], await actions.signAction(await importSeed(ms.member_seeds[i]), ms.sender, ms.nonce, payload)] as [Uint8Array, string]));
+  assert.equal(actions.multisigSignature(ms.threshold, members, sigs.reverse()), ms.signature, "multisig witness");
+  const signed = actions.submitBody(ms.sender, ms.nonce, ms.signature, payload);
+  assert.equal(await verifySignedAction(signed), true, "multisig verifies");
+  assert.equal(await verifySignedAction({ ...signed, nonce: ms.nonce + 1 }), false, "multisig bound to nonce");
+  assert.equal(await verifySignedAction({ ...signed, signature: actions.multisigSignature(ms.threshold, members, sigs.slice(0, 1)) }), false, "multisig below threshold");
 }
 console.log("sdk codec tests passed");
 
