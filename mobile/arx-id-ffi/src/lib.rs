@@ -63,6 +63,15 @@ struct Context {
     age_cutoff_days: u32,
 }
 
+/// A regulated asset's gate, as the node returns it (`required_claims` in
+/// `ClaimTopic` names, any case: `Kyc`, `Aml`, `Accredited`, `Jurisdiction`).
+#[derive(Deserialize)]
+struct AssetGate {
+    asset_ref: String,
+    required_claims: Vec<String>,
+    allowed_jurisdictions: Option<Vec<String>>,
+}
+
 #[derive(Deserialize)]
 struct Request {
     operation: String,
@@ -73,6 +82,10 @@ struct Request {
     countries: Option<Vec<String>>,
     membership_path: Option<Vec<String>>,
     membership_index: Option<u32>,
+    /// `prove_asset_claim` only.
+    asset: Option<AssetGate>,
+    sender_pubkey: Option<String>,
+    today_days: Option<u32>,
 }
 
 fn parse_field(hex_value: &str) -> Result<Fr, String> {
@@ -145,6 +158,9 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
     if input.operation == "validate_opening" {
         let (_, leaf) = validate_opening(input.opening.ok_or("credential required")?, secret)?;
         return Ok(serde_json::json!({ "leaf": encode_field(&leaf) }));
+    }
+    if input.operation == "prove_asset_claim" {
+        return prove_asset_claim(input, secret);
     }
     let context = input.context.ok_or("missing context")?;
     let scope = parse_field(&context.scope)?;
@@ -242,6 +258,76 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
         .serialize_compressed(&mut bytes)
         .map_err(|_| "proof serialization")?;
     Ok(serde_json::json!({ "sub": encode_field(&sub), "proof": hex::encode(bytes) }))
+}
+
+/// `VerifyClaimProof` (payload variant 40) for a private-mode asset: proves
+/// the imported credential meets the asset's gate without revealing it.
+/// Pass the account's on-chain `identity_hash` as `opening.leaf`, so a
+/// credential that isn't the attested one fails here, not on chain.
+/// `today_days` defaults to the current UTC day, which the chain requires
+/// within a day of the block.
+fn prove_asset_claim(input: Request, secret: Fr) -> Result<serde_json::Value, String> {
+    let (opening, _) = validate_opening(input.opening.ok_or("credential required")?, secret)?;
+    let gate = input.asset.ok_or("asset required")?;
+    let sender = hex::decode(input.sender_pubkey.ok_or("sender_pubkey required")?)
+        .map_err(|_| "invalid sender_pubkey")?;
+    if sender.len() != 32 {
+        return Err("sender_pubkey must be 32 bytes".into());
+    }
+    // Same mapping as `circuit_identity::verify_claim_proof`; `Jurisdiction`
+    // needs no bit of its own, the allowed list restricts it.
+    let mut mask = 0;
+    for topic in &gate.required_claims {
+        mask |= match topic.to_ascii_lowercase().as_str() {
+            "kyc" => predicate::KYC,
+            "aml" => predicate::AML,
+            "accredited" => predicate::ACCREDITED,
+            "jurisdiction" => 0,
+            _ => return Err(format!("unknown claim {topic}")),
+        };
+    }
+    let countries = match &gate.allowed_jurisdictions {
+        Some(allowed) => {
+            mask |= predicate::RESIDENCY;
+            predicate::country_set(allowed.iter().map(String::as_str))
+                .ok_or("asset's jurisdiction list is not provable")?
+        }
+        None => Vec::new(),
+    };
+    let today_days = match input.today_days {
+        Some(day) => day,
+        None => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| "clock before 1970")?
+                .as_secs();
+            u32::try_from(now / 86_400).map_err(|_| "clock out of range")?
+                + zk::CREDENTIAL_EPOCH_OFFSET_DAYS
+        }
+    };
+    // Before the key: loading it takes seconds on a phone.
+    predicate::check_asset_claim(&opening, mask, &countries, today_days)?;
+    let pk = predicate_key().ok_or("invalid bundled predicate key")?;
+    let (sub, proof) = predicate::prove_asset_claim(
+        secret,
+        &opening,
+        &sender,
+        &gate.asset_ref,
+        mask,
+        &countries,
+        today_days,
+        pk,
+        &mut ark_std::rand::rngs::OsRng,
+    )?;
+    let mut bytes = Vec::new();
+    proof
+        .serialize_compressed(&mut bytes)
+        .map_err(|_| "proof serialization")?;
+    Ok(serde_json::json!({
+        "sub": encode_field(&sub),
+        "today_days": today_days,
+        "proof": hex::encode(bytes),
+    }))
 }
 
 /// Returned pointer belongs to the caller until `arx_id_free` is called.
@@ -422,5 +508,142 @@ mod tests {
         let vk =
             zk::VerifyingKey::<Bls12_381>::deserialize_compressed(zk::PREDICATE_VK_BYTES).unwrap();
         assert!(predicate::verify_predicate(p, &proof, &vk));
+    }
+
+    /// A credential the chain's `verify_claim_proof` should accept: KYC'd,
+    /// Swiss, expiring on day 50 000, for the wallet seeded with 0x01s.
+    fn swiss_opening() -> (serde_json::Value, Fr) {
+        let params = zk::poseidon_params();
+        let commitment = zk::id_commitment(&params, zk::derive_id_secret(&[1u8; 32]));
+        let opening = zk::CredentialOpening {
+            kyc: true,
+            aml: false,
+            accredited: false,
+            birth_date_days: 30_000,
+            country_code: *b"CH",
+            membership_root: Fr::from(0u64),
+            expiry_days: 50_000,
+            salt: Fr::from(19u64),
+        };
+        let leaf = zk::credential_leaf(&params, commitment, &opening);
+        let json = serde_json::json!({
+            "kyc": true, "aml": false, "accredited": false,
+            "birth_date_days": 30_000, "country_code": "CH",
+            "membership_root": encode_field(&opening.membership_root),
+            "expiry_days": 50_000, "salt": encode_field(&opening.salt),
+            "leaf": encode_field(&leaf),
+        });
+        (json, leaf)
+    }
+
+    /// EEA + CH, KYC required: an allow-list longer than the circuit's old
+    /// ten slots.
+    fn bond() -> xc_primitives::Asset {
+        let issuer = xc_primitives::Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+        let mut asset = xc_primitives::Asset::new("bond", issuer, false);
+        asset.required_claims = vec![xc_primitives::ClaimTopic::Kyc];
+        asset.allowed_jurisdictions = Some(
+            [
+                "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR",
+                "HU", "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MT", "NL", "NO", "PL", "PT", "RO",
+                "SE", "SI", "SK",
+            ]
+            .map(String::from)
+            .to_vec(),
+        );
+        asset.private_claims = true;
+        asset
+    }
+
+    fn prove_for(asset: &xc_primitives::Asset, opening: serde_json::Value) -> serde_json::Value {
+        call(serde_json::json!({
+            "operation": "prove_asset_claim", "seed_hex": "01".repeat(32), "opening": opening,
+            "asset": {
+                "asset_ref": asset.asset_ref.to_string(),
+                "required_claims": serde_json::to_value(&asset.required_claims).unwrap(),
+                "allowed_jurisdictions": asset.allowed_jurisdictions,
+            },
+            "sender_pubkey": hex::encode([5u8; 32]), "today_days": 46_290,
+        }))
+    }
+
+    /// What the wallet sends is exactly what the chain verifies: a proof
+    /// from this ABI passes `circuit_identity::verify_claim_proof` for the
+    /// sender it was made for, and nobody else.
+    #[test]
+    fn an_asset_claim_proof_verifies_on_chain() {
+        use xc_storage::{AccountUpdates, ArxiumDb};
+        let asset = bond();
+        let (opening, leaf) = swiss_opening();
+        let reply = prove_for(&asset, opening);
+        assert!(reply.get("error").is_none(), "{reply}");
+        let sub: [u8; 32] = hex::decode(reply["sub"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let proof = hex::decode(reply["proof"].as_str().unwrap()).unwrap();
+
+        let db = ArxiumDb::open(
+            &std::env::temp_dir().join(format!("arxium-test-arx-id-ffi-{}", std::process::id())),
+        )
+        .unwrap();
+        let sender = xc_primitives::Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        let other = xc_primitives::Address::from_pubkey_bytes(&[6u8; 32]).unwrap();
+        let attested = xc_primitives::AccountEntry {
+            identity_hash: Some(encode_field(&leaf)),
+            attested_at: Some(0),
+            ..Default::default()
+        };
+        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
+            (sender.clone(), attested.clone()),
+            (other.clone(), attested),
+        ])))
+        .unwrap();
+        let block_time = u64::from(46_290 - zk::CREDENTIAL_EPOCH_OFFSET_DAYS) * 86_400 + 3_600;
+        circuit_identity::verify_claim_proof(
+            &db, &sender, &asset, &sub, 46_290, block_time, &proof,
+        )
+        .expect("the chain accepts the wallet's proof");
+        assert!(matches!(
+            circuit_identity::verify_claim_proof(
+                &db, &other, &asset, &sub, 46_290, block_time, &proof
+            ),
+            Err(circuit_identity::IdentityError::ProofRejected)
+        ));
+    }
+
+    /// An unmet gate is named before any proving — the holder learns why,
+    /// instead of paying for a transaction the chain rejects.
+    #[test]
+    fn an_unmet_asset_gate_is_named_without_proving() {
+        let (opening, _) = swiss_opening();
+        let unmet = |edit: &dyn Fn(&mut serde_json::Value, &mut xc_primitives::Asset)| {
+            let (mut opening, mut asset) = (opening.clone(), bond());
+            edit(&mut opening, &mut asset);
+            opening.as_object_mut().unwrap().remove("leaf");
+            prove_for(&asset, opening)["error"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            unmet(&|o, _| o["country_code"] = "US".into()),
+            "credential's country is not allowed for this asset"
+        );
+        assert_eq!(
+            unmet(&|o, _| o["kyc"] = false.into()),
+            "credential lacks the KYC claim"
+        );
+        assert_eq!(
+            unmet(&|o, _| o["expiry_days"] = 40_000.into()),
+            "credential expired"
+        );
+        assert_eq!(
+            unmet(&|_, a| {
+                a.required_claims.clear();
+                a.allowed_jurisdictions = None;
+            }),
+            "asset asks for no provable claims"
+        );
     }
 }

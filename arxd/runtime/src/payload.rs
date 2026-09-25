@@ -457,6 +457,32 @@ pub type ChainBlock = xc_primitives::Block<ActionPayload>;
 mod tests {
     use super::*;
 
+    /// `VerifyClaimProof`'s exact bytes, pinned identically in Arx+ Swift's
+    /// `ArxiumCodecTests`: variant 40, the ref as a string, `sub` as 32 raw
+    /// bytes (a fixed array has no length prefix), `today_days` as a varint,
+    /// the proof as a length-prefixed byte string.
+    #[test]
+    fn verify_claim_proof_wire_bytes_are_pinned() {
+        let payload = ActionPayload::VerifyClaimProof {
+            asset: AssetRef::derive(
+                &xc_primitives::Address::from_pubkey_bytes(&[7u8; 32]).unwrap(),
+                "bond",
+            )
+            .unwrap(),
+            sub: [1u8; 32],
+            today_days: 46_290,
+            proof: vec![2, 3],
+        };
+        let bytes = bincode::serde::encode_to_vec(&payload, xc_primitives::wire_config()).unwrap();
+        assert_eq!(
+            hex::encode(bytes),
+            "28436172786173736574316c72776a6b6c676e3634656b76357a67673564366e77613035676c7971\
+             6361656e66747138343679706c75733435763332653671716c656a3270\
+             0101010101010101010101010101010101010101010101010101010101010101\
+             fbd2b4020203"
+        );
+    }
+
     /// Wire discriminants the out-of-process codecs (Arx-Plus Swift, Console
     /// TS, Retracer) have hard-coded. Inserting a variant mid-enum shifts
     /// every later index and fails here instead of on a phone.
