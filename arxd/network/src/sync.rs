@@ -200,6 +200,17 @@ pub(crate) fn advance_stuck_tip(
     }
 }
 
+/// A `Blocks` page that starts at or below the tip it arrived at and moved
+/// nothing: its request went out from an older tip, and another page (from
+/// this peer or another) already covered the range. The status tick sends a
+/// fresh `Blocks` request to every peer that is ahead without checking for one
+/// already in flight, so while catching up several pages race for each
+/// range. Counting the losers as stuck rounds gave up on healthy peers at every
+/// page boundary.
+pub(crate) fn is_stale_page(first_height: u64, tip_before: u64, tip_after: u64) -> bool {
+    first_height <= tip_before && tip_after == tip_before
+}
+
 pub(crate) fn send_sync_request(
     swarm: &mut libp2p::Swarm<Behaviour>,
     peer: &PeerId,
@@ -253,6 +264,17 @@ pub(crate) mod tests {
             assert_eq!(rounds, expected);
             state = next_state;
         }
+    }
+
+    #[test]
+    fn stale_page_is_only_one_that_starts_at_or_below_tip_and_moves_nothing() {
+        // Lost the race: page 901..=1000 arrives after another page took the tip to 1000.
+        assert!(is_stale_page(901, 1000, 1000));
+        assert!(is_stale_page(1000, 1000, 1000));
+        // Real rejection: the peer served tip + 1 and the node refused it.
+        assert!(!is_stale_page(1001, 1000, 1000));
+        // Overlapping page that still moved the tip is progress.
+        assert!(!is_stale_page(950, 1000, 1050));
     }
 
     #[test]
