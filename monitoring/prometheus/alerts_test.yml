@@ -226,3 +226,103 @@ tests:
       - eval_time: 7h
         alertname: RetracerDiskGrowth
         exp_alerts: []
+
+  # --- host ---------------------------------------------------------------
+
+  # The 2026-09-21 shape: 40 GB root disk losing ~1.8 GB/h. Projected empty
+  # well inside 3 days, while still above 10% free, so only the early
+  # warning fires.
+  - interval: 10m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="host",device="/dev/sda2",fstype="ext4",mountpoint="/"}'
+        values: '20e9-300e6x50'
+      - series: 'node_filesystem_size_bytes{job="host",device="/dev/sda2",fstype="ext4",mountpoint="/"}'
+        values: '40e9x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: HostDiskWillFillIn3Days
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: host
+              device: /dev/sda2
+              fstype: ext4
+              mountpoint: /
+            exp_annotations:
+              summary: "Disk / is projected to fill within 3 days"
+              description: "At the rate of the last 6 hours, free space on / (/dev/sda2) reaches zero within 3 days. Find what grows with du before the node stops.\n"
+      - eval_time: 7h
+        alertname: HostDiskAlmostFull
+        exp_alerts: []
+
+  # Slow growth (30 MB/h, ~2 GB in 3 days against 20 GB free): quiet.
+  - interval: 10m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="host",device="/dev/sda2",fstype="ext4",mountpoint="/"}'
+        values: '20e9-5e6x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: HostDiskWillFillIn3Days
+        exp_alerts: []
+
+  # tmpfs mounts fill and drain by design; they must never page.
+  - interval: 10m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="host",device="tmpfs",fstype="tmpfs",mountpoint="/run"}'
+        values: '1e9-100e6x50'
+      - series: 'node_filesystem_size_bytes{job="host",device="tmpfs",fstype="tmpfs",mountpoint="/run"}'
+        values: '1e9x50'
+    alert_rule_test:
+      - eval_time: 7h
+        alertname: HostDiskWillFillIn3Days
+        exp_alerts: []
+      - eval_time: 7h
+        alertname: HostDiskAlmostFull
+        exp_alerts: []
+
+  # Flat at 7.5% free: already critical even with no growth.
+  - interval: 1m
+    input_series:
+      - series: 'node_filesystem_avail_bytes{job="host",device="/dev/sda2",fstype="ext4",mountpoint="/"}'
+        values: '3e9x20'
+      - series: 'node_filesystem_size_bytes{job="host",device="/dev/sda2",fstype="ext4",mountpoint="/"}'
+        values: '40e9x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HostDiskAlmostFull
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: HostDiskAlmostFull
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: host
+              device: /dev/sda2
+              fstype: ext4
+              mountpoint: /
+            exp_annotations:
+              summary: "Disk / has 7.5% free"
+              description: "Less than 10% of / (/dev/sda2) is free. RocksDB and Postgres stop writing when it reaches zero.\n"
+      - eval_time: 10m
+        alertname: HostDiskWillFillIn3Days
+        exp_alerts: []
+
+  # A dead exporter must be visible, otherwise the disk rules go silent.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="host",instance="127.0.0.1:9100"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: HostMetricsUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: HostMetricsUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: host
+              instance: 127.0.0.1:9100
+            exp_annotations:
+              summary: "Host metrics are unavailable"
+              description: "Prometheus has been unable to scrape node_exporter for five minutes, so the disk alerts below cannot fire. Check systemctl status arxium-node-exporter.\n"

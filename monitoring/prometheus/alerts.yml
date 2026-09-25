@@ -132,3 +132,49 @@ groups:
             Linear projection of retracer_database_size_bytes over the last
             6 hours crosses the 12 GB budget within the next 7 days. The
             database shares the root disk with the node's chain data.
+
+  # Host disk. Needs the `host` job (node_exporter on 127.0.0.1:9100), which
+  # the native installer always adds; elsewhere these rules match nothing.
+  # A full root disk halted the chain on 2026-09-21, and nothing watched it:
+  # the chain data, Retracer's Postgres and the logs all share that disk.
+  - name: host
+    rules:
+      - alert: HostMetricsUnavailable
+        expr: up{job="host"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Host metrics are unavailable"
+          description: >
+            Prometheus has been unable to scrape node_exporter for five
+            minutes, so the disk alerts below cannot fire. Check systemctl
+            status arxium-node-exporter.
+
+      # Linear projection over 6 hours, like RetracerDiskGrowth, so a short
+      # burst (a compaction, a backup dump) does not page.
+      - alert: HostDiskWillFillIn3Days
+        expr: >
+          predict_linear(node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs"}[6h], 3 * 24 * 3600) < 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} is projected to fill within 3 days"
+          description: >
+            At the rate of the last 6 hours, free space on
+            {{ $labels.mountpoint }} ({{ $labels.device }}) reaches zero
+            within 3 days. Find what grows with du before the node stops.
+
+      - alert: HostDiskAlmostFull
+        expr: >
+          node_filesystem_avail_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs"}
+            / node_filesystem_size_bytes{fstype!~"tmpfs|ramfs|overlay|squashfs"} < 0.10
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Disk {{ $labels.mountpoint }} has {{ $value | humanizePercentage }} free"
+          description: >
+            Less than 10% of {{ $labels.mountpoint }} ({{ $labels.device }})
+            is free. RocksDB and Postgres stop writing when it reaches zero.

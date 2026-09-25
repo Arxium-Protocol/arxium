@@ -42,7 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts
 ```
 
 The flag downloads a checksum-covered monitoring archive from the same release
-tag as the node binary. Prometheus, Grafana, and Alertmanager downloads are
+tag as the node binary. Prometheus, node_exporter, Grafana, and Alertmanager downloads are
 also verified against checksums published by their upstream projects. Native
 installation requires `nftables` for Grafana process isolation.
 
@@ -54,7 +54,8 @@ sudo ./monitoring/native/install-monitoring.sh
 
 Prometheus and Grafana run as separate unprivileged system users. Their data is
 stored under `/var/lib/arxium-monitoring`. Prometheus stays private on
-`127.0.0.1:9090`. Grafana listens publicly on port 3000 with a generated
+`127.0.0.1:9090`. node_exporter runs with only its filesystem collector,
+private on `127.0.0.1:9100`, and feeds the host disk alerts. Grafana listens publicly on port 3000 with a generated
 self-signed TLS certificate.
 
 During the first installation, the installer asks for:
@@ -135,8 +136,8 @@ readable only by root and the monitoring service account.
 sudo ./monitoring/native/uninstall-monitoring.sh
 ```
 
-The uninstaller removes the Prometheus, Grafana, and optional Alertmanager
-services but preserves binaries, credentials, configuration, dashboards, and
+The uninstaller removes the Prometheus, node_exporter, Grafana, and optional
+Alertmanager services but preserves binaries, credentials, configuration, dashboards, and
 time-series data until you deliberately remove their directories.
 
 ## Docker Compose
@@ -163,7 +164,10 @@ The shipped rules detect:
 - a validator set that cannot reach finality quorum with its registered BLS
   keys;
 - rejected blocks and block-production errors;
-- a sustained mempool backlog.
+- a sustained mempool backlog;
+- on the native install, a disk projected to fill within 3 days (6-hour
+  trend), a disk under 10% free, and a dead node_exporter. The Compose path
+  runs no node_exporter, so these never fire there.
 
 The Grafana dashboard under `grafana/dashboards/arxium-node.json` shows tip
 height and age, finality capacity, peers, block rates, mempool depth, RPC rate,
