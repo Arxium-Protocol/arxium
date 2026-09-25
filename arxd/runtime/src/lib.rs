@@ -1795,9 +1795,33 @@ mod sdk_golden_fixtures {
                 &key,
                 nonce,
                 ActionPayload::IssueAssetTo {
-                    asset,
+                    asset: asset.clone(),
                     to: recipient,
                     amount,
+                },
+            ),
+            fixture(
+                "verifyClaimProof",
+                json!({"asset": asset, "sub": b(&[1u8; 32]), "todayDays": 46_290, "proof": b(&[2, 3, 4])}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::VerifyClaimProof {
+                    asset: asset.clone(),
+                    sub: [1u8; 32],
+                    today_days: 46_290,
+                    proof: vec![2, 3, 4],
+                },
+            ),
+            fixture(
+                "setPrivateClaims",
+                json!({"asset": asset, "enabled": true}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::SetPrivateClaims {
+                    asset,
+                    enabled: true,
                 },
             ),
         ];
