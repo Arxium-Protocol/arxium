@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Install Prometheus, Grafana, and optional Alertmanager under systemd.
+# Install Prometheus, node_exporter, Grafana, and optional Alertmanager under systemd.
 set -Eeuo pipefail
 
 PROM_VERSION="${PROM_VERSION:-3.7.2}"
 AM_VERSION="${AM_VERSION:-0.28.1}"
+NODE_EXPORTER_VERSION="${NODE_EXPORTER_VERSION:-1.12.1}"
 GRAFANA_VERSION="${GRAFANA_VERSION:-12.1.4}"
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/arxium-monitoring}"
 CONFIG_ROOT="${CONFIG_ROOT:-/etc/arxium-monitoring}"
@@ -84,15 +85,18 @@ bootstrap_pending=0
 transaction_active=0
 grafana_was_active=0
 prometheus_was_active=0
+node_exporter_was_active=0
 alertmanager_was_active=0
 grafana_was_enabled=0
 prometheus_was_enabled=0
+node_exporter_was_enabled=0
 alertmanager_was_enabled=0
 had_config_root=0
 had_grafana_data=0
 config_root_existed=0
 grafana_data_existed=0
 old_prometheus_target=""
+old_node_exporter_target=""
 old_grafana_target=""
 old_alertmanager_target=""
 
@@ -108,9 +112,10 @@ restore_link() {
 rollback_monitoring() {
   set +e
   log "validation failed; restoring the previous monitoring installation"
-  systemctl stop arxium-grafana arxium-prometheus arxium-alertmanager >/dev/null 2>&1
-  systemctl disable arxium-grafana arxium-prometheus arxium-alertmanager >/dev/null 2>&1
+  systemctl stop arxium-grafana arxium-prometheus arxium-alertmanager arxium-node-exporter >/dev/null 2>&1
+  systemctl disable arxium-grafana arxium-prometheus arxium-alertmanager arxium-node-exporter >/dev/null 2>&1
   restore_link prometheus "$old_prometheus_target"
+  restore_link node_exporter "$old_node_exporter_target"
   restore_link grafana "$old_grafana_target"
   restore_link alertmanager "$old_alertmanager_target"
 
@@ -128,7 +133,7 @@ rollback_monitoring() {
     rm -rf "$STATE_ROOT/grafana/data"
   fi
 
-  for unit in arxium-prometheus arxium-grafana arxium-alertmanager; do
+  for unit in arxium-prometheus arxium-grafana arxium-alertmanager arxium-node-exporter; do
     if [[ -f "$tmp/$unit.service" ]]; then
       cp -a "$tmp/$unit.service" "/etc/systemd/system/$unit.service"
     else
@@ -138,9 +143,11 @@ rollback_monitoring() {
   nft list table inet arxium_grafana >/dev/null 2>&1 \
     && nft delete table inet arxium_grafana
   systemctl daemon-reload
+  [[ $node_exporter_was_enabled -eq 1 ]] && systemctl enable arxium-node-exporter
   [[ $prometheus_was_enabled -eq 1 ]] && systemctl enable arxium-prometheus
   [[ $alertmanager_was_enabled -eq 1 ]] && systemctl enable arxium-alertmanager
   [[ $grafana_was_enabled -eq 1 ]] && systemctl enable arxium-grafana
+  [[ $node_exporter_was_active -eq 1 ]] && systemctl restart arxium-node-exporter
   [[ $prometheus_was_active -eq 1 ]] && systemctl restart arxium-prometheus
   [[ $alertmanager_was_active -eq 1 ]] && systemctl restart arxium-alertmanager
   [[ $grafana_was_active -eq 1 ]] && systemctl restart arxium-grafana
@@ -276,15 +283,19 @@ if ! id grafana >/dev/null 2>&1; then
 fi
 
 install_component prometheus "$PROM_VERSION"
+install_component node_exporter "$NODE_EXPORTER_VERSION"
 install_grafana
 
 old_prometheus_target="$(readlink -f "$INSTALL_ROOT/prometheus" 2>/dev/null || true)"
+old_node_exporter_target="$(readlink -f "$INSTALL_ROOT/node_exporter" 2>/dev/null || true)"
 old_grafana_target="$(readlink -f "$INSTALL_ROOT/grafana" 2>/dev/null || true)"
 old_alertmanager_target="$(readlink -f "$INSTALL_ROOT/alertmanager" 2>/dev/null || true)"
 systemctl is-active --quiet arxium-prometheus && prometheus_was_active=1
+systemctl is-active --quiet arxium-node-exporter && node_exporter_was_active=1
 systemctl is-active --quiet arxium-grafana && grafana_was_active=1
 systemctl is-active --quiet arxium-alertmanager && alertmanager_was_active=1
 systemctl is-enabled --quiet arxium-prometheus && prometheus_was_enabled=1
+systemctl is-enabled --quiet arxium-node-exporter && node_exporter_was_enabled=1
 systemctl is-enabled --quiet arxium-grafana && grafana_was_enabled=1
 systemctl is-enabled --quiet arxium-alertmanager && alertmanager_was_enabled=1
 if [[ -d "$CONFIG_ROOT" ]]; then
@@ -293,7 +304,7 @@ if [[ -d "$CONFIG_ROOT" ]]; then
     || die "could not back up the existing monitoring configuration"
   had_config_root=1
 fi
-for unit in arxium-prometheus arxium-grafana arxium-alertmanager; do
+for unit in arxium-prometheus arxium-grafana arxium-alertmanager arxium-node-exporter; do
   if [[ -f "/etc/systemd/system/$unit.service" ]]; then
     cp -a "/etc/systemd/system/$unit.service" "$tmp/$unit.service" \
       || die "could not back up $unit.service"
@@ -311,6 +322,7 @@ fi
 transaction_active=1
 
 ln -sfn "$INSTALL_ROOT/prometheus-$PROM_VERSION" "$INSTALL_ROOT/prometheus"
+ln -sfn "$INSTALL_ROOT/node_exporter-$NODE_EXPORTER_VERSION" "$INSTALL_ROOT/node_exporter"
 ln -sfn "$INSTALL_ROOT/grafana-$GRAFANA_VERSION" "$INSTALL_ROOT/grafana"
 
 mkdir -p "$CONFIG_ROOT" "$STATE_ROOT/prometheus"
@@ -331,6 +343,17 @@ if [[ $WITH_RETRACER == 1 ]]; then
       - targets: ['127.0.0.1:8080']
 YAML
 fi
+# Host metrics come from the node_exporter this installer always runs, so the
+# job is appended here rather than shipped in the shared prometheus.yml (the
+# Compose path runs no node_exporter). Only the filesystem collector is on:
+# it is all the host rules in alerts.yml need.
+cat >> "$CONFIG_ROOT/prometheus.yml" <<'YAML'
+
+  - job_name: host
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['127.0.0.1:9100']
+YAML
 if [[ -f "$SCRIPT_DIR/alertmanager.yml.example" ]]; then
   install -m 0644 "$SCRIPT_DIR/alertmanager.yml.example" "$CONFIG_ROOT/alertmanager.yml.example"
 fi
@@ -626,6 +649,30 @@ if [[ $ALERTMANAGER == 1 ]]; then
   chown -R prometheus:prometheus "$STATE_ROOT/alertmanager"
 fi
 
+cat > /etc/systemd/system/arxium-node-exporter.service <<UNIT
+[Unit]
+Description=Arxium host metrics (node_exporter)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=prometheus
+ExecStart=$INSTALL_ROOT/node_exporter/node_exporter \\
+  --collector.disable-defaults \\
+  --collector.filesystem \\
+  --web.listen-address=127.0.0.1:9100
+Restart=on-failure
+RestartSec=5
+UMask=0027
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
 cat > /etc/systemd/system/arxium-prometheus.service <<UNIT
 [Unit]
 Description=Arxium node metrics scraper (Prometheus)
@@ -687,6 +734,8 @@ if [[ $ALERTMANAGER == 1 ]]; then
   systemctl enable arxium-alertmanager
   systemctl restart arxium-alertmanager
 fi
+systemctl enable arxium-node-exporter
+systemctl restart arxium-node-exporter
 systemctl enable arxium-prometheus
 systemctl restart arxium-prometheus
 systemctl restart arxium-grafana
@@ -694,6 +743,7 @@ systemctl restart arxium-grafana
 attempt=1
 while [[ $attempt -le 120 ]]; do
   if curl -fsS http://127.0.0.1:9090/-/ready >/dev/null 2>&1 \
+    && curl -fsS http://127.0.0.1:9100/metrics >/dev/null 2>&1 \
     && curl --resolve "$grafana_public_host:3000:127.0.0.1" \
       --cacert "$GRAFANA_CERT" -fsS "https://$grafana_public_host:3000/api/health" \
       >/dev/null 2>&1; then
@@ -705,8 +755,9 @@ done
 
 [[ $attempt -le 120 ]] || {
   systemctl status arxium-prometheus --no-pager >&2 || true
+  systemctl status arxium-node-exporter --no-pager >&2 || true
   systemctl status arxium-grafana --no-pager >&2 || true
-  die "Prometheus and Grafana did not become ready within 120 seconds"
+  die "Prometheus, node_exporter, and Grafana did not become ready within 120 seconds"
 }
 
 if [[ $bootstrap_pending -eq 1 ]]; then
@@ -752,6 +803,7 @@ transaction_active=0
 
 certificate_fingerprint="$(openssl x509 -in "$GRAFANA_CERT" -noout -fingerprint -sha256 | cut -d= -f2)"
 log "Prometheus is ready at http://127.0.0.1:9090"
+log "node_exporter is ready at http://127.0.0.1:9100 (filesystem collector only)"
 log "Grafana is ready at https://$grafana_public_host:3000"
 log "Grafana username: $grafana_admin_user"
 log "Grafana password: configured and stored by Grafana as a salted hash (not displayed)"

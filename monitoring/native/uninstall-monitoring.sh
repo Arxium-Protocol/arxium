@@ -6,9 +6,11 @@ set -Eeuo pipefail
 systemctl disable --now arxium-prometheus 2>/dev/null || true
 systemctl disable --now arxium-alertmanager 2>/dev/null || true
 systemctl disable --now arxium-grafana 2>/dev/null || true
+systemctl disable --now arxium-node-exporter 2>/dev/null || true
 rm -f /etc/systemd/system/arxium-prometheus.service
 rm -f /etc/systemd/system/arxium-alertmanager.service
 rm -f /etc/systemd/system/arxium-grafana.service
+rm -f /etc/systemd/system/arxium-node-exporter.service
 nft list table inet arxium_grafana >/dev/null 2>&1 \
   && nft delete table inet arxium_grafana \
   || true

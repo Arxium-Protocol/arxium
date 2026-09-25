@@ -261,6 +261,21 @@ jobs:
           test -f /etc/arxium-monitoring/grafana-initialized
           test ! -e /etc/arxium-monitoring/grafana-bootstrap.env
           sudo systemctl is-active --quiet arxium-prometheus arxium-grafana
+          # Host disk alerts depend on this exporter and on Prometheus scraping it.
+          sudo systemctl is-active --quiet arxium-node-exporter
+          node_metrics="$(curl -fsS http://127.0.0.1:9100/metrics)"
+          grep -q '^node_filesystem_avail_bytes{' <<< "$node_metrics"
+          if curl --max-time 2 -fsS "http://$(hostname -I | awk '{print $1}'):9100/metrics" >/dev/null; then
+            echo "node_exporter is reachable beyond loopback" >&2
+            exit 1
+          fi
+          for _ in $(seq 1 60); do
+            curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22host%22%7D' \
+              | jq -e '.data.result[0].value[1] == "1"' >/dev/null && break
+            sleep 1
+          done
+          curl -fsS 'http://127.0.0.1:9090/api/v1/query?query=up%7Bjob%3D%22host%22%7D' \
+            | jq -e '.data.result[0].value[1] == "1"' >/dev/null
           curl --cacert /etc/arxium-monitoring/grafana/grafana.crt \
             -fsS https://127.0.0.1:3000/api/health >/dev/null
           curl --cacert /etc/arxium-monitoring/grafana/grafana.crt \
