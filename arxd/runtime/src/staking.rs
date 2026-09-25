@@ -299,6 +299,7 @@ mod tests {
             &[alice],
             0,
             &no_bls_owner,
+            0,
         ) {
             Err(err) => err,
             Ok(_) => panic!("expected leaving the last validator to be rejected"),
@@ -336,6 +337,7 @@ mod tests {
             &[alice.clone(), bob],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         assert!(matches!(
@@ -376,6 +378,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -434,6 +437,7 @@ mod tests {
             std::slice::from_ref(&alice),
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -480,6 +484,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(
@@ -517,6 +522,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("minimum validator stake"));
@@ -552,6 +558,7 @@ mod tests {
             &[alice.clone(), bob],
             5,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -626,6 +633,7 @@ mod tests {
             &[alice.clone(), bob],
             5,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("already has an unbonding batch"));
@@ -661,6 +669,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("is not authorized to manage"));
@@ -700,6 +709,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -776,6 +786,7 @@ mod tests {
             &[alice.clone(), bob.clone()],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -829,6 +840,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("is not authorized to manage"));
@@ -876,6 +888,7 @@ mod tests {
                 &[],
                 10,
                 &no_bls_owner,
+                0,
             );
             assert!(
                 result.is_err(),
@@ -920,6 +933,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .expect("a well-formed join must succeed");
 

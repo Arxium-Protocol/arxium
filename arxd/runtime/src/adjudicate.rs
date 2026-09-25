@@ -295,6 +295,9 @@ pub fn adjudicate_block_divergence(
             &validators,
             *height,
             &bls_pubkey_owner_lookup,
+            // Signed by the proposer as part of the header — the same value
+            // `accept_block` handed `dispatch`.
+            block_attestation.header.timestamp,
         );
         trie = view.trie;
 
@@ -438,6 +441,17 @@ fn replay(
                 .to_string(),
         ));
     }
+    // An `ActionClaim` signs no block timestamp, so an action whose result
+    // depends on it can't be replayed from this artifact alone.
+    if matches!(
+        action.payload,
+        crate::ActionPayload::VerifyClaimProof { .. }
+    ) {
+        return Ok(ReplayResult::Unprovable(
+            "VerifyClaimProof depends on the block timestamp, which an ActionDivergence claim doesn't sign"
+                .to_string(),
+        ));
+    }
 
     let pre_root = decode_root(&claim.pre_state_root)?;
     let proofs = decode_proofs(&claim.proofs)?;
@@ -479,6 +493,8 @@ fn replay(
         &validators,
         height,
         &bls_pubkey_owner_lookup,
+        // Only `VerifyClaimProof` reads it, and that is refused above.
+        0,
     );
 
     let updates = match updates {
@@ -768,6 +784,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -801,6 +818,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1065,6 +1083,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -1104,6 +1123,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1212,6 +1232,7 @@ mod tests {
             &validators,
             height,
             &bls_owner,
+            0,
         )
         .unwrap();
         // Writes are logged the way `execute_actions` logs them: by folding
@@ -1417,7 +1438,6 @@ mod tests {
     /// result instead — same shape as `build_scenario` above, one level up.
     fn build_block_scenario(dissent_amount: u128) -> (EvidenceArtifact, String, String) {
         let db = temp_db();
-        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
         let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let bob = xc_primitives::Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
@@ -1437,7 +1457,6 @@ mod tests {
             },
         };
         let actions = vec![action.clone()];
-        let tx_root = xc_poe::tx_root(&actions).unwrap();
 
         let view = xc_storage::BlockView::new(&db);
         let real_updates = crate::dispatch(
@@ -1448,6 +1467,7 @@ mod tests {
             &[],
             5,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -1478,6 +1498,7 @@ mod tests {
             &[],
             5,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1490,15 +1511,38 @@ mod tests {
             hex_proof(db.prove(&bob_key, &parent_root).unwrap()),
         ];
 
+        sign_block_divergence(
+            parent_root,
+            &actions,
+            1234,
+            real_state_root,
+            dissent_state_root,
+            proofs,
+        )
+    }
+
+    /// A `BlockDivergence` artifact for a height-5 block of `actions` stamped
+    /// `timestamp`: the proposer signs a header claiming `proposer_root`, a
+    /// dissenter BLS-signs `dissent_root` with `proofs` against `parent_root`.
+    fn sign_block_divergence(
+        parent_root: String,
+        actions: &[crate::ChainAction],
+        timestamp: u64,
+        proposer_root: String,
+        dissent_root: String,
+        proofs: Vec<StateProof>,
+    ) -> (EvidenceArtifact, String, String) {
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let tx_root = xc_poe::tx_root(actions).unwrap();
         let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
 
         let header = xc_artifact::CanonicalHeader {
             height: 5,
             parent_hash: "0xparent".to_string(),
-            timestamp: 1234,
+            timestamp,
             tx_root: format!("0x{}", hex::encode(tx_root)),
             proposer: "arx1proposer".to_string(),
-            state_root: real_state_root,
+            state_root: proposer_root,
             round: 0,
         };
         let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
@@ -1515,7 +1559,7 @@ mod tests {
             5,
             &header_commitment,
             &parent_root,
-            &dissent_state_root,
+            &dissent_root,
         );
 
         let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
@@ -1530,15 +1574,20 @@ mod tests {
                 height: 5,
                 parent_state_root: parent_root,
                 block_attestation,
-                actions: vec![format!(
-                    "0x{}",
-                    hex::encode(
-                        bincode::serde::encode_to_vec(&action, bincode::config::standard())
-                            .unwrap()
-                    )
-                )],
+                actions: actions
+                    .iter()
+                    .map(|action| {
+                        format!(
+                            "0x{}",
+                            hex::encode(
+                                bincode::serde::encode_to_vec(action, bincode::config::standard())
+                                    .unwrap()
+                            )
+                        )
+                    })
+                    .collect(),
                 dissent_claim: xc_artifact::BlockDissentClaim {
-                    computed_state_root: dissent_state_root,
+                    computed_state_root: dissent_root,
                     proofs,
                     signature: format!(
                         "0x{}",
@@ -1550,6 +1599,125 @@ mod tests {
         };
 
         (artifact, proposer_pubkey, voter_pubkey)
+    }
+
+    /// `VerifyClaimProof` checks credential expiry against the block's own
+    /// time, so replay must use the timestamp in the header the proposer
+    /// signed. That is the only way to tell an honest proposer from one that
+    /// accepted a backdated proof.
+    #[test]
+    fn claim_proof_blocks_replay_at_the_signed_header_timestamp() {
+        use crate::test_support::{CLAIM_DAY, claim_proof, day_start};
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let mut bond = xc_primitives::Asset::new("bond", issuer, false);
+        bond.required_claims = vec![xc_primitives::ClaimTopic::Kyc];
+        bond.allowed_jurisdictions = Some(vec!["CH".into()]);
+        bond.private_claims = true;
+        let (leaf, sub, proof) = claim_proof(&holder, &bond.asset_ref, CLAIM_DAY);
+        let action: crate::ChainAction = xc_primitives::Action {
+            sender: holder.clone(),
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::VerifyClaimProof {
+                asset: bond.asset_ref.clone(),
+                sub,
+                today_days: CLAIM_DAY,
+                proof,
+            },
+        };
+
+        // The proposer applies the proof as of `applied_at` and signs a
+        // header stamped `stamped`; the dissenter says it was rejected.
+        let scenario = |applied_at: u64, stamped: u64| {
+            let db = temp_db();
+            db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+                holder.clone(),
+                xc_primitives::AccountEntry {
+                    identity_hash: Some(leaf.clone()),
+                    attested_at: Some(0),
+                    ..entry(1_000_000_000)
+                },
+            )])))
+            .unwrap();
+            db.write_batch(&bond).unwrap();
+            let parent_root = db.compute_state_root(&[]).unwrap();
+            let view = xc_storage::BlockView::new_recording(&db);
+            let updates = crate::dispatch(
+                &action,
+                &view,
+                &no_operator,
+                &no_operator_validators,
+                &[],
+                5,
+                &no_bls_owner,
+                applied_at,
+            )
+            .unwrap();
+            let proofs = view
+                .touched_keys()
+                .iter()
+                .map(|key| hex_proof(db.prove(key, &parent_root).unwrap()))
+                .collect();
+            db.write_batch(&updates.accounts).unwrap();
+            db.write_batch(&updates.holder_states).unwrap();
+            let proposer_root = db.compute_state_root(&[]).unwrap();
+            sign_block_divergence(
+                parent_root.clone(),
+                std::slice::from_ref(&action),
+                stamped,
+                proposer_root,
+                parent_root,
+                proofs,
+            )
+        };
+
+        let (artifact, _, voter) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter
+            },
+            "an on-day proof was valid; the dissenter who rejected it is wrong"
+        );
+        let (artifact, proposer, _) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY + 5));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: proposer
+            },
+            "a proof dated five days before the signed block time must be rejected"
+        );
+    }
+
+    /// An `ActionClaim` signs no block timestamp, so a disputed
+    /// `VerifyClaimProof` can't be replayed from it. That is a
+    /// `Disagreement`, never a guess made at some stand-in time.
+    #[test]
+    fn a_claim_proof_action_divergence_is_unprovable() {
+        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = temp_db();
+        let pre_root = db.compute_state_root(&[]).unwrap();
+        let action: crate::ChainAction = xc_primitives::Action {
+            sender: holder.clone(),
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::VerifyClaimProof {
+                asset: xc_primitives::AssetRef::derive(&holder, "bond").unwrap(),
+                sub: [0; 32],
+                today_days: 0,
+                proof: Vec::new(),
+            },
+        };
+        let fake_post = format!("0x{}", hex::encode([0xAAu8; 32]));
+        let (artifact, _) =
+            artifact_with_wrong_dissent(&pre_root, &fake_post, Vec::new(), &action, 5);
+        match adjudicate_action_divergence(&artifact).unwrap() {
+            AdjudicationOutcome::Disagreement { reason } => {
+                assert!(reason.contains("block timestamp"), "got: {reason}")
+            }
+            other => panic!("expected Disagreement, got {other:?}"),
+        }
     }
 
     /// The block-level counterpart to
@@ -1839,6 +2007,7 @@ mod tests {
                 &[],
                 0,
                 &no_bls_owner,
+                0,
             )
             .unwrap();
             actions.push(action);

@@ -114,6 +114,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         assert_eq!(
@@ -162,6 +163,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         assert_eq!(

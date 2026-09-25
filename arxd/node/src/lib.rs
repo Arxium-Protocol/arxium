@@ -1041,6 +1041,7 @@ fn spawn_subsystems<R: ChainRuntime>(
         Box::new(move |block: Block<R::Payload>, sync: bool| -> bool {
             let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
             let height = block.height;
+            let timestamp = block.timestamp;
             let candidate = block.clone();
             let params = match db.chain_params() {
                 Ok(params) => params,
@@ -1064,6 +1065,7 @@ fn spawn_subsystems<R: ChainRuntime>(
                             operator_validators_lookup,
                             validators,
                             height,
+                            timestamp,
                         },
                     )
                 },

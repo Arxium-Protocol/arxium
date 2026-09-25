@@ -90,6 +90,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
+            0,
         )?;
         view.apply_accounts(&updates.accounts)?;
         view.apply_governance(&updates.governance);
