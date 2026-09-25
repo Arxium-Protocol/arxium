@@ -128,6 +128,8 @@ pub enum RwaError {
     },
     #[error("pro-rata arithmetic for {asset} overflows u128")]
     ShareOverflow { asset: AssetRef },
+    #[error("{address}'s attestation changed in this block; prove again in the next one")]
+    AttestedThisBlock { address: Address },
 }
 
 impl RwaError {
@@ -283,6 +285,16 @@ pub const CLAIM_PROOF_TTL_SECS: u64 = 90 * 86_400;
 /// live (revocation or attestor deregistration closes the gate at once), not
 /// re-granted since the proof (a new grant may carry narrower claims), and
 /// within `CLAIM_PROOF_TTL_SECS`.
+///
+/// "Since" is strict: a grant at the proof's own height could have landed
+/// after it in the same block, so it voids the proof. That is also why
+/// `apply_record_claim_proof` refuses a proof in the grant's own block.
+///
+/// This is the whole revocation story — no nullifier set is needed. The
+/// proof is bound to the holder's own attested leaf and key (never an
+/// anonymous set), and this check re-reads the live attestation on every
+/// transfer. Re-registering a deregistered attestor revives its grants and
+/// the proofs over them, exactly as it revives their clear-text claims.
 fn claim_proof_live<V: KvRead<Error = StorageError>>(
     view: &V,
     party: &Address,
@@ -295,7 +307,7 @@ fn claim_proof_live<V: KvRead<Error = StorageError>>(
     };
     if entry
         .and_then(|e| e.attested_at)
-        .is_none_or(|at| at > verified_at)
+        .is_none_or(|at| at >= verified_at)
         || !is_attested(view, party)?
     {
         return Ok(false);
@@ -310,12 +322,22 @@ fn claim_proof_live<V: KvRead<Error = StorageError>>(
 
 /// Records an accepted claim proof (`circuit_identity::verify_claim_proof`)
 /// for `holder` at `current_height`. Verification is the caller's job.
+///
+/// Refused in the block the attestation was (re-)granted: the grant could
+/// sit after the proof in that block, and `claim_proof_live` couldn't tell
+/// which came first. Proving again one block later always works.
 pub fn apply_record_claim_proof<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &Asset,
     holder: &Address,
     current_height: u64,
 ) -> Result<HolderStateUpdates, RwaError> {
+    let attested_at = view.get(&AccountKey(holder))?.and_then(|e| e.attested_at);
+    if attested_at.is_some_and(|at| at >= current_height) {
+        return Err(RwaError::AttestedThisBlock {
+            address: holder.clone(),
+        });
+    }
     // Raw read, like `apply_set_holder_frozen`: don't drop an expired lock
     // as a side effect of an unrelated write.
     let mut state = view
@@ -1850,6 +1872,75 @@ mod tests {
             send(&mut asset, 10),
             Err(RwaError::NotCompliant { .. })
         ));
+    }
+
+    /// D-17b item 5: every way an attestation ends closes the private gate,
+    /// through the real identity paths, so no nullifier set is needed:
+    /// revocation, attestor deregistration, and a re-grant (including one
+    /// in the proof's own block, which could have come after it).
+    #[test]
+    fn every_end_of_an_attestation_closes_the_private_gate() {
+        use circuit_identity::{
+            apply_deregister_attestor, apply_grant_attestation, apply_register_attestor,
+            apply_revoke_attestation,
+        };
+        let db = temp_db();
+        let (issuer, holder, attestor) = (addr(1), addr(2), addr(9));
+        let mut asset = Asset::new("bond", issuer.clone(), false);
+        asset.required_claims = vec![ClaimTopic::Kyc];
+        asset.allowed_jurisdictions = Some(vec!["CH".into()]);
+        asset.private_claims = true;
+        attest(&db, &issuer, &[ClaimTopic::Kyc], Some("CH"));
+        let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
+        db.write_batch(&accounts).unwrap();
+        db.write_batch(&assets).unwrap();
+        db.write_batch(&apply_register_attestor(&db, &attestor, "kyc", 0).unwrap())
+            .unwrap();
+        let grant = |height| {
+            db.write_batch(
+                &apply_grant_attestation(&db, &attestor, &holder, "leaf", &[], None, height)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let prove = |height| apply_record_claim_proof(&db, &asset, &holder, height);
+        let send = |height| {
+            let mut asset = asset.clone();
+            apply_compliant_transfer(&db, &mut asset, &issuer, 1, &holder, 10, height)
+        };
+
+        grant(5);
+        assert!(
+            matches!(prove(5), Err(RwaError::AttestedThisBlock { .. })),
+            "a proof in the grant's own block is refused"
+        );
+        db.write_batch(&prove(6).unwrap()).unwrap();
+        send(7).expect("a proof one block later is live");
+
+        grant(6);
+        assert!(
+            send(7).is_err(),
+            "a re-grant in the proof's own block voids it"
+        );
+        db.write_batch(&prove(7).unwrap()).unwrap();
+        send(8).expect("proving again after the re-grant");
+
+        db.write_batch(&apply_revoke_attestation(&db, &attestor, &holder).unwrap())
+            .unwrap();
+        assert!(
+            matches!(send(8), Err(RwaError::NotCompliant { .. })),
+            "revoked"
+        );
+
+        grant(9);
+        db.write_batch(&prove(10).unwrap()).unwrap();
+        send(11).expect("re-attested and proved");
+        db.write_batch(&apply_deregister_attestor(&db, &attestor).unwrap())
+            .unwrap();
+        assert!(
+            matches!(send(11), Err(RwaError::NotCompliant { .. })),
+            "the attestor was deregistered"
+        );
     }
 
     /// Both ends of a transfer must carry every required topic — a compliant
