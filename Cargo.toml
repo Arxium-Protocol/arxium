@@ -38,10 +38,6 @@ members = [
     "examples/toy-chain",
 ]
 exclude = ["fuzz"]
-
-# Wrapped balances are silent ledger corruption; panic instead.
-[profile.release]
-overflow-checks = true
 resolver = "2"
 default-members = ["arxd"]
 
@@ -132,3 +128,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 tower = { version = "0.5", features = ["util"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+
+# Wrapped balances are silent ledger corruption; panic instead.
+[profile.release]
+overflow-checks = true

@@ -353,7 +353,13 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// gained `claim_verified_at` (zk claim proofs, `VerifyClaimProof` /
 /// `SetPrivateClaims`, variants 40–41). Positional bincode on merkleized
 /// `CF_ASSETS` rows — devnet reset.
-pub const SCHEMA_VERSION: u32 = 18;
+///
+/// Bumped 18 -> 19: `CF_MERKLE` can hold 65-byte shortcut records in place
+/// of a single-key subtree's chain of nodes (see `shortcut`). Hashes and
+/// roots are unchanged and this binary still reads 64-byte-only tries, so
+/// 18 -> 19 is a re-stamp in `migrate_schema`, not a reset. The bump exists
+/// so that an older binary refuses a trie it can't read.
+pub const SCHEMA_VERSION: u32 = 19;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -432,6 +438,65 @@ fn decode_root(root: &str) -> Result<[u8; 32], StorageError> {
     bytes
         .try_into()
         .map_err(|_| StorageError::InvalidRoot(root.to_string()))
+}
+
+/// Nodes rebuilt from shortcut records during one descent: hash to (the
+/// node's own shortcut record, its two children).
+type Expanded = HashMap<[u8; 32], (Vec<u8>, ([u8; 32], [u8; 32]))>;
+
+/// One sibling hash per trie level, index 0 nearest the root.
+type Siblings = [[u8; 32]; 256];
+
+/// Byte length of a shortcut record in `CF_MERKLE`. Internal nodes are 64
+/// bytes (two child hashes), so the length alone tells the two apart. Leaves
+/// are never read through `node_children`, so their length doesn't matter.
+const SHORTCUT_LEN: usize = 65;
+
+/// Stored in place of the node at `level` whose subtree holds only
+/// `key_hash` (leaf hash `leaf`): the one key, its leaf hash and the level.
+/// That's enough to recompute every node on the chain below it
+/// (`lone_chain`), so none of those nodes are written. Only storage changes:
+/// node hashes, roots and proofs are exactly what the full trie gives.
+fn shortcut(key_hash: &[u8; 32], leaf: &[u8; 32], level: usize) -> Vec<u8> {
+    let mut content = Vec::with_capacity(SHORTCUT_LEN);
+    content.extend_from_slice(key_hash);
+    content.extend_from_slice(leaf);
+    content.push(u8::try_from(level).expect("shortcut level is below 256"));
+    content
+}
+
+fn decode_shortcut(bytes: &[u8]) -> ([u8; 32], [u8; 32], usize) {
+    (
+        bytes[..32].try_into().expect("caller checked SHORTCUT_LEN"),
+        bytes[32..64]
+            .try_into()
+            .expect("caller checked SHORTCUT_LEN"),
+        usize::from(bytes[64]),
+    )
+}
+
+/// `chain[l]` for `l` in `level..=256` is the node at level `l` on
+/// `key_hash`'s path, in a subtree that holds only that key. `chain[256]` is
+/// the leaf.
+fn lone_chain(key_hash: &[u8; 32], leaf: &[u8; 32], level: usize) -> [[u8; 32]; 257] {
+    let defaults = default_hashes();
+    let mut chain = [[0u8; 32]; 257];
+    chain[256] = *leaf;
+    for l in (level..256).rev() {
+        chain[l] = if bit_at(key_hash, l) == 0 {
+            internal_hash(&chain[l + 1], &defaults[255 - l])
+        } else {
+            internal_hash(&defaults[255 - l], &chain[l + 1])
+        };
+    }
+    chain
+}
+
+fn leaf_of(value: &Option<Vec<u8>>, key_hash: &[u8; 32]) -> [u8; 32] {
+    leaf_hash(
+        key_hash,
+        value.as_deref().expect("only a present key is lone"),
+    )
 }
 
 // The trie's hash functions, default-subtree table, and proof
@@ -530,6 +595,11 @@ impl ArxiumDb {
         let mut db_opts = RocksOptions::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        // The default cap is 4x the total memtable budget across all column
+        // families, several GB here, because rarely-written families never
+        // flush on their own. Past this cap, RocksDB flushes them so the old
+        // WAL files can be deleted.
+        db_opts.set_max_total_wal_size(256 << 20);
         let cf_descriptors = COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, RocksOptions::default()));
@@ -564,12 +634,29 @@ impl ArxiumDb {
                         supported: SCHEMA_VERSION,
                     })
                 } else {
-                    Err(StorageError::SchemaTooOld {
-                        found,
-                        supported: SCHEMA_VERSION,
-                    })
+                    self.migrate_schema(found)
                 }
             }
+        }
+    }
+
+    /// Brings an older database up to `SCHEMA_VERSION`, or refuses it with
+    /// `SchemaTooOld` when no migration exists from `found`.
+    fn migrate_schema(&self, found: u32) -> Result<(), StorageError> {
+        match found {
+            // Read-compatible: existing 64-byte nodes stay valid.
+            18 => {
+                self.db.put_cf(
+                    self.cf(CF_META),
+                    SCHEMA_VERSION_KEY,
+                    SCHEMA_VERSION.to_le_bytes(),
+                )?;
+                Ok(())
+            }
+            _ => Err(StorageError::SchemaTooOld {
+                found,
+                supported: SCHEMA_VERSION,
+            }),
         }
     }
 
@@ -1556,11 +1643,19 @@ impl ArxiumDb {
     /// `CF_MERKLE`. Only ever called for a hash already known not to be a
     /// default/empty-subtree hash, so a miss here means the trie is
     /// corrupted, not merely sparse.
+    ///
+    /// A node can also be stored as a shortcut record (see `shortcut`). Its
+    /// children are rebuilt from that record, and every node below it on the
+    /// single-leaf chain goes into `expanded` so the descent can keep going.
     fn node_children(
         &self,
         hash: &[u8; 32],
         overrides: &HashMap<[u8; 32], Vec<u8>>,
+        expanded: &mut Expanded,
     ) -> Result<([u8; 32], [u8; 32]), StorageError> {
+        if let Some((_, children)) = expanded.get(hash) {
+            return Ok(*children);
+        }
         let bytes = match overrides.get(hash) {
             Some(bytes) => bytes.clone(),
             None => self
@@ -1568,12 +1663,30 @@ impl ArxiumDb {
                 .get_cf(self.cf(CF_MERKLE), hash)?
                 .ok_or(StorageError::CorruptedMeta)?,
         };
-        if bytes.len() != 64 {
-            return Err(StorageError::CorruptedMeta);
+        match bytes.len() {
+            64 => {
+                let left: [u8; 32] = bytes[..32].try_into().expect("checked len above");
+                let right: [u8; 32] = bytes[32..].try_into().expect("checked len above");
+                Ok((left, right))
+            }
+            SHORTCUT_LEN => {
+                let (key_hash, leaf, level) = decode_shortcut(&bytes);
+                // Rebuild the single-child chain below this node once, and
+                // cache every node on it so the rest of the descent is lookups.
+                let chain = lone_chain(&key_hash, &leaf, level);
+                for l in level..256 {
+                    let empty = default_hashes()[255 - l];
+                    let children = if bit_at(&key_hash, l) == 0 {
+                        (chain[l + 1], empty)
+                    } else {
+                        (empty, chain[l + 1])
+                    };
+                    expanded.insert(chain[l], (shortcut(&key_hash, &leaf, l), children));
+                }
+                Ok(expanded[hash].1)
+            }
+            _ => Err(StorageError::CorruptedMeta),
         }
-        let left: [u8; 32] = bytes[..32].try_into().expect("checked len above");
-        let right: [u8; 32] = bytes[32..].try_into().expect("checked len above");
-        Ok((left, right))
     }
 
     /// Descends from `root` along `key_hash`'s 256-bit path, recording the
@@ -1582,14 +1695,20 @@ impl ArxiumDb {
     /// `default_hashes()[0]` if `key_hash` isn't present under `root`. Shared
     /// by `trie_root_after` (which then climbs back up with a new leaf in
     /// place) and `prove` (which stops here — the descent path *is* the
-    /// inclusion/non-inclusion proof).
+    /// inclusion/non-inclusion proof). Also returns the nodes it rebuilt from
+    /// shortcut records, which `trie_root_after` has to persist when one of
+    /// them becomes a sibling on the new path.
     fn descend(
         &self,
         root: [u8; 32],
         key_hash: &[u8; 32],
         overrides: &HashMap<[u8; 32], Vec<u8>>,
-    ) -> Result<([[u8; 32]; 256], [u8; 32]), StorageError> {
-        descend(root, key_hash, |hash| self.node_children(hash, overrides))
+    ) -> Result<(Siblings, [u8; 32], Expanded), StorageError> {
+        let mut expanded = HashMap::new();
+        let (siblings, leaf) = descend(root, key_hash, |hash| {
+            self.node_children(hash, overrides, &mut expanded)
+        })?;
+        Ok((siblings, leaf, expanded))
     }
 
     /// Builds an inclusion (or non-inclusion) proof for `key` against `root`
@@ -1604,7 +1723,7 @@ impl ArxiumDb {
     pub fn prove(&self, key: &[u8], root: &str) -> Result<InclusionProof, StorageError> {
         let root_bytes = decode_root(root)?;
         let key_hash = hash_key(key);
-        let (siblings, leaf_node) = self.descend(root_bytes, &key_hash, &HashMap::new())?;
+        let (siblings, leaf_node, _) = self.descend(root_bytes, &key_hash, &HashMap::new())?;
         let value = if leaf_node == default_hashes()[0] {
             None
         } else {
@@ -1647,10 +1766,25 @@ impl ArxiumDb {
             // without ever touching storage during descent, which is what
             // keeps an update to one key cheap regardless of how much of the
             // trie is still empty.
-            let (siblings, _leaf_node) = self.descend(root, key_hash, &overrides)?;
+            let (siblings, _leaf_node, expanded) = self.descend(root, key_hash, &overrides)?;
+
+            // A sibling rebuilt from a shortcut record is about to get a stored
+            // parent, so it needs a record of its own to stay reachable.
+            for sibling in &siblings {
+                if let Some((content, _)) = expanded.get(sibling) {
+                    if let Some(batch) = batch.as_deref_mut() {
+                        batch.put_cf(self.cf(CF_MERKLE), sibling, content);
+                    }
+                    overrides.insert(*sibling, content.clone());
+                }
+            }
 
             // Climb back up, recomputing every node on the path with the new
-            // leaf in place of the old one.
+            // leaf in place of the old one. Hashes are unchanged, but while the
+            // subtree below holds only this key, its single-child nodes are not
+            // stored: one shortcut record at the top of that chain stands in
+            // for all of them (~250 nodes, i.e. ~24 KB, per changed key).
+            let mut lone = new_value.is_some();
             let mut current = match new_value {
                 Some(value) => {
                     let leaf = leaf_hash(key_hash, value);
@@ -1671,12 +1805,36 @@ impl ArxiumDb {
                     (sibling, current)
                 };
                 let parent = internal_hash(&left, &right);
-                let content = [left.as_slice(), right.as_slice()].concat();
-                if let Some(batch) = batch.as_deref_mut() {
-                    batch.put_cf(self.cf(CF_MERKLE), parent, &content);
+                if lone && sibling == defaults[255 - level] {
+                    current = parent;
+                    continue;
                 }
-                overrides.insert(parent, content);
+                if lone {
+                    lone = false;
+                    if level + 1 < 256 {
+                        let content = shortcut(key_hash, &leaf_of(new_value, key_hash), level + 1);
+                        if let Some(batch) = batch.as_deref_mut() {
+                            batch.put_cf(self.cf(CF_MERKLE), current, &content);
+                        }
+                        overrides.insert(current, content);
+                    }
+                }
+                // An all-empty subtree resolves from `defaults`, never storage.
+                if parent != defaults[256 - level] {
+                    let content = [left.as_slice(), right.as_slice()].concat();
+                    if let Some(batch) = batch.as_deref_mut() {
+                        batch.put_cf(self.cf(CF_MERKLE), parent, &content);
+                    }
+                    overrides.insert(parent, content);
+                }
                 current = parent;
+            }
+            if lone {
+                let content = shortcut(key_hash, &leaf_of(new_value, key_hash), 0);
+                if let Some(batch) = batch.as_deref_mut() {
+                    batch.put_cf(self.cf(CF_MERKLE), current, &content);
+                }
+                overrides.insert(current, content);
             }
             root = current;
         }
@@ -2261,6 +2419,27 @@ mod explorer_index_tests {
         assert_eq!(db.all_validator_statuses().unwrap().len(), 1);
         // No params row seeded: defaults, not an error.
         assert_eq!(db.chain_params().unwrap(), ChainParams::default());
+    }
+
+    /// A version-18 database (full 64-byte trie nodes only) opens as-is and
+    /// is re-stamped: this binary reads that trie, so no reset is needed.
+    #[test]
+    fn schema_18_database_is_restamped_not_refused() {
+        let path = std::env::temp_dir().join(format!("arxium-test-storage-{}", uuid_like()));
+        {
+            let db = ArxiumDb::open(&path).unwrap();
+            db.db
+                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 18u32.to_le_bytes())
+                .unwrap();
+        }
+        let db = ArxiumDb::open(&path).unwrap();
+        assert_eq!(
+            db.db
+                .get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY)
+                .unwrap()
+                .unwrap(),
+            SCHEMA_VERSION.to_le_bytes()
+        );
     }
 
     /// A pre-10 database is refused, not migrated: the asset re-key cannot be
@@ -3009,6 +3188,74 @@ mod merkle_state_root_tests {
 
         db.write_batch(&accounts(&[(1, 100)])).unwrap();
         assert_eq!(db.compute_state_root(&[]).unwrap(), original);
+    }
+
+    /// Shortcut records change only what's stored, never a hash. So over a
+    /// random mix of inserts, updates and deletes, applied in batches of
+    /// varying size, the committed root must equal the in-memory full-trie
+    /// root, every key must prove against it, and one changed key must cost
+    /// a handful of stored nodes, not 257.
+    #[test]
+    fn compact_trie_matches_the_full_trie_and_stays_small() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let mut reference: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let keys: Vec<[u8; 32]> = (0..40u8).map(|i| hash_key(&[i])).collect();
+        for round in 0..100 {
+            let mut changes = BTreeMap::new();
+            for _ in 0..1 + next() % 4 {
+                let key = keys[(next() % keys.len() as u64) as usize];
+                let value = (next() % 5 != 0).then(|| next().to_le_bytes().to_vec());
+                changes.insert(key, value);
+            }
+            for (key, value) in &changes {
+                match value {
+                    Some(v) => reference.insert(*key, v.clone()),
+                    None => reference.remove(key),
+                };
+            }
+            let mut batch = WriteBatch::default();
+            let root = db.trie_root_after(&changes, Some(&mut batch)).unwrap();
+            db.db.write(batch).unwrap();
+            assert_eq!(
+                root,
+                xc_poe::state_trie::root_of(&reference),
+                "round {round}"
+            );
+
+            for key in &keys {
+                let (siblings, _, _) = db.descend(root, key, &HashMap::new()).unwrap();
+                let proof = InclusionProof {
+                    key_hash: *key,
+                    value: reference.get(key).cloned(),
+                    siblings: siblings.to_vec(),
+                };
+                assert!(
+                    xc_poe::state_trie::verify_proof(root, &proof),
+                    "round {round}"
+                );
+            }
+        }
+
+        let count = |db: &ArxiumDb| {
+            db.db
+                .iterator_cf(db.cf(CF_MERKLE), IteratorMode::Start)
+                .count()
+        };
+        let before = count(&db);
+        let key = keys[0];
+        let changes = BTreeMap::from([(key, Some(b"one more".to_vec()))]);
+        let mut batch = WriteBatch::default();
+        db.trie_root_after(&changes, Some(&mut batch)).unwrap();
+        db.db.write(batch).unwrap();
+        let written = count(&db) - before;
+        assert!(written <= 12, "one changed key stored {written} nodes");
     }
 
     /// `prove` (Part 3 Stage 1) must produce a proof `xc_poe::state_trie::verify_proof`
