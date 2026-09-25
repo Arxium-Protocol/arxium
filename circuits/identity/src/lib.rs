@@ -46,7 +46,7 @@ pub enum IdentityError {
     NotAttested(Address),
     #[error("asset has no claims a proof could satisfy")]
     NothingToProve,
-    #[error("asset's jurisdiction list is empty, invalid or longer than a claim proof's 10 slots")]
+    #[error("asset's jurisdiction list is empty or has a code outside ISO 3166-1 alpha-2")]
     UnprovableJurisdictions,
     #[error("sub is not a valid field element")]
     MalformedSub,
@@ -301,7 +301,7 @@ pub fn verify_claim_proof<V: KvRead<Error = StorageError>>(
             predicate::country_set(allowed.iter().map(String::as_str))
                 .ok_or(IdentityError::UnprovableJurisdictions)?
         }
-        None => [0; 10],
+        None => Vec::new(),
     };
     // A zero mask skips the leaf check inside the circuit entirely.
     if mask == 0 {
@@ -567,7 +567,13 @@ mod tests {
                 let params = circuit_identity_zk::poseidon_params();
                 let tree = AttestedTree::from_leaves(&params, &[self.leaf()]).unwrap();
                 let countries =
-                    predicate::country_set(countries.iter().copied()).unwrap_or([0; 10]);
+                    predicate::country_set(countries.iter().copied()).unwrap_or_default();
+                let (country_path, country_index) = predicate::country_path(
+                    &params,
+                    &countries,
+                    u16::from_be_bytes(self.opening.country_code),
+                )
+                .unwrap_or(([Fr::from(0u64); predicate::COUNTRY_TREE_DEPTH], 0));
                 let scope = circuit_identity_zk::asset_scope(&params, &asset.asset_ref.to_string());
                 let sub = circuit_identity_zk::derive_sub(&params, self.secret, scope);
                 let public = Public {
@@ -589,7 +595,8 @@ mod tests {
                     leaf_index: 0,
                     membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
                     membership_index: 0,
-                    countries,
+                    country_path,
+                    country_index,
                 };
                 let proof = predicate::prove_predicate(
                     public,
@@ -605,11 +612,18 @@ mod tests {
             }
         }
 
-        /// KYC required, Swiss or German holders only.
+        /// EEA + Switzerland: 31 countries, well past the old ten-slot limit.
+        const EEA_AND_CH: [&str; 31] = [
+            "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR",
+            "HU", "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MT", "NL", "NO", "PL", "PT", "RO",
+            "SE", "SI", "SK",
+        ];
+
+        /// KYC required, EEA or Swiss holders only.
         fn bond(name: &str) -> Asset {
             let mut asset = Asset::new(name, addr(7), false);
             asset.required_claims = vec![ClaimTopic::Kyc];
-            asset.allowed_jurisdictions = Some(vec!["CH".into(), "DE".into()]);
+            asset.allowed_jurisdictions = Some(EEA_AND_CH.map(String::from).to_vec());
             asset
         }
 
@@ -631,7 +645,7 @@ mod tests {
             assert!(entry.claims.is_empty() && entry.jurisdiction.is_none());
 
             let asset = bond("bond");
-            let (sub, proof) = holder.prove(&alice, &asset, KYC | RESIDENCY, &["CH", "DE"]);
+            let (sub, proof) = holder.prove(&alice, &asset, KYC | RESIDENCY, &EEA_AND_CH);
             verify_claim_proof(&db, &alice, &asset, &sub, TODAY, NOW, &proof).unwrap();
         }
 
@@ -641,7 +655,7 @@ mod tests {
             let db = db_with_attestor(&attestor);
             let alice_cred = Holder::new(11, b"CH");
             grant(&db, &attestor, &alice, &alice_cred);
-            let bob_cred = Holder::new(22, b"FR");
+            let bob_cred = Holder::new(22, b"US");
             grant(&db, &attestor, &bob, &bob_cred);
             let asset = bond("bond");
             let rejected = |who: &Address, (sub, proof): ([u8; 32], Vec<u8>)| {
@@ -651,10 +665,10 @@ mod tests {
                 )
             };
 
-            // Wrong jurisdiction: Bob (FR) proves residency in a set he's in.
+            // Wrong jurisdiction: Bob (US) proves residency in a set he's in.
             assert!(rejected(
                 &bob,
-                bob_cred.prove(&bob, &asset, KYC | RESIDENCY, &["FR"])
+                bob_cred.prove(&bob, &asset, KYC | RESIDENCY, &["US"])
             ));
             // Wrong claim: a proof that skips the asset's KYC requirement.
             let mut no_kyc = Holder::new(33, b"CH");
@@ -662,15 +676,15 @@ mod tests {
             grant(&db, &attestor, &bob, &no_kyc);
             assert!(rejected(
                 &bob,
-                no_kyc.prove(&bob, &asset, RESIDENCY, &["CH", "DE"])
+                no_kyc.prove(&bob, &asset, RESIDENCY, &EEA_AND_CH)
             ));
             // Wrong root: Bob submits a proof over Alice's credential.
             assert!(rejected(
                 &bob,
-                alice_cred.prove(&bob, &asset, KYC | RESIDENCY, &["CH", "DE"])
+                alice_cred.prove(&bob, &asset, KYC | RESIDENCY, &EEA_AND_CH)
             ));
             // Replay: Alice's own proof, submitted by Bob.
-            let alices = alice_cred.prove(&alice, &asset, KYC | RESIDENCY, &["CH", "DE"]);
+            let alices = alice_cred.prove(&alice, &asset, KYC | RESIDENCY, &EEA_AND_CH);
             assert!(rejected(&bob, alices.clone()));
             // Wrong asset: Alice's proof for `bond` against another asset.
             let other = bond("other");
@@ -722,7 +736,9 @@ mod tests {
                 verify_claim_proof(&db, &alice, &open, &[0; 32], TODAY, NOW, &[]),
                 Err(IdentityError::NothingToProve)
             ));
-            let mut wide = asset;
+            // Any number of countries is provable (the old ten-slot limit is
+            // gone): an 11-country list gets as far as parsing the proof.
+            let mut wide = asset.clone();
             wide.allowed_jurisdictions = Some(
                 [
                     "AT", "BE", "CH", "DE", "DK", "ES", "FI", "FR", "IE", "IT", "NL",
@@ -732,6 +748,13 @@ mod tests {
             );
             assert!(matches!(
                 verify_claim_proof(&db, &alice, &wide, &[0; 32], TODAY, NOW, &[]),
+                Err(IdentityError::MalformedSub | IdentityError::MalformedProof)
+            ));
+            // A code outside ISO 3166-1 has no leaf in the country tree.
+            let mut unknown = asset;
+            unknown.allowed_jurisdictions = Some(vec!["CH".into(), "XX".into()]);
+            assert!(matches!(
+                verify_claim_proof(&db, &alice, &unknown, &[0; 32], TODAY, NOW, &[]),
                 Err(IdentityError::UnprovableJurisdictions)
             ));
         }
