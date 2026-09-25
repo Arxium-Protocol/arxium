@@ -590,16 +590,21 @@ pub trait BatchWritable {
     }
 }
 
+/// Most write-ahead log RocksDB may keep before it flushes the column
+/// families holding its oldest entries. A log file can only be deleted once
+/// every family has flushed what's in it, and the rarely-written ones
+/// (`meta`, `validators`, `governance`) almost never fill a memtable on their
+/// own. RocksDB's default limit (4x every memtable, several GB here) let
+/// devnet keep a 2.2 GB WAL. This is a runtime option: nothing on disk
+/// changes.
+const MAX_TOTAL_WAL_BYTES: u64 = 256 << 20;
+
 impl ArxiumDb {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let mut db_opts = RocksOptions::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
-        // The default cap is 4x the total memtable budget across all column
-        // families, several GB here, because rarely-written families never
-        // flush on their own. Past this cap, RocksDB flushes them so the old
-        // WAL files can be deleted.
-        db_opts.set_max_total_wal_size(256 << 20);
+        db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
         let cf_descriptors = COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, RocksOptions::default()));
@@ -3928,5 +3933,33 @@ mod divergence_recovery_tests {
         expected.sort();
         assert_eq!(db.validator_addresses_at(4).unwrap(), expected);
         assert_eq!(db.validator_addresses_at(5).unwrap(), vec![addr(3)]);
+    }
+}
+
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
+
+    /// `ArxiumDb::open` really applies the cap: RocksDB records the options
+    /// it opened with in the `OPTIONS-*` file.
+    #[test]
+    fn open_applies_the_production_cap() {
+        let path = std::env::temp_dir().join(format!(
+            "arxium-test-wal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        drop(ArxiumDb::open(&path).unwrap());
+        let options = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect::<String>();
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(options.contains(&format!("max_total_wal_size={MAX_TOTAL_WAL_BYTES}")));
     }
 }
