@@ -46,7 +46,7 @@ use gossip::{
 use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse, advance_stuck_tip,
-    local_tip_height, send_sync_request,
+    is_stale_page, local_tip_height, send_sync_request,
 };
 use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
@@ -1085,8 +1085,16 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                 // just means re-fetching this page from a peer.
                                 let tip_before = local_tip_height(&db);
                                 let page_len = blocks.len();
+                                let first_height = blocks[0].height;
                                 let page_started = Instant::now();
                                 for block in blocks {
+                                    // Already held: a page that raced another
+                                    // one for the same range (see
+                                    // `is_stale_page`). Skipping it keeps
+                                    // `on_block` from warning once per block.
+                                    if block.height <= local_tip_height(&db) {
+                                        continue;
+                                    }
                                     if on_block(block, true) {
                                         record_bad_gossip(
                                             &mut swarm,
@@ -1103,6 +1111,15 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                     warn!("failed to flush WAL after sync page: {err}");
                                 }
                                 let local_tip = local_tip_height(&db);
+                                // A stale page says nothing about this peer,
+                                // so it is not a stuck round. Also end this
+                                // request chain: the page that moved the tip
+                                // is already fetching the next range, and one
+                                // chain per range is enough.
+                                if is_stale_page(first_height, tip_before, local_tip) {
+                                    debug!("stale sync page {first_height}.. from {peer} (tip already {local_tip}), dropping");
+                                    continue;
+                                }
                                 // B2 is unmeasured, and the pruning /
                                 // snapshot-sync decision should fall out of a
                                 // number rather than an intuition: `CF_MERKLE`
