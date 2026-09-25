@@ -38,6 +38,10 @@ members = [
     "examples/toy-chain",
 ]
 exclude = ["fuzz"]
+
+# Wrapped balances are silent ledger corruption; panic instead.
+[profile.release]
+overflow-checks = true
 resolver = "2"
 default-members = ["arxd"]
 
