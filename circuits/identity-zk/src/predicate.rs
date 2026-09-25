@@ -4,8 +4,8 @@
 //! N*365 cutoff would incorrectly admit under-age users around leap years.
 
 use super::*;
-use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
 use ark_crypto_primitives::crh::CRHSchemeGadget;
+use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
@@ -298,6 +298,127 @@ pub fn country_path(
     let levels = country_tree(params, countries);
     let path = std::array::from_fn(|depth| levels[depth][(index >> depth) ^ 1]);
     Some((path, index as u32))
+}
+
+/// The public inputs of an on-chain claim proof (`VerifyClaimProof`). The
+/// one place they are built, for the chain's verifier and the wallet's
+/// prover alike, so the two can't drift apart:
+/// - `merkle_root` is a one-leaf tree over the holder's own credential leaf
+///   (the account's `identity_hash`): the proof speaks for that account.
+/// - `scope` is the asset and `nonce` the sender's key, so a proof can't be
+///   moved to another asset or replayed by another sender.
+/// - Age and membership are never asked on chain; their inputs are zero.
+#[allow(clippy::too_many_arguments)]
+pub fn asset_claim_public(
+    params: &PoseidonConfig<Fr>,
+    leaf: Fr,
+    sender_pubkey: &[u8],
+    asset_ref: &str,
+    claims_mask: u32,
+    countries: &[u16],
+    sub: Fr,
+    today_days: u32,
+) -> Public {
+    Public {
+        sub,
+        scope: asset_scope(params, asset_ref),
+        nonce: sender_binding(sender_pubkey),
+        claims_mask,
+        age_n: 0,
+        country_set_hash: country_set_hash(params, countries),
+        group_root: Fr::from(0u64),
+        merkle_root: AttestedTree::from_leaves(params, &[leaf])
+            .expect("one leaf fits the tree")
+            .root(),
+        today_days,
+        age_cutoff_days: 0,
+    }
+}
+
+/// Whether `opening` meets an asset's gate as of `today_days`, with the
+/// unmet claim named. Cheap, so a wallet can say why before it loads the
+/// proving key; `prove_asset_claim` runs it too.
+pub fn check_asset_claim(
+    opening: &CredentialOpening,
+    claims_mask: u32,
+    countries: &[u16],
+    today_days: u32,
+) -> Result<(), String> {
+    if claims_mask == 0 || claims_mask & !(KYC | AML | ACCREDITED | RESIDENCY) != 0 {
+        return Err("asset asks for no provable claims".into());
+    }
+    for (bit, held, name) in [
+        (KYC, opening.kyc, "KYC"),
+        (AML, opening.aml, "AML"),
+        (ACCREDITED, opening.accredited, "accredited-investor"),
+    ] {
+        if claims_mask & bit != 0 && !held {
+            return Err(format!("credential lacks the {name} claim"));
+        }
+    }
+    if opening.expiry_days <= today_days {
+        return Err("credential expired".into());
+    }
+    let country = u16::from_be_bytes(opening.country_code);
+    if claims_mask & RESIDENCY != 0 && (country == 0 || !countries.contains(&country)) {
+        return Err("credential's country is not allowed for this asset".into());
+    }
+    Ok(())
+}
+
+/// The wallet side of `VerifyClaimProof`: proves that the credential
+/// `opening` (for `id_secret`) meets `claims_mask` over `countries`, for
+/// `asset_ref`, sent by `sender_pubkey`, dated `today_days`. Returns `sub`
+/// and the proof. An unmet claim is reported by name instead of producing a
+/// proof the chain would only reject.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_asset_claim<R: RngCore + ark_std::rand::CryptoRng>(
+    id_secret: Fr,
+    opening: &CredentialOpening,
+    sender_pubkey: &[u8],
+    asset_ref: &str,
+    claims_mask: u32,
+    countries: &[u16],
+    today_days: u32,
+    pk: &ProvingKey<Bls12_381>,
+    rng: &mut R,
+) -> Result<(Fr, Proof<Bls12_381>), String> {
+    check_asset_claim(opening, claims_mask, countries, today_days)?;
+    let params = poseidon_params();
+    let (country_path, country_index) = if claims_mask & RESIDENCY != 0 {
+        self::country_path(&params, countries, u16::from_be_bytes(opening.country_code))
+            .ok_or("credential's country is not allowed for this asset")?
+    } else {
+        ([Fr::from(0u64); COUNTRY_TREE_DEPTH], 0)
+    };
+    let leaf = credential_leaf(&params, id_commitment(&params, id_secret), opening);
+    let scope = asset_scope(&params, asset_ref);
+    let sub = derive_sub(&params, id_secret, scope);
+    let public = asset_claim_public(
+        &params,
+        leaf,
+        sender_pubkey,
+        asset_ref,
+        claims_mask,
+        countries,
+        sub,
+        today_days,
+    );
+    let witness = Witness {
+        id_secret,
+        opening: opening.clone(),
+        leaf_path: AttestedTree::from_leaves(&params, &[leaf])
+            .expect("one leaf fits the tree")
+            .path(0)
+            .expect("leaf 0 exists"),
+        leaf_index: 0,
+        membership_path: [Fr::from(0u64); ATTESTED_TREE_DEPTH],
+        membership_index: 0,
+        country_path,
+        country_index,
+    };
+    let proof = prove_predicate(public, witness, pk, rng).map_err(|_| "claim not satisfied")?;
+    Ok((sub, proof))
 }
 
 pub fn setup_predicate<R: RngCore + ark_std::rand::CryptoRng>(
