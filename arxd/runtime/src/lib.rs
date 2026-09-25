@@ -556,6 +556,17 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             Some(*until_height),
             current_height,
         ),
+        ActionPayload::VerifyClaimProof {
+            asset,
+            sub,
+            today_days,
+            proof,
+        } => {
+            asset::verify_claim_proof(view, action, asset, sub, *today_days, proof, current_height)
+        }
+        ActionPayload::SetPrivateClaims { asset, enabled } => {
+            asset::set_private_claims(view, action, asset, *enabled)
+        }
         ActionPayload::SetAssetLimits {
             asset,
             max_holders,

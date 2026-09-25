@@ -17,7 +17,7 @@ use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use thiserror::Error;
 use xc_circuit::{AccountKey, AttestorRecordKey, KvRead};
-use xc_primitives::{Address, AttestorRecord, ClaimTopic};
+use xc_primitives::{Address, Asset, AttestorRecord, ClaimTopic};
 use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
 
 #[derive(Error, Debug)]
@@ -42,6 +42,14 @@ pub enum IdentityError {
     MalformedSender,
     #[error("zk credential proof failed verification")]
     ProofRejected,
+    #[error("{0} has no live attestation")]
+    NotAttested(Address),
+    #[error("asset has no claims a proof could satisfy")]
+    NothingToProve,
+    #[error("asset's jurisdiction list is empty, invalid or longer than a claim proof's 10 slots")]
+    UnprovableJurisdictions,
+    #[error("sub is not a valid field element")]
+    MalformedSub,
 }
 
 /// ISO-3166-1 alpha-2, uppercase. Shared by attestation grants and asset
@@ -217,6 +225,106 @@ pub fn apply_verify_credential<V: KvRead<Error = StorageError>>(
     Ok(AccountUpdates(BTreeMap::from([(sender.clone(), entry)])))
 }
 
+fn predicate_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls12_381> {
+    static VK: OnceLock<circuit_identity_zk::VerifyingKey<Bls12_381>> = OnceLock::new();
+    VK.get_or_init(|| {
+        circuit_identity_zk::VerifyingKey::deserialize_compressed(
+            circuit_identity_zk::PREDICATE_VK_BYTES,
+        )
+        .expect("checked-in devnet predicate verifying key is well-formed")
+    })
+}
+
+/// zk-KYC (whitepaper §8.2): `sender`'s attested credential leaf opens to
+/// claims that satisfy `asset`'s `required_claims` and `allowed_jurisdictions`,
+/// without the claims or the country appearing anywhere on chain.
+///
+/// Same `PredicateCircuit` as Arx ID sign-in, with every public input but
+/// `sub` and `today_days` rebuilt here from state, never from the payload:
+/// - `merkle_root` is the root of a one-leaf tree holding `sender`'s own
+///   `identity_hash`, so the proof speaks for this account's credential
+///   and can't be made with someone else's (no credential lending).
+/// - `scope` is the asset, `nonce` the sender's key: a proof for another
+///   asset, or replayed by another sender, fails verification.
+/// - `claims_mask` and the country set come from the asset record.
+///
+// ponytail: `today_days` (credential expiry) is the prover's word. Dispatch
+// has no block timestamp — threading one through `DispatchCtx` and the
+// fault-proof replay is its own consensus change. Staleness is bounded
+// instead by revocation, `max_attestation_age` and `CLAIM_PROOF_TTL_SECS`.
+pub fn verify_claim_proof<V: KvRead<Error = StorageError>>(
+    view: &V,
+    sender: &Address,
+    asset: &Asset,
+    sub: &[u8; 32],
+    today_days: u32,
+    proof: &[u8],
+) -> Result<(), IdentityError> {
+    use circuit_identity_zk::AttestedTree;
+    use circuit_identity_zk::predicate::{self, ACCREDITED, AML, KYC, Public, RESIDENCY};
+
+    if !is_attested(view, sender)? {
+        return Err(IdentityError::NotAttested(sender.clone()));
+    }
+    let entry = view
+        .get(&AccountKey(sender))?
+        .ok_or_else(|| IdentityError::AccountNotFound(sender.clone()))?;
+    let hash_hex = entry.identity_hash.ok_or(IdentityError::NoIdentityHash)?;
+    let leaf = hex::decode(&hash_hex)
+        .ok()
+        .and_then(|bytes| Fr::deserialize_compressed(bytes.as_slice()).ok())
+        .ok_or(IdentityError::MalformedIdentityHash)?;
+
+    // `Jurisdiction` needs no bit of its own: every v1 leaf carries a
+    // country, and `allowed_jurisdictions` below is what restricts it.
+    let mut mask = asset.required_claims.iter().fold(0, |mask, topic| {
+        mask | match topic {
+            ClaimTopic::Kyc => KYC,
+            ClaimTopic::Aml => AML,
+            ClaimTopic::Accredited => ACCREDITED,
+            ClaimTopic::Jurisdiction => 0,
+        }
+    });
+    let countries = match &asset.allowed_jurisdictions {
+        Some(allowed) => {
+            mask |= RESIDENCY;
+            predicate::country_set(allowed.iter().map(String::as_str))
+                .ok_or(IdentityError::UnprovableJurisdictions)?
+        }
+        None => [0; 10],
+    };
+    // A zero mask skips the leaf check inside the circuit entirely.
+    if mask == 0 {
+        return Err(IdentityError::NothingToProve);
+    }
+
+    let params = circuit_identity_zk::poseidon_params();
+    let merkle_root = AttestedTree::from_leaves(&params, &[leaf])
+        .expect("one leaf fits the tree")
+        .root();
+    let sender_pubkey = sender
+        .pubkey_bytes()
+        .map_err(|_| IdentityError::MalformedSender)?;
+    let public = Public {
+        sub: Fr::deserialize_compressed(sub.as_slice()).map_err(|_| IdentityError::MalformedSub)?,
+        scope: circuit_identity_zk::asset_scope(&params, &asset.asset_ref.to_string()),
+        nonce: circuit_identity_zk::sender_binding(&sender_pubkey),
+        claims_mask: mask,
+        age_n: 0,
+        country_set_hash: predicate::country_set_hash(&params, &countries),
+        group_root: Fr::from(0u64),
+        merkle_root,
+        today_days,
+        age_cutoff_days: 0,
+    };
+    let proof = circuit_identity_zk::Proof::<Bls12_381>::deserialize_compressed(proof)
+        .map_err(|_| IdentityError::MalformedProof)?;
+    if !predicate::verify_predicate(public, &proof, predicate_vk()) {
+        return Err(IdentityError::ProofRejected);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +485,220 @@ mod tests {
             apply_verify_credential(&db, &alice, &[0xFF; 4]).unwrap_err(),
             IdentityError::MalformedProof
         ));
+    }
+
+    mod claim_proof {
+        use super::*;
+        use ark_serialize::CanonicalSerialize;
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
+        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
+        use circuit_identity_zk::{AttestedTree, CredentialOpening, ProvingKey};
+
+        const TODAY: u32 = 46_290;
+
+        fn pk() -> &'static ProvingKey<Bls12_381> {
+            static PK: OnceLock<ProvingKey<Bls12_381>> = OnceLock::new();
+            PK.get_or_init(|| {
+                ProvingKey::deserialize_compressed_unchecked(
+                    include_bytes!("../../identity-zk/predicate_pk.bin").as_slice(),
+                )
+                .unwrap()
+            })
+        }
+
+        struct Holder {
+            secret: Fr,
+            opening: CredentialOpening,
+        }
+
+        impl Holder {
+            fn new(secret: u64, country: &[u8; 2]) -> Self {
+                Self {
+                    secret: Fr::from(secret),
+                    opening: CredentialOpening {
+                        kyc: true,
+                        aml: false,
+                        accredited: false,
+                        birth_date_days: 30_000,
+                        country_code: *country,
+                        membership_root: Fr::from(0u64),
+                        expiry_days: 50_000,
+                        salt: Fr::from(secret + 1000),
+                    },
+                }
+            }
+
+            fn leaf(&self) -> Fr {
+                let params = circuit_identity_zk::poseidon_params();
+                let commitment = circuit_identity_zk::id_commitment(&params, self.secret);
+                circuit_identity_zk::credential_leaf(&params, commitment, &self.opening)
+            }
+
+            fn leaf_hex(&self) -> String {
+                let mut bytes = Vec::new();
+                self.leaf().serialize_compressed(&mut bytes).unwrap();
+                hex::encode(bytes)
+            }
+
+            /// What an honest wallet does, but with every public input the
+            /// prover's own choice — the chain must rebuild them, not trust
+            /// them. Always a satisfiable statement, so a rejection proves
+            /// the chain's inputs differ, not that proving failed.
+            fn prove(
+                &self,
+                prover: &Address,
+                asset: &Asset,
+                mask: u32,
+                countries: &[&str],
+            ) -> ([u8; 32], Vec<u8>) {
+                let params = circuit_identity_zk::poseidon_params();
+                let tree = AttestedTree::from_leaves(&params, &[self.leaf()]).unwrap();
+                let countries =
+                    predicate::country_set(countries.iter().copied()).unwrap_or([0; 10]);
+                let scope = circuit_identity_zk::asset_scope(&params, &asset.asset_ref.to_string());
+                let sub = circuit_identity_zk::derive_sub(&params, self.secret, scope);
+                let public = Public {
+                    sub,
+                    scope,
+                    nonce: circuit_identity_zk::sender_binding(&prover.pubkey_bytes().unwrap()),
+                    claims_mask: mask,
+                    age_n: 0,
+                    country_set_hash: predicate::country_set_hash(&params, &countries),
+                    group_root: Fr::from(0u64),
+                    merkle_root: tree.root(),
+                    today_days: TODAY,
+                    age_cutoff_days: 0,
+                };
+                let witness = Witness {
+                    id_secret: self.secret,
+                    opening: self.opening.clone(),
+                    leaf_path: tree.path(0).unwrap(),
+                    leaf_index: 0,
+                    membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
+                    membership_index: 0,
+                    countries,
+                };
+                let proof = predicate::prove_predicate(
+                    public,
+                    witness,
+                    pk(),
+                    &mut StdRng::seed_from_u64(3),
+                )
+                .unwrap();
+                let (mut sub_bytes, mut proof_bytes) = (Vec::new(), Vec::new());
+                sub.serialize_compressed(&mut sub_bytes).unwrap();
+                proof.serialize_compressed(&mut proof_bytes).unwrap();
+                (sub_bytes.try_into().unwrap(), proof_bytes)
+            }
+        }
+
+        /// KYC required, Swiss or German holders only.
+        fn bond(name: &str) -> Asset {
+            let mut asset = Asset::new(name, addr(7), false);
+            asset.required_claims = vec![ClaimTopic::Kyc];
+            asset.allowed_jurisdictions = Some(vec!["CH".into(), "DE".into()]);
+            asset
+        }
+
+        fn grant(db: &ArxiumDb, attestor: &Address, who: &Address, holder: &Holder) {
+            db.write_batch(
+                &apply_grant_attestation(db, attestor, who, &holder.leaf_hex(), &[], None, 1)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+
+        #[test]
+        fn a_holder_proves_claims_and_jurisdiction_without_either_on_chain() {
+            let (attestor, alice) = (addr(9), addr(1));
+            let db = db_with_attestor(&attestor);
+            let holder = Holder::new(11, b"CH");
+            grant(&db, &attestor, &alice, &holder);
+            let entry = KvRead::get(&db, &AccountKey(&alice)).unwrap().unwrap();
+            assert!(entry.claims.is_empty() && entry.jurisdiction.is_none());
+
+            let asset = bond("bond");
+            let (sub, proof) = holder.prove(&alice, &asset, KYC | RESIDENCY, &["CH", "DE"]);
+            verify_claim_proof(&db, &alice, &asset, &sub, TODAY, &proof).unwrap();
+        }
+
+        #[test]
+        fn proofs_of_a_weaker_statement_or_for_someone_else_are_rejected() {
+            let (attestor, alice, bob) = (addr(9), addr(1), addr(2));
+            let db = db_with_attestor(&attestor);
+            let alice_cred = Holder::new(11, b"CH");
+            grant(&db, &attestor, &alice, &alice_cred);
+            let bob_cred = Holder::new(22, b"FR");
+            grant(&db, &attestor, &bob, &bob_cred);
+            let asset = bond("bond");
+            let rejected = |who: &Address, (sub, proof): ([u8; 32], Vec<u8>)| {
+                matches!(
+                    verify_claim_proof(&db, who, &asset, &sub, TODAY, &proof),
+                    Err(IdentityError::ProofRejected)
+                )
+            };
+
+            // Wrong jurisdiction: Bob (FR) proves residency in a set he's in.
+            assert!(rejected(
+                &bob,
+                bob_cred.prove(&bob, &asset, KYC | RESIDENCY, &["FR"])
+            ));
+            // Wrong claim: a proof that skips the asset's KYC requirement.
+            let mut no_kyc = Holder::new(33, b"CH");
+            no_kyc.opening.kyc = false;
+            grant(&db, &attestor, &bob, &no_kyc);
+            assert!(rejected(
+                &bob,
+                no_kyc.prove(&bob, &asset, RESIDENCY, &["CH", "DE"])
+            ));
+            // Wrong root: Bob submits a proof over Alice's credential.
+            assert!(rejected(
+                &bob,
+                alice_cred.prove(&bob, &asset, KYC | RESIDENCY, &["CH", "DE"])
+            ));
+            // Replay: Alice's own proof, submitted by Bob.
+            let alices = alice_cred.prove(&alice, &asset, KYC | RESIDENCY, &["CH", "DE"]);
+            assert!(rejected(&bob, alices.clone()));
+            // Wrong asset: Alice's proof for `bond` against another asset.
+            let other = bond("other");
+            assert!(matches!(
+                verify_claim_proof(&db, &alice, &other, &alices.0, TODAY, &alices.1),
+                Err(IdentityError::ProofRejected)
+            ));
+            verify_claim_proof(&db, &alice, &asset, &alices.0, TODAY, &alices.1)
+                .expect("the untampered proof still verifies");
+        }
+
+        #[test]
+        fn unattested_senders_and_unprovable_assets_are_refused_before_verifying() {
+            let (attestor, alice) = (addr(9), addr(1));
+            let db = db_with_attestor(&attestor);
+            let asset = bond("bond");
+            assert!(matches!(
+                verify_claim_proof(&db, &alice, &asset, &[0; 32], TODAY, &[]),
+                Err(IdentityError::NotAttested(_))
+            ));
+            grant(&db, &attestor, &alice, &Holder::new(11, b"CH"));
+
+            let mut open = asset.clone();
+            open.required_claims.clear();
+            open.allowed_jurisdictions = None;
+            assert!(matches!(
+                verify_claim_proof(&db, &alice, &open, &[0; 32], TODAY, &[]),
+                Err(IdentityError::NothingToProve)
+            ));
+            let mut wide = asset;
+            wide.allowed_jurisdictions = Some(
+                [
+                    "AT", "BE", "CH", "DE", "DK", "ES", "FI", "FR", "IE", "IT", "NL",
+                ]
+                .map(String::from)
+                .to_vec(),
+            );
+            assert!(matches!(
+                verify_claim_proof(&db, &alice, &wide, &[0; 32], TODAY, &[]),
+                Err(IdentityError::UnprovableJurisdictions)
+            ));
+        }
     }
 }

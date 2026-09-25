@@ -428,6 +428,26 @@ pub enum ActionPayload {
         numerator: u128,
         denominator: u128,
     },
+    /// zk-KYC: proves the sender's attested credential satisfies `asset`'s
+    /// `required_claims` and `allowed_jurisdictions` without revealing them
+    /// (`circuit_identity::verify_claim_proof`), and records it on the
+    /// sender's `HolderState` so `check_party` accepts them for a while.
+    /// `sub` is the per-asset pseudonym the proof commits to; `today_days`
+    /// is days since 1900-01-01 for the credential expiry check. Only for
+    /// assets with `private_claims`. Variant 40.
+    VerifyClaimProof {
+        asset: AssetRef,
+        sub: [u8; 32],
+        today_days: u32,
+        proof: Vec<u8>,
+    },
+    /// Issuer turns claim proofs on or off for `asset`
+    /// (`Asset.private_claims`). Turning it off makes every holder fall back
+    /// to clear-text gating immediately. Variant 41.
+    SetPrivateClaims {
+        asset: AssetRef,
+        enabled: bool,
+    },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -442,7 +462,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 40] = [
+        const EXPECTED: [&str; 42] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -483,6 +503,8 @@ mod tests {
             "DistributeToHolders",
             "RedeemHolders",
             "SplitAsset",
+            "VerifyClaimProof",
+            "SetPrivateClaims",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

@@ -1571,6 +1571,7 @@ mod tests {
                     frozen: false,
                     frozen_amount: u128::MAX,
                     lock_expires_at: None,
+                    claim_verified_at: None,
                 },
             )]));
             let index = state

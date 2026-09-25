@@ -348,7 +348,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// behind `SnapshotHolders`/`DistributeToHolders`/`RedeemHolders`/
 /// `SplitAsset`, variants 36–39). Positional bincode on a merkleized
 /// `asset_record:` row — devnet reset.
-pub const SCHEMA_VERSION: u32 = 17;
+///
+/// Bumped 17 -> 18: `Asset` gained `private_claims` and `HolderState`
+/// gained `claim_verified_at` (zk claim proofs, `VerifyClaimProof` /
+/// `SetPrivateClaims`, variants 40–41). Positional bincode on merkleized
+/// `CF_ASSETS` rows — devnet reset.
+pub const SCHEMA_VERSION: u32 = 18;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";

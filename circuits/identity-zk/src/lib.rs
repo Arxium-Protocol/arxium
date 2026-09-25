@@ -189,6 +189,15 @@ pub fn asker_scope(params: &PoseidonConfig<Fr>, asker_account_id: &str) -> Fr {
     CRH::<Fr>::evaluate(params, vec![hash_to_field(&digest)]).expect("poseidon scope")
 }
 
+/// On-chain claim proofs (`VerifyClaimProof`) use the asset as the scope, so
+/// a proof made for one asset can't clear another asset's gate. Separate
+/// domain label from `asker_scope`: a gateway account id can never collide
+/// with an asset ref.
+pub fn asset_scope(params: &PoseidonConfig<Fr>, asset_ref: &str) -> Fr {
+    let digest = Sha256::digest([b"arx-rwa-scope/v1".as_slice(), asset_ref.as_bytes()].concat());
+    CRH::<Fr>::evaluate(params, vec![hash_to_field(&digest)]).expect("poseidon scope")
+}
+
 /// Stable within an asker account, unlinkable between independently scoped
 /// accounts. Both plain sign-in and credential proofs must use this function.
 pub fn derive_sub(params: &PoseidonConfig<Fr>, id_secret: Fr, scope: Fr) -> Fr {

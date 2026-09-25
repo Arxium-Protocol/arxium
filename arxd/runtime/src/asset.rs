@@ -495,6 +495,47 @@ pub(crate) fn set_limits<V: KvRead<Error = StorageError>>(
     })
 }
 
+pub(crate) fn set_private_claims<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    enabled: bool,
+) -> anyhow::Result<BlockUpdates> {
+    let mut asset = require_issuer(view, action, asset)?;
+    asset.private_claims = enabled;
+    Ok(BlockUpdates {
+        asset_registration: Some(asset),
+        ..Default::default()
+    })
+}
+
+/// Anyone attested may prove; the asset must have opted in, so an issuer
+/// that needs clear-text gating never has it bypassed.
+pub(crate) fn verify_claim_proof<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    asset: &AssetRef,
+    sub: &[u8; 32],
+    today_days: u32,
+    proof: &[u8],
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let asset = resolve_asset(view, asset)?;
+    if !asset.private_claims {
+        anyhow::bail!("{} does not accept claim proofs", asset.asset_ref);
+    }
+    circuit_identity::verify_claim_proof(view, &action.sender, &asset, sub, today_days, proof)?;
+    Ok(BlockUpdates {
+        holder_states: circuit_rwa_asset::apply_record_claim_proof(
+            view,
+            &asset,
+            &action.sender,
+            current_height,
+        )?,
+        ..Default::default()
+    })
+}
+
 pub(crate) fn recover_holder<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -1574,5 +1615,204 @@ mod tests {
         .unwrap();
         assert_eq!(updates.assets.0[&(gold.clone(), holder.clone())], 60);
         assert_eq!(updates.assets.0[&(gold.clone(), receiver.clone())], 40);
+    }
+
+    /// D-17 end to end through dispatch: the issuer opts `bond` into claim
+    /// proofs, a holder with no clear-text claims or jurisdiction submits a
+    /// real predicate proof, and a compliant transfer to them then clears
+    /// the KYC + jurisdiction gate.
+    #[test]
+    fn claim_proof_opens_a_restricted_asset_to_a_holder_with_nothing_in_clear() {
+        use ark_bls12_381::{Bls12_381, Fr};
+        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
+        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
+        use circuit_identity_zk::{AttestedTree, CredentialOpening};
+        use xc_primitives::{AccountEntry, ClaimTopic};
+
+        let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let params = circuit_identity_zk::poseidon_params();
+        let secret = Fr::from(42u64);
+        let opening = CredentialOpening {
+            kyc: true,
+            aml: false,
+            accredited: false,
+            birth_date_days: 30_000,
+            country_code: *b"CH",
+            membership_root: Fr::from(0u64),
+            expiry_days: 50_000,
+            salt: Fr::from(7u64),
+        };
+        let leaf = circuit_identity_zk::credential_leaf(
+            &params,
+            circuit_identity_zk::id_commitment(&params, secret),
+            &opening,
+        );
+        let mut leaf_bytes = Vec::new();
+        leaf.serialize_compressed(&mut leaf_bytes).unwrap();
+
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (
+                    issuer.clone(),
+                    AccountEntry {
+                        identity_hash: Some("kyc-issuer".into()),
+                        claims: vec![ClaimTopic::Kyc],
+                        jurisdiction: Some("CH".into()),
+                        ..funded(FEE_BUDGET * 4)
+                    },
+                ),
+                (
+                    holder.clone(),
+                    AccountEntry {
+                        identity_hash: Some(hex::encode(leaf_bytes)),
+                        attested_at: Some(0),
+                        ..funded(FEE_BUDGET * 2)
+                    },
+                ),
+            ]),
+            HashMap::new(),
+        );
+        let mut bond = Asset::new("bond", issuer.clone(), false);
+        bond.required_claims = vec![ClaimTopic::Kyc];
+        bond.allowed_jurisdictions = Some(vec!["CH".into()]);
+        let bond_ref = bond.asset_ref.clone();
+        view.put(&AssetKey(&bond_ref), &bond).unwrap();
+        let act = |sender: &Address, nonce, payload| Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload,
+        };
+
+        let updates = dispatch_at(
+            &act(
+                &issuer,
+                0,
+                ActionPayload::IssueAsset {
+                    asset: bond_ref.clone(),
+                    amount: 100,
+                },
+            ),
+            &view,
+            1,
+        )
+        .unwrap();
+        view.apply_accounts(&updates.accounts).unwrap();
+        view.apply_asset_balances(&updates.assets).unwrap();
+        view.put(
+            &AssetKey(&bond_ref),
+            updates.asset_registration.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        // The wallet's side: prove against the one-leaf tree of its own
+        // credential, scoped to the asset, bound to its own key.
+        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed_unchecked(
+            include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
+        )
+        .unwrap();
+        let tree = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
+        let countries = predicate::country_set(["CH"]).unwrap();
+        let scope = circuit_identity_zk::asset_scope(&params, &bond_ref.to_string());
+        let sub = circuit_identity_zk::derive_sub(&params, secret, scope);
+        let public = Public {
+            sub,
+            scope,
+            nonce: circuit_identity_zk::sender_binding(&holder.pubkey_bytes().unwrap()),
+            claims_mask: KYC | RESIDENCY,
+            age_n: 0,
+            country_set_hash: predicate::country_set_hash(&params, &countries),
+            group_root: Fr::from(0u64),
+            merkle_root: tree.root(),
+            today_days: 46_290,
+            age_cutoff_days: 0,
+        };
+        let witness = Witness {
+            id_secret: secret,
+            opening,
+            leaf_path: tree.path(0).unwrap(),
+            leaf_index: 0,
+            membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
+            membership_index: 0,
+            countries,
+        };
+        let proof = predicate::prove_predicate(public, witness, &pk, &mut StdRng::seed_from_u64(1))
+            .unwrap();
+        let (mut sub_bytes, mut proof_bytes) = (Vec::new(), Vec::new());
+        sub.serialize_compressed(&mut sub_bytes).unwrap();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+        let verify = act(
+            &holder,
+            0,
+            ActionPayload::VerifyClaimProof {
+                asset: bond_ref.clone(),
+                sub: sub_bytes.try_into().unwrap(),
+                today_days: 46_290,
+                proof: proof_bytes,
+            },
+        );
+        let transfer = act(
+            &issuer,
+            2,
+            ActionPayload::TransferAsset {
+                asset: bond_ref.clone(),
+                to: holder.clone(),
+                amount: 10,
+            },
+        );
+
+        let err = dispatch_at(&verify, &view, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("does not accept claim proofs"),
+            "got: {err}"
+        );
+        let err = dispatch_at(
+            &act(
+                &holder,
+                0,
+                ActionPayload::SetPrivateClaims {
+                    asset: bond_ref.clone(),
+                    enabled: true,
+                },
+            ),
+            &view,
+            2,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("only the issuer"), "got: {err}");
+        let updates = dispatch_at(
+            &act(
+                &issuer,
+                1,
+                ActionPayload::SetPrivateClaims {
+                    asset: bond_ref.clone(),
+                    enabled: true,
+                },
+            ),
+            &view,
+            2,
+        )
+        .unwrap();
+        view.apply_accounts(&updates.accounts).unwrap();
+        view.put(
+            &AssetKey(&bond_ref),
+            updates.asset_registration.as_ref().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            dispatch_at(&transfer, &view, 3).is_err(),
+            "no proof recorded yet"
+        );
+
+        let updates = dispatch_at(&verify, &view, 3).unwrap();
+        view.apply_accounts(&updates.accounts).unwrap();
+        view.apply_holder_states(&updates.holder_states).unwrap();
+
+        let updates = dispatch_at(&transfer, &view, 3).expect("the proof clears the gate");
+        assert_eq!(updates.assets.0[&(bond_ref, holder)], 10);
     }
 }

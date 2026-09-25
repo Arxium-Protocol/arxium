@@ -44,7 +44,7 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         LeaveValidator { .. } => 150,
         AuthorizeOperator { .. } | RevokeOperator => 100,
         // Groth16 verify over BLS12-381.
-        VerifyIdentityCredential { .. } => 5_000,
+        VerifyIdentityCredential { .. } | VerifyClaimProof { .. } => 5_000,
         GrantAttestation { .. } | RevokeAttestation { .. } => 100,
         RegisterAttestor { .. } | DeregisterAttestor { .. } => 100,
         RegisterAsset { .. } => 150,
@@ -62,6 +62,7 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         | LockHolderAmountUntil { .. }
         | UnlockHolderAmount { .. }
         | SetAssetLimits { .. }
+        | SetPrivateClaims { .. }
         | LockIssuance { .. }
         | TransferIssuer { .. }
         | SetAssetMetadataUri { .. } => 100,
