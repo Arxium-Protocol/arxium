@@ -834,6 +834,8 @@ pub(crate) mod test_support {
         );
         let tree = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
         let countries = predicate::country_set(["CH"]).unwrap();
+        let (country_path, country_index) =
+            predicate::country_path(&params, &countries, u16::from_be_bytes(*b"CH")).unwrap();
         let scope = circuit_identity_zk::asset_scope(&params, &asset.to_string());
         let sub = circuit_identity_zk::derive_sub(&params, secret, scope);
         let public = Public {
@@ -855,7 +857,8 @@ pub(crate) mod test_support {
             leaf_index: 0,
             membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
             membership_index: 0,
-            countries,
+            country_path,
+            country_index,
         };
         let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed_unchecked(
             include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
