@@ -5,7 +5,7 @@
 
 use super::*;
 use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
-use ark_crypto_primitives::crh::{CRHScheme, CRHSchemeGadget};
+use ark_crypto_primitives::crh::CRHSchemeGadget;
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
@@ -60,8 +60,10 @@ pub struct Witness {
     pub leaf_index: u32,
     pub membership_path: [Fr; ATTESTED_TREE_DEPTH],
     pub membership_index: u32,
-    /// Ten sorted, deduplicated country codes, padded with zeros.
-    pub countries: [u16; 10],
+    /// The holder's country's path in the `country_set_hash` tree, and its
+    /// leaf index (`country_path`). Unused unless `RESIDENCY` is requested.
+    pub country_path: [Fr; COUNTRY_TREE_DEPTH],
+    pub country_index: u32,
 }
 
 #[derive(Clone)]
@@ -196,25 +198,15 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
         let old_enough = birth.is_cmp(&cutoff, Ordering::Less, true)?;
         (&flags[3] & &!old_enough).enforce_equal(&Boolean::FALSE)?;
 
-        let country_vars: Vec<_> = (0..10)
-            .map(|i| {
-                let bits = UInt16::<Fr>::new_witness(cs.clone(), || {
-                    w.as_ref()
-                        .map(|w| w.countries[i])
-                        .ok_or(SynthesisError::AssignmentMissing)
-                })?;
-                Boolean::le_bits_to_fp(&bits.to_bits_le()?)
-            })
-            .collect::<ark_relations::gr1cs::Result<_>>()?;
-        let set_hash = CRHGadget::<Fr>::evaluate(&params, &country_vars)?;
-        ((set_hash - countries_hash) * FpVar::from(flags[4].clone()))
+        // Residency: the credential's country is a leaf of the allowed-set
+        // tree. Its padding leaves are zero, so a zero (absent) country must
+        // never match — the check zkPassport makes against its padding.
+        let path = w.as_ref().map(|w| &w.country_path);
+        let index = w.as_ref().map(|w| w.country_index);
+        let computed_countries = merkle_gadget(cs.clone(), &params, country.clone(), path, index)?;
+        ((computed_countries - countries_hash) * FpVar::from(flags[4].clone()))
             .enforce_equal(&FpVar::zero())?;
-        let mut allowed = Boolean::FALSE;
-        for candidate in &country_vars {
-            let nonzero = !candidate.is_eq(&FpVar::zero())?;
-            allowed = &allowed | &(&candidate.is_eq(&country)? & &nonzero);
-        }
-        (&flags[4] & &!allowed).enforce_equal(&Boolean::FALSE)?;
+        (&flags[4] & &country.is_eq(&FpVar::zero())?).enforce_equal(&Boolean::FALSE)?;
 
         ((membership_root - &group_root) * FpVar::from(flags[5].clone()))
             .enforce_equal(&FpVar::zero())?;
@@ -226,14 +218,14 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
     }
 }
 
-fn merkle_gadget(
+fn merkle_gadget<const DEPTH: usize>(
     cs: ConstraintSystemRef<Fr>,
     params: &CRHParametersVar<Fr>,
     mut node: FpVar<Fr>,
-    path: Option<&[Fr; ATTESTED_TREE_DEPTH]>,
+    path: Option<&[Fr; DEPTH]>,
     index: Option<u32>,
 ) -> ark_relations::gr1cs::Result<FpVar<Fr>> {
-    for depth in 0..ATTESTED_TREE_DEPTH {
+    for depth in 0..DEPTH {
         let sibling = FpVar::new_witness(cs.clone(), || {
             path.map(|p| p[depth])
                 .ok_or(SynthesisError::AssignmentMissing)
@@ -250,18 +242,17 @@ fn merkle_gadget(
     Ok(node)
 }
 
-pub fn country_set_hash(params: &PoseidonConfig<Fr>, countries: &[u16; 10]) -> Fr {
-    CRH::<Fr>::evaluate(
-        params,
-        countries.iter().map(|c| Fr::from(*c)).collect::<Vec<_>>(),
-    )
-    .expect("country set")
-}
+/// Depth of the allowed-country tree: 256 leaves, room for every ISO 3166-1
+/// alpha-2 code (249), so no allow-list is ever too long to prove. Same
+/// approach as zkPassport's all-countries list, as a Merkle root instead of a
+/// flat hash: 8 Poseidon hashes in-circuit instead of ~125.
+pub const COUNTRY_TREE_DEPTH: usize = 8;
 
-/// The circuit's fixed ten-slot country set: codes as big-endian `u16`,
-/// sorted, deduplicated, zero-padded. `None` for an invalid code, an empty
-/// set, or more than ten distinct codes — the circuit can't express those.
-pub fn country_set<'a>(codes: impl IntoIterator<Item = &'a str>) -> Option<[u16; 10]> {
+/// Canonical allowed-country set: codes as big-endian `u16`, sorted and
+/// deduplicated — the leaf order of the `country_set_hash` tree, so node and
+/// wallet always build the same one. `None` for an invalid code or an empty
+/// set.
+pub fn country_set<'a>(codes: impl IntoIterator<Item = &'a str>) -> Option<Vec<u16>> {
     let set = codes
         .into_iter()
         .map(|code| {
@@ -269,15 +260,44 @@ pub fn country_set<'a>(codes: impl IntoIterator<Item = &'a str>) -> Option<[u16;
                 .then(|| u16::from_be_bytes([code.as_bytes()[0], code.as_bytes()[1]]))
         })
         .collect::<Option<std::collections::BTreeSet<u16>>>()?;
-    if set.is_empty() || set.len() > 10 {
-        return None;
+    (!set.is_empty()).then(|| set.into_iter().collect())
+}
+
+fn country_tree(params: &PoseidonConfig<Fr>, countries: &[u16]) -> Vec<Vec<Fr>> {
+    let mut level: Vec<Fr> = (0..1usize << COUNTRY_TREE_DEPTH)
+        .map(|i| Fr::from(countries.get(i).copied().unwrap_or(0)))
+        .collect();
+    let mut levels = vec![level.clone()];
+    for _ in 0..COUNTRY_TREE_DEPTH {
+        level = level
+            .chunks(2)
+            .map(|pair| poseidon_pair(params, pair[0], pair[1]))
+            .collect();
+        levels.push(level.clone());
     }
-    let mut fixed = [0u16; 10];
-    fixed
-        .iter_mut()
-        .zip(set)
-        .for_each(|(slot, code)| *slot = code);
-    Some(fixed)
+    levels
+}
+
+/// The `country_set_hash` public input: the root of a depth-8 Poseidon tree
+/// over `country_set`'s output, zero-padded. An empty set gives the
+/// all-padding root, which no country can open (the circuit rejects zero).
+pub fn country_set_hash(params: &PoseidonConfig<Fr>, countries: &[u16]) -> Fr {
+    country_tree(params, countries)[COUNTRY_TREE_DEPTH][0]
+}
+
+/// The witness for `RESIDENCY`: `country`'s sibling path and leaf index in
+/// `countries`' tree, or `None` if it isn't in the set.
+pub fn country_path(
+    params: &PoseidonConfig<Fr>,
+    countries: &[u16],
+    country: u16,
+) -> Option<([Fr; COUNTRY_TREE_DEPTH], u32)> {
+    let index = countries
+        .iter()
+        .position(|c| *c == country && country != 0)?;
+    let levels = country_tree(params, countries);
+    let path = std::array::from_fn(|depth| levels[depth][(index >> depth) ^ 1]);
+    Some((path, index as u32))
 }
 
 pub fn setup_predicate<R: RngCore + ark_std::rand::CryptoRng>(
@@ -343,7 +363,11 @@ mod tests {
         };
         let leaf = credential_leaf(&params, commitment, &opening);
         let live = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
-        let countries = [u16::from_be_bytes(*b"CH"), 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // EEA + CH: 31 countries, three times the old ten-slot limit, with
+        // CH somewhere in the middle of the tree rather than at leaf 0.
+        let countries = country_set(EEA_AND_CH).unwrap();
+        let (country_path, country_index) =
+            super::country_path(&params, &countries, u16::from_be_bytes(*b"CH")).unwrap();
         let scope = asker_scope(&params, "acct_shop");
         let p = Public {
             sub: derive_sub(&params, secret, scope),
@@ -364,9 +388,56 @@ mod tests {
             leaf_index: 0,
             membership_path: group.path(0).unwrap(),
             membership_index: 0,
-            countries,
+            country_path,
+            country_index,
         };
         (p, w)
+    }
+
+    const EEA_AND_CH: [&str; 31] = [
+        "AT", "BE", "BG", "CH", "CY", "CZ", "DE", "DK", "EE", "ES", "FI", "FR", "GR", "HR", "HU",
+        "IE", "IS", "IT", "LI", "LT", "LU", "LV", "MT", "NL", "NO", "PL", "PT", "RO", "SE", "SI",
+        "SK",
+    ];
+
+    /// Any allow-list size fits, a country outside it can't borrow another
+    /// country's path, and an empty country can't open a padding leaf.
+    #[test]
+    fn residency_proves_membership_of_a_list_of_any_length() {
+        let params = poseidon_params();
+        let every: Vec<&str> = ISO3166_ALPHA2.split_ascii_whitespace().collect();
+        let all = country_set(every.iter().copied()).unwrap();
+        assert_eq!(all.len(), 249);
+        let (mut p, mut w) = fixture();
+        p.claims_mask = RESIDENCY;
+        p.country_set_hash = country_set_hash(&params, &all);
+        (w.country_path, w.country_index) =
+            country_path(&params, &all, u16::from_be_bytes(*b"CH")).unwrap();
+        assert!(satisfies(p, w).0, "CH within all 249 ISO codes");
+
+        let (mut p, mut w) = fixture();
+        p.claims_mask = RESIDENCY;
+        w.opening.country_code = *b"US";
+        assert!(!satisfies(p, w.clone()).0, "US reusing CH's path");
+        w.opening.country_code = [0, 0];
+        let padding = countries_padding_path(&params);
+        (w.country_path, w.country_index) = padding;
+        assert!(
+            !satisfies(p, w).0,
+            "an empty country opening a zero padding leaf"
+        );
+    }
+
+    /// The path of the first zero padding leaf in the fixture's set — what a
+    /// credential with no country would try to use.
+    fn countries_padding_path(params: &PoseidonConfig<Fr>) -> ([Fr; COUNTRY_TREE_DEPTH], u32) {
+        let countries = country_set(EEA_AND_CH).unwrap();
+        let index = countries.len();
+        let levels = country_tree(params, &countries);
+        (
+            std::array::from_fn(|depth| levels[depth][(index >> depth) ^ 1]),
+            index as u32,
+        )
     }
 
     fn satisfies(p: Public, w: Witness) -> (bool, usize) {

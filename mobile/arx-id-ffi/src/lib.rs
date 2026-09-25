@@ -192,17 +192,24 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
         if tree.root() != public.merkle_root {
             return Err("leaf list root changed; retry".into());
         }
-        let mut countries = [0u16; 10];
-        for (i, code) in input.countries.unwrap_or_default().into_iter().enumerate() {
-            if i >= 10 {
-                return Err("too many countries".into());
+        // The request's allowed countries, as the tree `country_set_hash`
+        // commits to. Only needed (and only checked) when residency is asked.
+        let (country_path, country_index) = if context.claims_mask & predicate::RESIDENCY != 0 {
+            let requested = input.countries.unwrap_or_default();
+            let countries = predicate::country_set(requested.iter().map(String::as_str))
+                .ok_or("invalid country")?;
+            if predicate::country_set_hash(&params, &countries) != public.country_set_hash {
+                return Err("country list does not match the request".into());
             }
-            let bytes = code.as_bytes();
-            if !zk::valid_country_code(&code) {
-                return Err("invalid country".into());
-            }
-            countries[i] = u16::from_be_bytes([bytes[0], bytes[1]]);
-        }
+            predicate::country_path(
+                &params,
+                &countries,
+                u16::from_be_bytes(opening.country_code),
+            )
+            .ok_or("claim not satisfied")?
+        } else {
+            ([Fr::from(0u64); predicate::COUNTRY_TREE_DEPTH], 0)
+        };
         let member = input.membership_path.unwrap_or_default();
         let mut membership_path = [Fr::from(0u64); zk::ATTESTED_TREE_DEPTH];
         if context.claims_mask & predicate::MEMBERSHIP != 0
@@ -223,7 +230,8 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
             leaf_index: leaf_index as u32,
             membership_path,
             membership_index: input.membership_index.unwrap_or(0),
-            countries,
+            country_path,
+            country_index,
         };
         let pk = predicate_key().ok_or("invalid bundled predicate key")?;
         predicate::prove_predicate(public, witness, pk, &mut rng)
@@ -379,14 +387,13 @@ mod tests {
         let tree = zk::AttestedTree::from_leaves(&params, &[leaf]).unwrap();
         let scope = zk::asker_scope(&params, "acct_shop");
         let nonce = Fr::from(22u64);
-        let countries = [0u16; 10];
         let p = predicate::Public {
             sub: zk::derive_sub(&params, secret, scope),
             scope,
             nonce,
             claims_mask: predicate::KYC | predicate::AGE,
             age_n: 18,
-            country_set_hash: predicate::country_set_hash(&params, &countries),
+            country_set_hash: predicate::country_set_hash(&params, &[]),
             group_root: Fr::from(0u64),
             merkle_root: tree.root(),
             today_days: 20000,

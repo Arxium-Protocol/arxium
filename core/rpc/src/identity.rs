@@ -861,7 +861,8 @@ mod tests {
             leaf_index: 0,
             membership_path: [Fr::from(0u64); 20],
             membership_index: 0,
-            countries: [0; 10],
+            country_path: [Fr::from(0u64); predicate::COUNTRY_TREE_DEPTH],
+            country_index: 0,
         };
         let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed(
             include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
