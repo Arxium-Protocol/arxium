@@ -13,6 +13,7 @@ xc-circuit = { workspace = true }
 circuit-staking = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+metrics = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 hex = { workspace = true }

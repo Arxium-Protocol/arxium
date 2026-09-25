@@ -314,16 +314,45 @@ const ROUND_TIMEOUT: Duration = Duration::from_millis(150);
 #[cfg(all(not(test), feature = "fault-injection"))]
 static ROUND_TIMEOUT_OVERRIDE: std::sync::LazyLock<Result<Option<Duration>, String>> =
     std::sync::LazyLock::new(|| {
-        let Ok(raw) = std::env::var("ARXD_ROUND_TIMEOUT_SECS") else {
-            return Ok(None);
-        };
-        match raw.trim().parse::<u64>() {
-            Ok(secs) => Ok(Some(Duration::from_secs(secs))),
-            Err(err) => Err(format!(
-                "ARXD_ROUND_TIMEOUT_SECS: {raw:?} is not a whole number of seconds: {err}"
-            )),
-        }
+        env_u64("ARXD_ROUND_TIMEOUT_SECS").map(|s| s.map(Duration::from_secs))
     });
+
+/// An unset or blank variable is `None`; anything else must be a `u64`.
+#[cfg(feature = "fault-injection")]
+fn env_u64(name: &str) -> Result<Option<u64>, String> {
+    match std::env::var(name) {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|err| format!("{name}: {raw:?} is not a whole number: {err}")),
+        _ => Ok(None),
+    }
+}
+
+/// Harness-only (`--features fault-injection`): the height a Byzantine
+/// proposer withholds, from `ARXD_WITHHOLD_BLOCK_AT_HEIGHT`. See
+/// `scripts/withholding-proposer-harness.sh`. This crate's half is "never
+/// vote at that height": `spawn_finality` drops every `BlockObserved` there,
+/// so the node signs no precommit for its own block (or any later round's)
+/// and its timeout clock stays at `h − 1` — which is what lets it co-sign
+/// round 0's timeout certificate for a block it built itself. `arxd/network`
+/// reads the same value for the delivery half (gossip nothing, sync only to
+/// `ARXD_WITHHOLD_EXCEPT_PEERS`).
+#[cfg(feature = "fault-injection")]
+static WITHHOLD_AT_HEIGHT: std::sync::LazyLock<Result<Option<u64>, String>> =
+    std::sync::LazyLock::new(|| env_u64("ARXD_WITHHOLD_BLOCK_AT_HEIGHT"));
+
+#[cfg(feature = "fault-injection")]
+pub fn withheld_height() -> Option<u64> {
+    WITHHOLD_AT_HEIGHT.as_ref().ok().copied().flatten()
+}
+
+/// Same boot-time check as `round_timeout_override_error`, same reason.
+#[cfg(feature = "fault-injection")]
+pub fn withheld_height_error() -> Option<String> {
+    WITHHOLD_AT_HEIGHT.as_ref().err().cloned()
+}
 
 /// `Some(complaint)` if `ARXD_ROUND_TIMEOUT_SECS` is set but unreadable.
 ///
@@ -596,6 +625,20 @@ where
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
             };
+
+            // Harness-only Byzantine proposer: see `WITHHOLD_AT_HEIGHT`.
+            // Before the watermark/clock updates below, so the withheld
+            // height never counts as progress here.
+            #[cfg(feature = "fault-injection")]
+            if let FinalityEvent::BlockObserved(block) = &event
+                && withheld_height() == Some(block.height)
+            {
+                warn!(
+                    "fault-injection: not voting at withheld height {} (round {})",
+                    block.height, block.round
+                );
+                continue;
+            }
 
             // Only `BlockObserved` moves the watermark: it's emitted for blocks
             // this node already validated and persisted, so its height is local

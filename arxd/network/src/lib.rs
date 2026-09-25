@@ -9,6 +9,8 @@ mod snapshot_sync;
 mod sync;
 mod transport;
 pub mod wire;
+#[cfg(feature = "fault-injection")]
+mod withhold;
 
 pub use snapshot_sync::SnapshotTrust;
 
@@ -341,6 +343,15 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
 
     let expected_identify_protocol = identify_protocol_version(chain_id);
 
+    #[cfg(feature = "fault-injection")]
+    let mut withhold = match withhold::Withhold::from_env() {
+        Ok(withhold) => withhold,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
     let actions_topic = gossipsub::IdentTopic::new(actions_topic(chain_id));
     let blocks_topic = gossipsub::IdentTopic::new(blocks_topic(chain_id));
     let precommits_topic = gossipsub::IdentTopic::new(precommits_topic(chain_id));
@@ -492,6 +503,17 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     // Sender side (block-production loop) is gone — nothing left to publish.
                     continue;
                 };
+                #[cfg(feature = "fault-injection")]
+                if let Some(w) = withhold.as_mut()
+                    && w.intercept(&block)
+                {
+                    warn!(
+                        "fault-injection: withholding block {} ({}) from gossip",
+                        block.height,
+                        block.hash()
+                    );
+                    continue;
+                }
                 match bincode::serde::encode_to_vec(&block, xc_primitives::wire_config()) {
                     Ok(bytes) => {
                         if let Err(err) = swarm.behaviour_mut().gossipsub.publish(blocks_topic.clone(), bytes) {
@@ -806,6 +828,11 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             }
                         };
                         let response = sync::build_sync_response::<P>(&db, peer, sync_request);
+                        #[cfg(feature = "fault-injection")]
+                        let response = match &withhold {
+                            Some(w) => w.filter(&db, &peer, response),
+                            None => response,
+                        };
                         match bincode::serde::encode_to_vec(&response, xc_primitives::wire_config()) {
                             Ok(bytes) => {
                                 if swarm.behaviour_mut().sync.send_response(channel, bytes).is_err() {

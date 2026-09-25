@@ -352,6 +352,9 @@ where
         tip.round,
         tip_height - 1
     );
+    // Same counter as `arxd_finality::unwind_dead_tip`: one metric for "a
+    // dead tip was replaced", whichever side noticed first.
+    metrics::counter!("arxium_dead_tips_unwound_total").increment(1);
     db.revert_to::<P>(tip_height - 1)?;
     Ok(())
 }

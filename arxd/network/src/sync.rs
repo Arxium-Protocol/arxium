@@ -224,7 +224,7 @@ pub(crate) fn send_sync_request(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(rounds, 0);
     }
 
-    fn temp_db() -> ArxiumDb {
+    pub(crate) fn temp_db() -> ArxiumDb {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "arxium-test-sync-{}-{}",
@@ -275,7 +275,7 @@ mod tests {
         ArxiumDb::open(&path).unwrap()
     }
 
-    fn block(height: u64) -> Block<()> {
+    pub(crate) fn block(height: u64) -> Block<()> {
         Block {
             height,
             parent_hash: "0xparent".into(),

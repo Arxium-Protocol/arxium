@@ -1311,6 +1311,24 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         );
     }
 
+    // Same guard again: this one makes the node a Byzantine proposer
+    // (arxd/network's `withhold`, arxd/finality's `withheld_height`). The
+    // peer list is validated where it is parsed, in `run_swarm`.
+    #[cfg(feature = "fault-injection")]
+    if let Ok(height) = std::env::var("ARXD_WITHHOLD_BLOCK_AT_HEIGHT")
+        && !height.trim().is_empty()
+    {
+        ensure_fault_injection_allowed(&chain_name)?;
+        if let Some(err) = arxd_finality::withheld_height_error() {
+            anyhow::bail!(err);
+        }
+        warn!(
+            %height,
+            "WITHHOLDING PROPOSER ARMED — this node will not gossip or vote on its block \
+             at this height. Never use outside a devnet acceptance test."
+        );
+    }
+
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the
     // RPC server so `GET /metrics` can render it.

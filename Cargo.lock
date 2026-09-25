@@ -5356,6 +5356,7 @@ dependencies = [
  "circuit-staking",
  "ed25519-dalek",
  "hex",
+ "metrics",
  "serde",
  "thiserror 2.0.19",
  "tracing",

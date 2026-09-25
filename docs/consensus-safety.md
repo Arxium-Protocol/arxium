@@ -87,7 +87,8 @@ After B1c:
   than on a dead tip, because the dead tip is gone before its next tick.
 
 So `N1` unwinds `A` on seeing `B@1`'s certificate, commits `B`, votes it:
-`N1, N2, N3` = 3, `B` finalizes.
+`N1, N2, N3` = 3, `B` finalizes. Exercised live by
+`scripts/withholding-proposer-harness.sh`.
 
 ## 4. What remains provisional-only (accepted)
 
