@@ -270,8 +270,7 @@ pub fn verify_claim_proof<V: KvRead<Error = StorageError>>(
             block_day,
         });
     }
-    use circuit_identity_zk::AttestedTree;
-    use circuit_identity_zk::predicate::{self, ACCREDITED, AML, KYC, Public, RESIDENCY};
+    use circuit_identity_zk::predicate::{self, ACCREDITED, AML, KYC, RESIDENCY};
 
     if !is_attested(view, sender)? {
         return Err(IdentityError::NotAttested(sender.clone()));
@@ -308,25 +307,19 @@ pub fn verify_claim_proof<V: KvRead<Error = StorageError>>(
         return Err(IdentityError::NothingToProve);
     }
 
-    let params = circuit_identity_zk::poseidon_params();
-    let merkle_root = AttestedTree::from_leaves(&params, &[leaf])
-        .expect("one leaf fits the tree")
-        .root();
     let sender_pubkey = sender
         .pubkey_bytes()
         .map_err(|_| IdentityError::MalformedSender)?;
-    let public = Public {
-        sub: Fr::deserialize_compressed(sub.as_slice()).map_err(|_| IdentityError::MalformedSub)?,
-        scope: circuit_identity_zk::asset_scope(&params, &asset.asset_ref.to_string()),
-        nonce: circuit_identity_zk::sender_binding(&sender_pubkey),
-        claims_mask: mask,
-        age_n: 0,
-        country_set_hash: predicate::country_set_hash(&params, &countries),
-        group_root: Fr::from(0u64),
-        merkle_root,
+    let public = predicate::asset_claim_public(
+        &circuit_identity_zk::poseidon_params(),
+        leaf,
+        &sender_pubkey,
+        &asset.asset_ref.to_string(),
+        mask,
+        &countries,
+        Fr::deserialize_compressed(sub.as_slice()).map_err(|_| IdentityError::MalformedSub)?,
         today_days,
-        age_cutoff_days: 0,
-    };
+    );
     let proof = circuit_identity_zk::Proof::<Bls12_381>::deserialize_compressed(proof)
         .map_err(|_| IdentityError::MalformedProof)?;
     if !predicate::verify_predicate(public, &proof, predicate_vk()) {
@@ -501,8 +494,8 @@ mod tests {
         use super::*;
         use ark_serialize::CanonicalSerialize;
         use ark_std::rand::{SeedableRng, rngs::StdRng};
-        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
-        use circuit_identity_zk::{AttestedTree, CredentialOpening, ProvingKey};
+        use circuit_identity_zk::predicate::{self, KYC, RESIDENCY};
+        use circuit_identity_zk::{CredentialOpening, ProvingKey};
 
         const TODAY: u32 = 46_290;
         /// A block timestamp on `TODAY`.
@@ -564,43 +557,14 @@ mod tests {
                 mask: u32,
                 countries: &[&str],
             ) -> ([u8; 32], Vec<u8>) {
-                let params = circuit_identity_zk::poseidon_params();
-                let tree = AttestedTree::from_leaves(&params, &[self.leaf()]).unwrap();
-                let countries =
-                    predicate::country_set(countries.iter().copied()).unwrap_or_default();
-                let (country_path, country_index) = predicate::country_path(
-                    &params,
-                    &countries,
-                    u16::from_be_bytes(self.opening.country_code),
-                )
-                .unwrap_or(([Fr::from(0u64); predicate::COUNTRY_TREE_DEPTH], 0));
-                let scope = circuit_identity_zk::asset_scope(&params, &asset.asset_ref.to_string());
-                let sub = circuit_identity_zk::derive_sub(&params, self.secret, scope);
-                let public = Public {
-                    sub,
-                    scope,
-                    nonce: circuit_identity_zk::sender_binding(&prover.pubkey_bytes().unwrap()),
-                    claims_mask: mask,
-                    age_n: 0,
-                    country_set_hash: predicate::country_set_hash(&params, &countries),
-                    group_root: Fr::from(0u64),
-                    merkle_root: tree.root(),
-                    today_days: TODAY,
-                    age_cutoff_days: 0,
-                };
-                let witness = Witness {
-                    id_secret: self.secret,
-                    opening: self.opening.clone(),
-                    leaf_path: tree.path(0).unwrap(),
-                    leaf_index: 0,
-                    membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
-                    membership_index: 0,
-                    country_path,
-                    country_index,
-                };
-                let proof = predicate::prove_predicate(
-                    public,
-                    witness,
+                let (sub, proof) = predicate::prove_asset_claim(
+                    self.secret,
+                    &self.opening,
+                    &prover.pubkey_bytes().unwrap(),
+                    &asset.asset_ref.to_string(),
+                    mask,
+                    &predicate::country_set(countries.iter().copied()).unwrap_or_default(),
+                    TODAY,
                     pk(),
                     &mut StdRng::seed_from_u64(3),
                 )

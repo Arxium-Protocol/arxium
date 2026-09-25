@@ -812,8 +812,8 @@ pub(crate) mod test_support {
         use ark_bls12_381::{Bls12_381, Fr};
         use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
         use ark_std::rand::{SeedableRng, rngs::StdRng};
-        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
-        use circuit_identity_zk::{AttestedTree, CredentialOpening};
+        use circuit_identity_zk::CredentialOpening;
+        use circuit_identity_zk::predicate::{self, KYC, RESIDENCY};
 
         let params = circuit_identity_zk::poseidon_params();
         let secret = Fr::from(42u64);
@@ -832,40 +832,22 @@ pub(crate) mod test_support {
             circuit_identity_zk::id_commitment(&params, secret),
             &opening,
         );
-        let tree = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
-        let countries = predicate::country_set(["CH"]).unwrap();
-        let (country_path, country_index) =
-            predicate::country_path(&params, &countries, u16::from_be_bytes(*b"CH")).unwrap();
-        let scope = circuit_identity_zk::asset_scope(&params, &asset.to_string());
-        let sub = circuit_identity_zk::derive_sub(&params, secret, scope);
-        let public = Public {
-            sub,
-            scope,
-            nonce: circuit_identity_zk::sender_binding(&holder.pubkey_bytes().unwrap()),
-            claims_mask: KYC | RESIDENCY,
-            age_n: 0,
-            country_set_hash: predicate::country_set_hash(&params, &countries),
-            group_root: Fr::from(0u64),
-            merkle_root: tree.root(),
-            today_days,
-            age_cutoff_days: 0,
-        };
-        let witness = Witness {
-            id_secret: secret,
-            opening,
-            leaf_path: tree.path(0).unwrap(),
-            leaf_index: 0,
-            membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
-            membership_index: 0,
-            country_path,
-            country_index,
-        };
         let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed_unchecked(
             include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
         )
         .unwrap();
-        let proof = predicate::prove_predicate(public, witness, &pk, &mut StdRng::seed_from_u64(1))
-            .unwrap();
+        let (sub, proof) = predicate::prove_asset_claim(
+            secret,
+            &opening,
+            &holder.pubkey_bytes().unwrap(),
+            &asset.to_string(),
+            KYC | RESIDENCY,
+            &predicate::country_set(["CH"]).unwrap(),
+            today_days,
+            &pk,
+            &mut StdRng::seed_from_u64(1),
+        )
+        .unwrap();
         let (mut leaf_bytes, mut sub_bytes, mut proof_bytes) = (Vec::new(), Vec::new(), Vec::new());
         leaf.serialize_compressed(&mut leaf_bytes).unwrap();
         sub.serialize_compressed(&mut sub_bytes).unwrap();

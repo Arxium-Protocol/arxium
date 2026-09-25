@@ -20,6 +20,12 @@ serde_json = { workspace = true }
 hex = { workspace = true }
 zeroize = { workspace = true }
 
+[dev-dependencies]
+# Cross-checks `prove_asset_claim` against the chain's own verifier.
+circuit-identity = { workspace = true }
+xc-primitives = { workspace = true }
+xc-storage = { workspace = true }
+
 [lints.clippy]
 todo = "deny"
 unimplemented = "deny"

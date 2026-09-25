@@ -381,10 +381,13 @@ dependencies = [
  "ark-ff",
  "ark-serialize",
  "ark-std",
+ "circuit-identity",
  "circuit-identity-zk",
  "hex",
  "serde",
  "serde_json",
+ "xc-primitives",
+ "xc-storage",
  "zeroize",
 ]
 

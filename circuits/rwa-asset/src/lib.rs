@@ -293,9 +293,9 @@ fn claim_proof_live<V: KvRead<Error = StorageError>>(
     let Some(verified_at) = state.claim_verified_at else {
         return Ok(false);
     };
-    if !entry
+    if entry
         .and_then(|e| e.attested_at)
-        .is_some_and(|at| at <= verified_at)
+        .is_none_or(|at| at > verified_at)
         || !is_attested(view, party)?
     {
         return Ok(false);
