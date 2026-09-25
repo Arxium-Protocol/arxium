@@ -8,7 +8,7 @@ export const ACTION_VARIANT = {
   registerAsset: 12, issueAsset: 13, transferAsset: 14, freezeAsset: 18, unfreezeAsset: 19,
   burnAsset: 21, setHolderFrozen: 22, lockHolderAmount: 23, unlockHolderAmount: 24,
   issuerForcedTransfer: 25, recoverHolder: 26, issueAssetTo: 27,
-  setAssetLimits: 31,
+  setAssetLimits: 31, verifyClaimProof: 40, setPrivateClaims: 41,
 } as const;
 const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5 } as const;
 const TOPIC = { kyc: 0, aml: 1, accredited: 2, jurisdiction: 3 } as const;
@@ -38,6 +38,10 @@ export function encodeIssuerForcedTransfer(asset: string, from: string, to: stri
 export function encodeRecoverHolder(asset: string, lost: string, replacement: string): Uint8Array { return new Writer().varint(ACTION_VARIANT.recoverHolder).string(asset).string(lost).string(replacement).bytes(); }
 export function encodeIssueAssetTo(asset: string, to: string, amount: bigint): Uint8Array { return new Writer().varint(ACTION_VARIANT.issueAssetTo).string(asset).string(to).varint(amount).bytes(); }
 /** Sets issuer-controlled investor, concentration, and attestation-age limits. `null` clears each limit. */
+/** zk-KYC: a holder's private eligibility proof. `sub` is a fixed 32-byte array on the node, so it rides raw (no length prefix); `proof` is length-prefixed. */
+export function encodeVerifyClaimProof(asset: string, sub: Uint8Array, todayDays: number, proof: Uint8Array): Uint8Array { if (sub.length !== 32) throw new Error("sub must be 32 bytes"); return new Writer().varint(ACTION_VARIANT.verifyClaimProof).string(asset).raw(sub).varint(todayDays).vec(Array.from(proof), (w, b) => w.u8(b)).bytes(); }
+/** Issuer opt-in: whether holders may clear `asset`'s gate with a claim proof instead of clear-text claims. */
+export function encodeSetPrivateClaims(asset: string, enabled: boolean): Uint8Array { return new Writer().varint(ACTION_VARIANT.setPrivateClaims).string(asset).bool(enabled).bytes(); }
 export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
 
 /** `{ name, input }` names and shapes match `fixtures/signed-actions.json`: amounts are decimal strings, byte fields are number arrays. */
@@ -66,6 +70,8 @@ export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
     case "recoverHolder": return encodeRecoverHolder(input.asset, input.lost, input.replacement);
     case "issueAssetTo": return encodeIssueAssetTo(input.asset, input.to, BigInt(input.amount));
     case "setAssetLimits": return encodeSetAssetLimits(input.asset, input.maxHolders, nullableBig(input.maxBalancePerHolder), nullableBig(input.maxAttestationAge));
+    case "verifyClaimProof": return encodeVerifyClaimProof(input.asset, Uint8Array.from(input.sub), input.todayDays, Uint8Array.from(input.proof));
+    case "setPrivateClaims": return encodeSetPrivateClaims(input.asset, input.enabled);
   }
 }
 const invert = <K extends string>(table: Record<K, number>): Record<number, K> => Object.fromEntries(Object.entries(table).map(([key, value]) => [value, key])) as Record<number, K>;
@@ -102,6 +108,8 @@ export function decodePayload(payload: Uint8Array): DecodedPayload {
     recoverHolder: () => ({ asset: str(), lost: str(), replacement: str() }),
     issueAssetTo: () => ({ asset: str(), to: str(), amount: amount() }),
     setAssetLimits: () => ({ asset: str(), maxHolders: r.option((rr) => Number(rr.varint())), maxBalancePerHolder: r.option(amount), maxAttestationAge: r.option(amount) }),
+    verifyClaimProof: () => ({ asset: str(), sub: Array.from({ length: 32 }, () => r.u8()), todayDays: Number(r.varint()), proof: bytes() }),
+    setPrivateClaims: () => ({ asset: str(), enabled: r.bool() }),
   };
   const decoded = { name, input: read[name]() };
   r.done();
