@@ -276,6 +276,11 @@ pub struct Asset {
     // give it its own merkleized key if snapshots of thousands of holders
     // start showing up in transfer cost.
     pub snapshot: Option<CapTable>,
+    /// Issuer opt-in (`SetPrivateClaims`, variant 41): a holder may clear
+    /// `required_claims`/`allowed_jurisdictions` with a zk claim proof
+    /// (`VerifyClaimProof`, variant 40) instead of clear-text account
+    /// fields. Off by default, so existing assets keep today's gating.
+    pub private_claims: bool,
 }
 
 /// A cap table frozen at `height`: every non-issuer holder with a positive
@@ -343,6 +348,7 @@ impl Asset {
             max_attestation_age: None,
             holder_count: 0,
             snapshot: None,
+            private_claims: false,
         }
     }
 
@@ -380,6 +386,7 @@ impl Asset {
             max_attestation_age: None,
             holder_count: 0,
             snapshot: None,
+            private_claims: false,
         }
     }
 }
@@ -406,6 +413,11 @@ pub struct HolderState {
     /// lock holds until the issuer unlocks it. Reads treat the lock as zero
     /// once `current_height >= lock_expires_at`; the record isn't rewritten.
     pub lock_expires_at: Option<u64>,
+    /// Height of the holder's last accepted `VerifyClaimProof` for this
+    /// asset. Honoured by `check_party` only while the asset has
+    /// `private_claims`, the attestation is live and not re-granted since,
+    /// and the proof is younger than `CLAIM_PROOF_TTL_SECS`.
+    pub claim_verified_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

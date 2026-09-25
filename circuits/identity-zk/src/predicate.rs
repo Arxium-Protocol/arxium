@@ -258,6 +258,28 @@ pub fn country_set_hash(params: &PoseidonConfig<Fr>, countries: &[u16; 10]) -> F
     .expect("country set")
 }
 
+/// The circuit's fixed ten-slot country set: codes as big-endian `u16`,
+/// sorted, deduplicated, zero-padded. `None` for an invalid code, an empty
+/// set, or more than ten distinct codes — the circuit can't express those.
+pub fn country_set<'a>(codes: impl IntoIterator<Item = &'a str>) -> Option<[u16; 10]> {
+    let set = codes
+        .into_iter()
+        .map(|code| {
+            valid_country_code(code)
+                .then(|| u16::from_be_bytes([code.as_bytes()[0], code.as_bytes()[1]]))
+        })
+        .collect::<Option<std::collections::BTreeSet<u16>>>()?;
+    if set.is_empty() || set.len() > 10 {
+        return None;
+    }
+    let mut fixed = [0u16; 10];
+    fixed
+        .iter_mut()
+        .zip(set)
+        .for_each(|(slot, code)| *slot = code);
+    Some(fixed)
+}
+
 pub fn setup_predicate<R: RngCore + ark_std::rand::CryptoRng>(
     rng: &mut R,
 ) -> (ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>) {

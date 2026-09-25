@@ -24,6 +24,8 @@ pub enum AccountError {
         balance: u128,
         amount: u128,
     },
+    #[error("balance overflow crediting {account}")]
+    Overflow { account: Address },
 }
 
 /// Validates and applies a transfer of `amount` from `sender` (at `nonce`) to
@@ -79,7 +81,13 @@ pub fn apply_transfer<V: KvRead<Error = StorageError>>(
 
     sender_entry.balance -= amount;
     sender_entry.nonce += 1;
-    receiver_entry.balance += amount;
+    receiver_entry.balance =
+        receiver_entry
+            .balance
+            .checked_add(amount)
+            .ok_or_else(|| AccountError::Overflow {
+                account: to.clone(),
+            })?;
 
     let mut updates = BTreeMap::new();
     updates.insert(sender.clone(), sender_entry);
@@ -132,5 +140,32 @@ mod tests {
         let entry = &updates.0[&sender];
         assert_eq!(entry.balance, 100, "self-transfer must not mint balance");
         assert_eq!(entry.nonce, 1, "self-transfer must still bump nonce");
+    }
+
+    #[test]
+    fn transfer_rejects_receiver_overflow_instead_of_wrapping() {
+        let db = temp_db();
+        let sender = addr();
+        let receiver = Address::from_pubkey_bytes(&[8u8; 32]).unwrap();
+        db.write_batch(&AccountUpdates(BTreeMap::from([
+            (
+                sender.clone(),
+                AccountEntry {
+                    balance: 10,
+                    ..Default::default()
+                },
+            ),
+            (
+                receiver.clone(),
+                AccountEntry {
+                    balance: u128::MAX,
+                    ..Default::default()
+                },
+            ),
+        ])))
+        .unwrap();
+
+        let err = apply_transfer(&db, &sender, 0, &receiver, 1).unwrap_err();
+        assert!(matches!(err, AccountError::Overflow { .. }));
     }
 }

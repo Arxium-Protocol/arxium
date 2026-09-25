@@ -88,6 +88,16 @@ pub enum StakingError {
          {MAX_DELEGATION_PER_VALIDATOR} cap"
     )]
     DelegationCapExceeded { validator: Address, new_total: u128 },
+    #[error("balance overflow crediting {account}")]
+    Overflow { account: Address },
+}
+
+fn credit(balance: u128, amount: u128, account: &Address) -> Result<u128, StakingError> {
+    balance
+        .checked_add(amount)
+        .ok_or_else(|| StakingError::Overflow {
+            account: account.clone(),
+        })
 }
 
 fn default_account() -> AccountEntry {
@@ -129,12 +139,20 @@ pub fn apply_block_reward<V: KvRead<Error = StorageError>>(
     let mut proposer_entry = view
         .get(&AccountKey(proposer))?
         .unwrap_or_else(default_account);
-    proposer_entry.balance += block_reward + proposer_fee_share;
+    // Supply is fixed, so an overflow here means the ledger is already
+    // corrupt — halt rather than wrap.
+    proposer_entry.balance = proposer_entry
+        .balance
+        .checked_add(block_reward + proposer_fee_share)
+        .expect("proposer balance overflow: supply invariant broken");
 
     let mut treasury_entry = view
         .get(&AccountKey(&treasury))?
         .unwrap_or_else(default_account);
-    treasury_entry.balance += treasury_fee_share;
+    treasury_entry.balance = treasury_entry
+        .balance
+        .checked_add(treasury_fee_share)
+        .expect("treasury balance overflow: supply invariant broken");
 
     let mut updates = BTreeMap::new();
     updates.insert(pool_account, pool_entry);
@@ -213,7 +231,7 @@ pub fn apply_stake<V: KvRead<Error = StorageError>>(
 
     master_entry.balance -= amount;
     master_entry.nonce += 1;
-    sub_entry.balance += amount;
+    sub_entry.balance = credit(sub_entry.balance, amount, &sub_account)?;
 
     let new_allocation = match existing {
         Some(mut existing) => {
@@ -388,7 +406,7 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
     let mut pool_entry = view
         .get(&AccountKey(&pool_account))?
         .unwrap_or_else(default_account);
-    pool_entry.balance += debited;
+    pool_entry.balance = credit(pool_entry.balance, debited, &pool_account)?;
 
     let mut account_updates = BTreeMap::new();
     account_updates.insert(sub_account, sub_entry);
@@ -480,7 +498,10 @@ pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
                 .get(&AccountKey(&allocation.master))?
                 .unwrap_or_else(default_account),
         };
-        master_entry.balance += unbonding.amount;
+        master_entry.balance = master_entry
+            .balance
+            .checked_add(unbonding.amount)
+            .expect("master balance overflow: supply invariant broken");
         overlay.insert(allocation.master.clone(), master_entry);
 
         let sub_account = stake_subaccount(&allocation.validator);

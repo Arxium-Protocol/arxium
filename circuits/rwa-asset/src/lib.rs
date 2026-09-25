@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 use xc_circuit::{
-    AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, KeySpec, KvRead,
+    AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey, ChainParamsKey, KeySpec,
+    KvRead,
 };
 use xc_primitives::{
     AccountEntry, Address, Asset, AssetRef, CapTable, ClaimTopic, CountryCode, HolderState,
@@ -198,17 +199,25 @@ fn check_party<V: KvRead<Error = StorageError>>(
     current_height: u64,
 ) -> Result<(), RwaError> {
     let entry = view.get(&AccountKey(party))?;
+    let state = holder_state(view, asset, party, current_height)?;
 
     // An issuer-frozen holder is out of circulation in both directions,
     // whatever its claims say.
-    if holder_state(view, asset, party, current_height)?.frozen {
+    if state.frozen {
         return Err(RwaError::HolderFrozen {
             asset: asset.asset_ref.clone(),
             address: party.clone(),
         });
     }
 
-    if !asset.required_claims.is_empty() {
+    // A live claim proof stands in for the clear-text claims and
+    // jurisdiction checks below; freeze and attestation age still apply.
+    let proven = asset.private_claims
+        && claim_proof_live(view, party, entry.as_ref(), &state, current_height)?;
+
+    if proven {
+        // `claim_proof_live` already required a live attestation.
+    } else if !asset.required_claims.is_empty() {
         // An attested account is still the baseline: topics qualify an
         // attestation, they don't substitute for having one.
         if !is_attested(view, party)? {
@@ -252,7 +261,7 @@ fn check_party<V: KvRead<Error = StorageError>>(
     // An unknown jurisdiction is rejected, not waved through: a restricted
     // asset can only be held where it is permitted, and "we don't know" is
     // not a permission.
-    if let Some(allowed) = &asset.allowed_jurisdictions {
+    if let Some(allowed) = asset.allowed_jurisdictions.as_ref().filter(|_| !proven) {
         let held = entry.as_ref().and_then(|e| e.jurisdiction.clone());
         if !held.as_ref().is_some_and(|code| allowed.contains(code)) {
             return Err(RwaError::JurisdictionNotAllowed {
@@ -263,6 +272,63 @@ fn check_party<V: KvRead<Error = StorageError>>(
         }
     }
     Ok(())
+}
+
+/// How long an accepted `VerifyClaimProof` keeps clearing `check_party`
+/// before the holder has to prove again — the periodic re-check compliance
+/// expects, and the backstop for credential expiry the chain can't see.
+pub const CLAIM_PROOF_TTL_SECS: u64 = 90 * 86_400;
+
+/// Whether `state.claim_verified_at` still vouches for `party`: attestation
+/// live (revocation or attestor deregistration closes the gate at once), not
+/// re-granted since the proof (a new grant may carry narrower claims), and
+/// within `CLAIM_PROOF_TTL_SECS`.
+fn claim_proof_live<V: KvRead<Error = StorageError>>(
+    view: &V,
+    party: &Address,
+    entry: Option<&AccountEntry>,
+    state: &HolderState,
+    current_height: u64,
+) -> Result<bool, StorageError> {
+    let Some(verified_at) = state.claim_verified_at else {
+        return Ok(false);
+    };
+    if !entry
+        .and_then(|e| e.attested_at)
+        .is_some_and(|at| at <= verified_at)
+        || !is_attested(view, party)?
+    {
+        return Ok(false);
+    }
+    let interval = view
+        .get(&ChainParamsKey)?
+        .unwrap_or_default()
+        .block_interval_secs
+        .max(1);
+    Ok(current_height < verified_at.saturating_add(CLAIM_PROOF_TTL_SECS / interval))
+}
+
+/// Records an accepted claim proof (`circuit_identity::verify_claim_proof`)
+/// for `holder` at `current_height`. Verification is the caller's job.
+pub fn apply_record_claim_proof<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    holder: &Address,
+    current_height: u64,
+) -> Result<HolderStateUpdates, RwaError> {
+    // Raw read, like `apply_set_holder_frozen`: don't drop an expired lock
+    // as a side effect of an unrelated write.
+    let mut state = view
+        .get(&AssetHolderStateKey {
+            asset: &asset.asset_ref,
+            holder,
+        })?
+        .unwrap_or_default();
+    state.claim_verified_at = Some(current_height);
+    Ok(HolderStateUpdates(BTreeMap::from([(
+        (asset.asset_ref.clone(), holder.clone()),
+        state,
+    )])))
 }
 
 /// The recipient side of a compliant credit: `check_party`, then the two
@@ -1222,6 +1288,7 @@ mod tests {
                 frozen: true,
                 frozen_amount: 10,
                 lock_expires_at: None,
+                claim_verified_at: None,
             },
         )])))
         .unwrap();
@@ -1235,6 +1302,7 @@ mod tests {
                 frozen: false,
                 frozen_amount: 10,
                 lock_expires_at: None,
+                claim_verified_at: None,
             },
         )])))
         .unwrap();
@@ -1712,6 +1780,76 @@ mod tests {
             },
         )])))
         .unwrap();
+    }
+
+    /// D-17's "done when": a holder with no clear-text claims and
+    /// `jurisdiction: None` clears a KYC + jurisdiction gate on a recorded
+    /// claim proof — and only while the asset opts in, the attestation is
+    /// live and unchanged since the proof, and the proof is within its TTL.
+    #[test]
+    fn a_live_claim_proof_stands_in_for_clear_claims_and_jurisdiction() {
+        let db = temp_db();
+        let (issuer, holder) = (addr(1), addr(2));
+        let mut asset = Asset::new("bond", issuer.clone(), false);
+        asset.required_claims = vec![ClaimTopic::Kyc];
+        asset.allowed_jurisdictions = Some(vec!["CH".into()]);
+        asset.private_claims = true;
+        attest(&db, &issuer, &[ClaimTopic::Kyc], Some("CH"));
+        let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
+        db.write_batch(&accounts).unwrap();
+        db.write_batch(&assets).unwrap();
+        let attested_at = |at: Option<u64>, hash: Option<&str>| {
+            db.write_batch(&AccountUpdates(BTreeMap::from([(
+                holder.clone(),
+                AccountEntry {
+                    identity_hash: hash.map(str::to_string),
+                    attested_at: at,
+                    ..Default::default()
+                },
+            )])))
+            .unwrap();
+        };
+        let send = |asset: &mut Asset, height| {
+            apply_compliant_transfer(&db, asset, &issuer, 1, &holder, 10, height)
+        };
+
+        attested_at(Some(5), Some("leaf"));
+        assert!(matches!(
+            send(&mut asset, 10),
+            Err(RwaError::MissingClaim { .. })
+        ));
+
+        db.write_batch(&apply_record_claim_proof(&db, &asset, &holder, 10).unwrap())
+            .unwrap();
+        send(&mut asset, 10).expect("the proof clears claims and jurisdiction");
+
+        let mut opted_out = asset.clone();
+        opted_out.private_claims = false;
+        assert!(matches!(
+            send(&mut opted_out, 10),
+            Err(RwaError::MissingClaim { .. })
+        ));
+
+        let ttl = CLAIM_PROOF_TTL_SECS / xc_primitives::ChainParams::default().block_interval_secs;
+        send(&mut asset, 10 + ttl - 1).expect("still inside the TTL");
+        assert!(matches!(
+            send(&mut asset, 10 + ttl),
+            Err(RwaError::MissingClaim { .. })
+        ));
+
+        // A re-grant after the proof may carry narrower claims: prove again.
+        attested_at(Some(11), Some("leaf-v2"));
+        assert!(matches!(
+            send(&mut asset, 12),
+            Err(RwaError::MissingClaim { .. })
+        ));
+
+        // Revocation closes the gate at once.
+        attested_at(Some(5), None);
+        assert!(matches!(
+            send(&mut asset, 10),
+            Err(RwaError::NotCompliant { .. })
+        ));
     }
 
     /// Both ends of a transfer must carry every required topic — a compliant
