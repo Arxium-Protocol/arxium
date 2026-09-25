@@ -116,6 +116,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
                     operator_validators_lookup,
                     validators,
                     height: next_height,
+                    timestamp,
                 },
             )
         },
@@ -657,7 +658,10 @@ mod tests {
     /// stamped timestamps can't run ahead of wall time.
     #[test]
     fn slot_due_waits_a_full_interval_after_the_parent() {
-        assert!(slot_due(100, 0, 0, 2), "first block after genesis is always due");
+        assert!(
+            slot_due(100, 0, 0, 2),
+            "first block after genesis is always due"
+        );
         assert!(!slot_due(100, 100, 5, 2));
         assert!(!slot_due(101, 100, 5, 2));
         assert!(slot_due(102, 100, 5, 2));
@@ -690,6 +694,7 @@ mod tests {
                     validators,
                     0,
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
+                    0,
                 )
             },
             &meter::<CoreChainRuntime>(Default::default()),
@@ -868,6 +873,7 @@ mod tests {
                             vals,
                             height,
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
+                            0,
                         )
                     },
                     <CoreChainRuntime as ChainRuntime>::on_block_sealed,

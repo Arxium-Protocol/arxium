@@ -519,12 +519,21 @@ pub(crate) fn verify_claim_proof<V: KvRead<Error = StorageError>>(
     today_days: u32,
     proof: &[u8],
     current_height: u64,
+    block_timestamp: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let asset = resolve_asset(view, asset)?;
     if !asset.private_claims {
         anyhow::bail!("{} does not accept claim proofs", asset.asset_ref);
     }
-    circuit_identity::verify_claim_proof(view, &action.sender, &asset, sub, today_days, proof)?;
+    circuit_identity::verify_claim_proof(
+        view,
+        &action.sender,
+        &asset,
+        sub,
+        today_days,
+        block_timestamp,
+        proof,
+    )?;
     Ok(BlockUpdates {
         holder_states: circuit_rwa_asset::apply_record_claim_proof(
             view,
@@ -718,6 +727,7 @@ mod tests {
                 &[],
                 0,
                 &no_bls_owner,
+                0,
             )
         }
 
@@ -1232,6 +1242,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
+            day_start(CLAIM_DAY),
         )
     }
 
@@ -1623,34 +1634,12 @@ mod tests {
     /// the KYC + jurisdiction gate.
     #[test]
     fn claim_proof_opens_a_restricted_asset_to_a_holder_with_nothing_in_clear() {
-        use ark_bls12_381::{Bls12_381, Fr};
-        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
-        use ark_std::rand::{SeedableRng, rngs::StdRng};
-        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
-        use circuit_identity_zk::{AttestedTree, CredentialOpening};
         use xc_primitives::{AccountEntry, ClaimTopic};
 
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
         let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        let params = circuit_identity_zk::poseidon_params();
-        let secret = Fr::from(42u64);
-        let opening = CredentialOpening {
-            kyc: true,
-            aml: false,
-            accredited: false,
-            birth_date_days: 30_000,
-            country_code: *b"CH",
-            membership_root: Fr::from(0u64),
-            expiry_days: 50_000,
-            salt: Fr::from(7u64),
-        };
-        let leaf = circuit_identity_zk::credential_leaf(
-            &params,
-            circuit_identity_zk::id_commitment(&params, secret),
-            &opening,
-        );
-        let mut leaf_bytes = Vec::new();
-        leaf.serialize_compressed(&mut leaf_bytes).unwrap();
+        let bond_ref = AssetRef::derive(&issuer, "bond").unwrap();
+        let (leaf_hex, sub, proof) = claim_proof(&holder, &bond_ref, CLAIM_DAY);
 
         let db = temp_db();
         let mut view = seeded_view(
@@ -1668,7 +1657,7 @@ mod tests {
                 (
                     holder.clone(),
                     AccountEntry {
-                        identity_hash: Some(hex::encode(leaf_bytes)),
+                        identity_hash: Some(leaf_hex),
                         attested_at: Some(0),
                         ..funded(FEE_BUDGET * 2)
                     },
@@ -1679,7 +1668,6 @@ mod tests {
         let mut bond = Asset::new("bond", issuer.clone(), false);
         bond.required_claims = vec![ClaimTopic::Kyc];
         bond.allowed_jurisdictions = Some(vec!["CH".into()]);
-        let bond_ref = bond.asset_ref.clone();
         view.put(&AssetKey(&bond_ref), &bond).unwrap();
         let act = |sender: &Address, nonce, payload| Action {
             sender: sender.clone(),
@@ -1709,50 +1697,14 @@ mod tests {
         )
         .unwrap();
 
-        // The wallet's side: prove against the one-leaf tree of its own
-        // credential, scoped to the asset, bound to its own key.
-        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed_unchecked(
-            include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
-        )
-        .unwrap();
-        let tree = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
-        let countries = predicate::country_set(["CH"]).unwrap();
-        let scope = circuit_identity_zk::asset_scope(&params, &bond_ref.to_string());
-        let sub = circuit_identity_zk::derive_sub(&params, secret, scope);
-        let public = Public {
-            sub,
-            scope,
-            nonce: circuit_identity_zk::sender_binding(&holder.pubkey_bytes().unwrap()),
-            claims_mask: KYC | RESIDENCY,
-            age_n: 0,
-            country_set_hash: predicate::country_set_hash(&params, &countries),
-            group_root: Fr::from(0u64),
-            merkle_root: tree.root(),
-            today_days: 46_290,
-            age_cutoff_days: 0,
-        };
-        let witness = Witness {
-            id_secret: secret,
-            opening,
-            leaf_path: tree.path(0).unwrap(),
-            leaf_index: 0,
-            membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
-            membership_index: 0,
-            countries,
-        };
-        let proof = predicate::prove_predicate(public, witness, &pk, &mut StdRng::seed_from_u64(1))
-            .unwrap();
-        let (mut sub_bytes, mut proof_bytes) = (Vec::new(), Vec::new());
-        sub.serialize_compressed(&mut sub_bytes).unwrap();
-        proof.serialize_compressed(&mut proof_bytes).unwrap();
         let verify = act(
             &holder,
             0,
             ActionPayload::VerifyClaimProof {
                 asset: bond_ref.clone(),
-                sub: sub_bytes.try_into().unwrap(),
-                today_days: 46_290,
-                proof: proof_bytes,
+                sub,
+                today_days: CLAIM_DAY,
+                proof,
             },
         );
         let transfer = act(
@@ -1807,6 +1759,27 @@ mod tests {
             dispatch_at(&transfer, &view, 3).is_err(),
             "no proof recorded yet"
         );
+
+        // Expiry is checked against the block's day: a proof dated a day
+        // off still lands (made just before midnight), two days off doesn't.
+        let at = |timestamp| {
+            crate::dispatch(
+                &verify,
+                &view,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &[],
+                3,
+                &no_bls_owner,
+                timestamp,
+            )
+        };
+        let err = at(day_start(CLAIM_DAY + 2)).unwrap_err();
+        assert!(
+            err.to_string().contains("but this block is on day"),
+            "got: {err}"
+        );
+        at(day_start(CLAIM_DAY + 1) + 3_600).expect("a day's slack for midnight");
 
         let updates = dispatch_at(&verify, &view, 3).unwrap();
         view.apply_accounts(&updates.accounts).unwrap();

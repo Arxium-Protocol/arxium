@@ -52,6 +52,10 @@ pub struct DispatchCtx<'a> {
     pub operator_validators_lookup: &'a dyn Fn(&Address) -> Result<Vec<Address>, StorageError>,
     pub validators: &'a [Address],
     pub height: u64,
+    /// The block's own header timestamp (unix seconds) — consensus time, not
+    /// this node's clock, so every replica and every fault-proof replay sees
+    /// the same value.
+    pub timestamp: u64,
 }
 
 pub trait ChainRuntime: Send + Sync + 'static {

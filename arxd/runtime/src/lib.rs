@@ -75,6 +75,7 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             ctx.height,
             // Through the view (overlay + touched-key recording), not `db`.
             &|pk: &BlsPublicKey| ctx.view.get(&xc_circuit::BlsPubkeyOwnerKey(pk)),
+            ctx.timestamp,
         )
     }
 
@@ -311,6 +312,7 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
     validators: &[Address],
     current_height: u64,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
+    block_timestamp: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let mut updates = dispatch_inner(
         action,
@@ -320,6 +322,7 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
         validators,
         current_height,
         bls_pubkey_owner_lookup,
+        block_timestamp,
     )?;
     consume_nonce(action, view, &mut updates)?;
     charge_action_fee(action, view, &mut updates)?;
@@ -396,6 +399,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
     validators: &[Address],
     current_height: u64,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
+    block_timestamp: u64,
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
         ActionPayload::Transfer { to, amount } => account::transfer(view, action, to, *amount),
@@ -561,9 +565,16 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             sub,
             today_days,
             proof,
-        } => {
-            asset::verify_claim_proof(view, action, asset, sub, *today_days, proof, current_height)
-        }
+        } => asset::verify_claim_proof(
+            view,
+            action,
+            asset,
+            sub,
+            *today_days,
+            proof,
+            current_height,
+            block_timestamp,
+        ),
         ActionPayload::SetPrivateClaims { asset, enabled } => {
             asset::set_private_claims(view, action, asset, *enabled)
         }
@@ -778,6 +789,89 @@ pub(crate) mod test_support {
     pub(crate) fn test_bls_pop(seed: u8) -> Vec<u8> {
         let (sk, _pk) = xc_bls::keygen_from_seed(&[seed; 32]).expect("keygen");
         xc_bls::prove_possession(&sk).0.to_vec()
+    }
+
+    /// The day the claim-proof fixtures are dated (days since 1900-01-01).
+    pub(crate) const CLAIM_DAY: u32 = 46_290;
+
+    /// Midnight UTC of `day` as a block timestamp.
+    pub(crate) fn day_start(day: u32) -> u64 {
+        u64::from(day - circuit_identity_zk::CREDENTIAL_EPOCH_OFFSET_DAYS) * 86_400
+    }
+
+    /// The wallet side of `VerifyClaimProof`: a KYC'd, Swiss-resident
+    /// credential (expiring on day 50 000) and a real predicate proof that
+    /// `holder` satisfies an asset requiring `Kyc` with
+    /// `allowed_jurisdictions: ["CH"]`, dated `today_days`. Returns the
+    /// `identity_hash` to attest `holder` with, `sub`, and the proof.
+    pub(crate) fn claim_proof(
+        holder: &Address,
+        asset: &xc_primitives::AssetRef,
+        today_days: u32,
+    ) -> (String, [u8; 32], Vec<u8>) {
+        use ark_bls12_381::{Bls12_381, Fr};
+        use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+        use ark_std::rand::{SeedableRng, rngs::StdRng};
+        use circuit_identity_zk::predicate::{self, KYC, Public, RESIDENCY, Witness};
+        use circuit_identity_zk::{AttestedTree, CredentialOpening};
+
+        let params = circuit_identity_zk::poseidon_params();
+        let secret = Fr::from(42u64);
+        let opening = CredentialOpening {
+            kyc: true,
+            aml: false,
+            accredited: false,
+            birth_date_days: 30_000,
+            country_code: *b"CH",
+            membership_root: Fr::from(0u64),
+            expiry_days: 50_000,
+            salt: Fr::from(7u64),
+        };
+        let leaf = circuit_identity_zk::credential_leaf(
+            &params,
+            circuit_identity_zk::id_commitment(&params, secret),
+            &opening,
+        );
+        let tree = AttestedTree::from_leaves(&params, &[leaf]).unwrap();
+        let countries = predicate::country_set(["CH"]).unwrap();
+        let scope = circuit_identity_zk::asset_scope(&params, &asset.to_string());
+        let sub = circuit_identity_zk::derive_sub(&params, secret, scope);
+        let public = Public {
+            sub,
+            scope,
+            nonce: circuit_identity_zk::sender_binding(&holder.pubkey_bytes().unwrap()),
+            claims_mask: KYC | RESIDENCY,
+            age_n: 0,
+            country_set_hash: predicate::country_set_hash(&params, &countries),
+            group_root: Fr::from(0u64),
+            merkle_root: tree.root(),
+            today_days,
+            age_cutoff_days: 0,
+        };
+        let witness = Witness {
+            id_secret: secret,
+            opening,
+            leaf_path: tree.path(0).unwrap(),
+            leaf_index: 0,
+            membership_path: [Fr::from(0u64); circuit_identity_zk::ATTESTED_TREE_DEPTH],
+            membership_index: 0,
+            countries,
+        };
+        let pk = circuit_identity_zk::ProvingKey::<Bls12_381>::deserialize_compressed_unchecked(
+            include_bytes!("../../../circuits/identity-zk/predicate_pk.bin").as_slice(),
+        )
+        .unwrap();
+        let proof = predicate::prove_predicate(public, witness, &pk, &mut StdRng::seed_from_u64(1))
+            .unwrap();
+        let (mut leaf_bytes, mut sub_bytes, mut proof_bytes) = (Vec::new(), Vec::new(), Vec::new());
+        leaf.serialize_compressed(&mut leaf_bytes).unwrap();
+        sub.serialize_compressed(&mut sub_bytes).unwrap();
+        proof.serialize_compressed(&mut proof_bytes).unwrap();
+        (
+            hex::encode(leaf_bytes),
+            sub_bytes.try_into().unwrap(),
+            proof_bytes,
+        )
     }
 }
 

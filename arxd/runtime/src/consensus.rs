@@ -426,6 +426,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap();
 
@@ -533,6 +534,7 @@ mod tests {
             &[],
             10,
             &bls_owner,
+            0,
         )
         .unwrap();
 
@@ -586,6 +588,7 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("already processed"));
@@ -636,6 +639,7 @@ mod tests {
                 &[],
                 10,
                 &no_bls_owner,
+                0,
             )
             .unwrap()
         };
@@ -705,6 +709,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap();
         let registration = updates.bls_key.expect("expected a bls_key update");
@@ -743,6 +748,7 @@ mod tests {
             &[],
             0,
             &owned_by_bob,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("already registered"));
@@ -778,6 +784,7 @@ mod tests {
             &[],
             0,
             &owned_by_self,
+            0,
         )
         .expect("re-registering your own key should stay a no-op success");
         assert_eq!(
@@ -810,6 +817,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid BLS public key"));
@@ -854,6 +862,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
+            0,
         )
         .unwrap_err();
         assert!(

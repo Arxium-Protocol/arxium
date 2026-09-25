@@ -50,6 +50,8 @@ pub enum IdentityError {
     UnprovableJurisdictions,
     #[error("sub is not a valid field element")]
     MalformedSub,
+    #[error("proof dated day {claimed}, but this block is on day {block_day}")]
+    WrongDate { claimed: u32, block_day: u64 },
 }
 
 /// ISO-3166-1 alpha-2, uppercase. Shared by attestation grants and asset
@@ -241,25 +243,33 @@ fn predicate_vk() -> &'static circuit_identity_zk::VerifyingKey<Bls12_381> {
 ///
 /// Same `PredicateCircuit` as Arx ID sign-in, with every public input but
 /// `sub` and `today_days` rebuilt here from state, never from the payload:
+/// - `today_days` (what credential expiry is checked against) must be within
+///   a day of `block_timestamp`'s calendar day, so a proof made just before
+///   midnight still lands, but a backdated one can't revive an expired
+///   credential.
 /// - `merkle_root` is the root of a one-leaf tree holding `sender`'s own
 ///   `identity_hash`, so the proof speaks for this account's credential
 ///   and can't be made with someone else's (no credential lending).
 /// - `scope` is the asset, `nonce` the sender's key: a proof for another
 ///   asset, or replayed by another sender, fails verification.
 /// - `claims_mask` and the country set come from the asset record.
-///
-// ponytail: `today_days` (credential expiry) is the prover's word. Dispatch
-// has no block timestamp — threading one through `DispatchCtx` and the
-// fault-proof replay is its own consensus change. Staleness is bounded
-// instead by revocation, `max_attestation_age` and `CLAIM_PROOF_TTL_SECS`.
 pub fn verify_claim_proof<V: KvRead<Error = StorageError>>(
     view: &V,
     sender: &Address,
     asset: &Asset,
     sub: &[u8; 32],
     today_days: u32,
+    block_timestamp: u64,
     proof: &[u8],
 ) -> Result<(), IdentityError> {
+    let block_day =
+        block_timestamp / 86_400 + u64::from(circuit_identity_zk::CREDENTIAL_EPOCH_OFFSET_DAYS);
+    if u64::from(today_days).abs_diff(block_day) > 1 {
+        return Err(IdentityError::WrongDate {
+            claimed: today_days,
+            block_day,
+        });
+    }
     use circuit_identity_zk::AttestedTree;
     use circuit_identity_zk::predicate::{self, ACCREDITED, AML, KYC, Public, RESIDENCY};
 
@@ -495,6 +505,9 @@ mod tests {
         use circuit_identity_zk::{AttestedTree, CredentialOpening, ProvingKey};
 
         const TODAY: u32 = 46_290;
+        /// A block timestamp on `TODAY`.
+        const NOW: u64 =
+            (TODAY - circuit_identity_zk::CREDENTIAL_EPOCH_OFFSET_DAYS) as u64 * 86_400;
 
         fn pk() -> &'static ProvingKey<Bls12_381> {
             static PK: OnceLock<ProvingKey<Bls12_381>> = OnceLock::new();
@@ -619,7 +632,7 @@ mod tests {
 
             let asset = bond("bond");
             let (sub, proof) = holder.prove(&alice, &asset, KYC | RESIDENCY, &["CH", "DE"]);
-            verify_claim_proof(&db, &alice, &asset, &sub, TODAY, &proof).unwrap();
+            verify_claim_proof(&db, &alice, &asset, &sub, TODAY, NOW, &proof).unwrap();
         }
 
         #[test]
@@ -633,7 +646,7 @@ mod tests {
             let asset = bond("bond");
             let rejected = |who: &Address, (sub, proof): ([u8; 32], Vec<u8>)| {
                 matches!(
-                    verify_claim_proof(&db, who, &asset, &sub, TODAY, &proof),
+                    verify_claim_proof(&db, who, &asset, &sub, TODAY, NOW, &proof),
                     Err(IdentityError::ProofRejected)
                 )
             };
@@ -662,11 +675,33 @@ mod tests {
             // Wrong asset: Alice's proof for `bond` against another asset.
             let other = bond("other");
             assert!(matches!(
-                verify_claim_proof(&db, &alice, &other, &alices.0, TODAY, &alices.1),
+                verify_claim_proof(&db, &alice, &other, &alices.0, TODAY, NOW, &alices.1),
                 Err(IdentityError::ProofRejected)
             ));
-            verify_claim_proof(&db, &alice, &asset, &alices.0, TODAY, &alices.1)
+            verify_claim_proof(&db, &alice, &asset, &alices.0, TODAY, NOW, &alices.1)
                 .expect("the untampered proof still verifies");
+        }
+
+        /// Expiry is checked against the block's calendar day, with a day of
+        /// slack either side; anything further is refused before verifying.
+        #[test]
+        fn a_proof_dated_more_than_a_day_from_the_block_is_refused() {
+            let db = db_with_attestor(&addr(9));
+            let asset = bond("bond");
+            for (claimed, ok) in [
+                (TODAY - 2, false),
+                (TODAY - 1, true),
+                (TODAY + 1, true),
+                (TODAY + 2, false),
+            ] {
+                let result =
+                    verify_claim_proof(&db, &addr(1), &asset, &[0; 32], claimed, NOW + 3_600, &[]);
+                assert_eq!(
+                    !matches!(result, Err(IdentityError::WrongDate { .. })),
+                    ok,
+                    "day {claimed}: {result:?}"
+                );
+            }
         }
 
         #[test]
@@ -675,7 +710,7 @@ mod tests {
             let db = db_with_attestor(&attestor);
             let asset = bond("bond");
             assert!(matches!(
-                verify_claim_proof(&db, &alice, &asset, &[0; 32], TODAY, &[]),
+                verify_claim_proof(&db, &alice, &asset, &[0; 32], TODAY, NOW, &[]),
                 Err(IdentityError::NotAttested(_))
             ));
             grant(&db, &attestor, &alice, &Holder::new(11, b"CH"));
@@ -684,7 +719,7 @@ mod tests {
             open.required_claims.clear();
             open.allowed_jurisdictions = None;
             assert!(matches!(
-                verify_claim_proof(&db, &alice, &open, &[0; 32], TODAY, &[]),
+                verify_claim_proof(&db, &alice, &open, &[0; 32], TODAY, NOW, &[]),
                 Err(IdentityError::NothingToProve)
             ));
             let mut wide = asset;
@@ -696,7 +731,7 @@ mod tests {
                 .to_vec(),
             );
             assert!(matches!(
-                verify_claim_proof(&db, &alice, &wide, &[0; 32], TODAY, &[]),
+                verify_claim_proof(&db, &alice, &wide, &[0; 32], TODAY, NOW, &[]),
                 Err(IdentityError::UnprovableJurisdictions)
             ));
         }
