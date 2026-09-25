@@ -525,11 +525,28 @@ pub trait BatchWritable {
     }
 }
 
+/// Most write-ahead log RocksDB may keep before it flushes the column
+/// families that still hold the oldest entries.
+///
+/// A log file can only be deleted once every column family has flushed the
+/// data written into it, and several of ours (`meta`, `validators`,
+/// `governance`, ...) take a few bytes per block, so their memtables almost
+/// never fill. Left at RocksDB's default (0, which derives a limit of
+/// 4 x every memtable of every column family, about 5 GB across our ten),
+/// a devnet node kept 40+ log files of 54 MB and the WAL was 57% of the
+/// chain directory, growing about 4 GB a day on empty blocks.
+///
+/// Two memtables' worth (2 x 64 MiB) keeps a crash replay short and forces a
+/// flush well before the disk feels it. This is a runtime option: it changes
+/// nothing on disk, so it needs no schema bump and no reset.
+const MAX_TOTAL_WAL_BYTES: u64 = 128 * 1024 * 1024;
+
 impl ArxiumDb {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         let mut db_opts = RocksOptions::default();
         db_opts.create_if_missing(true);
         db_opts.create_missing_column_families(true);
+        db_opts.set_max_total_wal_size(MAX_TOTAL_WAL_BYTES);
         let cf_descriptors = COLUMN_FAMILIES
             .iter()
             .map(|name| ColumnFamilyDescriptor::new(*name, RocksOptions::default()));
@@ -3681,5 +3698,119 @@ mod divergence_recovery_tests {
         expected.sort();
         assert_eq!(db.validator_addresses_at(4).unwrap(), expected);
         assert_eq!(db.validator_addresses_at(5).unwrap(), vec![addr(3)]);
+    }
+}
+
+#[cfg(test)]
+mod wal_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const BULK_BYTES: usize = 40 * 1024 * 1024;
+    const VALUE_BYTES: usize = 256 * 1024;
+    /// Small memtables so the busy column family switches log files after a
+    /// few MiB, as a production node does after 64 MiB.
+    const TEST_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+    fn temp_path() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "arxium-test-wal-{}",
+            nanos + COUNTER.fetch_add(1, Ordering::Relaxed) as u128
+        ))
+    }
+
+    fn wal_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "log"))
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    }
+
+    /// The shape of a chain of empty blocks: `blocks` takes bulk writes and
+    /// keeps switching to a new log, while `meta` gets a few bytes now and
+    /// then and never fills its memtable, so it pins every old log. Returns
+    /// the WAL left on disk once RocksDB has had time to flush.
+    ///
+    /// This drives RocksDB directly with our column families, small
+    /// memtables and the given cap: `open_applies_the_production_cap` covers
+    /// that `ArxiumDb::open` really sets the cap.
+    fn wal_after_pinned_writes(max_total_wal_bytes: u64) -> u64 {
+        let path = temp_path();
+        let mut db_opts = RocksOptions::default();
+        db_opts.create_if_missing(true);
+        db_opts.create_missing_column_families(true);
+        db_opts.set_max_total_wal_size(max_total_wal_bytes);
+        let cfs = COLUMN_FAMILIES.iter().map(|name| {
+            let mut cf_opts = RocksOptions::default();
+            cf_opts.set_write_buffer_size(TEST_WRITE_BUFFER_BYTES);
+            ColumnFamilyDescriptor::new(*name, cf_opts)
+        });
+        let db = DB::open_cf_descriptors(&db_opts, &path, cfs).unwrap();
+        let meta = db.cf_handle(CF_META).unwrap();
+        let blocks = db.cf_handle(CF_BLOCKS).unwrap();
+        let value = vec![7u8; VALUE_BYTES];
+        for i in 0..(BULK_BYTES / VALUE_BYTES) {
+            db.put_cf(blocks, format!("block-{i:06}"), &value).unwrap();
+            if i % 4 == 0 {
+                db.put_cf(meta, format!("quiet-{i:06}"), b"1").unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut left = wal_bytes(&path);
+        while left > BULK_BYTES as u64 / 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            left = wal_bytes(&path);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&path);
+        left
+    }
+
+    /// Control: with RocksDB's default (0), nothing forces `meta` to flush, so
+    /// every log stays pinned. This is the growth the cap exists to stop.
+    #[test]
+    fn default_limit_keeps_the_whole_wal() {
+        let left = wal_after_pinned_writes(0);
+        assert!(
+            left >= BULK_BYTES as u64,
+            "control expected the uncapped WAL to hold the {BULK_BYTES} bytes written, found {left}"
+        );
+    }
+
+    #[test]
+    fn a_limit_flushes_the_pinning_column_family_and_frees_the_wal() {
+        let left = wal_after_pinned_writes(8 * 1024 * 1024);
+        assert!(
+            left < BULK_BYTES as u64 / 2,
+            "WAL should shrink well below the {BULK_BYTES} bytes written once capped, found {left}"
+        );
+    }
+
+    #[test]
+    fn open_applies_the_production_cap() {
+        let path = temp_path();
+        {
+            let _db = ArxiumDb::open(&path).unwrap();
+        }
+        let options = std::fs::read_dir(&path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("OPTIONS-"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(
+            options.contains(&format!("max_total_wal_size={MAX_TOTAL_WAL_BYTES}")),
+            "opened database should carry max_total_wal_size={MAX_TOTAL_WAL_BYTES}"
+        );
     }
 }
