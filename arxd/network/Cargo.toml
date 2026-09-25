@@ -23,9 +23,10 @@ hex = { workspace = true }
 libp2p = { version = "0.57.0", features = ["tcp", "quic", "noise", "yamux", "tokio", "mdns", "macros", "gossipsub", "request-response", "cbor", "identify"] }
 
 [features]
-# Harness-only knob (`ARXD_BLOCK_PEERS`, see `build_swarm`). Empty on
-# purpose: it gates code, pulls in nothing.
-fault-injection = []
+# Harness-only knobs (`ARXD_BLOCK_PEERS`, see `build_swarm`; the
+# withholding proposer, see `withhold`). Pulls in nothing but finality's own
+# gate, which owns the withheld height.
+fault-injection = ["arxd-finality/fault-injection"]
 
 [lints]
 workspace = true

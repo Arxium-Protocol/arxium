@@ -18,8 +18,9 @@ ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 
 [features]
-# Harness-only knob (`ARXD_ROUND_TIMEOUT_SECS`, see `round_timeout`). Empty
-# on purpose: it gates code, pulls in nothing.
+# Harness-only knobs (`ARXD_ROUND_TIMEOUT_SECS`, see `round_timeout`;
+# `ARXD_WITHHOLD_BLOCK_AT_HEIGHT`, see `withheld_height`). Empty on purpose:
+# it gates code, pulls in nothing.
 fault-injection = []
 
 [lints]

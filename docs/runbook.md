@@ -620,6 +620,24 @@ required to check it:
 4. Run `arx-verify <file>` (see `tools/arx-verify/README.md`) to check the
    signatures and get a `VALID`/`UNRESOLVED` verdict.
 
+## Withholding-proposer acceptance harness (B1c)
+
+`scripts/withholding-proposer-harness.sh` runs `docs/consensus-safety.md` §3
+live: 4 validators, and the round-0 proposer of `TARGET_H` (default 12) gives
+its block only to one honest node and never votes. It passes when round 1's
+block finalizes with the three honest nodes, the favoured node unwinds its
+round-0 block exactly once (`arxium_dead_tips_unwound_total`), and nobody
+reports an equivocation. Exit codes: 0 pass, 1 fail, and 3 INCONCLUSIVE (the
+setup never happened). It needs the same `fault-injection` build and harness
+chain name as the harness below. It arms the proposer with
+`ARXD_WITHHOLD_BLOCK_AT_HEIGHT` / `ARXD_WITHHOLD_EXCEPT_PEERS`, and the node
+refuses both on any other chain.
+
+```sh
+scripts/withholding-proposer-harness.sh
+TARGET_H=20 ROUND_TIMEOUT_SECS=30 scripts/withholding-proposer-harness.sh
+```
+
 ## Two-node fault-injection acceptance harness
 
 `scripts/two-node-fault-harness.sh` boots `NUM_VALIDATORS` (default 4) local
