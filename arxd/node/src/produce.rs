@@ -398,7 +398,9 @@ pub fn produce_loop<R: ChainRuntime>(
     loop {
         // Re-read each tick, same as the fee params in `meter`, so a
         // governed cadence change takes effect without a restart.
-        let block_interval_secs = db.chain_params()?.block_interval_secs;
+        // Genesis and governance both reject 0; the clamp is a backstop so a
+        // bad row can't turn this loop into a busy spin.
+        let block_interval_secs = db.chain_params()?.block_interval_secs.max(1);
         let interval = Duration::from_secs(block_interval_secs);
         thread::sleep(next_sleep(&mut next_tick, Instant::now(), interval));
 

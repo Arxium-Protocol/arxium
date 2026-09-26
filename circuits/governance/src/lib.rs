@@ -92,6 +92,11 @@ fn proposal<V: KvRead<Error = StorageError>>(
 fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
     match action {
         GovernanceAction::SetChainParams(p) => {
+            if p.block_interval_secs == 0 {
+                return Err(GovernanceError::InvalidParams(
+                    "block_interval_secs must be positive",
+                ));
+            }
             if p.epoch_length == 0 {
                 return Err(GovernanceError::InvalidParams(
                     "epoch_length must be positive",
@@ -489,6 +494,10 @@ mod tests {
     fn chain_params_proposals_are_validated_at_submission_and_applied_on_pass() {
         let db = db();
         for bad in [
+            ChainParams {
+                block_interval_secs: 0,
+                ..Default::default()
+            },
             ChainParams {
                 epoch_length: 0,
                 ..Default::default()
