@@ -324,25 +324,43 @@ pub(crate) fn record_tip(height: u64, timestamp: u64) {
 /// with that subsystem dead, with nothing in the logs to say why block
 /// production or finalization had quietly stalled.
 ///
-/// A plain (non-panicking) return is logged and counted but not fatal: the
-/// ctrl-c watcher and the precommit bridge both return normally as part of
-/// an ordinary shutdown, once the channels they depend on start closing.
+/// A plain return is fatal too unless a shutdown is already latched: every
+/// supervised thread is critical and only returns once its input channel
+/// closes, so a return while `shutdown_code() == 0` means the node would keep
+/// producing with, say, no finality — and nothing in the logs to show it.
+/// During an ordinary shutdown (ctrl-c, halt) the latch is set first, so the
+/// bridges draining out afterwards stay quiet.
+///
+/// No RocksDB flush before exiting: writes aren't `manual_wal_flush`, so each
+/// one is in the OS page cache before it returns and survives `exit`.
 fn spawn_supervised(name: &'static str, handle: thread::JoinHandle<()>) {
-    thread::spawn(move || match handle.join() {
-        Ok(()) => {
-            debug!("subsystem '{name}' thread exited");
+    thread::spawn(move || {
+        match handle.join() {
+            Ok(()) if arxd_network::shutdown_code() != 0 => {
+                debug!("subsystem '{name}' thread exited during shutdown");
+                return;
+            }
+            Ok(()) => error!("subsystem '{name}' thread exited unexpectedly, stopping the node"),
+            Err(panic) => {
+                let msg = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                error!("subsystem '{name}' thread panicked: {msg}");
+            }
         }
-        Err(panic) => {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            error!("subsystem '{name}' thread panicked: {msg}");
-            counter!("arxium_subsystem_exit_total", "subsystem" => name).increment(1);
-            std::process::exit(1);
-        }
+        counter!("arxium_subsystem_exit_total", "subsystem" => name).increment(1);
+        std::process::exit(1);
     });
+}
+
+/// For `run()`'s error paths once subsystems exist: latches a stop before the
+/// channels drop, so `spawn_supervised` doesn't read the bridges draining out
+/// as an unexpected exit and `exit(1)` over `main`'s own error report. The
+/// code only silences the supervisors — `main` still exits 1 on the `Err`.
+fn latch_shutdown(_: &anyhow::Error) {
+    arxd_network::request_shutdown(arxd_network::GRACEFUL_SHUTDOWN);
 }
 
 /// Everything `spawn_subsystems` builds that `run()` still needs afterward:
@@ -1440,7 +1458,8 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         bls_identity,
         &boot_nodes,
         metrics_handle,
-    )?;
+    )
+    .inspect_err(latch_shutdown)?;
 
     // Every node joins the network, not just validators — the libp2p
     // identity is separate from the validator signing key above.
@@ -1466,7 +1485,8 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         snapshot_trust: config
             .snapshot_trust
             .map(|(height, block_hash)| arxd_network::SnapshotTrust { height, block_hash }),
-    })?;
+    })
+    .inspect_err(latch_shutdown)?;
 
     produce::produce_loop::<R>(
         &db,
@@ -1476,4 +1496,5 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         &finality_event_tx,
         &block_tx,
     )
+    .inspect_err(latch_shutdown)
 }
