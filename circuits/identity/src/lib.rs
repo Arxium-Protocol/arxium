@@ -151,15 +151,25 @@ pub fn apply_grant_attestation<V: KvRead<Error = StorageError>>(
         validate_jurisdiction_code(code)?;
     }
     let mut entry = view.get(&AccountKey(subject))?.unwrap_or_default();
+    // `zk_identity_verified` vouches for a proof over the *old* hash; a new
+    // credential has to be proven again, same reason revocation clears it.
+    if entry.identity_hash.as_deref() != Some(hash) {
+        entry.zk_identity_verified = false;
+    }
     entry.identity_hash = Some(hash.to_string());
     entry.attested_by = Some(attestor.clone());
     entry.attested_at = Some(current_height);
     // Deduped so repeated topics can't grow the list without bound across
-    // re-grants; order is not meaningful to any reader.
+    // re-grants; order is not meaningful to any reader. Not `Vec::dedup`,
+    // which only drops *adjacent* repeats (`[Kyc, Aml, Kyc]` kept both).
     entry.claims = {
-        let mut topics = topics.to_vec();
-        topics.dedup();
-        topics
+        let mut unique: Vec<ClaimTopic> = Vec::with_capacity(topics.len());
+        for topic in topics {
+            if !unique.contains(topic) {
+                unique.push(topic.clone());
+            }
+        }
+        unique
     };
     entry.jurisdiction = jurisdiction.map(str::to_string);
     Ok(AccountUpdates(BTreeMap::from([(subject.clone(), entry)])))
@@ -355,6 +365,47 @@ mod tests {
         db.write_batch(&apply_register_attestor(&db, attestor, "test", 0).unwrap())
             .unwrap();
         db
+    }
+
+    #[test]
+    fn grant_dedupes_non_adjacent_repeated_topics() {
+        let attestor = addr(1);
+        let db = db_with_attestor(&attestor);
+        let updates = apply_grant_attestation(
+            &db,
+            &attestor,
+            &addr(2),
+            "ab",
+            &[ClaimTopic::Kyc, ClaimTopic::Aml, ClaimTopic::Kyc],
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            updates.0[&addr(2)].claims,
+            vec![ClaimTopic::Kyc, ClaimTopic::Aml]
+        );
+    }
+
+    /// A zk-verified flag earned for one credential must not carry over to a
+    /// different one granted later.
+    #[test]
+    fn a_new_identity_hash_clears_zk_identity_verified() {
+        let attestor = addr(1);
+        let db = db_with_attestor(&attestor);
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            addr(2),
+            xc_primitives::AccountEntry {
+                identity_hash: Some("aa".into()),
+                zk_identity_verified: true,
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        let same = apply_grant_attestation(&db, &attestor, &addr(2), "aa", &[], None, 1).unwrap();
+        assert!(same.0[&addr(2)].zk_identity_verified, "same hash keeps it");
+        let new = apply_grant_attestation(&db, &attestor, &addr(2), "bb", &[], None, 1).unwrap();
+        assert!(!new.0[&addr(2)].zk_identity_verified);
     }
 
     #[test]
