@@ -188,7 +188,40 @@ pub fn adjudicate_action_divergence(
 /// list is actually the one the proposer signed for. This function does
 /// that first, by recomputing `tx_root` and checking it against the
 /// header's signed value, before trusting anything replayed from it.
+///
+/// **Never returns `Culpable` for now.** Every caller routes through here —
+/// on-chain slashing (`SubmitExecutionFault`), the node's auto-submit
+/// pre-check, and `arx-verify` — and the replay can't yet be trusted to
+/// name a culprit, for two reasons:
+///
+/// 1. `parent_state_root` is chosen by the dissenter and never checked
+///    against the chain's real parent state, so a dissenter can invent a
+///    parent, replay on it, and frame an honest proposer.
+/// 2. The replay skips `on_block_sealed` (block reward, downtime slash,
+///    epoch boundary), which every real `header.state_root` includes, so an
+///    honest proposer's root never matches the replay. Sealing can't be
+///    replayed from proofs as-is: the boundary hook scans the whole DB.
+///
+/// A replay that would name someone is downgraded to `Disagreement`; the
+/// artifact is still written to disk and inspectable, it just can't slash.
+// ponytail: slashing off until parent_state_root is bound to the stored
+// header at height-1 and sealing is replayed; then return the replay's
+// outcome directly.
 pub fn adjudicate_block_divergence(
+    artifact: &EvidenceArtifact,
+) -> Result<AdjudicationOutcome, AdjudicateError> {
+    Ok(match replay_block_divergence(artifact)? {
+        AdjudicationOutcome::Culpable { culpable_pubkey } => AdjudicationOutcome::Disagreement {
+            reason: format!(
+                "replay names {culpable_pubkey}, but BlockDivergence adjudication is disabled: the \
+                 parent state root isn't bound to the chain and block sealing isn't replayed"
+            ),
+        },
+        disagreement => disagreement,
+    })
+}
+
+fn replay_block_divergence(
     artifact: &EvidenceArtifact,
 ) -> Result<AdjudicationOutcome, AdjudicateError> {
     xc_artifact::verify(artifact)?;
@@ -1674,7 +1707,7 @@ mod tests {
 
         let (artifact, _, voter) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY));
         assert_eq!(
-            adjudicate_block_divergence(&artifact).unwrap(),
+            replay_block_divergence(&artifact).unwrap(),
             AdjudicationOutcome::Culpable {
                 culpable_pubkey: voter
             },
@@ -1682,12 +1715,18 @@ mod tests {
         );
         let (artifact, proposer, _) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY + 5));
         assert_eq!(
-            adjudicate_block_divergence(&artifact).unwrap(),
+            replay_block_divergence(&artifact).unwrap(),
             AdjudicationOutcome::Culpable {
                 culpable_pubkey: proposer
             },
             "a proof dated five days before the signed block time must be rejected"
         );
+        // The public entry point every slashing path uses must not name
+        // anyone, even when the replay does (see its doc comment).
+        assert!(matches!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Disagreement { .. }
+        ));
     }
 
     /// An `ActionClaim` signs no block timestamp, so a disputed
@@ -1727,7 +1766,7 @@ mod tests {
     #[test]
     fn a_dissenter_with_a_wrong_block_result_is_named_culpable() {
         let (artifact, _proposer_pubkey, voter_pubkey) = build_block_scenario(999);
-        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        let outcome = replay_block_divergence(&artifact).unwrap();
         assert_eq!(
             outcome,
             AdjudicationOutcome::Culpable {
@@ -1781,7 +1820,7 @@ mod tests {
         dissent_claim.signature =
             format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0));
 
-        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        let outcome = replay_block_divergence(&artifact).unwrap();
         assert_eq!(
             outcome,
             AdjudicationOutcome::Culpable {
@@ -1816,7 +1855,7 @@ mod tests {
             )
         );
 
-        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        let outcome = replay_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
@@ -1925,7 +1964,7 @@ mod tests {
             human_readable: serde_json::json!({}),
         };
 
-        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        let outcome = replay_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
@@ -1941,7 +1980,7 @@ mod tests {
         // Not valid encodings — proves the cap is checked before decoding.
         *actions = vec!["0xnot-a-real-action".to_string(); MAX_ADJUDICATED_ACTIONS + 1];
 
-        let outcome = adjudicate_block_divergence(&artifact).unwrap();
+        let outcome = replay_block_divergence(&artifact).unwrap();
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
