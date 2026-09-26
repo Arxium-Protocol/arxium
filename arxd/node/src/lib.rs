@@ -4,6 +4,8 @@
 mod cli;
 mod commands;
 mod components;
+#[cfg(feature = "fault-injection")]
+mod fault_injection;
 mod produce;
 mod validator;
 
@@ -1261,44 +1263,6 @@ fn spawn_subsystems<R: ChainRuntime>(
     })
 }
 
-/// The one `chain_name` a fault-injection build is allowed to arm on. Not
-/// the built-in `--chain devnet` preset — that preset's spec (`devnet.json`)
-/// names itself `"corechain"` and its `boot_nodes` point at real public
-/// IPs, so it's a shared network, not a local sandbox. A harness chain spec
-/// must set `"chain_name": "arxium-fault-injection-harness"` explicitly, so
-/// a mistyped `--chain` or a copy-pasted systemd unit can't ever satisfy
-/// this by accident — anywhere else, this flag wouldn't be a test, it would
-/// be a validator lying about its own state to real peers.
-#[cfg(feature = "fault-injection")]
-const FAULT_INJECTION_CHAIN_NAME: &str = "arxium-fault-injection-harness";
-
-#[cfg(feature = "fault-injection")]
-fn ensure_fault_injection_allowed(chain_name: &str) -> Result<()> {
-    anyhow::ensure!(
-        chain_name == FAULT_INJECTION_CHAIN_NAME,
-        "fault injection requires chain_name {FAULT_INJECTION_CHAIN_NAME:?}, refusing to start on {chain_name:?}"
-    );
-    Ok(())
-}
-
-#[cfg(all(test, feature = "fault-injection"))]
-mod fault_injection_tests {
-    use super::{FAULT_INJECTION_CHAIN_NAME, ensure_fault_injection_allowed};
-
-    #[test]
-    fn the_harness_chain_name_is_allowed() {
-        assert!(ensure_fault_injection_allowed(FAULT_INJECTION_CHAIN_NAME).is_ok());
-    }
-
-    #[test]
-    fn anything_else_is_refused_including_the_real_devnet_preset() {
-        assert!(ensure_fault_injection_allowed("mainnet").is_err());
-        assert!(ensure_fault_injection_allowed("").is_err());
-        // devnet.json's actual chain_name — must never pass.
-        assert!(ensure_fault_injection_allowed("corechain").is_err());
-    }
-}
-
 pub fn run<R: ChainRuntime>() -> Result<()> {
     let cli = Cli::parse();
 
@@ -1374,79 +1338,7 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     }
 
     #[cfg(feature = "fault-injection")]
-    if let Some(height) = inject_fault_at_height {
-        ensure_fault_injection_allowed(&chain_name)?;
-        produce::INJECT_FAULT_AT_HEIGHT
-            .set(height)
-            .expect("set exactly once, before any block is produced");
-        warn!(
-            height,
-            "FAULT INJECTION ARMED — this node will corrupt its own state_root when it \
-             produces this height. Never use outside a devnet acceptance test."
-        );
-    }
-
-    // Same guard as the fault flag above, for the same reason: this one
-    // makes a validator refuse to talk to named peers, which outside a
-    // harness is just a node silently cutting itself off from the network.
-    // `build_swarm` reads the variable itself (arxd/network's
-    // `partitioned_block_list`); this only decides whether the process is
-    // allowed to boot with it set at all.
-    #[cfg(feature = "fault-injection")]
-    if let Ok(peers) = std::env::var("ARXD_BLOCK_PEERS")
-        && !peers.trim().is_empty()
-    {
-        ensure_fault_injection_allowed(&chain_name)?;
-        warn!(
-            %peers,
-            "PARTITION ARMED — this node refuses all connections to these peers. \
-             Never use outside a devnet acceptance test."
-        );
-    }
-
-    // Same guard again. Slowing the round timeout down is how the
-    // partition harness makes its heal-during-voting window deterministic
-    // (arxd/finality's `round_timeout`); on a real chain it would just be a
-    // validator that tolerates a stalled round far longer than its peers do.
-    #[cfg(feature = "fault-injection")]
-    if let Ok(secs) = std::env::var("ARXD_ROUND_TIMEOUT_SECS")
-        && !secs.trim().is_empty()
-    {
-        ensure_fault_injection_allowed(&chain_name)?;
-        // Parsed here, on the main thread, so a typo refuses to boot. The
-        // value is read lazily by a thread `spawn_finality` spawns, where
-        // rejecting it is not an option: a panic there unwinds that thread
-        // alone (no panic hook, no `panic = "abort"`), leaving a node that
-        // still produces and gossips but has silently stopped voting and
-        // tallying. Touching it here resolves it while a failure can still
-        // be a clean startup error.
-        if let Some(err) = arxd_finality::round_timeout_override_error() {
-            anyhow::bail!(err);
-        }
-        warn!(
-            %secs,
-            "ROUND TIMEOUT OVERRIDDEN — this node waits this long before voting to \
-             advance a round. Never use outside a devnet acceptance test."
-        );
-    }
-
-    // Same guard again: this one makes the node a Byzantine proposer
-    // (arxd/network's `withhold`, arxd/finality's `withheld_height`). The
-    // peer list is validated where it is parsed, in `run_swarm`.
-    #[cfg(feature = "fault-injection")]
-    if let Ok(height) = std::env::var("ARXD_WITHHOLD_BLOCK_AT_HEIGHT")
-        && !height.trim().is_empty()
-    {
-        ensure_fault_injection_allowed(&chain_name)?;
-        if let Some(err) = arxd_finality::withheld_height_error() {
-            anyhow::bail!(err);
-        }
-        warn!(
-            %height,
-            "WITHHOLDING PROPOSER ARMED — this node will not gossip or vote on its block \
-             at this height. Never use outside a devnet acceptance test."
-        );
-    }
+    fault_injection::check_startup(&chain_name, inject_fault_at_height)?;
 
     // Installs the global recorder the `counter!`/`gauge!` calls below write
     // to; the handle is just a read side onto the same data, handed to the
