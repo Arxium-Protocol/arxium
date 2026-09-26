@@ -698,23 +698,16 @@ fn handle_rejected_block<R: ChainRuntime>(
     }
 }
 
-/// Spawns every subsystem thread (evidence watcher, finality, the
-/// precommit-vote bridge, RPC ingest, the ctrl-c watcher) and wires the
-/// channels/closures between them. Everything `spawn_p2p_node` and
-/// `produce::produce_loop` need afterward comes back in `SubsystemHandles`;
-/// network spawning and the produce loop itself stay in `run()` since they
-/// aren't "subsystems" spawned here so much as `run()`'s own next steps.
-fn spawn_subsystems<R: ChainRuntime>(
+/// Spawns the evidence watcher and returns the sender everything else
+/// reports competing blocks, dissents and equivocations on.
+fn spawn_evidence<R: ChainRuntime>(
     config: &xc_primitives::NodeConfig,
     chain_name: &str,
     genesis_hash: [u8; 32],
     db: &ArxiumDb,
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
     identity: &Option<(Address, ed25519_dalek::SigningKey)>,
-    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
-    boot_nodes: &[String],
-    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
-) -> Result<SubsystemHandles<R>> {
+) -> std_mpsc::Sender<EvidenceEvent<R::Payload>> {
     // The evidence subsystem's own message-passing seam: `on_block` below
     // sends it competing-block sightings, it decides whether that's real
     // equivocation and (if this node has a validator key) reports it —
@@ -819,7 +812,53 @@ fn spawn_subsystems<R: ChainRuntime>(
             genesis_hash,
         ),
     );
+    evidence_tx
+}
 
+/// Admits peer-sourced finality events through `backlog` — see
+/// `PEER_EVENT_BACKLOG_CAP` for why the channel itself stays unbounded.
+#[derive(Clone)]
+struct PeerEvents<P> {
+    tx: std_mpsc::Sender<FinalityEvent<P>>,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl<P> PeerEvents<P> {
+    fn send(&self, event: FinalityEvent<P>) {
+        if self.backlog.fetch_add(1, Ordering::Relaxed) >= PEER_EVENT_BACKLOG_CAP {
+            self.backlog.fetch_sub(1, Ordering::Relaxed);
+            counter!("arxium_finality_peer_events_dropped_total").increment(1);
+            return;
+        }
+        if self.tx.send(event).is_err() {
+            self.backlog.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What `spawn_finality_bridges` hands back: the finality thread's inputs,
+/// and the network-side ends of its vote/dissent channels.
+struct FinalityBridges<P> {
+    event_tx: std_mpsc::Sender<FinalityEvent<P>>,
+    peer_events: PeerEvents<P>,
+    dissent_tx: tokio::sync::mpsc::UnboundedSender<Dissent>,
+    dissent_rx: tokio::sync::mpsc::UnboundedReceiver<Dissent>,
+    precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
+    round_timeout_rx: tokio::sync::mpsc::UnboundedReceiver<RoundTimeoutVote>,
+    on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
+    on_dissent: Box<dyn Fn(Dissent) + Send>,
+    on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
+}
+
+/// Spawns the finality thread plus the four threads bridging its output:
+/// dissents and precommit equivocations into evidence, signed precommit and
+/// round-timeout votes onto the network's tokio channels.
+fn spawn_finality_bridges<R: ChainRuntime>(
+    db: &ArxiumDb,
+    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
+    evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
+    chain_lock: &Arc<Mutex<()>>,
+) -> FinalityBridges<R::Payload> {
     // Finality subsystem's own message-passing seam: locally observed
     // blocks and peer precommit votes both funnel in as `FinalityEvent`s;
     // freshly-signed votes come back out on `finality_vote_rx` to be
@@ -839,33 +878,13 @@ fn spawn_subsystems<R: ChainRuntime>(
     // above, and for the same reason: `arxd/finality` owns the votes and
     // their signing, this crate owns the artifact shape.
     let (equivocation_tx, equivocation_rx) = std_mpsc::channel::<PrecommitEquivocation>();
-    // `on_block` below also needs the BLS key to sign dissents on execution
-    // disagreement, so clone before `spawn_finality` consumes the original.
-    let bls_identity_for_dissent = bls_identity.clone();
-    // Guards the read-tip / decide / write critical section shared by this
-    // node's own production loop below, the gossip block-accept path, and
-    // the finality thread's unwind when a certificate contradicts what this
-    // node committed — so a self-produced block, a peer's gossiped block for
-    // the same height, and a revert can never interleave. Whichever gets the
-    // lock first wins, and the others observe the moved tip and back off.
-    let chain_lock = Arc::new(Mutex::new(()));
 
     // Peer-sourced finality events are admitted through this counter — see
     // `PEER_EVENT_BACKLOG_CAP` for why the channel itself stays unbounded.
     let peer_backlog = Arc::new(AtomicUsize::new(0));
-    let send_peer_event = {
-        let finality_event_tx = finality_event_tx.clone();
-        let peer_backlog = peer_backlog.clone();
-        move |event: FinalityEvent<R::Payload>| {
-            if peer_backlog.fetch_add(1, Ordering::Relaxed) >= PEER_EVENT_BACKLOG_CAP {
-                peer_backlog.fetch_sub(1, Ordering::Relaxed);
-                counter!("arxium_finality_peer_events_dropped_total").increment(1);
-                return;
-            }
-            if finality_event_tx.send(event).is_err() {
-                peer_backlog.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
+    let peer_events = PeerEvents {
+        tx: finality_event_tx.clone(),
+        backlog: peer_backlog.clone(),
     };
 
     spawn_supervised(
@@ -980,28 +999,45 @@ fn spawn_subsystems<R: ChainRuntime>(
     );
 
     let on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send> = {
-        let send = send_peer_event.clone();
-        Box::new(move |vote: PrecommitVote| send(FinalityEvent::VoteObserved(vote)))
+        let send = peer_events.clone();
+        Box::new(move |vote: PrecommitVote| send.send(FinalityEvent::VoteObserved(vote)))
     };
 
     let on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send> = {
-        let send = send_peer_event.clone();
-        Box::new(move |vote: RoundTimeoutVote| send(FinalityEvent::RoundTimeoutObserved(vote)))
+        let send = peer_events.clone();
+        Box::new(move |vote: RoundTimeoutVote| send.send(FinalityEvent::RoundTimeoutObserved(vote)))
     };
 
     let on_dissent: Box<dyn Fn(Dissent) + Send> = {
-        let send = send_peer_event.clone();
-        Box::new(move |dissent: Dissent| send(FinalityEvent::DissentObserved(dissent)))
+        let send = peer_events.clone();
+        Box::new(move |dissent: Dissent| send.send(FinalityEvent::DissentObserved(dissent)))
     };
 
     let (dissent_tx, dissent_rx) = tokio::sync::mpsc::unbounded_channel::<Dissent>();
 
-    // Shared between RPC submission and gossip receipt so a `JoinValidator`/
-    // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
-    // `dispatch` gets rejected here instead, immediately and with a real
-    // reason — see `ChainRuntime::admission_precheck`'s doc comment.
-    let payload_precheck: xc_mempool::PayloadPrecheck<R::Payload> = Arc::new(R::admission_precheck);
+    FinalityBridges {
+        event_tx: finality_event_tx,
+        peer_events,
+        dissent_tx,
+        dissent_rx,
+        precommit_rx,
+        round_timeout_rx,
+        on_precommit_vote,
+        on_dissent,
+        on_round_timeout_vote,
+    }
+}
 
+/// Starts the HTTP RPC server. Returns the receiver for actions it accepted,
+/// to be gossiped.
+fn spawn_rpc<R: ChainRuntime>(
+    config: &xc_primitives::NodeConfig,
+    chain_name: &str,
+    db: &ArxiumDb,
+    mempool: &Arc<Mutex<Mempool<R::Payload>>>,
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+    payload_precheck: &xc_mempool::PayloadPrecheck<R::Payload>,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>> {
     let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
     spawn_http_ingest(IngestConfig {
         mempool: mempool.clone(),
@@ -1020,108 +1056,180 @@ fn spawn_subsystems<R: ChainRuntime>(
         evidence_dir: config.base_path.join(chain_name).join("evidence"),
         limits: config.limits.clone(),
     })?;
+    Ok(gossip_rx)
+}
 
-    let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Returns `true` only when the block's signature itself didn't verify —
-    // unambiguously forged, never just an honest peer relaying something
-    // out of order (wrong turn, stale height, etc.) — so the network layer
-    // can penalize the sending peer for exactly that case and no other.
-    let on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send> = {
-        let db = db.clone();
-        let chain_lock = chain_lock.clone();
-        let evidence_tx = evidence_tx.clone();
-        let finality_event_tx = finality_event_tx.clone();
-        // Own dissents go through the same gate as peer events so the
-        // backlog counter's increments and decrements stay paired.
-        let send_peer_event = send_peer_event.clone();
-        let mempool = mempool.clone();
-        let bls_identity = bls_identity_for_dissent.clone();
-        let dissent_tx = dissent_tx.clone();
-        Box::new(move |block: Block<R::Payload>, sync: bool| -> bool {
-            let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
-            let height = block.height;
-            let timestamp = block.timestamp;
-            let candidate = block.clone();
-            let params = match db.chain_params() {
-                Ok(params) => params,
-                Err(err) => {
-                    tracing::error!(height, %err, "cannot read chain params, rejecting block");
-                    return false;
-                }
-            };
-            match accept_block(
-                &db,
-                block,
-                sync,
-                &crate::produce::meter::<R>(params),
-                |action, view, operator_lookup, operator_validators_lookup, validators| {
-                    R::dispatch(
-                        action,
-                        &xc_runtime_api::DispatchCtx {
-                            view,
-                            db: &db,
-                            operator_lookup,
-                            operator_validators_lookup,
-                            validators,
-                            height,
-                            timestamp,
-                        },
-                    )
-                },
-                R::on_block_sealed,
-            ) {
-                Ok(accepted) => {
-                    // During sync catch-up this fires once per block in a
-                    // page (up to 100) — logging each at info level is what
-                    // produced tens of thousands of lines during a large
-                    // catch-up. The caller logs one summary per page instead;
-                    // live gossip acceptance (naturally bounded by block
-                    // production rate) still gets its own info line.
-                    if sync {
-                        debug!(
-                            "accepted synced block {} with {} action(s), hash={}",
-                            accepted.height,
-                            accepted.actions.len(),
-                            accepted.hash()
-                        );
-                    } else {
-                        info!(
-                            "accepted gossiped block {} with {} action(s), hash={}",
-                            accepted.height,
-                            accepted.actions.len(),
-                            accepted.hash()
-                        );
-                    }
-                    counter!("arxium_blocks_accepted_total").increment(1);
-                    record_tip(accepted.height, accepted.timestamp);
-                    {
-                        let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
-                        for action in &accepted.actions {
-                            mempool.purge_stale(&action.sender, action.nonce + 1);
-                        }
-                    }
-                    let _ = finality_event_tx.send(FinalityEvent::BlockObserved(accepted));
-                    false
-                }
-                Err(err) => {
-                    counter!("arxium_blocks_rejected_total").increment(1);
-                    handle_rejected_block::<R>(
-                        &err,
-                        height,
-                        &candidate,
-                        &db,
-                        genesis_hash,
-                        &bls_identity,
-                        &send_peer_event,
-                        &dissent_tx,
-                        &evidence_tx,
-                    );
-                    matches!(err, xc_executor::AcceptBlockError::Signature(_))
-                }
+/// The network layer's block-accept callback. Returns `true` only when the
+/// block's signature itself didn't verify — unambiguously forged, never just
+/// an honest peer relaying something out of order (wrong turn, stale height,
+/// etc.) — so the network layer can penalize the sending peer for exactly
+/// that case and no other.
+fn build_on_block<R: ChainRuntime>(
+    db: &ArxiumDb,
+    mempool: &Arc<Mutex<Mempool<R::Payload>>>,
+    chain_lock: &Arc<Mutex<()>>,
+    genesis_hash: [u8; 32],
+    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
+    evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
+    finality: &FinalityBridges<R::Payload>,
+) -> Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send> {
+    let db = db.clone();
+    let chain_lock = chain_lock.clone();
+    let evidence_tx = evidence_tx.clone();
+    let finality_event_tx = finality.event_tx.clone();
+    // Own dissents go through the same gate as peer events so the
+    // backlog counter's increments and decrements stay paired.
+    let peer_events = finality.peer_events.clone();
+    let mempool = mempool.clone();
+    let dissent_tx = finality.dissent_tx.clone();
+    Box::new(move |block: Block<R::Payload>, sync: bool| -> bool {
+        let _guard = chain_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let height = block.height;
+        let timestamp = block.timestamp;
+        let candidate = block.clone();
+        let params = match db.chain_params() {
+            Ok(params) => params,
+            Err(err) => {
+                tracing::error!(height, %err, "cannot read chain params, rejecting block");
+                return false;
             }
-        })
-    };
+        };
+        match accept_block(
+            &db,
+            block,
+            sync,
+            &crate::produce::meter::<R>(params),
+            |action, view, operator_lookup, operator_validators_lookup, validators| {
+                R::dispatch(
+                    action,
+                    &xc_runtime_api::DispatchCtx {
+                        view,
+                        db: &db,
+                        operator_lookup,
+                        operator_validators_lookup,
+                        validators,
+                        height,
+                        timestamp,
+                    },
+                )
+            },
+            R::on_block_sealed,
+        ) {
+            Ok(accepted) => {
+                // During sync catch-up this fires once per block in a
+                // page (up to 100) — logging each at info level is what
+                // produced tens of thousands of lines during a large
+                // catch-up. The caller logs one summary per page instead;
+                // live gossip acceptance (naturally bounded by block
+                // production rate) still gets its own info line.
+                if sync {
+                    debug!(
+                        "accepted synced block {} with {} action(s), hash={}",
+                        accepted.height,
+                        accepted.actions.len(),
+                        accepted.hash()
+                    );
+                } else {
+                    info!(
+                        "accepted gossiped block {} with {} action(s), hash={}",
+                        accepted.height,
+                        accepted.actions.len(),
+                        accepted.hash()
+                    );
+                }
+                counter!("arxium_blocks_accepted_total").increment(1);
+                record_tip(accepted.height, accepted.timestamp);
+                {
+                    let mut mempool = mempool.lock().unwrap_or_else(|e| e.into_inner());
+                    for action in &accepted.actions {
+                        mempool.purge_stale(&action.sender, action.nonce + 1);
+                    }
+                }
+                let _ = finality_event_tx.send(FinalityEvent::BlockObserved(accepted));
+                false
+            }
+            Err(err) => {
+                counter!("arxium_blocks_rejected_total").increment(1);
+                handle_rejected_block::<R>(
+                    &err,
+                    height,
+                    &candidate,
+                    &db,
+                    genesis_hash,
+                    &bls_identity,
+                    &|event| peer_events.send(event),
+                    &dissent_tx,
+                    &evidence_tx,
+                );
+                matches!(err, xc_executor::AcceptBlockError::Signature(_))
+            }
+        }
+    })
+}
+
+/// Spawns every subsystem thread (evidence watcher, finality, the
+/// precommit-vote bridge, RPC ingest, the ctrl-c watcher) and wires the
+/// channels/closures between them. Everything `spawn_p2p_node` and
+/// `produce::produce_loop` need afterward comes back in `SubsystemHandles`;
+/// network spawning and the produce loop itself stay in `run()` since they
+/// aren't "subsystems" spawned here so much as `run()`'s own next steps.
+fn spawn_subsystems<R: ChainRuntime>(
+    config: &xc_primitives::NodeConfig,
+    chain_name: &str,
+    genesis_hash: [u8; 32],
+    db: &ArxiumDb,
+    mempool: &Arc<Mutex<Mempool<R::Payload>>>,
+    identity: &Option<(Address, ed25519_dalek::SigningKey)>,
+    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
+    boot_nodes: &[String],
+    metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
+) -> Result<SubsystemHandles<R>> {
+    let evidence_tx = spawn_evidence::<R>(config, chain_name, genesis_hash, db, mempool, identity);
+    // Guards the read-tip / decide / write critical section shared by this
+    // node's own production loop below, the gossip block-accept path, and
+    // the finality thread's unwind when a certificate contradicts what this
+    // node committed — so a self-produced block, a peer's gossiped block for
+    // the same height, and a revert can never interleave. Whichever gets the
+    // lock first wins, and the others observe the moved tip and back off.
+    let chain_lock = Arc::new(Mutex::new(()));
+    // `on_block` below also needs the BLS key to sign dissents on execution
+    // disagreement, so clone before `spawn_finality_bridges` consumes the
+    // original.
+    let bls_identity_for_dissent = bls_identity.clone();
+    let finality = spawn_finality_bridges::<R>(db, bls_identity, &evidence_tx, &chain_lock);
+    // Shared between RPC submission and gossip receipt so a `JoinValidator`/
+    // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by
+    // `dispatch` gets rejected here instead, immediately and with a real
+    // reason — see `ChainRuntime::admission_precheck`'s doc comment.
+    let payload_precheck: xc_mempool::PayloadPrecheck<R::Payload> = Arc::new(R::admission_precheck);
+    let gossip_rx = spawn_rpc::<R>(
+        config,
+        chain_name,
+        db,
+        mempool,
+        metrics_handle,
+        &payload_precheck,
+    )?;
+    let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
+    let on_block = build_on_block::<R>(
+        db,
+        mempool,
+        &chain_lock,
+        genesis_hash,
+        bls_identity_for_dissent,
+        &evidence_tx,
+        &finality,
+    );
+    let FinalityBridges {
+        event_tx: finality_event_tx,
+        dissent_rx,
+        precommit_rx,
+        round_timeout_rx,
+        on_precommit_vote,
+        on_dissent,
+        on_round_timeout_vote,
+        ..
+    } = finality;
 
     // An explicit --bootnodes always wins; otherwise fall back to the chain
     // spec's own boot_nodes list (devnet.json) — so a fresh node needs zero
