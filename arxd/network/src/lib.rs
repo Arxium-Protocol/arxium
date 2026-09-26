@@ -73,11 +73,11 @@ pub struct P2pConfig<'a, P: Payload> {
     pub chain_id: &'a str,
     pub mempool: Arc<Mutex<Mempool<P>>>,
     pub db: ArxiumDb,
-    pub gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
-    pub block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
-    pub precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
-    pub dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
-    pub round_timeout_rx: tokio_mpsc::UnboundedReceiver<RoundTimeoutVote>,
+    pub gossip_rx: tokio_mpsc::Receiver<Action<P>>,
+    pub block_rx: tokio_mpsc::Receiver<Block<P>>,
+    pub precommit_rx: tokio_mpsc::Receiver<PrecommitVote>,
+    pub dissent_rx: tokio_mpsc::Receiver<Dissent>,
+    pub round_timeout_rx: tokio_mpsc::Receiver<RoundTimeoutVote>,
     /// Returns `true` if the block's signature is itself forged, so the
     /// sending peer can be penalized — see `record_bad_gossip`. Second
     /// argument is `sync`: true when applying a `SyncRequest::Blocks` page
@@ -103,6 +103,29 @@ pub struct P2pConfig<'a, P: Payload> {
     /// Snapshot sync anchor (`--snapshot-trust-height`/`-hash`). Only acted
     /// on while this node is still at genesis; see `snapshot_sync`.
     pub snapshot_trust: Option<SnapshotTrust>,
+}
+
+/// Capacity of the node → swarm channels (own blocks, votes, dissents). Their
+/// producers are local and rate-limited by the chain itself, so this is only
+/// ever reached if the swarm loop stalls, e.g. while it applies a long sync page.
+pub const OUTBOUND_CHANNEL_CAP: usize = 1024;
+
+/// Queues `item` for the swarm loop without blocking: several callers hold
+/// `chain_lock`, which the swarm loop's `on_block` also takes, so a blocking
+/// send could deadlock. A full channel drops the item and counts it under
+/// `arxium_network_outbound_dropped_total{channel}`. Everything sent here is
+/// re-sent or re-fetched later (votes are rebroadcast, blocks are synced).
+/// Returns `false` once the swarm loop is gone.
+pub fn send_outbound<T>(tx: &tokio_mpsc::Sender<T>, item: T, channel: &'static str) -> bool {
+    match tx.try_send(item) {
+        Ok(()) => true,
+        Err(tokio_mpsc::error::TrySendError::Full(_)) => {
+            metrics::counter!("arxium_network_outbound_dropped_total", "channel" => channel)
+                .increment(1);
+            true
+        }
+        Err(tokio_mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 pub type OnBlock<P> = Box<dyn Fn(Block<P>, bool) -> bool + Send>;
@@ -309,11 +332,11 @@ struct SwarmParams<'a, P: Payload> {
     chain_id: &'a str,
     mempool: Arc<Mutex<Mempool<P>>>,
     db: ArxiumDb,
-    gossip_rx: tokio_mpsc::UnboundedReceiver<Action<P>>,
-    block_rx: tokio_mpsc::UnboundedReceiver<Block<P>>,
-    precommit_rx: tokio_mpsc::UnboundedReceiver<PrecommitVote>,
-    dissent_rx: tokio_mpsc::UnboundedReceiver<Dissent>,
-    round_timeout_rx: tokio_mpsc::UnboundedReceiver<RoundTimeoutVote>,
+    gossip_rx: tokio_mpsc::Receiver<Action<P>>,
+    block_rx: tokio_mpsc::Receiver<Block<P>>,
+    precommit_rx: tokio_mpsc::Receiver<PrecommitVote>,
+    dissent_rx: tokio_mpsc::Receiver<Dissent>,
+    round_timeout_rx: tokio_mpsc::Receiver<RoundTimeoutVote>,
     on_block: OnBlock<P>,
     on_precommit_vote: OnPrecommitVote,
     on_dissent: OnDissent,
@@ -1226,6 +1249,18 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn send_outbound_drops_when_full_and_reports_closed() {
+        let (tx, mut rx) = tokio_mpsc::channel::<u8>(1);
+        assert!(send_outbound(&tx, 1, "test"));
+        // Full: dropped, but the swarm loop is still there.
+        assert!(send_outbound(&tx, 2, "test"));
+        assert_eq!(rx.try_recv().unwrap(), 1);
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        assert!(!send_outbound(&tx, 3, "test"));
+    }
     use super::*;
 
     #[test]
@@ -1241,11 +1276,11 @@ mod tests {
 
         let mempool = Arc::new(Mutex::new(Mempool::<()>::new()));
         let db = ArxiumDb::open(&base_path.join("data")).unwrap();
-        let (_gossip_tx, gossip_rx) = tokio_mpsc::unbounded_channel();
-        let (_block_tx, block_rx) = tokio_mpsc::unbounded_channel();
-        let (_precommit_tx, precommit_rx) = tokio_mpsc::unbounded_channel();
-        let (_dissent_tx, dissent_rx) = tokio_mpsc::unbounded_channel();
-        let (_round_timeout_tx, round_timeout_rx) = tokio_mpsc::unbounded_channel();
+        let (_gossip_tx, gossip_rx) = tokio_mpsc::channel(1);
+        let (_block_tx, block_rx) = tokio_mpsc::channel(1);
+        let (_precommit_tx, precommit_rx) = tokio_mpsc::channel(1);
+        let (_dissent_tx, dissent_rx) = tokio_mpsc::channel(1);
+        let (_round_timeout_tx, round_timeout_rx) = tokio_mpsc::channel(1);
 
         let peer_id = spawn_p2p_node(P2pConfig {
             base_path: &base_path,

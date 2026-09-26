@@ -112,7 +112,7 @@ struct AppState<P: Payload> {
     max_nonce_gap: u64,
     // Broadcasts freshly admitted actions out to peers over gossip. `None`
     // in tests / any caller that doesn't wire up `network`.
-    gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
+    gossip_tx: Option<tokio::sync::mpsc::Sender<Action<P>>>,
     metrics_handle: PrometheusHandle,
     // Chain-specific admission rules (e.g. arxd/node's validator
     // authorization/min-stake checks) layered on top of the payload-agnostic
@@ -329,7 +329,7 @@ pub struct IngestConfig<P: Payload> {
     pub rpc_token: Option<String>,
     /// See `NodeConfig::admin_token`. `None` leaves `/admin/*` unmounted.
     pub admin_token: Option<String>,
-    pub gossip_tx: Option<tokio::sync::mpsc::UnboundedSender<Action<P>>>,
+    pub gossip_tx: Option<tokio::sync::mpsc::Sender<Action<P>>>,
     pub metrics_handle: PrometheusHandle,
     pub payload_precheck: Option<PayloadPrecheck<P>>,
     pub fee_hints: Option<FeeHints>,
@@ -564,8 +564,14 @@ async fn submit_action<P: Payload>(
     {
         Ok(()) => {
             info!("queued action from {sender} via RPC");
-            if let (Some(tx), Some(action)) = (&state.gossip_tx, gossip_action) {
-                let _ = tx.send(action);
+            // Never block the handler on a stalled swarm loop: the action is
+            // already queued here, so a dropped gossip only delays it until
+            // this node proposes. Sized to the mempool, see `spawn_rpc`.
+            if let (Some(tx), Some(action)) = (&state.gossip_tx, gossip_action)
+                && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(action)
+            {
+                metrics::counter!("arxium_network_outbound_dropped_total", "channel" => "gossip")
+                    .increment(1);
             }
             StatusCode::ACCEPTED.into_response()
         }
