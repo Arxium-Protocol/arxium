@@ -20,6 +20,8 @@ use xc_runtime_api::ChainRuntime;
 use xc_runtime_api::DispatchCtx;
 use xc_storage::{ArxiumDb, BatchWritable, ValidatorSetSnapshot};
 
+use crate::validator::SignedHeight;
+
 /// Height this node is armed to corrupt its own state_root at, set once
 /// (if at all) from `run()`'s devnet-only fault-injection flag. Only
 /// compiled in with `--features fault-injection`; see
@@ -364,10 +366,13 @@ const MAX_BLOCK_ACTION_BYTES: usize = xc_primitives::MAX_WIRE_MESSAGE_SIZE - 64 
 /// ctrl-c (graceful return) or a HALT this node proved against itself, which
 /// exits the process with `HALT_EXIT_CODE` so a supervisor can alert on it
 /// instead of reading a silent exit as an ordinary crash.
+///
+/// `identity` carries the validator's `SignedHeight` record: no height at or
+/// below it is ever signed, and each new one is claimed on disk first.
 pub fn produce_loop<R: ChainRuntime>(
     db: &ArxiumDb,
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
-    identity: Option<(Address, SigningKey)>,
+    mut identity: Option<(Address, SigningKey, SignedHeight)>,
     chain_lock: &Arc<Mutex<()>>,
     finality_event_tx: &std_mpsc::Sender<FinalityEvent<R::Payload>>,
     block_tx: &tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
@@ -383,6 +388,10 @@ pub fn produce_loop<R: ChainRuntime>(
     // a monotonic deadline instead makes the period converge to
     // `max(interval, work_time)`.
     let mut next_tick = Instant::now();
+
+    // Startup sync gate, latched once passed: see `caught_up`.
+    let booted = Instant::now();
+    let mut synced = false;
 
     loop {
         // Re-read each tick, same as the fee params in `meter`, so a
@@ -426,10 +435,22 @@ pub fn produce_loop<R: ChainRuntime>(
         // by construction.
         let now = now_secs();
 
-        let proposer = match &identity {
-            Some((address, key)) => {
+        let proposer = match &mut identity {
+            Some((address, key, signed)) => {
                 let tip_height = db.get_tip_height()?.unwrap_or(0);
                 let next_height = tip_height + 1;
+                if !synced {
+                    synced = caught_up(tip_height, arxd_network::best_peer_tip(), booted.elapsed());
+                    if !synced {
+                        info!(
+                            "not producing yet: syncing with peers (local tip {tip_height}, best \
+                             peer tip {:?})",
+                            arxd_network::best_peer_tip()
+                        );
+                        drop(guard);
+                        continue;
+                    }
+                }
                 let parent: Block<R::Payload> = db
                     .get_block(tip_height)?
                     .expect("tip block must exist if tip_height is set");
@@ -487,7 +508,15 @@ pub fn produce_loop<R: ChainRuntime>(
                 match eligible_proposer(&validators, next_height, round) {
                     Some(expected) if &expected == address => {
                         gauge!("arxium_is_expected_proposer").set(1.0);
-                        Some((address, key))
+                        // Claimed before signing; a refusal here is the
+                        // slashing protection doing its job, not an error.
+                        if let Err(err) = signed.claim(next_height) {
+                            warn!("not producing height {next_height}: {err:#}");
+                            counter!("arxium_production_refused_already_signed_total").increment(1);
+                            drop(guard);
+                            continue;
+                        }
+                        Some((&*address, &*key))
                     }
                     // Skipping is normal — it's simply another validator's
                     // turn. Skipping *forever* is the failure mode that took
@@ -593,6 +622,22 @@ pub fn produce_loop<R: ChainRuntime>(
     }
 }
 
+/// How long a freshly booted validator waits for any peer to report its tip
+/// before producing anyway (a lone validator, or bootnodes all down).
+/// `SignedHeight` still refuses every height already signed either way.
+const PEER_WAIT: Duration = Duration::from_secs(30);
+
+/// Whether a freshly booted validator may start proposing: once it holds at
+/// least the best tip a peer has reported, or after `PEER_WAIT` with no peer
+/// heard from. Producing on a stale DB would sign heights the network
+/// already filled — wasted at best, equivocation at worst.
+fn caught_up(local_tip: u64, best_peer_tip: Option<u64>, waited: Duration) -> bool {
+    match best_peer_tip {
+        Some(best) => local_tip >= best,
+        None => waited >= PEER_WAIT,
+    }
+}
+
 /// Whether a full `interval` has passed since the parent's stamped time, so
 /// the next block may be produced. Genesis (height 0) carries a synthetic
 /// timestamp of 0 and is always due.
@@ -668,6 +713,19 @@ mod tests {
         // A parent stamped ahead of this clock holds production until wall
         // time catches up, instead of stamping further ahead.
         assert!(!slot_due(100, 127, 5, 2));
+    }
+
+    #[test]
+    fn a_booted_validator_waits_for_peers_before_producing() {
+        let early = Duration::from_secs(1);
+        assert!(!caught_up(3, Some(10), early), "behind a peer");
+        assert!(
+            !caught_up(3, Some(10), PEER_WAIT * 10),
+            "behind a peer, however long"
+        );
+        assert!(caught_up(10, Some(10), early), "level with the best peer");
+        assert!(!caught_up(0, None, early), "no peer heard yet");
+        assert!(caught_up(0, None, PEER_WAIT), "nobody answers: proceed");
     }
 
     #[test]

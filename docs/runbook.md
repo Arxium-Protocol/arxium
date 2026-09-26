@@ -429,9 +429,17 @@ having one.
 1. Stop the node (`docker compose ... stop arxd` or `arxd` process kill —
    RocksDB allows exactly one writer per DB directory, a second process
    pointed at the same `--base-path` will fail to open it).
-2. Untar the backup into a fresh (or emptied) `--base-path`.
-3. Start the node normally. It reads the tip from the restored DB —
-   nothing special to invoke.
+2. Untar the backup into a fresh (or emptied) `--base-path`. **Validators:
+   keep the newer `signed_height`.** If the old base path still has one,
+   copy it over the restored file. It records the last height this
+   validator signed, and a backup's copy is older. Starting with the older
+   one lets the node sign a height a second time, which is equivocation: a
+   full slash and a permanent ban.
+3. Start the node normally, with its peers reachable. It reads the tip
+   from the restored DB and doesn't propose until it has caught up with
+   the best tip a peer reports. If no peer answers within 30s it starts
+   anyway, so a restored validator started with no reachable peers is only
+   protected by `signed_height`.
 4. If instead the *box* is gone and only `validator.key` survived (e.g. it
    was backed up separately), a fresh node with that key can rejoin and
    catch up via P2P sync **only if there are reachable peers/bootnodes to
