@@ -122,8 +122,13 @@ An operator wallet can be authorized to submit staking actions on a
 validator's behalf without the signing key leaving the machine:
 
 ```sh
-ARXD_RPC_TOKEN=<rpc-token> arxd pair --node <host:port>
+ssh -N -L 30333:127.0.0.1:30333 <node-host> &   # the RPC is plain HTTP
+ARXD_RPC_TOKEN=<rpc-token> arxd pair
 ```
+
+`arxd pair` shows the operator address the app sent and asks before it signs;
+check it against the address in the app. It refuses a `--node` that isn't on
+this machine unless you pass `--insecure-remote`.
 
 ### Bootstrapping from a snapshot
 

@@ -114,7 +114,17 @@ pub(crate) fn cmd_pair<R: ChainRuntime>(
     node: &str,
     token: Option<&str>,
     revoke: bool,
+    insecure_remote: bool,
 ) -> Result<()> {
+    // Plain HTTP: whoever sits between here and a remote node reads the
+    // bearer token and picks the operator address this command signs for.
+    if !insecure_remote && !is_loopback(node)? {
+        anyhow::bail!(
+            "--node {node} is not on this machine, and the RPC is plain HTTP. Tunnel it \
+             (`ssh -L 30333:127.0.0.1:30333 <host>`, then leave --node at its default), \
+             or pass --insecure-remote to send the token and trust the reply over the network"
+        );
+    }
     // The pairing session this command creates lives only in this node
     // process's memory (see core/rpc's PairingStore) — printed up front
     // so a mismatch against whatever node the app's backend actually
@@ -129,6 +139,16 @@ pub(crate) fn cmd_pair<R: ChainRuntime>(
     let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes())
         .context("validator key produced an invalid address")?;
     R::pair(&key.to_bytes(), &sender, node, token, revoke)
+}
+
+/// True when every address `node` resolves to is loopback.
+fn is_loopback(node: &str) -> Result<bool> {
+    use std::net::ToSocketAddrs;
+    let mut addrs = node
+        .to_socket_addrs()
+        .with_context(|| format!("--node {node} is not a host:port"))?
+        .peekable();
+    Ok(addrs.peek().is_some() && addrs.all(|a| a.ip().is_loopback()))
 }
 
 /// Opens an existing node's data for `snapshot`/`prune`. `new_partial`
@@ -254,6 +274,16 @@ pub(crate) fn cmd_chain_spec<R: ChainRuntime>(chain: &str) -> Result<()> {
 mod tests {
     use super::*;
     use arxd_runtime::CoreChainRuntime;
+
+    #[test]
+    fn pair_treats_only_loopback_nodes_as_local() {
+        assert!(is_loopback("127.0.0.1:30333").unwrap());
+        assert!(is_loopback("[::1]:30333").unwrap());
+        assert!(is_loopback("localhost:30333").unwrap());
+        assert!(!is_loopback("10.0.0.5:30333").unwrap());
+        assert!(!is_loopback("203.0.113.9:30333").unwrap());
+        assert!(is_loopback("no-port").is_err());
+    }
 
     #[test]
     fn snapshot_and_prune_refuse_a_path_with_no_chain() {

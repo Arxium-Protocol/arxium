@@ -1335,8 +1335,9 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
             node,
             token,
             revoke,
+            insecure_remote,
         }) => {
-            return cmd_pair::<R>(base_path, node, token.as_deref(), *revoke);
+            return cmd_pair::<R>(base_path, node, token.as_deref(), *revoke, *insecure_remote);
         }
         Some(Command::Snapshot {
             base_path,

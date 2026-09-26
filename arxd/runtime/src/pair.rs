@@ -146,6 +146,11 @@ fn sign_and_submit(
     Ok(())
 }
 
+/// Only an explicit yes; empty input (EOF, no TTY) is a no.
+fn confirmed(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// Implements `ChainRuntime::pair` for CoreChain — see `Command::Pair`'s doc
 /// comment for the full flow. `seed` is the validator's already-loaded
 /// signing seed (`arxd-node`'s `validator::load_or_generate_key`, chain-
@@ -189,7 +194,16 @@ pub fn run(
     println!("Waiting for the app to confirm...");
 
     let operator = wait_for_operator(node, token, &session.nonce)?;
-    println!("App confirmed — authorizing {operator} as operator for {sender}");
+    // The address came back from the node, not from the app, so check it
+    // against what the app shows before it gets staking rights.
+    println!("The app answered with operator {operator}.");
+    print!("Is this the address your app shows? Authorize it for {sender}? [y/N] ");
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !confirmed(&answer) {
+        bail!("not authorized; nothing was signed");
+    }
 
     sign_and_submit(
         node,
@@ -200,4 +214,17 @@ pub fn run(
     )?;
     println!("pairing complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_an_explicit_yes_confirms() {
+        for yes in ["y\n", "Y", " yes \n", "YES"] {
+            assert!(super::confirmed(yes), "{yes:?}");
+        }
+        for no in ["", "\n", "n", "no", "yep", "y y"] {
+            assert!(!super::confirmed(no), "{no:?}");
+        }
+    }
 }

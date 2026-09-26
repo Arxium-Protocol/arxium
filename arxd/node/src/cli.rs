@@ -110,6 +110,12 @@ pub enum Command {
         /// Revoke the current operator instead of pairing a new one.
         #[arg(long)]
         revoke: bool,
+        /// Allow a `--node` that isn't on this machine. The RPC is plain
+        /// HTTP, so the token and the operator address the node returns
+        /// cross the network unprotected. Prefer an SSH tunnel
+        /// (`ssh -L 30333:127.0.0.1:30333 <host>`) and the default `--node`.
+        #[arg(long)]
+        insecure_remote: bool,
     },
     /// Writes a consistent copy of this node's chain data to `output`, for
     /// bootstrapping a new node without replaying every block from genesis —

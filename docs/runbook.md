@@ -146,10 +146,14 @@ there, this node will never propose until a `JoinValidator` action adds it.
    who never voted (`xc_bls::verify_possession` spells out the construction).
 7. To let an operator wallet (e.g. Arx-Plus) submit staking actions on this
    validator's behalf without the validator's signing key ever leaving the
-   box: `arxd pair --base-path <path> --node <host:port>` with the RPC token in
+   box: `arxd pair --base-path <path>` with the RPC token in
    `$ARXD_RPC_TOKEN`
-   shows a QR code; scanning it and confirming in the app completes the
-   `AuthorizeOperator` action. `--revoke` removes the current operator
+   shows a QR code. Scan it in the app, then check the operator address
+   `arxd pair` prints against the one the app shows and answer `y`; that
+   signs the `AuthorizeOperator` action. `--node` must be on this machine,
+   because the RPC is plain HTTP. For the gateway the app uses, tunnel it
+   (`ssh -N -L 30333:127.0.0.1:30333 <gateway>`) rather than passing
+   `--insecure-remote`. `--revoke` removes the current operator
    without needing to scan anything.
 
 ## Running a custom chain
