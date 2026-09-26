@@ -21,8 +21,10 @@ services:
       - "30334:30334/udp" # P2P (QUIC)
     volumes:
       - arxd-data:/data
-    command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-trusted-proxy-hops", "2", "--rpc-token", "${ARXD_RPC_TOKEN:?set ARXD_RPC_TOKEN in .env}"]
+    command: ["--base-path", "/data", "--bootnode", "--validator", "--rpc-bind", "0.0.0.0", "--rpc-trusted-proxy-hops", "2"]
     environment:
+      # Env, not --rpc-token: a flag's value is visible in `ps` on the host.
+      ARXD_RPC_TOKEN: "${ARXD_RPC_TOKEN:?set ARXD_RPC_TOKEN in .env}"
       # Optional; blank leaves /admin unmounted (see .env.example).
       ARXD_ADMIN_TOKEN: "${ARXD_ADMIN_TOKEN:-}"
     restart: unless-stopped

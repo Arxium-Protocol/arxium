@@ -213,14 +213,24 @@ pub struct RunArgs {
     pub validator: bool,
 
     /// If set, the RPC server requires `Authorization: Bearer <token>` on every request.
+    /// Prefer `$ARXD_RPC_TOKEN` or `--rpc-token-file`: a flag's value shows
+    /// up in `ps` and shell history for any local user.
     #[arg(long, env = "ARXD_RPC_TOKEN")]
     pub rpc_token: Option<String>,
+
+    /// Reads the RPC token from this file (surrounding whitespace trimmed).
+    #[arg(long, env = "ARXD_RPC_TOKEN_FILE", conflicts_with = "rpc_token")]
+    pub rpc_token_file: Option<PathBuf>,
 
     /// Enables `/admin/*` (e.g. `POST /admin/checkpoint`) behind this bearer
     /// token. Keep it separate from `--rpc-token`: that one is shared with
     /// every client that submits actions. Unset: no admin routes.
     #[arg(long, env = "ARXD_ADMIN_TOKEN")]
     pub admin_token: Option<String>,
+
+    /// Reads the admin token from this file (surrounding whitespace trimmed).
+    #[arg(long, env = "ARXD_ADMIN_TOKEN_FILE", conflicts_with = "admin_token")]
+    pub admin_token_file: Option<PathBuf>,
 
     /// Address the RPC server binds to. Defaults to loopback-only; put a TLS-
     /// terminating reverse proxy in front for production, or pass 0.0.0.0 to
@@ -340,6 +350,35 @@ impl From<LimitArgs> for Limits {
     }
 }
 
+/// Token flags given on the command line itself (not through their env
+/// var), which any local user can read from `ps` or shell history.
+pub fn tokens_on_command_line(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    const FLAGS: [&str; 3] = ["--rpc-token", "--admin-token", "--token"];
+    args.into_iter()
+        .filter_map(|arg| {
+            let flag = arg.split('=').next().unwrap_or_default();
+            FLAGS.contains(&flag).then(|| flag.to_string())
+        })
+        .collect()
+}
+
+fn read_token(from_flag: Option<String>, file: Option<PathBuf>) -> anyhow::Result<Option<String>> {
+    let token =
+        match file {
+            Some(path) => Some(std::fs::read_to_string(&path).map_err(|e| {
+                anyhow::anyhow!("failed to read token file {}: {e}", path.display())
+            })?),
+            None => from_flag,
+        };
+    // Blank is "unset", not "the empty string is the password": clap already
+    // drops an empty env var, this covers `--admin-token ""` from a script
+    // and an empty token file. An admin router keyed on `Bearer ` would
+    // otherwise be open to anyone who sends that literal.
+    Ok(token
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty()))
+}
+
 fn default_base_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -347,8 +386,8 @@ fn default_base_path() -> PathBuf {
 }
 
 impl RunArgs {
-    pub fn into_config(self) -> NodeConfig {
-        NodeConfig {
+    pub fn into_config(self) -> anyhow::Result<NodeConfig> {
+        Ok(NodeConfig {
             base_path: self.base_path,
             chain: self.chain,
             port: self.port,
@@ -370,15 +409,11 @@ impl RunArgs {
             snapshot_trust: self.snapshot_trust_height.zip(self.snapshot_trust_hash),
             is_bootnode: self.bootnode,
             is_validator: self.validator,
-            // Blank is "unset", not "the empty string is the password":
-            // clap already drops an empty env var, this covers `--admin-token ""`
-            // from a script — an admin router keyed on `Bearer ` would
-            // otherwise be open to anyone who sends that literal.
-            rpc_token: self.rpc_token.filter(|t| !t.trim().is_empty()),
-            admin_token: self.admin_token.filter(|t| !t.trim().is_empty()),
+            rpc_token: read_token(self.rpc_token, self.rpc_token_file)?,
+            admin_token: read_token(self.admin_token, self.admin_token_file)?,
             rpc_bind: self.rpc_bind,
             limits: self.limits.into(),
-        }
+        })
     }
 }
 
@@ -399,11 +434,65 @@ mod tests {
     /// otherwise `arxd/node` sees a non-empty list, skips the chain spec's
     /// `boot_nodes` fallback, and the node joins nothing at all.
     #[test]
+    fn tokens_are_read_from_files() {
+        let dir = std::env::temp_dir().join(format!("arxd-token-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rpc = dir.join("rpc");
+        let admin = dir.join("admin");
+        std::fs::write(&rpc, "rpc-secret\n").unwrap();
+        std::fs::write(&admin, "\n").unwrap();
+        let cfg = Cli::try_parse_from([
+            "arxd",
+            "--rpc-token-file",
+            rpc.to_str().unwrap(),
+            "--admin-token-file",
+            admin.to_str().unwrap(),
+        ])
+        .unwrap()
+        .run
+        .into_config()
+        .unwrap();
+        assert_eq!(cfg.rpc_token.as_deref(), Some("rpc-secret"));
+        assert!(
+            cfg.admin_token.is_none(),
+            "an empty file must not mount /admin"
+        );
+
+        let missing = Cli::try_parse_from(["arxd", "--rpc-token-file", "/nonexistent/token"])
+            .unwrap()
+            .run
+            .into_config();
+        assert!(missing.is_err(), "a missing token file must fail the boot");
+        assert!(
+            Cli::try_parse_from(["arxd", "--rpc-token", "a", "--rpc-token-file", "b"]).is_err(),
+            "the flag and the file are exclusive"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn token_flags_on_the_command_line_are_found() {
+        let args = [
+            "arxd",
+            "--rpc-token=x",
+            "--admin-token",
+            "y",
+            "--rpc-token-file",
+            "f",
+        ];
+        assert_eq!(
+            tokens_on_command_line(args.map(String::from)),
+            ["--rpc-token", "--admin-token"]
+        );
+    }
+
+    #[test]
     fn blank_tokens_are_unset() {
         let cfg = Cli::try_parse_from(["arxd", "--rpc-token", "", "--admin-token", " "])
             .unwrap()
             .run
-            .into_config();
+            .into_config()
+            .unwrap();
         assert!(cfg.rpc_token.is_none());
         assert!(
             cfg.admin_token.is_none(),
@@ -416,7 +505,8 @@ mod tests {
         let cfg = Cli::try_parse_from(["arxd", "--bootnodes", ""])
             .unwrap()
             .run
-            .into_config();
+            .into_config()
+            .unwrap();
         assert!(
             cfg.bootnodes.is_empty(),
             "blank must fall back to the chain spec"
@@ -429,7 +519,8 @@ mod tests {
         ])
         .unwrap()
         .run
-        .into_config();
+        .into_config()
+        .unwrap();
         assert_eq!(
             cfg.bootnodes.len(),
             2,
@@ -461,7 +552,8 @@ mod tests {
         ])
         .unwrap()
         .run
-        .into_config();
+        .into_config()
+        .unwrap();
         assert_eq!(cfg.snapshot_trust, Some((5, hash.parse().unwrap())));
     }
 
