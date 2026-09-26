@@ -857,7 +857,7 @@ struct FinalityBridges<P> {
 /// round-timeout votes onto the network's tokio channels.
 fn spawn_finality_bridges<R: ChainRuntime>(
     db: &ArxiumDb,
-    bls_identity: Option<(Address, xc_bls::BlsSecretKey)>,
+    bls_identity: Option<(Address, xc_bls::BlsSecretKey, arxd_finality::SignedVotes)>,
     evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
     chain_lock: &Arc<Mutex<()>>,
 ) -> FinalityBridges<R::Payload> {
@@ -1198,6 +1198,15 @@ fn spawn_subsystems<R: ChainRuntime>(
     // disagreement, so clone before `spawn_finality_bridges` consumes the
     // original.
     let bls_identity_for_dissent = bls_identity.clone();
+    // Slashing protection for finality votes, beside the keys like
+    // `signed_height`. Loaded here so a corrupt file stops boot.
+    let bls_identity = bls_identity
+        .map(|(address, key)| {
+            arxd_finality::SignedVotes::load(&config.base_path, &hex::encode(genesis_hash))
+                .map(|signed| (address, key, signed))
+                .map_err(anyhow::Error::msg)
+        })
+        .transpose()?;
     let finality = spawn_finality_bridges::<R>(db, bls_identity, &evidence_tx, &chain_lock);
     // Shared between RPC submission and gossip receipt so a `JoinValidator`/
     // `LeaveValidator`/`RegisterBlsKey` that will actually be rejected by

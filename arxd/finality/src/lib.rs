@@ -1,6 +1,9 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
+mod signed_votes;
+pub use signed_votes::SignedVotes;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -10,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use xc_bls::{BlsPublicKey, BlsSecretKey, BlsSignature};
 use xc_primitives::{Address, Block, Hash32, quorum_reached, round_timeout_signing_bytes};
 use xc_storage::{
@@ -392,9 +395,11 @@ pub enum FinalityEvent<P> {
     RoundTimeoutObserved(RoundTimeoutVote),
 }
 
-/// Runs on its own thread. `bls_identity` is `Some((address, secret_key))`
-/// on a node that holds a registered BLS key — it still tallies and
-/// finalizes without one, it just can't contribute a vote. `vote_tx` is
+/// Runs on its own thread. `bls_identity` is `Some((address, secret_key,
+/// signed_votes))` on a node that holds a registered BLS key — it still
+/// tallies and finalizes without one, it just can't contribute a vote.
+/// `signed_votes` is checked and updated before every vote is signed; see
+/// `SignedVotes`. `vote_tx` is
 /// where freshly-signed precommits go out to be gossiped; `round_timeout_tx`
 /// is the same for round-timeout votes; `events` carries locally-observed
 /// blocks and incoming peer votes/dissents/round-timeouts. `dissent_tx` gets
@@ -403,7 +408,7 @@ pub enum FinalityEvent<P> {
 /// evidence artifact for both paths, see `xc_evidence::EvidenceEvent`.
 pub fn spawn_finality<P>(
     db: ArxiumDb,
-    bls_identity: Option<(Address, BlsSecretKey)>,
+    bls_identity: Option<(Address, BlsSecretKey, SignedVotes)>,
     events: Receiver<FinalityEvent<P>>,
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
@@ -421,6 +426,7 @@ where
     P: Serialize + DeserializeOwned + Send + 'static,
 {
     thread::spawn(move || {
+        let mut bls_identity = bls_identity;
         // height -> ((block_hash, ep) -> (voter -> signature)); a height can
         // only ever have one canonical (hash, ep) pair in practice, but keyed
         // this way a stray vote for a competing hash or a diverging ep can't
@@ -542,7 +548,7 @@ where
                             return;
                         }
                     }
-                    if let Some((address, secret_key)) = &bls_identity
+                    if let Some((address, secret_key, signed)) = &mut bls_identity
                         && last_progress.1.elapsed() >= round_timeout()
                     {
                         let next_height = last_progress.0 + 1;
@@ -564,12 +570,26 @@ where
                                     && !my_round_timeout_votes.contains_key(&(next_height, round))
                                 {
                                     match db.get_block::<P>(next_height.saturating_sub(1)) {
-                                        Ok(Some(parent)) => {
+                                        Ok(Some(parent)) => 'sign: {
+                                            let parent_hash = parent.hash().to_string();
+                                            // Durable before signing: a restored
+                                            // DB forgets `my_votes`, this file
+                                            // doesn't.
+                                            if let Err(err) = signed.claim_timeout(
+                                                next_height,
+                                                round,
+                                                &parent_hash,
+                                            ) {
+                                                warn!(
+                                                    "finality: not signing a round-timeout vote at height {next_height} round {round}: {err}"
+                                                );
+                                                break 'sign;
+                                            }
                                             let msg = round_timeout_signing_bytes(
                                                 &genesis,
                                                 next_height,
                                                 round,
-                                                &parent.hash().to_string(),
+                                                &parent_hash,
                                             );
                                             let signature = xc_bls::sign(secret_key, &msg);
                                             let vote = RoundTimeoutVote {
@@ -705,10 +725,15 @@ where
             }
             round_timeout_tallies.retain(|(height, _), _| *height >= cutoff);
             my_round_timeout_votes.retain(|(height, _), _| *height >= cutoff);
+            if let Some((_, _, signed)) = &mut bls_identity
+                && let Err(err) = signed.prune_below(cutoff)
+            {
+                warn!("finality: failed to prune signed-vote record: {err}");
+            }
 
             match event {
                 FinalityEvent::BlockObserved(block) => {
-                    let Some((address, secret_key)) = &bls_identity else {
+                    let Some((address, secret_key, signed)) = &mut bls_identity else {
                         continue;
                     };
                     // S2 (`docs/consensus-safety.md` §2), the other
@@ -763,6 +788,26 @@ where
                         &hash.to_string(),
                         &ep,
                     );
+                    // Durable before signing — see `SignedVotes`. Heights at
+                    // or below its floor are long past (catch-up after a DB
+                    // restore), so that refusal is routine, not a warning.
+                    if block.height <= signed.floor() {
+                        debug!(
+                            "finality: not precommitting block {}: below the signed-vote floor {}",
+                            block.height,
+                            signed.floor()
+                        );
+                        continue;
+                    }
+                    if let Err(err) =
+                        signed.claim_precommit(block.height, block.round, &hash.to_string())
+                    {
+                        warn!(
+                            "finality: not precommitting block {} at round {}: {err}",
+                            block.height, block.round
+                        );
+                        continue;
+                    }
                     let signature = xc_bls::sign(secret_key, &msg);
                     let vote = PrecommitVote {
                         height: block.height,
@@ -2162,7 +2207,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             vote_tx,
             round_timeout_tx,
@@ -2211,7 +2256,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db.clone(),
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             vote_tx,
             round_timeout_tx,
@@ -2261,7 +2306,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             vote_tx,
             round_timeout_tx,
@@ -2292,6 +2337,57 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Card 172: a restored DB forgets this validator's votes, but the
+    /// `SignedVotes` file doesn't. With a precommit for another block already
+    /// on record at (5, 0), observing a different block there must not
+    /// produce a vote; the next height still does.
+    #[test]
+    fn spawn_finality_refuses_a_precommit_its_signed_votes_record_conflicts_with() {
+        let (db, dir) = open_test_db();
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[5u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[6u8; 32]).unwrap();
+        let mut signed = SignedVotes::scratch();
+        signed
+            .claim_precommit(5, 0, "0xsigned-before-the-restore")
+            .unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, vote_rx) = mpsc::channel();
+        let (round_timeout_tx, _round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr.clone(), sk, signed)),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+            dissent_tx,
+            equivocation_tx_for_test(),
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let conflicting = signed_block(&key, 5, 100);
+        assert_eq!(conflicting.round, 0);
+        event_tx
+            .send(FinalityEvent::BlockObserved(conflicting))
+            .unwrap();
+        event_tx
+            .send(FinalityEvent::BlockObserved(signed_block(&key, 6, 101)))
+            .unwrap();
+
+        let vote = vote_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("height 6 must still get a vote");
+        assert_eq!(vote.height, 6, "no vote may be signed at height 5");
+
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
+        assert!(vote_rx.try_iter().all(|v| v.height != 5));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The pruning watermark used to be raised from raw event heights, before
     /// any signature check, so one unauthenticated gossiped vote claiming
     /// `height: u64::MAX` pruned every real tally and this node's own votes —
@@ -2310,7 +2406,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             vote_tx,
             round_timeout_tx,
@@ -2732,7 +2828,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db,
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             _vote_tx,
             round_timeout_tx,
@@ -2778,7 +2874,7 @@ mod tests {
         let (dissent_tx, _dissent_rx) = mpsc::channel();
         let handle = spawn_finality::<()>(
             db.clone(),
-            Some((addr.clone(), sk)),
+            Some((addr.clone(), sk, SignedVotes::scratch())),
             event_rx,
             _vote_tx,
             round_timeout_tx,
