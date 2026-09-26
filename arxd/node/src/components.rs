@@ -179,20 +179,7 @@ mod tests {
                 .as_nanos(),
             std::thread::current().id(),
         ));
-        NodeConfig {
-            base_path,
-            chain: "devnet".to_string(),
-            port: 0,
-            p2p_port: 0,
-            bootnodes: Vec::new(),
-            is_bootnode: false,
-            is_validator: false,
-            rpc_token: None,
-            admin_token: None,
-            rpc_bind: "127.0.0.1".to_string(),
-            limits: xc_primitives::Limits::default(),
-            snapshot_trust: None,
-        }
+        NodeConfig::offline(base_path, "devnet")
     }
 
     #[test]
@@ -270,18 +257,8 @@ mod tests {
         .unwrap();
 
         let config = NodeConfig {
-            base_path: base_path.clone(),
-            chain: spec_path.to_string_lossy().into_owned(),
-            port: 0,
-            p2p_port: 0,
-            bootnodes: Vec::new(),
-            is_bootnode: false,
             is_validator: true,
-            rpc_token: None,
-            admin_token: None,
-            rpc_bind: "127.0.0.1".to_string(),
-            limits: xc_primitives::Limits::default(),
-            snapshot_trust: None,
+            ..NodeConfig::offline(base_path.clone(), spec_path.to_string_lossy())
         };
 
         assert!(

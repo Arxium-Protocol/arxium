@@ -187,6 +187,29 @@ pub struct NodeConfig {
     pub snapshot_trust: Option<(u64, String)>,
 }
 
+impl NodeConfig {
+    /// Config for opening a chain's data without running a node — offline
+    /// commands (`snapshot`, `prune`) and tests. Not a validator (so no key
+    /// material is generated), no tokens, loopback RPC, ports unused.
+    /// Override fields with struct-update syntax.
+    pub fn offline(base_path: PathBuf, chain: impl Into<String>) -> Self {
+        Self {
+            base_path,
+            chain: chain.into(),
+            port: 0,
+            p2p_port: 0,
+            bootnodes: Vec::new(),
+            is_bootnode: false,
+            is_validator: false,
+            rpc_token: None,
+            admin_token: None,
+            rpc_bind: "127.0.0.1".to_string(),
+            limits: Limits::default(),
+            snapshot_trust: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod wire_decode_tests {
     use super::*;

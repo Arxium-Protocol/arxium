@@ -140,22 +140,9 @@ pub(crate) fn cmd_snapshot<R: ChainRuntime>(
     // does rather than opening the DB by hand — same tip-signature
     // verification, same genesis-write-on-first-run behavior, so a
     // snapshot taken from data nothing else has ever booted still works.
-    // `is_validator: false` (the default below) means no key material
+    // `is_validator: false` (`offline`'s default) means no key material
     // gets generated just to export a checkpoint.
-    let config = xc_primitives::NodeConfig {
-        base_path: base_path.to_path_buf(),
-        chain: chain.to_string(),
-        port: 0,
-        p2p_port: 0,
-        bootnodes: Vec::new(),
-        is_bootnode: false,
-        is_validator: false,
-        rpc_token: None,
-        admin_token: None,
-        rpc_bind: "127.0.0.1".to_string(),
-        limits: xc_primitives::Limits::default(),
-        snapshot_trust: None,
-    };
+    let config = xc_primitives::NodeConfig::offline(base_path.to_path_buf(), chain);
     let components = new_partial::<R>(&config)?;
     components.db.export_checkpoint(output).with_context(|| {
         format!(
@@ -176,20 +163,7 @@ pub(crate) fn cmd_prune<R: ChainRuntime>(
     chain: &str,
     retain_blocks: u64,
 ) -> Result<()> {
-    let config = xc_primitives::NodeConfig {
-        base_path: base_path.to_path_buf(),
-        chain: chain.to_string(),
-        port: 0,
-        p2p_port: 0,
-        bootnodes: Vec::new(),
-        is_bootnode: false,
-        is_validator: false,
-        rpc_token: None,
-        admin_token: None,
-        rpc_bind: "127.0.0.1".to_string(),
-        limits: xc_primitives::Limits::default(),
-        snapshot_trust: None,
-    };
+    let config = xc_primitives::NodeConfig::offline(base_path.to_path_buf(), chain);
     let components = new_partial::<R>(&config)?;
     let tip = components.db.get_tip_height()?.unwrap_or(0);
     let requested_cutoff = tip.saturating_sub(retain_blocks);
