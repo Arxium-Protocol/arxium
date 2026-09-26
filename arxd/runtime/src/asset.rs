@@ -289,15 +289,24 @@ pub(crate) fn forced_transfer<V: KvRead<Error = StorageError>>(
     to: &Address,
     amount: u128,
     reason: &str,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     check_reason(reason, "a forced transfer")?;
     crate::identity::require_admin(view, action, AdminRole::Recovery)
         .map_err(|_| anyhow::anyhow!("only the recovery admin may force a transfer"))?;
 
     let mut asset = resolve_asset(view, asset)?;
-    let assets = circuit_rwa_asset::apply_forced_transfer(view, &mut asset, from, to, amount)?;
+    let (assets, holder_states) = circuit_rwa_asset::apply_forced_transfer_with_lock(
+        view,
+        &mut asset,
+        from,
+        to,
+        amount,
+        current_height,
+    )?;
     Ok(BlockUpdates {
         assets,
+        holder_states,
         asset_registration: Some(asset),
         ..Default::default()
     })
@@ -397,12 +406,21 @@ pub(crate) fn issuer_forced_transfer<V: KvRead<Error = StorageError>>(
     to: &Address,
     amount: u128,
     reason: &str,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     check_reason(reason, "a forced transfer")?;
     let mut asset = require_issuer(view, action, asset)?;
-    let assets = circuit_rwa_asset::apply_forced_transfer(view, &mut asset, from, to, amount)?;
+    let (assets, holder_states) = circuit_rwa_asset::apply_forced_transfer_with_lock(
+        view,
+        &mut asset,
+        from,
+        to,
+        amount,
+        current_height,
+    )?;
     Ok(BlockUpdates {
         assets,
+        holder_states,
         asset_registration: Some(asset),
         ..Default::default()
     })
@@ -645,15 +663,18 @@ pub(crate) fn redeem<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     asset: &AssetRef,
     snapshot_height: u64,
+    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let mut asset = require_issuer(view, action, asset)?;
     let table = snapshot_at(&asset, snapshot_height)?;
     if table.total == 0 {
         anyhow::bail!("nothing to redeem");
     }
-    let assets = circuit_rwa_asset::apply_redemption(view, &mut asset, &table)?;
+    let (assets, holder_states) =
+        circuit_rwa_asset::apply_redemption(view, &mut asset, &table, current_height)?;
     Ok(BlockUpdates {
         assets,
+        holder_states,
         asset_registration: Some(asset),
         ..Default::default()
     })
@@ -673,7 +694,7 @@ pub(crate) fn split<V: KvRead<Error = StorageError>>(
         anyhow::bail!("split ratio needs a positive numerator and denominator");
     }
     let table = snapshot_at(&asset, snapshot_height)?;
-    let assets = circuit_rwa_asset::apply_split(
+    let (assets, holder_states) = circuit_rwa_asset::apply_split(
         view,
         &mut asset,
         &table,
@@ -683,6 +704,7 @@ pub(crate) fn split<V: KvRead<Error = StorageError>>(
     )?;
     Ok(BlockUpdates {
         assets,
+        holder_states,
         asset_registration: Some(asset),
         ..Default::default()
     })
@@ -1225,7 +1247,7 @@ mod tests {
         freeze_only
             .put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger)
             .unwrap();
-        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why")
+        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why", 0)
             .unwrap_err();
         assert!(
             err.to_string().contains("only the recovery admin"),
@@ -1587,6 +1609,7 @@ mod tests {
             &receiver,
             40,
             "court order 2026-114",
+            0,
         )
         .unwrap_err();
         assert!(
@@ -1603,6 +1626,7 @@ mod tests {
             &receiver,
             40,
             "  ",
+            0,
         )
         .unwrap_err();
         assert!(err.to_string().contains("non-empty reason"), "got: {err}");
@@ -1615,6 +1639,7 @@ mod tests {
             &receiver,
             40,
             &"x".repeat(513),
+            0,
         )
         .unwrap_err();
         assert!(
@@ -1630,6 +1655,7 @@ mod tests {
             &receiver,
             40,
             "court order 2026-114",
+            0,
         )
         .unwrap();
         assert_eq!(updates.assets.0[&(gold.clone(), holder.clone())], 60);

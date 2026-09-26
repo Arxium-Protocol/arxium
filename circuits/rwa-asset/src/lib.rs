@@ -724,6 +724,53 @@ fn holder_state<V: KvRead<Error = StorageError>>(
     Ok(state)
 }
 
+/// `holder`'s lock after units moved without its signature (forced transfer,
+/// redemption, split): scaled by `numerator / denominator` for a split, then
+/// clamped to `balance_after`. Left bigger than the balance, a lock would
+/// catch whatever the holder receives next. `None` when nothing changes.
+fn adjusted_lock<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    holder: &Address,
+    balance_after: u128,
+    (numerator, denominator): (u128, u128),
+    current_height: u64,
+) -> Result<Option<HolderState>, RwaError> {
+    let mut state = holder_state(view, asset, holder, current_height)?;
+    if state.frozen_amount == 0 {
+        return Ok(None);
+    }
+    let scaled = state
+        .frozen_amount
+        .checked_mul(numerator)
+        .map(|n| n / denominator)
+        .ok_or_else(|| RwaError::ShareOverflow {
+            asset: asset.asset_ref.clone(),
+        })?;
+    let locked = scaled.min(balance_after);
+    if locked == state.frozen_amount {
+        return Ok(None);
+    }
+    state.frozen_amount = locked;
+    if locked == 0 {
+        state.lock_expires_at = None;
+    }
+    Ok(Some(state))
+}
+
+fn balance_of<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &Asset,
+    owner: &Address,
+) -> Result<u128, StorageError> {
+    Ok(view
+        .get(&AssetBalanceKey {
+            asset: &asset.asset_ref,
+            owner,
+        })?
+        .unwrap_or(0))
+}
+
 /// A balance credit. Every credit is already bounded by `total_supply`'s
 /// own `checked_add`, but that argument lives in a different variable —
 /// keep the overflow check local so it doesn't have to be reconstructed.
@@ -964,6 +1011,28 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     ])))
 }
 
+/// `ForcedTransfer` itself: `apply_forced_transfer`, plus `from`'s lock
+/// clamped to what it has left.
+pub fn apply_forced_transfer_with_lock<V: KvRead<Error = StorageError>>(
+    view: &V,
+    asset: &mut Asset,
+    from: &Address,
+    to: &Address,
+    amount: u128,
+    current_height: u64,
+) -> Result<(AssetBalanceUpdates, HolderStateUpdates), RwaError> {
+    let balances = apply_forced_transfer(view, asset, from, to, amount)?;
+    let mut states = HolderStateUpdates::default();
+    if let Some(&after) = balances.0.get(&(asset.asset_ref.clone(), from.clone()))
+        && let Some(state) = adjusted_lock(view, asset, from, after, (1, 1), current_height)?
+    {
+        states
+            .0
+            .insert((asset.asset_ref.clone(), from.clone()), state);
+    }
+    Ok((balances, states))
+}
+
 /// Read-through overlay for one action that makes several balance moves:
 /// staged writes shadow `base`, so the second move sees the first one's
 /// debit instead of re-reading the pre-action balance. The same trick
@@ -1127,16 +1196,24 @@ pub fn apply_redemption<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &mut Asset,
     table: &CapTable,
-) -> Result<AssetBalanceUpdates, RwaError> {
+    current_height: u64,
+) -> Result<(AssetBalanceUpdates, HolderStateUpdates), RwaError> {
     let mut staged = Staged::new(view);
+    let mut states = HolderStateUpdates::default();
     let issuer = asset.issuer.clone();
     for (holder, holding) in &table.holders {
         staged.stage(&apply_forced_transfer(
             &staged, asset, holder, &issuer, *holding,
         )?)?;
+        let after = balance_of(&staged, asset, holder)?;
+        if let Some(state) = adjusted_lock(view, asset, holder, after, (1, 1), current_height)? {
+            states
+                .0
+                .insert((asset.asset_ref.clone(), holder.clone()), state);
+        }
     }
     asset.snapshot = None;
-    Ok(staged.into_updates()?)
+    Ok((staged.into_updates()?, states))
 }
 
 /// `SplitAsset`: every snapshot holding `b` becomes `b * numerator /
@@ -1151,8 +1228,9 @@ pub fn apply_split<V: KvRead<Error = StorageError>>(
     numerator: u128,
     denominator: u128,
     current_height: u64,
-) -> Result<AssetBalanceUpdates, RwaError> {
+) -> Result<(AssetBalanceUpdates, HolderStateUpdates), RwaError> {
     let mut staged = Staged::new(view);
+    let mut states = HolderStateUpdates::default();
     let issuer = asset.issuer.clone();
     for (holder, holding) in &table.holders {
         let scaled = holding
@@ -1167,9 +1245,17 @@ pub fn apply_split<V: KvRead<Error = StorageError>>(
             apply_forced_transfer(&staged, asset, holder, &issuer, holding - scaled)?
         };
         staged.stage(&updates)?;
+        // A lock-up covers the same share of the position after the split.
+        let after = balance_of(&staged, asset, holder)?;
+        let ratio = (numerator, denominator);
+        if let Some(state) = adjusted_lock(view, asset, holder, after, ratio, current_height)? {
+            states
+                .0
+                .insert((asset.asset_ref.clone(), holder.clone()), state);
+        }
     }
     asset.snapshot = None;
-    Ok(staged.into_updates()?)
+    Ok((staged.into_updates()?, states))
 }
 
 #[cfg(test)]
@@ -1269,14 +1355,14 @@ mod tests {
         );
 
         // 3:2 split: 60/30/10 -> 90/45/15, minted, supply follows.
-        let split = apply_split(&db, &mut bond, &table, 3, 2, 8).unwrap();
+        let (split, _) = apply_split(&db, &mut bond, &table, 3, 2, 8).unwrap();
         let bal = |who: &Address| split.0.get(&(bond.asset_ref.clone(), who.clone())).copied();
         assert_eq!((bal(&a), bal(&b), bal(&c)), (Some(90), Some(45), Some(15)));
         assert_eq!(bond.total_supply, 1_050);
         assert!(bond.snapshot.is_none(), "a split invalidates the snapshot");
 
         // Redemption pulls every snapshot balance back to the treasury.
-        let redeemed = apply_redemption(&db, &mut bond, &table).unwrap();
+        let (redeemed, _) = apply_redemption(&db, &mut bond, &table, 8).unwrap();
         let bal = |who: &Address| {
             redeemed
                 .0
@@ -1286,6 +1372,69 @@ mod tests {
         assert_eq!((bal(&a), bal(&b), bal(&c)), (Some(0), Some(0), Some(0)));
         assert_eq!(bal(&issuer), Some(1_000));
         assert_eq!(bond.holder_count, 0);
+    }
+
+    /// Units moved without the holder's signature take the lock with them:
+    /// a forced move clamps it to what's left (so it can't catch units
+    /// received later), a split scales it.
+    #[test]
+    fn locks_follow_forced_transfers_redemptions_and_splits() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let (a, b) = (addr(2), addr(3));
+        let mut asset = seeded_open_asset(&db, &issuer, 1_000);
+        let id = asset.asset_ref.clone();
+        let locked = |who: &Address| {
+            KvRead::get(
+                &db,
+                &AssetHolderStateKey {
+                    asset: &id,
+                    holder: who,
+                },
+            )
+            .unwrap()
+            .unwrap_or_default()
+            .frozen_amount
+        };
+        for who in [&a, &b] {
+            commit(
+                &db,
+                &apply_forced_transfer(&db, &mut asset, &issuer, who, 100).unwrap(),
+            );
+            db.write_batch(&apply_lock_amount(&db, &asset, who, 100, true, None, 0).unwrap())
+                .unwrap();
+        }
+
+        // 100 locked, 100 forced away, then 50 received: all 50 spendable.
+        let (moved, states) =
+            apply_forced_transfer_with_lock(&db, &mut asset, &a, &issuer, 100, 1).unwrap();
+        commit(&db, &moved);
+        db.write_batch(&states).unwrap();
+        assert_eq!(locked(&a), 0);
+        commit(
+            &db,
+            &apply_forced_transfer(&db, &mut asset, &issuer, &a, 50).unwrap(),
+        );
+        assert!(apply_compliant_transfer(&db, &mut asset, &a, 0, &issuer, 50, 1).is_ok());
+
+        // 2-for-1 on a fully locked position stays fully locked, and back.
+        for (ratio, expected) in [((2, 1), 200), ((1, 2), 100)] {
+            apply_snapshot(&db, &mut asset, 2).unwrap();
+            let table = asset.snapshot.clone().unwrap();
+            let (split, states) =
+                apply_split(&db, &mut asset, &table, ratio.0, ratio.1, 2).unwrap();
+            commit(&db, &split);
+            db.write_batch(&states).unwrap();
+            assert_eq!(locked(&b), expected, "split {ratio:?}");
+        }
+        assert_eq!(locked(&a), 0, "no lock, nothing written");
+
+        apply_snapshot(&db, &mut asset, 3).unwrap();
+        let table = asset.snapshot.clone().unwrap();
+        let (redeemed, states) = apply_redemption(&db, &mut asset, &table, 3).unwrap();
+        commit(&db, &redeemed);
+        db.write_batch(&states).unwrap();
+        assert_eq!(locked(&b), 0, "redeemed to zero, lock cleared");
     }
 
     #[test]
