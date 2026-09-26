@@ -146,6 +146,9 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
             if *amount == 0 {
                 return Err(GovernanceError::ZeroSpend);
             }
+            if *to == treasury_account() {
+                return Err(GovernanceError::InvalidAddress(to.clone()));
+            }
             to.pubkey_bytes()
                 .map_err(|_| GovernanceError::InvalidAddress(to.clone()))?;
         }
@@ -266,7 +269,12 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
             GovernanceAction::TreasurySpend { to, amount } => {
                 let treasury = treasury_account();
                 let mut from = view.get(&AccountKey(&treasury))?.unwrap_or_default();
-                if let Some(rest) = from.balance.checked_sub(*amount) {
+                // Refused at submission too; kept here for proposals stored
+                // before that check. Debiting and crediting the same row
+                // would write the credit over the debit and mint `amount`.
+                if to == &treasury {
+                    // Falls through as Rejected.
+                } else if let Some(rest) = from.balance.checked_sub(*amount) {
                     from.balance = rest;
                     let mut dest = view.get(&AccountKey(to))?.unwrap_or_default();
                     dest.balance = dest.balance.saturating_add(*amount);
@@ -316,6 +324,55 @@ mod tests {
         }))
         .unwrap();
         db
+    }
+
+    /// Debit and credit hit the same row, so the credit used to overwrite
+    /// the debit and mint `amount` into the treasury.
+    #[test]
+    fn a_treasury_spend_to_the_treasury_is_refused() {
+        let db = db();
+        let spend = GovernanceAction::TreasurySpend {
+            to: treasury_account(),
+            amount: 60,
+        };
+        assert!(matches!(
+            apply_submit(&db, &addr(1), spend.clone(), "loop", 5).unwrap_err(),
+            GovernanceError::InvalidAddress(_)
+        ));
+        // A proposal stored before the submission check still can't mint.
+        let treasury = treasury_account();
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            treasury.clone(),
+            AccountEntry {
+                balance: 100,
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        let mut stored = GovernanceUpdates::default();
+        stored
+            .put(
+                &ProposalKey(0),
+                &Proposal {
+                    id: 0,
+                    proposer: addr(1),
+                    action: spend,
+                    description: "loop".into(),
+                    created_at: 5,
+                    voting_ends_at: 15,
+                    yes_power: 9_000,
+                    no_power: 0,
+                    status: ProposalStatus::Open,
+                },
+            )
+            .unwrap();
+        db.write_batch(&stored).unwrap();
+        let (up, accounts) = apply_execute(&db, 0, 15).unwrap();
+        db.write_batch(&up).unwrap();
+        db.write_batch(&accounts).unwrap();
+        assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 100);
+        let p: Proposal = KvRead::get(&db, &ProposalKey(0)).unwrap().unwrap();
+        assert_eq!(p.status, ProposalStatus::Rejected);
     }
 
     #[test]
