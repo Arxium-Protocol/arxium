@@ -146,7 +146,7 @@ impl Default for Limits {
     }
 }
 
-#[derive(Debug)]
+/// `Debug` is hand-written below so the tokens never reach a log line.
 pub struct NodeConfig {
     pub base_path: PathBuf,
     /// Chain to run: a built-in preset name (`devnet`, `local`) or a path to
@@ -187,6 +187,44 @@ pub struct NodeConfig {
     pub snapshot_trust: Option<(u64, String)>,
 }
 
+impl std::fmt::Debug for NodeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `run_node` logs the whole config at boot; printing the tokens there
+        // handed admin access to anyone who can read journald/Docker logs.
+        // Destructured so a new field is a compile error here, not a silent
+        // omission (or a new secret printed by a derive).
+        let Self {
+            base_path,
+            chain,
+            port,
+            p2p_port,
+            bootnodes,
+            is_bootnode,
+            is_validator,
+            rpc_token,
+            admin_token,
+            rpc_bind,
+            limits,
+            snapshot_trust,
+        } = self;
+        let redact = |token: &Option<String>| token.as_ref().map(|_| "<redacted>");
+        f.debug_struct("NodeConfig")
+            .field("base_path", base_path)
+            .field("chain", chain)
+            .field("port", port)
+            .field("p2p_port", p2p_port)
+            .field("bootnodes", bootnodes)
+            .field("is_bootnode", is_bootnode)
+            .field("is_validator", is_validator)
+            .field("rpc_token", &redact(rpc_token))
+            .field("admin_token", &redact(admin_token))
+            .field("rpc_bind", rpc_bind)
+            .field("limits", limits)
+            .field("snapshot_trust", snapshot_trust)
+            .finish()
+    }
+}
+
 impl NodeConfig {
     /// Config for opening a chain's data without running a node — offline
     /// commands (`snapshot`, `prune`) and tests. Not a validator (so no key
@@ -207,6 +245,29 @@ impl NodeConfig {
             limits: Limits::default(),
             snapshot_trust: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod node_config_tests {
+    use super::*;
+
+    #[test]
+    fn debug_redacts_tokens() {
+        let config = NodeConfig {
+            rpc_token: Some("rpc-secret".into()),
+            admin_token: Some("admin-secret".into()),
+            ..NodeConfig::offline(PathBuf::from("/tmp/x"), "devnet")
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("secret"), "{printed}");
+        assert!(
+            printed.contains(r#"rpc_token: Some("<redacted>")"#),
+            "{printed}"
+        );
+        assert!(
+            format!("{:?}", NodeConfig::offline(PathBuf::new(), "x")).contains("admin_token: None")
+        );
     }
 }
 
