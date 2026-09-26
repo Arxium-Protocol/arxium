@@ -47,7 +47,7 @@ pub enum Command {
         /// cosmetic: it materializes a real `StakeAllocation`, so it is what
         /// the validator can be slashed against and what it unstakes on
         /// leaving. Defaults to the same floor a runtime join must clear.
-        #[arg(long, default_value_t = 100_000 * 1_000_000_000)]
+        #[arg(long, default_value_t = xc_primitives::DEFAULT_MIN_VALIDATOR_STAKE)]
         stake: u128,
     },
 
