@@ -100,6 +100,20 @@ fn validate_symbol(symbol: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Shared by registration and `SetAssetMetadataUri`, so the later update
+/// can't park what registration refuses.
+fn validate_metadata_uri(uri: Option<&str>) -> anyhow::Result<()> {
+    if let Some(uri) = uri
+        && uri.len() > MAX_METADATA_URI_LEN
+    {
+        anyhow::bail!(
+            "metadata_uri is {} bytes, over the {MAX_METADATA_URI_LEN}-byte limit",
+            uri.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
     validate_symbol(&metadata.symbol)?;
     if metadata.name.is_empty() || metadata.name.len() > MAX_NAME_LEN {
@@ -114,14 +128,7 @@ fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
             metadata.decimals
         );
     }
-    if let Some(uri) = &metadata.metadata_uri
-        && uri.len() > MAX_METADATA_URI_LEN
-    {
-        anyhow::bail!(
-            "metadata_uri is {} bytes, over the {MAX_METADATA_URI_LEN}-byte limit",
-            uri.len()
-        );
-    }
+    validate_metadata_uri(metadata.metadata_uri.as_deref())?;
     // `Some(vec![])` is left valid on purpose: it means no jurisdiction may
     // hold the asset, which is useless but unambiguous, and is distinct from
     // `None` (unrestricted). Rejecting it would make `None` and empty behave
@@ -464,6 +471,7 @@ pub(crate) fn set_metadata_uri<V: KvRead<Error = StorageError>>(
     asset: &AssetRef,
     metadata_uri: Option<String>,
 ) -> anyhow::Result<BlockUpdates> {
+    validate_metadata_uri(metadata_uri.as_deref())?;
     let mut asset = require_issuer(view, action, asset)?;
     asset.metadata_uri = metadata_uri;
     Ok(BlockUpdates {
@@ -1787,5 +1795,47 @@ mod tests {
 
         let updates = dispatch_at(&transfer, &view, 3).expect("the proof clears the gate");
         assert_eq!(updates.assets.0[&(bond_ref, holder)], 10);
+    }
+}
+
+#[cfg(test)]
+mod metadata_uri_tests {
+    use crate::ActionPayload;
+    use crate::test_support::*;
+    use std::collections::HashMap;
+    use xc_primitives::{Action, Address, AssetRef};
+
+    /// Registration capped the URI; the later update did not, so the cap
+    /// could be bypassed one action after registering.
+    #[test]
+    fn set_asset_metadata_uri_enforces_the_registration_length_cap() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(10 * FEE_BUDGET))]),
+            HashMap::new(),
+        );
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::SetAssetMetadataUri {
+                asset: AssetRef::derive(&alice, "gold").unwrap(),
+                metadata_uri: Some("a".repeat(super::MAX_METADATA_URI_LEN + 1)),
+            },
+        };
+        let err = crate::dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            1,
+            &no_bls_owner,
+            0,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("byte limit"), "{err}");
     }
 }

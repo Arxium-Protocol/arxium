@@ -58,7 +58,10 @@ pub(crate) fn join_validator<V: KvRead<Error = StorageError>>(
         .get(&xc_circuit::ChainParamsKey)?
         .unwrap_or_default()
         .min_validator_stake;
-    if existing_active + stake < min_stake {
+    // Saturating: `stake` is caller-chosen, and an overflow panic here
+    // would take down every node executing the block. A sum that large can
+    // never be funded anyway, which `apply_stake` rejects below.
+    if existing_active.saturating_add(stake) < min_stake {
         anyhow::bail!("stake {stake} is below the minimum validator stake {min_stake}");
     }
     let (accounts, stakes) = circuit_staking::apply_stake(
@@ -182,24 +185,35 @@ pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
             validator,
         })?
         .ok_or_else(|| anyhow::anyhow!("{master} has no stake in {validator} to unstake"))?;
-    // The master's own nonce, not `action.sender`'s — this action's
-    // own replay protection already happened at admission (keyed on
-    // `action.sender`'s nonce); `apply_unstake`'s nonce check is
-    // master-account bookkeeping, meaningless against a different
-    // account's counter when `master != action.sender`.
-    let master_nonce = view
-        .get(&AccountKey(&master))?
-        .map(|entry| entry.nonce)
-        .unwrap_or(0);
-    let (accounts, stakes) = circuit_staking::apply_unstake(
+    // `apply_unstake` checks and bumps the nonce of the account it is
+    // given. When the master sent this action, that is `action.nonce` —
+    // passing the stored nonce instead would satisfy the check trivially,
+    // and `consume_nonce` then sees it already bumped and skips its own
+    // check, so an old signed `LeaveValidator` could be replayed after a
+    // re-join. When an operator sent it, the master's counter is not this
+    // action's to consume (that would invalidate whatever the master has in
+    // flight): its bump is dropped and `consume_nonce` charges the sender.
+    let sender_is_master = master == action.sender;
+    let circuit_nonce = if sender_is_master {
+        action.nonce
+    } else {
+        view.get(&AccountKey(&master))?
+            .map(|entry| entry.nonce)
+            .unwrap_or(0)
+    };
+    let (mut accounts, stakes) = circuit_staking::apply_unstake(
         view,
         &master,
-        master_nonce,
+        circuit_nonce,
         validator,
         self_stake.active_amount,
         current_height,
         unbonding_blocks(view)?,
     )?;
+    if !sender_is_master {
+        // Only its nonce changed; nothing else of the master's moves here.
+        accounts.0.remove(&master);
+    }
     // Keeps voting until the boundary; the stake is already unbonding and
     // stays slashable for the whole unbonding window.
     let epoch_length = view.get(&ChainParamsKey)?.unwrap_or_default().epoch_length;
@@ -953,5 +967,140 @@ mod tests {
             pubkey,
             "the registered key must be the one the action carried",
         );
+    }
+}
+
+#[cfg(test)]
+mod nonce_and_overflow_tests {
+    use super::*;
+    use crate::ActionPayload;
+    use crate::test_support::*;
+    use std::collections::HashMap;
+    use xc_primitives::Action;
+
+    fn leave(sender: &Address, validator: &Address, nonce: u64) -> ChainAction {
+        Action {
+            sender: sender.clone(),
+            nonce,
+            signature: None,
+            payload: ActionPayload::LeaveValidator {
+                validator: validator.clone(),
+            },
+        }
+    }
+
+    /// A self-sent `LeaveValidator` used to hand `apply_unstake` the stored
+    /// nonce, so the check always passed, and `consume_nonce` then skipped
+    /// its own — any nonce went through, and an old signed leave could be
+    /// replayed after the validator re-joined.
+    #[test]
+    fn leave_validator_rejects_a_stale_nonce() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = temp_db();
+        let mut alice_entry = funded(FEE_BUDGET);
+        alice_entry.nonce = 7;
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), alice_entry)]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, 2_000),
+            )]),
+        );
+        let validators = [alice.clone(), bob];
+        let run = |nonce| {
+            crate::dispatch(
+                &leave(&alice, &alice, nonce),
+                &view,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &validators,
+                0,
+                &no_bls_owner,
+                0,
+            )
+        };
+        let err = run(3).unwrap_err();
+        assert!(err.to_string().contains("nonce"), "{err}");
+        let updates = run(7).unwrap();
+        assert_eq!(updates.accounts.0[&alice].nonce, 8);
+    }
+
+    /// An operator-sent leave consumes the operator's nonce, never the
+    /// master's.
+    #[test]
+    fn operator_leave_consumes_the_operators_nonce_not_the_masters() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let operator = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let db = temp_db();
+        let mut alice_entry = funded(0);
+        alice_entry.nonce = 4;
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (alice.clone(), alice_entry),
+                (operator.clone(), funded(FEE_BUDGET)),
+            ]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, 2_000),
+            )]),
+        );
+        view.put(&StakeByValidatorKey(&alice), &vec![alice.clone()])
+            .unwrap();
+        let lookup = make_operator_lookup(HashMap::from([(alice.clone(), operator.clone())]));
+        let updates = crate::dispatch(
+            &leave(&operator, &alice, 0),
+            &view,
+            &lookup,
+            &operator_validators_lookup,
+            &[alice.clone(), bob],
+            0,
+            &no_bls_owner,
+            0,
+        )
+        .unwrap();
+        assert_eq!(updates.accounts.0[&operator].nonce, 1);
+        assert!(
+            !updates.accounts.0.contains_key(&alice),
+            "the master's nonce must not move"
+        );
+    }
+
+    /// `existing_active + stake` used to be unchecked: with overflow checks
+    /// on (release profile) a crafted stake panicked the executing node.
+    #[test]
+    fn join_with_an_overflowing_stake_is_rejected_not_a_panic() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let db = temp_db();
+        let view = seeded_view(
+            &db,
+            HashMap::from([(alice.clone(), funded(FEE_BUDGET))]),
+            HashMap::from([((alice.clone(), alice.clone()), self_allocation(&alice, 1))]),
+        );
+        let action = Action {
+            sender: alice.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::JoinValidator {
+                validator: alice,
+                stake: u128::MAX,
+                bls_pubkey: test_bls_pubkey(1),
+                bls_pop: test_bls_pop(1),
+            },
+        };
+        let result = crate::dispatch(
+            &action,
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            10,
+            &no_bls_owner,
+            0,
+        );
+        assert!(result.is_err());
     }
 }

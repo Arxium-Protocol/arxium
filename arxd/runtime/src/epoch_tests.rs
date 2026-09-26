@@ -349,3 +349,85 @@ fn the_set_is_cut_at_max_validator_set_by_stake() {
         "cut from the set, back to waiting"
     );
 }
+
+fn balance(db: &ArxiumDb, address: &Address) -> u128 {
+    xc_circuit::KvRead::get(db, &xc_circuit::AccountKey(address))
+        .unwrap()
+        .map(|e: AccountEntry| e.balance)
+        .unwrap_or(0)
+}
+
+/// A missed slot runs both the block reward (debits the pool) and the
+/// downtime slash (credits the pool) in the same seal. Both must land: the
+/// slash's pool row used to be computed from the pre-reward balance and
+/// overwrite the reward's, so the reward was paid out without ever leaving
+/// the pool — minted from nothing on every missed-slot block.
+#[test]
+fn a_missed_slot_block_still_debits_the_block_reward_from_the_pool() {
+    let db = chain(&[1, 2, 3], MIN_VALIDATOR_STAKE);
+    let pool = circuit_staking::reward_pool_account();
+    let pool_start = 1_000 * xc_primitives::DEFAULT_REWARD_PER_BLOCK;
+    db.write_batch(&AccountUpdates(BTreeMap::from([(
+        pool.clone(),
+        AccountEntry {
+            balance: pool_start,
+            ..Default::default()
+        },
+    )])))
+    .unwrap();
+    // Give the primary's stake sub-account real funds so the slash moves
+    // something into the pool.
+    let height = 4;
+    let validators = db.validator_addresses_at(height).unwrap();
+    let primary = xc_primitives::expected_proposer(&validators, height).unwrap();
+    let backup = validators.iter().find(|v| **v != primary).unwrap().clone();
+    let sub = circuit_staking::stake_subaccount(&primary);
+    db.write_batch(&AccountUpdates(BTreeMap::from([(
+        sub.clone(),
+        AccountEntry {
+            balance: MIN_VALIDATOR_STAKE,
+            ..Default::default()
+        },
+    )])))
+    .unwrap();
+    let supply_before = balance(&db, &pool) + balance(&db, &backup) + balance(&db, &sub);
+
+    let view = BlockView::new(&db);
+    let updates =
+        CoreChainRuntime::on_block_sealed(&view, &backup, 0, &validators, height).unwrap();
+    db.write_batch(&updates.accounts).unwrap();
+
+    let slashed = MIN_VALIDATOR_STAKE - balance(&db, &sub);
+    assert!(slashed > 0, "the downtime slash must move stake");
+    assert_eq!(
+        balance(&db, &pool),
+        pool_start - xc_primitives::DEFAULT_REWARD_PER_BLOCK + slashed,
+        "pool = start - reward + slash"
+    );
+    let supply_after = balance(&db, &pool) + balance(&db, &backup) + balance(&db, &sub);
+    assert_eq!(supply_before, supply_after, "sealing must conserve supply");
+}
+
+/// A primary that misses the boundary block itself is jailed by that very
+/// seal; the boundary hook must see the jail (and the slashed stake) and
+/// leave it out of the next set, not re-admit it for another epoch.
+#[test]
+fn a_primary_that_misses_the_boundary_block_is_not_in_the_next_set() {
+    let db = chain(&[1, 2, 3], MIN_VALIDATOR_STAKE);
+    let height = boundary_of(0, EPOCH);
+    let validators = db.validator_addresses_at(height).unwrap();
+    let primary = xc_primitives::expected_proposer(&validators, height).unwrap();
+    let backup = validators.iter().find(|v| **v != primary).unwrap().clone();
+    let view = BlockView::new(&db);
+    let updates =
+        CoreChainRuntime::on_block_sealed(&view, &backup, 0, &validators, height).unwrap();
+    let set = updates.validator_set.expect("boundary writes a set");
+    assert!(
+        !set.contains_key(&primary),
+        "jailed this block, must be out of the next set"
+    );
+    assert_eq!(
+        updates.validator_statuses.0.get(&primary),
+        Some(&Some(ValidatorStatus::Jailed { until_epoch: 2 }))
+    );
+}
