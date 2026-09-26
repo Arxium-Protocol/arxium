@@ -135,6 +135,16 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     // Some((address, key)) if this node produces signed blocks on its turn;
     // None means it never produces — it only accepts blocks from peers.
     let identity = if config.is_validator {
+        let others = validator::other_chains_sharing_keys(&config.base_path, &chain_name);
+        if !others.is_empty() {
+            tracing::warn!(
+                "validator keys in {} are also used by chain(s) {}: blocks and votes are \
+                 bound to one chain, but signed transactions are not. Use a separate \
+                 --base-path per chain",
+                config.base_path.display(),
+                others.join(", ")
+            );
+        }
         let key = validator::load_or_generate_key(&config.base_path)?;
         let address = Address::from_pubkey_bytes(key.verifying_key().as_bytes())?;
         Some((address, key))

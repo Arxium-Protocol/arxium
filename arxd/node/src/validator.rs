@@ -52,6 +52,23 @@ fn load_or_generate_hex_seed(path: &Path, what: &str) -> Result<Zeroizing<[u8; 3
     Ok(seed)
 }
 
+/// Other chains with a data dir under `base_path`, which therefore share its
+/// validator keys with `chain_name`.
+// ponytail: warning only; per-chain key dirs (`<base>/<chain>/keys/`) need a
+// migration for every existing node and the key subcommands.
+pub fn other_chains_sharing_keys(base_path: &Path, chain_name: &str) -> Vec<String> {
+    let mut chains: Vec<String> = std::fs::read_dir(base_path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.path().join("data").is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != chain_name)
+        .collect();
+    chains.sort();
+    chains
+}
+
 /// Loads the validator signing key from `<base_path>/validator.key` (a
 /// hex-encoded 32-byte seed), generating and persisting a new one if absent.
 /// Logs the resulting address — an operator needs it to know whether this
@@ -157,6 +174,25 @@ mod tests {
     /// actually mints a validator's signing keys — a regression to
     /// `std::fs::write` + chmod would leave both of them briefly
     /// world-readable, and only this test would notice.
+    #[test]
+    fn finds_other_chains_under_the_same_base_path() {
+        let dir =
+            std::env::temp_dir().join(format!("arxium-test-shared-keys-{}", std::process::id()));
+        assert!(
+            other_chains_sharing_keys(&dir, "mainnet").is_empty(),
+            "no dir yet"
+        );
+        for chain in ["mainnet", "testnet", "devnet"] {
+            std::fs::create_dir_all(dir.join(chain).join("data")).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("not-a-chain")).unwrap();
+        assert_eq!(
+            other_chains_sharing_keys(&dir, "mainnet"),
+            ["devnet", "testnet"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn generated_validator_keys_are_never_world_readable() {
         let dir = std::env::temp_dir().join(format!(
