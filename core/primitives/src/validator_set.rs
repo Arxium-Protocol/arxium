@@ -185,6 +185,8 @@ pub struct ChainParams {
     #[serde(default = "default_block_interval_secs")]
     pub block_interval_secs: u64,
     /// Blocks per epoch. The validator set only changes at epoch boundaries.
+    /// Fixed for the chain's life: governance refuses to change it (see
+    /// `circuit_governance::changes_epoch_length`).
     #[serde(default = "default_epoch_length")]
     pub epoch_length: u64,
     /// Whether `JoinValidator` (and the boundary hook) require the validator

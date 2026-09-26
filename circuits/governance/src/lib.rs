@@ -86,6 +86,20 @@ fn proposal<V: KvRead<Error = StorageError>>(
         .ok_or(GovernanceError::UnknownProposal(id))
 }
 
+/// Epochs are `height / epoch_length` from genesis, and the set in force is
+/// read from one exact key (`validator_set_effective_height`). A new length
+/// moves that key to a height with no row (empty set, nobody can vote) or
+/// back onto an old row (a stale set votes), and re-numbers every stored
+/// epoch index (`Leaving { from_epoch }`, jail `until_epoch`).
+/// ponytail: fixed for the chain's life; retuning needs an epoch grid
+/// anchored at the height the change takes effect.
+fn changes_epoch_length<V: KvRead<Error = StorageError>>(
+    view: &V,
+    proposed: &ChainParams,
+) -> Result<bool, StorageError> {
+    Ok(proposed.epoch_length != chain_params(view)?.epoch_length)
+}
+
 /// The cheap sanity checks on a proposed action, run at submission so a
 /// proposal that could never execute isn't voted on for a week. State-
 /// dependent checks (treasury balance) wait for execution.
@@ -172,6 +186,13 @@ pub fn apply_submit<V: KvRead<Error = StorageError>>(
 ) -> Result<(u64, GovernanceUpdates), GovernanceError> {
     voting_power(view, proposer, current_height)?;
     validate_action(&action)?;
+    if let GovernanceAction::SetChainParams(p) = &action
+        && changes_epoch_length(view, p)?
+    {
+        return Err(GovernanceError::InvalidParams(
+            "epoch_length can't be changed by governance",
+        ));
+    }
     let id = view.get(&NextProposalIdKey)?.unwrap_or(0);
     let proposal = Proposal {
         id,
@@ -260,6 +281,9 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
     proposal.status = ProposalStatus::Rejected;
     if passed {
         match &proposal.action {
+            // Refused at submission too; kept for proposals stored before
+            // that check. Falls through as Rejected.
+            GovernanceAction::SetChainParams(params) if changes_epoch_length(view, params)? => {}
             GovernanceAction::SetChainParams(params) => {
                 updates.put(&ChainParamsKey, params)?;
                 proposal.status = ProposalStatus::Executed;
@@ -541,5 +565,50 @@ mod tests {
         let (up, _) = apply_execute(&db, id, 10).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(chain_params(&db).unwrap(), new_params);
+    }
+
+    #[test]
+    fn epoch_length_changes_are_refused_and_stored_ones_rejected() {
+        let db = db();
+        let before = chain_params(&db).unwrap();
+        let longer = ChainParams {
+            epoch_length: before.epoch_length * 2,
+            ..before.clone()
+        };
+        assert!(matches!(
+            apply_submit(
+                &db,
+                &addr(1),
+                GovernanceAction::SetChainParams(longer.clone()),
+                "",
+                0
+            )
+            .unwrap_err(),
+            GovernanceError::InvalidParams(_)
+        ));
+
+        // A passing proposal stored before submission checked this.
+        let mut stored = GovernanceUpdates::default();
+        stored
+            .put(
+                &ProposalKey(0),
+                &Proposal {
+                    id: 0,
+                    proposer: addr(1),
+                    action: GovernanceAction::SetChainParams(longer),
+                    description: String::new(),
+                    created_at: 0,
+                    voting_ends_at: 10,
+                    yes_power: TOTAL_VOTING_POWER,
+                    no_power: 0,
+                    status: ProposalStatus::Open,
+                },
+            )
+            .unwrap();
+        db.write_batch(&stored).unwrap();
+        let (up, _) = apply_execute(&db, 0, 10).unwrap();
+        db.write_batch(&up).unwrap();
+        assert_eq!(proposal(&db, 0).unwrap().status, ProposalStatus::Rejected);
+        assert_eq!(chain_params(&db).unwrap(), before);
     }
 }
