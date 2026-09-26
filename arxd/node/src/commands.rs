@@ -166,11 +166,12 @@ pub(crate) fn cmd_prune<R: ChainRuntime>(
     let config = xc_primitives::NodeConfig::offline(base_path.to_path_buf(), chain);
     let components = new_partial::<R>(&config)?;
     let tip = components.db.get_tip_height()?.unwrap_or(0);
-    let requested_cutoff = tip.saturating_sub(retain_blocks);
-    let actual_cutoff = requested_cutoff.min(components.db.get_final_watermark()?);
-    components.db.prune::<R::Payload>(requested_cutoff)?;
+    let report = components
+        .db
+        .prune::<R::Payload>(tip.saturating_sub(retain_blocks))?;
     println!(
-        "pruned blocks and superseded validator-set snapshots below height {actual_cutoff} (tip {tip}, retain_blocks {retain_blocks})"
+        "pruned {} block(s); none remain below height {} (tip {tip}, retain_blocks {retain_blocks})",
+        report.blocks, report.cutoff
     );
     Ok(())
 }

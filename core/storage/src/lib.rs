@@ -579,6 +579,14 @@ type BatchEntries = Vec<(Vec<u8>, Vec<u8>)>;
 /// `export_all_entries` hands to snapshot/artifact writers.
 type ExportedEntries = Vec<(String, Vec<u8>, Vec<u8>)>;
 
+/// What `ArxiumDb::prune` did: blocks below `cutoff` (after clamping to the
+/// finalized watermark) are gone, `blocks` of them deleted by this call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneReport {
+    pub cutoff: u64,
+    pub blocks: u64,
+}
+
 /// Anything that can be turned into a set of key-value pairs for storage.
 pub trait BatchWritable {
     fn batch_entries(&self) -> Result<BatchEntries, StorageError>;
@@ -1509,19 +1517,27 @@ impl ArxiumDb {
     /// (replay protection only needs "did I see this signature", not the
     /// block itself); revisit with a per-block action list if a caller ever
     /// needs the two to agree.
-    pub fn prune<P: DeserializeOwned + Serialize>(&self, cutoff: u64) -> Result<(), StorageError> {
+    ///
+    /// Returns what was actually done — the clamped cutoff and how many
+    /// blocks were deleted — so callers report that instead of re-deriving it.
+    pub fn prune<P: DeserializeOwned + Serialize>(
+        &self,
+        cutoff: u64,
+    ) -> Result<PruneReport, StorageError> {
         let cutoff = cutoff.min(self.get_final_watermark()?);
         let mut batch = WriteBatch::default();
+        let mut blocks = 0;
 
         for height in 0..cutoff {
             if let Some(block) = self.get_block::<P>(height)? {
                 batch.delete_cf(self.cf(CF_BLOCKS), format!("block:{height:020}"));
                 batch.delete_cf(self.cf(CF_BLOCKS), format!("block_hash:{}", block.hash()));
+                blocks += 1;
             }
         }
 
         self.db.write(batch)?;
-        Ok(())
+        Ok(PruneReport { cutoff, blocks })
     }
 
     /// Dumps every `(column_family, key, value)` triple currently on disk —
@@ -3873,7 +3889,15 @@ mod divergence_recovery_tests {
 
         // Asked to prune past the watermark, but the watermark clamps it —
         // nothing above height 3 may be touched, watermark or not.
-        db.prune::<()>(10).unwrap();
+        assert_eq!(
+            db.prune::<()>(10).unwrap(),
+            PruneReport {
+                cutoff: 3,
+                blocks: 3
+            }
+        );
+        // A second run reports the same cutoff but deletes nothing.
+        assert_eq!(db.prune::<()>(10).unwrap().blocks, 0);
 
         for height in 0..3 {
             assert!(
