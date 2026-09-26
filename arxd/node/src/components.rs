@@ -89,9 +89,10 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     // have the freedom to opt out of. A validator entry missing `bls_pubkey`
     // does not fail this call; it only warns (see `register_genesis_bls_keys`)
     // and that validator simply cannot vote until it registers one.
+    let in_data_path = || format!("genesis check on {}", data_path.display());
     let (chain_name, boot_nodes, state_root) = match &chain_spec {
         ChainSpec::Plain(snapshot) => {
-            let state_root = arxd_genesis::write_plain(&db, snapshot)?;
+            let state_root = arxd_genesis::write_plain(&db, snapshot).with_context(in_data_path)?;
             (
                 snapshot.chain_name.clone(),
                 snapshot.boot_nodes.clone(),
@@ -99,7 +100,7 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
             )
         }
         ChainSpec::Raw(raw) => {
-            arxd_genesis::write_raw(&db, raw)?;
+            arxd_genesis::write_raw(&db, raw).with_context(in_data_path)?;
             (
                 raw.chain_name.clone(),
                 raw.boot_nodes.clone(),

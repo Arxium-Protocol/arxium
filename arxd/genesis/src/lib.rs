@@ -111,10 +111,31 @@ pub fn register_genesis_bls_keys(
 /// recovered on the next call rather than left half-initialized: after the
 /// snapshot is written `db.is_initialized()` is already true, so only the
 /// block-0 check below still needs to run.
+///
+/// On a DB that already holds a block 0, the spec's own genesis root is
+/// recomputed in a scratch DB and must match it — otherwise a node reusing a
+/// data folder across a genesis reset (same `chain_name`, so same path)
+/// silently boots the old chain. See `check_same_genesis`.
+///
+/// ponytail: re-runs the spec's genesis in a scratch DB on every boot; fine
+/// for devnet-sized specs, store the root at install if genesis gets huge.
 pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
     snapshot
         .validate()
         .context("genesis spec failed validation")?;
+    if let Some(block_zero) = db.get_block::<()>(0)? {
+        let scratch = scratch_dir("arxium-genesis-check");
+        let expected = {
+            let scratch_db = ArxiumDb::open(&scratch).context("failed to open scratch DB")?;
+            install_plain(&scratch_db, snapshot)
+        };
+        std::fs::remove_dir_all(&scratch).ok();
+        check_same_genesis(&block_zero.state_root, &expected?)?;
+    }
+    install_plain(db, snapshot)
+}
+
+fn install_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
     if !db.is_initialized()? {
         db.write_batch(snapshot)?;
         register_genesis_bls_keys(db, &snapshot.validators)?;
@@ -195,6 +216,7 @@ pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
     let block_zero = db
         .get_block::<()>(0)?
         .context("raw chain spec installed but block 0 is missing from its entries")?;
+    check_same_genesis(&block_zero.state_root, &raw.state_root)?;
     seed_genesis_hash(db, &block_zero.state_root)?;
     let entries = artifact_entries(raw);
     seed_genesis_effects(
@@ -202,6 +224,34 @@ pub fn write_raw(db: &ArxiumDb, raw: &RawGenesis) -> Result<()> {
         entries.iter().map(|(_, k, v)| (k.as_slice(), v.as_slice())),
     )?;
     Ok(())
+}
+
+/// Block 0's state root never changes, so it identifies the chain a DB was
+/// installed for. A mismatch with the `--chain` spec means the data folder
+/// predates a genesis reset: booting would sit on the old chain, on a gossip
+/// topic nobody else uses, with no error.
+fn check_same_genesis(installed: &str, spec: &str) -> Result<()> {
+    if installed != spec {
+        bail!(
+            "this database holds a different chain: its genesis state root is {installed}, \
+             but the --chain spec's is {spec} — the chain was probably reset; wipe this \
+             node's data directory (<base_path>/<chain>/data) and restart"
+        );
+    }
+    Ok(())
+}
+
+/// Unique temp path for a throwaway DB.
+fn scratch_dir(prefix: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "{prefix}-{}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::thread::current().id(),
+    ))
 }
 
 /// Records the chain's own genesis hash (block 0's state root) where
@@ -266,20 +316,12 @@ pub fn derive_raw(spec_json: &str) -> Result<RawGenesis> {
         hex::encode(Sha256::digest(spec_json.as_bytes()))
     };
 
-    let scratch_dir = std::env::temp_dir().join(format!(
-        "arxium-genesis-derive-{}-{}-{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos(),
-        std::thread::current().id(),
-    ));
-    let db = ArxiumDb::open(&scratch_dir).context("failed to open scratch DB")?;
+    let scratch = scratch_dir("arxium-genesis-derive");
+    let db = ArxiumDb::open(&scratch).context("failed to open scratch DB")?;
     let state_root = write_plain(&db, &snapshot)?;
     let raw_entries = db.export_all_entries()?;
     drop(db);
-    std::fs::remove_dir_all(&scratch_dir).ok();
+    std::fs::remove_dir_all(&scratch).ok();
 
     let entries = raw_entries
         .into_iter()
@@ -366,16 +408,32 @@ mod tests {
     }"#;
 
     fn scratch_db() -> (ArxiumDb, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "arxium-test-genesis-{}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            std::thread::current().id(),
-        ));
+        let dir = scratch_dir("arxium-test-genesis");
         (ArxiumDb::open(&dir).unwrap(), dir)
+    }
+
+    /// Genesis reset with an unchanged `chain_name` reuses the same data
+    /// folder: both spec variants must refuse the old DB, not boot on it.
+    #[test]
+    fn existing_db_from_a_different_genesis_is_rejected() {
+        let mut snapshot: Snapshot = serde_json::from_str(SPEC).unwrap();
+        let (db, dir) = scratch_db();
+        write_plain(&db, &snapshot).unwrap();
+
+        snapshot.accounts.insert(
+            Address::from_pubkey_bytes(&[9; 32]).unwrap(),
+            AccountEntry {
+                balance: 5,
+                ..Default::default()
+            },
+        );
+        let err = write_plain(&db, &snapshot).unwrap_err();
+        assert!(err.to_string().contains("different chain"), "{err:?}");
+
+        let raw = derive_raw(&serde_json::to_string(&snapshot).unwrap()).unwrap();
+        let err = write_raw(&db, &raw).unwrap_err();
+        assert!(err.to_string().contains("different chain"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `write_plain` twice against the same DB must not re-run genesis or
