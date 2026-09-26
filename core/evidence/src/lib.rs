@@ -49,7 +49,12 @@ pub enum EvidenceError {
 /// height, with different content — the only way that's possible under
 /// plain Ed25519 is the proposer having signed twice. Returns the offending
 /// validator's address.
+///
+/// Signatures are checked against `genesis_hash`, the chain the caller is
+/// judging for: blocks the same key signed on another chain don't verify,
+/// so they can't get a validator slashed here.
 pub fn verify_equivocation<P: Serialize>(
+    genesis_hash: &[u8; 32],
     evidence: &EquivocationEvidence<P>,
 ) -> Result<Address, EvidenceError> {
     let a = &evidence.block_a;
@@ -65,8 +70,8 @@ pub fn verify_equivocation<P: Serialize>(
     if a.hash() == b.hash() {
         return Err(EvidenceError::SameBlock);
     }
-    a.verify_proposer_signature()?;
-    b.verify_proposer_signature()?;
+    a.verify_proposer_signature(genesis_hash)?;
+    b.verify_proposer_signature(genesis_hash)?;
     Ok(proposer_a)
 }
 
@@ -601,7 +606,7 @@ where
                 block_a: existing,
                 block_b: block,
             };
-            let proposer = match verify_equivocation(&evidence) {
+            let proposer = match verify_equivocation(&genesis_hash, &evidence) {
                 Ok(proposer) => proposer,
                 Err(err) => {
                     warn!("evidence: rejected equivocation evidence: {err}");
@@ -650,11 +655,14 @@ mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
 
+    /// Same value every `spawn_evidence_watcher` call below passes.
+    const GENESIS: [u8; 32] = [7u8; 32];
+
     fn signed_block(key: &SigningKey, height: u64, timestamp: u64) -> Block<()> {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(timestamp);
         block.height = height;
-        block.sign(addr, key);
+        block.sign(&GENESIS, addr, key);
         block
     }
 
@@ -664,7 +672,8 @@ mod tests {
         let block_a = signed_block(&key, 5, 100);
         let block_b = signed_block(&key, 5, 200);
 
-        let proposer = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap();
+        let proposer =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap();
         assert_eq!(
             proposer,
             Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap()
@@ -677,7 +686,8 @@ mod tests {
         let block_a = signed_block(&key, 5, 100);
         let block_b = block_a.clone();
 
-        let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
+        let err =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
         assert!(matches!(err, EvidenceError::SameBlock));
     }
 
@@ -688,7 +698,8 @@ mod tests {
         let block_a = signed_block(&key_a, 5, 100);
         let block_b = signed_block(&key_b, 5, 200);
 
-        let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
+        let err =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
         assert!(matches!(err, EvidenceError::ProposerMismatch));
     }
 
@@ -698,7 +709,8 @@ mod tests {
         let block_a = signed_block(&key, 5, 100);
         let block_b = signed_block(&key, 6, 200);
 
-        let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
+        let err =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
         assert!(matches!(err, EvidenceError::HeightMismatch(5, 6)));
     }
 
@@ -710,7 +722,23 @@ mod tests {
         // Tamper after signing — signature no longer matches content.
         block_a.timestamp += 1;
 
-        let err = verify_equivocation(&EquivocationEvidence { block_a, block_b }).unwrap_err();
+        let err =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
+        assert!(matches!(err, EvidenceError::Signature(_)));
+    }
+
+    /// A key reused on another chain (a testnet) signs two blocks at the same
+    /// height there. Checked against this chain's genesis hash they must not
+    /// count as equivocation.
+    #[test]
+    fn verify_equivocation_rejects_blocks_signed_for_another_chain() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let block_a = signed_block(&key, 5, 100);
+        let block_b = signed_block(&key, 5, 200);
+
+        let other_chain = [0x55u8; 32];
+        let err = verify_equivocation(&other_chain, &EquivocationEvidence { block_a, block_b })
+            .unwrap_err();
         assert!(matches!(err, EvidenceError::Signature(_)));
     }
 
@@ -756,7 +784,7 @@ mod tests {
             build_evidence_action,
             build_execution_fault_action,
             evidence_dir.clone(),
-            [7u8; 32],
+            GENESIS,
         );
 
         tx.send(EvidenceEvent::ExecutionDisagreement {
@@ -827,7 +855,7 @@ mod tests {
             build_evidence_action,
             build_execution_fault_action,
             evidence_dir.clone(),
-            [7u8; 32],
+            GENESIS,
         );
 
         tx.send(EvidenceEvent::BlockDivergence {
@@ -922,7 +950,7 @@ mod tests {
             build_evidence_action,
             build_execution_fault_action,
             evidence_dir.clone(),
-            [7u8; 32],
+            GENESIS,
         );
 
         // Two different dissenting voters reporting the same disputed
@@ -1021,7 +1049,7 @@ mod tests {
             build_evidence_action,
             build_execution_fault_action,
             evidence_dir.clone(),
-            [7u8; 32],
+            GENESIS,
         );
 
         for proposed in [proposed_a, proposed_b] {
@@ -1088,7 +1116,7 @@ mod tests {
             build_evidence_action,
             build_execution_fault_action,
             evidence_dir.clone(),
-            [7u8; 32],
+            GENESIS,
         );
 
         tx.send(EvidenceEvent::BlockObserved(competing)).unwrap();

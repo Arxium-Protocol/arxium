@@ -123,7 +123,7 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
             .with_context(|| {
                 format!("tip block {tip_height} is missing — on-disk corruption or tampering")
             })?
-            .verify_proposer_signature()
+            .verify_proposer_signature(&genesis_hash)
             .context("tip block signature failed verification — on-disk corruption or tampering")?;
     }
 

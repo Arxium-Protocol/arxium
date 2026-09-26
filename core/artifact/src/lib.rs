@@ -42,7 +42,9 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 /// years, so this never changes meaning, only grows new `Fault` variants.
 /// v3: every BLS signing-bytes function binds `genesis_hash`, so a v2
 /// artifact's signatures cannot be re-checked under v3 rules.
-pub const ARTIFACT_VERSION: u32 = 3;
+/// v4: the proposer's Ed25519 block signature binds `genesis_hash` too
+/// (`signing_bytes_for`), so a v3 artifact's block attestations don't verify.
+pub const ARTIFACT_VERSION: u32 = 4;
 
 /// The fields a proposer's signature actually covers (mirrors
 /// `xc_primitives::block::BlockSigningPayload` byte-for-byte, so
@@ -70,6 +72,7 @@ pub struct CanonicalHeader {
 /// this crate depending on `xc-primitives`.
 #[derive(Serialize)]
 struct SigningPayload<'a> {
+    genesis_hash: &'a [u8; 32],
     height: u64,
     parent_hash: &'a str,
     timestamp: u64,
@@ -87,13 +90,21 @@ struct SigningPayload<'a> {
 /// it's genuinely useful to anyone implementing a verifier outside this
 /// codebase, in another language: it's the one function that defines what
 /// "signing bytes" means for this format.
-pub fn signing_bytes_for(header: &CanonicalHeader) -> Result<Vec<u8>, VerifyError> {
+///
+/// `genesis` binds the signature to one chain: the same header signed for
+/// another chain (same validator key reused on a testnet) yields different
+/// bytes, so it can't be passed off as evidence here.
+pub fn signing_bytes_for(
+    genesis: &[u8; 32],
+    header: &CanonicalHeader,
+) -> Result<Vec<u8>, VerifyError> {
     let tx_root = decode_hex("tx_root", &header.tx_root)?;
     let tx_root: [u8; 32] = tx_root
         .as_slice()
         .try_into()
         .map_err(|_| VerifyError::BadTxRootLength(tx_root.len()))?;
     let payload = SigningPayload {
+        genesis_hash: genesis,
         height: header.height,
         parent_hash: &header.parent_hash,
         timestamp: header.timestamp,
@@ -620,6 +631,9 @@ pub enum Verdict {
 /// `core/primitives/src/block.rs`. Exposed (not `#[cfg(test)]`) so the
 /// cross-crate test can build the identical header without duplicating
 /// these literals and risking the two copies drifting apart.
+pub const FROZEN_TEST_GENESIS: [u8; 32] = [0x6e; 32];
+
+/// Header half of the frozen fixture; see [`FROZEN_TEST_GENESIS`].
 pub fn frozen_test_header() -> CanonicalHeader {
     CanonicalHeader {
         height: 42,
@@ -792,7 +806,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             proposer_pubkey,
             height,
             blocks,
-        } => verify_equivocation(proposer_pubkey, *height, blocks),
+        } => verify_equivocation(&genesis, proposer_pubkey, *height, blocks),
         Fault::ExecutionDisagreement {
             proposer_pubkey,
             height,
@@ -843,6 +857,7 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
 }
 
 fn verify_equivocation(
+    genesis: &[u8; 32],
     proposer_pubkey: &str,
     height: u64,
     blocks: &[BlockAttestation; 2],
@@ -864,7 +879,7 @@ fn verify_equivocation(
 
     let mut signed = Vec::with_capacity(2);
     for (i, block) in blocks.iter().enumerate() {
-        let bytes = signing_bytes_for(&block.header)?;
+        let bytes = signing_bytes_for(genesis, &block.header)?;
         check_sig(
             &key,
             &block.signature,
@@ -906,7 +921,7 @@ fn verify_execution_disagreement(
         });
     }
 
-    let bytes = signing_bytes_for(&proposed.header)?;
+    let bytes = signing_bytes_for(genesis, &proposed.header)?;
     check_sig(
         &key,
         &proposed.signature,
@@ -1146,7 +1161,7 @@ fn verify_block_divergence(
         });
     }
 
-    let header_bytes = signing_bytes_for(&block_attestation.header)?;
+    let header_bytes = signing_bytes_for(genesis, &block_attestation.header)?;
     check_sig(
         &key,
         &block_attestation.signature,
@@ -1215,7 +1230,7 @@ mod tests {
     }
 
     fn attestation(key: &SigningKey, header: CanonicalHeader) -> BlockAttestation {
-        let bytes = signing_bytes_for(&header).unwrap();
+        let bytes = signing_bytes_for(&GENESIS, &header).unwrap();
         let signature = key.sign(&bytes);
         BlockAttestation {
             header,
@@ -1445,10 +1460,10 @@ mod tests {
     #[test]
     fn frozen_signing_bytes_vector() {
         let header = frozen_test_header();
-        let bytes = signing_bytes_for(&header).unwrap();
+        let bytes = signing_bytes_for(&FROZEN_TEST_GENESIS, &header).unwrap();
         assert_eq!(
             hex::encode(&bytes),
-            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
         );
     }
 
@@ -1500,7 +1515,7 @@ mod tests {
     ) -> DissentAttestation {
         let ep = [3u8; 32];
         let header_commitment: [u8; 32] =
-            Sha256::digest(signing_bytes_for(disputed_header).unwrap()).into();
+            Sha256::digest(signing_bytes_for(&GENESIS, disputed_header).unwrap()).into();
         let msg = dissent_signing_bytes(
             &GENESIS,
             height,
@@ -1645,6 +1660,12 @@ mod tests {
         else {
             unreachable!()
         };
+        // The block attestation and the commitment derived from it bind the
+        // genesis too (artifact v4).
+        let header_bytes = signing_bytes_for(&genesis, &proposed.header).unwrap();
+        proposed.signature = format!("0x{}", hex::encode(proposer.sign(&header_bytes).to_bytes()));
+        let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
+        dissent.header_commitment = format!("0x{}", hex::encode(header_commitment));
         let msg = dissent_signing_bytes(
             &genesis,
             dissent.height,
@@ -1655,12 +1676,46 @@ mod tests {
             &dissent.reason,
         );
         dissent.signature = format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &msg).0));
-        let _ = proposed;
         art.human_readable = serde_json::json!({ "note": "devnet soak run, height 5" });
         verify(&art).unwrap();
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tools/arx-verify/examples/disagreement.json"
+        );
+        std::fs::write(path, serde_json::to_string_pretty(&art).unwrap() + "\n").unwrap();
+    }
+
+    /// Same as above, for `tools/arx-verify/examples/equivocation.json`:
+    /// `cargo test -p xc-artifact regenerate_arx_verify_equivocation_example -- --ignored`
+    #[test]
+    #[ignore]
+    fn regenerate_arx_verify_equivocation_example() {
+        let proposer = SigningKey::from_bytes(&[7u8; 32]);
+        let genesis_hash = "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff";
+        let genesis = decode_hex_32("genesis_hash", genesis_hash).unwrap();
+        let attest = |tx_root: u8| {
+            let mut header = header(5, tx_root, "arx1proposer");
+            header.state_root = "0xstate".to_string();
+            let bytes = signing_bytes_for(&genesis, &header).unwrap();
+            BlockAttestation {
+                header,
+                signature: format!("0x{}", hex::encode(proposer.sign(&bytes).to_bytes())),
+            }
+        };
+        let art = EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: genesis_hash.to_string(),
+            fault: Fault::Equivocation {
+                proposer_pubkey: format!("0x{}", hex::encode(proposer.verifying_key().as_bytes())),
+                height: 5,
+                blocks: [attest(1), attest(2)],
+            },
+            human_readable: serde_json::json!({ "note": "devnet soak run, height 5" }),
+        };
+        verify(&art).unwrap();
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/arx-verify/examples/equivocation.json"
         );
         std::fs::write(path, serde_json::to_string_pretty(&art).unwrap() + "\n").unwrap();
     }
@@ -2199,7 +2254,7 @@ mod tests {
         }
 
         fn block_attestation(fx: &Fixture, header: CanonicalHeader) -> BlockAttestation {
-            let bytes = signing_bytes_for(&header).unwrap();
+            let bytes = signing_bytes_for(&GENESIS, &header).unwrap();
             let signature = fx.proposer_key.sign(&bytes);
             BlockAttestation {
                 header,
@@ -2215,7 +2270,7 @@ mod tests {
             proofs: Vec<StateProof>,
             signer: &xc_bls::BlsSecretKey,
         ) -> BlockDissentClaim {
-            let header_bytes = signing_bytes_for(header).unwrap();
+            let header_bytes = signing_bytes_for(&GENESIS, header).unwrap();
             let header_commitment: [u8; 32] = Sha256::digest(&header_bytes).into();
             let parent_state_root = format!("0x{}", hex::encode(parent_root));
             let computed_state_root = format!("0x{}", hex::encode(computed_root));
@@ -2333,7 +2388,7 @@ mod tests {
                 &fx,
                 &format!("0x{}", hex::encode(root_after_writing(key, b"x"))),
             );
-            let header_bytes = signing_bytes_for(&header).unwrap();
+            let header_bytes = signing_bytes_for(&GENESIS, &header).unwrap();
             let forged_signature = other_key.sign(&header_bytes);
             let attestation = BlockAttestation {
                 header: header.clone(),

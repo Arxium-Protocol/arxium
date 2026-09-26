@@ -53,6 +53,11 @@ pub(crate) fn validated_bls_pubkey(pubkey: &[u8], pop: &[u8]) -> anyhow::Result<
 /// ordinary user. Anyone *could* submit one given the two blocks, but
 /// `xc_evidence::verify_equivocation` is what actually gates the slash, not
 /// who submitted it — so that's fine.
+///
+/// Signatures are checked against this chain's genesis hash (block signing
+/// bytes bind it), so two blocks a validator signed with the same key on
+/// another chain — a testnet, say — can't get it slashed here. Fails closed
+/// on a chain with no seeded genesis hash, like `submit_execution_fault`.
 pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     view: &V,
     block_a: &ChainBlock,
@@ -71,11 +76,16 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
             block_a.height
         );
     }
+    let chain_genesis = view.get(&GenesisHashKey)?.ok_or_else(|| {
+        anyhow::anyhow!("this chain has no seeded genesis hash to check the evidence against")
+    })?;
+    let chain_genesis = Hash32::parse(&chain_genesis)
+        .map_err(|err| anyhow::anyhow!("this chain's genesis hash is malformed: {err}"))?;
     let evidence = xc_evidence::EquivocationEvidence {
         block_a: block_a.clone(),
         block_b: block_b.clone(),
     };
-    let equivocator = xc_evidence::verify_equivocation(&evidence)
+    let equivocator = xc_evidence::verify_equivocation(chain_genesis.as_bytes(), &evidence)
         .map_err(|err| anyhow::anyhow!("invalid equivocation evidence: {err}"))?;
     if view
         .get(&EvidenceMarkerKey {
@@ -383,15 +393,19 @@ mod tests {
     use std::collections::HashMap;
     use xc_primitives::Action;
 
+    /// Genesis hash the equivocation tests seed as `GenesisHashKey`.
+    const GENESIS: [u8; 32] = [0xa1u8; 32];
+
     fn signed_chain_block(
         key: &ed25519_dalek::SigningKey,
         height: u64,
         timestamp: u64,
+        genesis: &[u8; 32],
     ) -> ChainBlock {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: ChainBlock = xc_primitives::Block::genesis(timestamp);
         block.height = height;
-        block.sign(addr, key);
+        block.sign(genesis, addr, key);
         block
     }
 
@@ -399,8 +413,8 @@ mod tests {
     fn equivocation_evidence_slashes_the_equivocator() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        let block_a = signed_chain_block(&key, 5, 100);
-        let block_b = signed_chain_block(&key, 5, 200);
+        let block_a = signed_chain_block(&key, 5, 100, &GENESIS);
+        let block_b = signed_chain_block(&key, 5, 200, &GENESIS);
 
         let sub_account = circuit_staking::stake_subaccount(&equivocator);
         let db = temp_db();
@@ -420,6 +434,7 @@ mod tests {
             &vec![equivocator.clone()],
         )
         .unwrap();
+        view.put(&GenesisHashKey, &hex::encode(GENESIS)).unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -463,16 +478,42 @@ mod tests {
     fn blocks_from_different_rounds_are_not_equivocation() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let proposer = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        let block_a = signed_chain_block(&key, 5, 100);
+        let block_a = signed_chain_block(&key, 5, 100, &GENESIS);
         let mut block_b: ChainBlock = xc_primitives::Block::genesis(200);
         block_b.height = 5;
         block_b.round = 3;
-        block_b.sign(proposer.clone(), &key);
+        block_b.sign(&GENESIS, proposer.clone(), &key);
 
         let db = temp_db();
         let view = seeded_view(&db, HashMap::new(), HashMap::new());
         let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
         assert!(err.to_string().contains("different rounds"), "{err}");
+    }
+
+    /// Card 139: a validator reusing its key on a testnet signs two blocks
+    /// at the same height there. Submitted here they must not slash it.
+    #[test]
+    fn equivocation_signed_for_another_chain_is_rejected() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let testnet = [0x55u8; 32];
+        let block_a = signed_chain_block(&key, 5, 100, &testnet);
+        let block_b = signed_chain_block(&key, 5, 200, &testnet);
+
+        let db = temp_db();
+        let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
+        view.put(&GenesisHashKey, &hex::encode(GENESIS)).unwrap();
+        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid equivocation evidence"),
+            "{err}"
+        );
+
+        // Fail closed: no seeded genesis hash, no slash.
+        let block_a = signed_chain_block(&key, 5, 100, &GENESIS);
+        let block_b = signed_chain_block(&key, 5, 200, &GENESIS);
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
+        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        assert!(err.to_string().contains("no seeded genesis hash"), "{err}");
     }
 
     #[test]
@@ -587,8 +628,8 @@ mod tests {
     fn equivocation_evidence_rejected_when_already_processed() {
         let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         let equivocator = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        let block_a = signed_chain_block(&key, 5, 100);
-        let block_b = signed_chain_block(&key, 5, 200);
+        let block_a = signed_chain_block(&key, 5, 100, &GENESIS);
+        let block_b = signed_chain_block(&key, 5, 200, &GENESIS);
 
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
@@ -600,6 +641,7 @@ mod tests {
             &(),
         )
         .unwrap();
+        view.put(&GenesisHashKey, &hex::encode(GENESIS)).unwrap();
         let action = Action {
             sender: equivocator.clone(),
             nonce: 0,
@@ -651,14 +693,15 @@ mod tests {
             &vec![equivocator.clone()],
         )
         .unwrap();
+        view.put(&GenesisHashKey, &hex::encode(GENESIS)).unwrap();
         let submit = |view: &_, height: u64, nonce: u64| {
             let action = Action {
                 sender: reporter.clone(),
                 nonce,
                 signature: None,
                 payload: ActionPayload::SubmitEquivocationEvidence {
-                    block_a: Box::new(signed_chain_block(&key, height, 100)),
-                    block_b: Box::new(signed_chain_block(&key, height, 200)),
+                    block_a: Box::new(signed_chain_block(&key, height, 100, &GENESIS)),
+                    block_b: Box::new(signed_chain_block(&key, height, 200, &GENESIS)),
                 },
             };
             crate::dispatch(

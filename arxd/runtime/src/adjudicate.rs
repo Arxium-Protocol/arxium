@@ -1578,7 +1578,7 @@ mod tests {
             state_root: proposer_root,
             round: 0,
         };
-        let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
+        let header_bytes = xc_artifact::signing_bytes_for(&GENESIS, &header).unwrap();
         let block_attestation = xc_artifact::BlockAttestation {
             header: header.clone(),
             signature: format!(
@@ -1798,7 +1798,7 @@ mod tests {
 
         let mut bogus_header = block_attestation.header.clone();
         bogus_header.state_root = format!("0x{}", hex::encode([0xCCu8; 32]));
-        let bogus_bytes = xc_artifact::signing_bytes_for(&bogus_header).unwrap();
+        let bogus_bytes = xc_artifact::signing_bytes_for(&GENESIS, &bogus_header).unwrap();
         let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
         block_attestation.signature = format!(
             "0x{}",
@@ -1916,7 +1916,7 @@ mod tests {
             state_root: fake_post_a,
             round: 0,
         };
-        let header_bytes = xc_artifact::signing_bytes_for(&header).unwrap();
+        let header_bytes = xc_artifact::signing_bytes_for(&GENESIS, &header).unwrap();
         let block_attestation = xc_artifact::BlockAttestation {
             header: header.clone(),
             signature: format!(

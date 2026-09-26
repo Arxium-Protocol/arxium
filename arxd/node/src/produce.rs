@@ -267,7 +267,9 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         round_certificate,
     };
     if let Some((address, key)) = proposer {
-        new_block.sign(address.clone(), key);
+        // Bound to this chain's genesis hash, so the signature can't be
+        // replayed as (or mistaken for) one on another chain.
+        new_block.sign(&db.genesis_hash_bytes()?, address.clone(), key);
     }
     // One atomic write for the block record, the account changes it caused,
     // any stake-allocation changes (dispatched actions plus matured
@@ -880,6 +882,9 @@ mod tests {
                 .unwrap();
             let genesis: ChainBlock = xc_primitives::Block::genesis(0);
             db.write_batches(&[&genesis]).unwrap();
+            // Signing binds it, as `arxd/genesis` would have seeded it.
+            db.write_batch(&xc_storage::GenesisHash(format!("0x{}", "a1".repeat(32))))
+                .unwrap();
 
             // Height 1 is exempt from the timestamp rules and always goes to
             // the plain primary, so establish it first and test height 2.
@@ -915,6 +920,8 @@ mod tests {
             peer.write_batch(&ValidatorSetSnapshot::equal_power(0, &validators))
                 .unwrap();
             peer.write_batches(&[&genesis]).unwrap();
+            peer.write_batch(&xc_storage::GenesisHash(format!("0x{}", "a1".repeat(32))))
+                .unwrap();
 
             for (block, height) in [(block1, 1u64), (block2, 2)] {
                 let result = xc_executor::accept_block(
@@ -977,6 +984,8 @@ mod tests {
             .unwrap();
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
+        db.write_batch(&xc_storage::GenesisHash(format!("0x{}", "a1".repeat(32))))
+            .unwrap();
 
         let block1 =
             produce_block::<CoreChainRuntime>(&db, vec![], 1_000_000, Some((&addr, &key))).unwrap();

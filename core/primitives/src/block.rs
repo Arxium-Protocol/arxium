@@ -102,8 +102,16 @@ impl RawBlock {
 /// that required decoding `P` to find out. `tx_root` is a plain `[u8; 32]`,
 /// so every field here is `P`-free, and a chain-agnostic verifier can read
 /// `height` straight off it without decoding anything.
+///
+/// `genesis_hash` comes first and binds the signature to one chain. Without
+/// it, two blocks a validator signed at the same height on *another* chain
+/// sharing its Ed25519 key (a testnet, say) verify here just as well and get
+/// it slashed and tombstoned for equivocation it never committed on this
+/// chain. Same domain separation every BLS signing-bytes function already
+/// has (`precommit_signing_bytes` etc.).
 #[derive(Serialize)]
 struct BlockSigningPayload<'a> {
+    genesis_hash: &'a [u8; 32],
     height: u64,
     parent_hash: &'a str,
     timestamp: u64,
@@ -144,8 +152,9 @@ impl<P: Serialize> Block<P> {
     /// (not just used internally by `sign`/`verify_proposer_signature`) so
     /// evidence tooling can commit to what was actually signed without
     /// needing to decode `P`.
-    pub fn signing_bytes(&self, proposer: &Address) -> Vec<u8> {
+    pub fn signing_bytes(&self, genesis_hash: &[u8; 32], proposer: &Address) -> Vec<u8> {
         let payload = BlockSigningPayload {
+            genesis_hash,
             height: self.height,
             parent_hash: &self.parent_hash,
             timestamp: self.timestamp,
@@ -158,21 +167,23 @@ impl<P: Serialize> Block<P> {
             .expect("signing payload encoding should never fail")
     }
 
-    /// Sets `proposer` from `key` and signs the block's content.
-    pub fn sign(&mut self, proposer: Address, key: &SigningKey) {
-        let bytes = self.signing_bytes(&proposer);
+    /// Sets `proposer` from `key` and signs the block's content for the
+    /// chain whose genesis hash is `genesis_hash`.
+    pub fn sign(&mut self, genesis_hash: &[u8; 32], proposer: Address, key: &SigningKey) {
+        let bytes = self.signing_bytes(genesis_hash, &proposer);
         let signature = key.sign(&bytes);
         self.signature = Some(hex::encode(signature.to_bytes()));
         self.proposer = Some(proposer);
     }
 
     /// Verifies `signature` was produced by the private key behind `proposer`,
-    /// over this block's (height, parent_hash, timestamp, tx_root, proposer,
-    /// state_root). Proves nothing about `actions` on its own — a caller
+    /// over this block's (genesis_hash, height, parent_hash, timestamp,
+    /// tx_root, proposer, state_root, round) — so only for the chain whose
+    /// genesis hash the caller passes. Proves nothing about `actions` on its own — a caller
     /// that trusts `actions` off a validly-signed block without separately
     /// checking `tx_root` against them is trusting an unverified field; see
     /// `xc_executor::accept_block`.
-    pub fn verify_proposer_signature(&self) -> Result<(), SignatureError> {
+    pub fn verify_proposer_signature(&self, genesis_hash: &[u8; 32]) -> Result<(), SignatureError> {
         let proposer = self.proposer.as_ref().ok_or(SignatureError::Missing)?;
         let sig_hex = self.signature.as_deref().ok_or(SignatureError::Missing)?;
         let sig_bytes = hex::decode(sig_hex).map_err(|_| SignatureError::InvalidHex)?;
@@ -191,7 +202,7 @@ impl<P: Serialize> Block<P> {
             VerifyingKey::from_bytes(&pubkey_bytes).map_err(|_| SignatureError::Invalid)?;
 
         verifying_key
-            .verify_strict(&self.signing_bytes(proposer), &signature)
+            .verify_strict(&self.signing_bytes(genesis_hash, proposer), &signature)
             .map_err(|_| SignatureError::Invalid)
     }
 }
@@ -200,15 +211,17 @@ impl<P: Serialize> Block<P> {
 mod tests {
     use super::*;
 
+    const GENESIS: [u8; 32] = [0x6e; 32];
+
     #[test]
     fn sign_then_verify_round_trips() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(1234);
         block.height = 5;
-        block.sign(addr, &key);
+        block.sign(&GENESIS, addr, &key);
 
-        assert!(block.verify_proposer_signature().is_ok());
+        assert!(block.verify_proposer_signature(&GENESIS).is_ok());
     }
 
     #[test]
@@ -216,10 +229,10 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(1234);
-        block.sign(addr, &key);
+        block.sign(&GENESIS, addr, &key);
 
         block.timestamp += 1;
-        assert!(block.verify_proposer_signature().is_err());
+        assert!(block.verify_proposer_signature(&GENESIS).is_err());
     }
 
     /// `tx_root` is part of the signed header, so changing it after signing
@@ -233,17 +246,17 @@ mod tests {
         let key = SigningKey::from_bytes(&[7u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(1234);
-        block.sign(addr, &key);
+        block.sign(&GENESIS, addr, &key);
 
         block.tx_root = [0xffu8; 32];
-        assert!(block.verify_proposer_signature().is_err());
+        assert!(block.verify_proposer_signature(&GENESIS).is_err());
     }
 
     #[test]
     fn unsigned_block_fails_verification() {
         let block: Block<()> = Block::genesis(1234);
         assert!(matches!(
-            block.verify_proposer_signature(),
+            block.verify_proposer_signature(&GENESIS),
             Err(SignatureError::Missing)
         ));
     }
@@ -292,8 +305,8 @@ mod tests {
         let (block, proposer) = block_matching_frozen_artifact_header();
         let header = xc_artifact::frozen_test_header();
         assert_eq!(
-            block.signing_bytes(&proposer),
-            xc_artifact::signing_bytes_for(&header).unwrap(),
+            block.signing_bytes(&xc_artifact::FROZEN_TEST_GENESIS, &proposer),
+            xc_artifact::signing_bytes_for(&xc_artifact::FROZEN_TEST_GENESIS, &header).unwrap(),
         );
     }
 
@@ -307,8 +320,8 @@ mod tests {
     fn frozen_signing_bytes_vector_matches_artifact_crate() {
         let (block, proposer) = block_matching_frozen_artifact_header();
         assert_eq!(
-            hex::encode(block.signing_bytes(&proposer)),
-            "2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
+            hex::encode(block.signing_bytes(&xc_artifact::FROZEN_TEST_GENESIS, &proposer)),
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
         );
     }
 }

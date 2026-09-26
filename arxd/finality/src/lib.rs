@@ -1344,7 +1344,7 @@ mod tests {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(timestamp);
         block.height = height;
-        block.sign(addr, key);
+        block.sign(&GENESIS, addr, key);
         block
     }
 

@@ -198,7 +198,7 @@ mod dissent_evidence_bridge_tests {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(timestamp);
         block.height = height;
-        block.sign(addr, key);
+        block.sign(&[0xa1u8; 32], addr, key);
         block
     }
 
@@ -538,7 +538,8 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
         .proposer
         .as_ref()
         .expect("signature already verified, proposer present");
-    let header_commitment: [u8; 32] = Sha256::digest(candidate.signing_bytes(proposer)).into();
+    let header_commitment: [u8; 32] =
+        Sha256::digest(candidate.signing_bytes(&genesis_hash, proposer)).into();
     let msg = dissent_signing_bytes(
         &genesis_hash,
         height,

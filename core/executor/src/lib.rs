@@ -481,7 +481,9 @@ pub fn accept_block<P>(
 where
     P: Serialize + DeserializeOwned + Clone,
 {
-    block.verify_proposer_signature()?;
+    // Against this chain's genesis hash: a block the same proposer key
+    // signed for another chain must not pass as one of ours.
+    block.verify_proposer_signature(&db.genesis_hash_bytes()?)?;
 
     // The signature covers `tx_root`, not `actions` (see `BlockSigningPayload`)
     // — a valid signature alone proves nothing about the actions in this
@@ -1293,6 +1295,10 @@ mod tests {
 
     const TEST_EPOCH_LENGTH: u64 = 3;
 
+    /// Genesis hash every `temp_db` is seeded with, which blocks must be
+    /// signed for.
+    const GENESIS: [u8; 32] = [0xa1u8; 32];
+
     fn temp_db() -> ArxiumDb {
         let path = std::env::temp_dir().join(format!("arxium-test-executor-{}", uuid_like()));
         let db = ArxiumDb::open(&path).unwrap();
@@ -1300,7 +1306,7 @@ mod tests {
         // `arxd/genesis` would.
         db.write_batch(&xc_storage::GenesisHash(format!(
             "0x{}",
-            hex::encode([0xa1u8; 32])
+            hex::encode(GENESIS)
         )))
         .unwrap();
         db
@@ -1353,12 +1359,12 @@ mod tests {
         key: &SigningKey,
     ) -> Result<Block<TestPayload>, AcceptBlockError> {
         block.tx_root = xc_poe::tx_root(&block.actions).unwrap();
-        block.sign(proposer.clone(), key);
+        block.sign(&GENESIS, proposer.clone(), key);
         if let Err(AcceptBlockError::StateRootMismatch { expected, .. }) =
             accept_block(db, block.clone(), false, &flat, dispatch, seal)
         {
             block.state_root = expected;
-            block.sign(proposer.clone(), key);
+            block.sign(&GENESIS, proposer.clone(), key);
         }
         accept_block(db, block, false, &flat, dispatch, seal)
     }
@@ -1921,7 +1927,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block1.sign(addr.clone(), &key);
+        block1.sign(&GENESIS, addr.clone(), &key);
         let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
         (db, key, addr, block1)
     }
@@ -1964,7 +1970,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block.sign(addr.clone(), key);
+        block.sign(&GENESIS, addr.clone(), key);
         block
     }
 
@@ -2015,7 +2021,7 @@ mod tests {
         let mut block2 = signed_block_at(&db, &key, &addr, &block1, base + 1);
         block2.actions = actions;
         block2.tx_root = xc_poe::tx_root(&block2.actions).unwrap();
-        block2.sign(addr.clone(), &key);
+        block2.sign(&GENESIS, addr.clone(), &key);
         let err = accept_block(&db, block2, false, &heavy, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::BlockOverWeight { over: 1, .. }),
@@ -2155,7 +2161,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block1.sign(addr1, &key1);
+        block1.sign(&GENESIS, addr1, &key1);
         let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
         (db, sorted, block1)
     }
@@ -2231,7 +2237,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block2.sign(addr, &key);
+        block2.sign(&GENESIS, addr, &key);
         let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
         assert!(
             matches!(err, AcceptBlockError::ParentMismatch { .. }),
@@ -2260,13 +2266,26 @@ mod tests {
                 round: 0,
                 round_certificate: None,
             };
-            block2.sign(addr.clone(), &key);
+            block2.sign(&GENESIS, addr.clone(), &key);
             let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
             assert!(
                 matches!(err, AcceptBlockError::NotNextHeight { .. }),
                 "height {bad_height} against tip 1 should be rejected, got {err:?}",
             );
         }
+    }
+
+    /// The proposer's signature binds the genesis hash: the same block signed
+    /// for another chain (a validator reusing its key on a testnet) must be
+    /// rejected here, not accepted as ours.
+    #[test]
+    fn a_block_signed_for_another_chain_is_rejected() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+        let mut block2 = signed_block_at(&db, &key, &addr, &block1, block1.timestamp + 1);
+        block2.sign(&[0x55u8; 32], addr, &key);
+
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
+        assert!(matches!(err, AcceptBlockError::Signature(_)), "got {err:?}");
     }
 
     /// The finality gate: once a quorum certificate names a block at a
@@ -2291,7 +2310,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block2.sign(addr.clone(), &key);
+        block2.sign(&GENESIS, addr.clone(), &key);
 
         // A certificate naming a different block at height 2.
         db.write_batch(&xc_storage::FinalityRecord {
@@ -2381,7 +2400,7 @@ mod tests {
             round: 0,
             round_certificate: None,
         };
-        block1.sign(alice, &alice_key);
+        block1.sign(&GENESIS, alice, &alice_key);
 
         let err = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap_err();
         assert!(

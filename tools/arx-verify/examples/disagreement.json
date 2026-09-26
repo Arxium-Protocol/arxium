@@ -1,5 +1,5 @@
 {
-  "artifact_version": 3,
+  "artifact_version": 4,
   "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
   "fault": "execution_disagreement",
   "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
@@ -14,18 +14,18 @@
       "state_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "round": 0
     },
-    "signature": "0x55f4b65acebef21ab7df9be118dab6a0a0a39d6380c79a06059b6d9477b0d048ca77d16cffe7a20cdcf7225610279b8e0b51c03c1511cf3633d032306c95df08"
+    "signature": "0xff507e8e98a98558be0bd1a1d1406c385d843c4edeac306a8965c218cc380b5e3f478e76ac9e00587560bce02707f2b7c335fec3078917c2fe9554e3ecbf5c0d"
   },
   "dissent": {
     "height": 5,
     "block_hash": "0xblockhash",
     "state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "header_commitment": "0x79beea8a831f77af10b8b577d866687cda5dec0a0a8b9399f56a570982eda680",
+    "header_commitment": "0x94d55b2a2288e89c0892cb163df39d2b43345a30973e9d020d6fda85b3402838",
     "ep": "0x0303030303030303030303030303030303030303030303030303030303030303",
     "reason": "state_root_mismatch",
     "voter": "arx1voter",
     "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b",
-    "signature": "0x861aa332c166720f87a738a292bd7b5dc7136436509c3e6112f76463f1923754e738f921b16d843af4435e813cb86f70147331aefbd294fd115f682f90d820c57e15568919ddae7b00f08cfa737da7ccb320cc9b32a1e0b24dee1562666f920c"
+    "signature": "0xb52b9e59db4f07ce4133b35f3f569a31bc161efaee71a1f476622c032b89a055ff3c74d3c89cf1bd5af7c4fd72ff64e319e5f7bc256902a75dd02b83251a072a315f3723ea13c32046857d9503a0f6510e228de2a7a1e12303d356eb1b2e32ba"
   },
   "human_readable": {
     "note": "devnet soak run, height 5"
