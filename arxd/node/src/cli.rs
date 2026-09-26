@@ -22,7 +22,7 @@ pub enum Command {
     /// print its PeerId, without starting the node — lets an operator learn
     /// their node's network identity to hand to peers ahead of time.
     NodeKey {
-        #[arg(long, default_value_os_t = default_base_path())]
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
         base_path: PathBuf,
     },
     /// Print every identity this node holds — validator address, BLS finality
@@ -66,7 +66,7 @@ pub enum Command {
     /// `send-tx --action register-bls-key` so this validator's precommit
     /// votes count toward finality quorum.
     BlsKey {
-        #[arg(long, default_value_os_t = default_base_path())]
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
         base_path: PathBuf,
         /// Also render pubkey‖proof-of-possession (288 hex chars) as a
         /// terminal QR code, for a client that scans it instead of copying
@@ -90,7 +90,7 @@ pub enum Command {
     /// `AuthorizeOperator` itself. See `--revoke` to remove the current
     /// operator instead (no scanning needed).
     Pair {
-        #[arg(long, default_value_os_t = default_base_path())]
+        #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
         base_path: PathBuf,
         /// RPC address of a node reachable both by this command and by the
         /// app (typically the same gateway the app already submits actions
@@ -433,6 +433,31 @@ mod tests {
             cfg.bootnodes.len(),
             2,
             "a stray comma must not add an empty entry"
+        );
+    }
+
+    /// `install.sh` sets the base path only via `ARXD_BASE_PATH`. A subcommand
+    /// without `env` silently falls back to `~/.arxium` and mints fresh keys
+    /// (e.g. `arxd bls-key` printing a key the node never signs with).
+    /// Checks the clap definition, so no env mutation or race with the test below.
+    #[test]
+    fn every_base_path_honours_env() {
+        let cmd = <Cli as clap::CommandFactory>::command();
+        let mut seen = 0;
+        for sub in std::iter::once(&cmd).chain(cmd.get_subcommands()) {
+            for arg in sub.get_arguments().filter(|a| a.get_id() == "base_path") {
+                seen += 1;
+                assert_eq!(
+                    arg.get_env().and_then(|e| e.to_str()),
+                    Some("ARXD_BASE_PATH"),
+                    "`{}` --base-path must read ARXD_BASE_PATH",
+                    sub.get_name()
+                );
+            }
+        }
+        assert!(
+            seen >= 8,
+            "expected the node plus every keyed subcommand, saw {seen}"
         );
     }
 

@@ -111,13 +111,18 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     let genesis_hash = state_root_bytes(&state_root)?;
 
     // Detect on-disk corruption/tampering before building on top of the tip:
-    // a signed block whose signature no longer verifies means something is
-    // wrong with this node's storage, not with the chain going forward.
+    // a tip whose signature no longer verifies means something is wrong with
+    // this node's storage, not with the chain going forward. Only genesis is
+    // unsigned — every later block passed `accept_block`'s signature check or
+    // was signed here — so above 0 a missing block or a missing signature is
+    // the same failure, not a reason to skip the check (stripping the
+    // signature used to be enough to get a tampered tip past it).
     let tip_height = db.get_tip_height()?.unwrap_or(0);
-    if let Some(tip_block) = db.get_block::<R::Payload>(tip_height)?
-        && tip_block.signature.is_some()
-    {
-        tip_block
+    if tip_height > 0 {
+        db.get_block::<R::Payload>(tip_height)?
+            .with_context(|| {
+                format!("tip block {tip_height} is missing — on-disk corruption or tampering")
+            })?
             .verify_proposer_signature()
             .context("tip block signature failed verification — on-disk corruption or tampering")?;
     }
@@ -210,6 +215,32 @@ mod tests {
         assert!(
             new_partial::<CoreChainRuntime>(&config).is_err(),
             "new_partial must reject a tip block whose signature no longer verifies"
+        );
+
+        // Stripping the signature must not turn the check off.
+        let db = ArxiumDb::open(&config.base_path.join("corechain").join("data")).unwrap();
+        tampered.signature = None;
+        db.write_batch(&tampered).unwrap();
+        drop(db);
+        assert!(
+            new_partial::<CoreChainRuntime>(&config).is_err(),
+            "new_partial must reject an unsigned tip above genesis"
+        );
+
+        // Nor may a tip height whose block isn't there at all.
+        let db = ArxiumDb::open(&config.base_path.join("corechain").join("data")).unwrap();
+        db.write_raw_entries(&[(
+            "meta".to_string(),
+            b"meta:tip_height".to_vec(),
+            2u64.to_be_bytes().to_vec(),
+        )])
+        .unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(2));
+        drop(db);
+        let err = new_partial::<CoreChainRuntime>(&config).err().unwrap();
+        assert!(
+            format!("{err:#}").contains("tip block 2 is missing"),
+            "{err:#}"
         );
 
         std::fs::remove_dir_all(&config.base_path).ok();
