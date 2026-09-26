@@ -146,7 +146,8 @@ there, this node will never propose until a `JoinValidator` action adds it.
    who never voted (`xc_bls::verify_possession` spells out the construction).
 7. To let an operator wallet (e.g. Arx-Plus) submit staking actions on this
    validator's behalf without the validator's signing key ever leaving the
-   box: `arxd pair --base-path <path> --node <host:port> --token <rpc-token>`
+   box: `arxd pair --base-path <path> --node <host:port>` with the RPC token in
+   `$ARXD_RPC_TOKEN`
    shows a QR code; scanning it and confirming in the app completes the
    `AuthorizeOperator` action. `--revoke` removes the current operator
    without needing to scan anything.

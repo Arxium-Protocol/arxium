@@ -1293,6 +1293,12 @@ fn spawn_subsystems<R: ChainRuntime>(
 
 pub fn run<R: ChainRuntime>() -> Result<()> {
     let cli = Cli::parse();
+    for flag in cli::tokens_on_command_line(std::env::args()) {
+        warn!(
+            "{flag} was given on the command line, where any local user can read it (ps, shell \
+             history); use its env var or --rpc-token-file/--admin-token-file instead"
+        );
+    }
 
     match &cli.command {
         Some(Command::NodeKey { base_path }) => return cmd_node_key(base_path),
@@ -1384,7 +1390,7 @@ fn report_validator_readiness(
 fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     #[cfg(feature = "fault-injection")]
     let inject_fault_at_height = cli.run.inject_fault_at_height;
-    let config = cli.run.into_config();
+    let config = cli.run.into_config()?;
     info!("{:?}", config);
 
     let components::NodeComponents {

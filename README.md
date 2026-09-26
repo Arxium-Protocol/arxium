@@ -60,7 +60,9 @@ arxd --base-path ~/.arxium/data --validator      # validator
 
 Configuration comes from flags or the matching `ARXD_*` environment variables,
 with flags taking precedence. The installer writes an env file that both
-systemd (`EnvironmentFile=`) and `arxd` read directly.
+systemd (`EnvironmentFile=`) and `arxd` read directly. Pass tokens through
+the env file or a `*-token-file`, never as flags: a flag's value is visible to
+every local user in `ps` and shell history, and `arxd` warns when it sees one.
 
 | Flag | Environment | Default | Purpose |
 | --- | --- | --- | --- |
@@ -71,6 +73,7 @@ systemd (`EnvironmentFile=`) and `arxd` read directly.
 | `--rpc-bind` | `ARXD_RPC_BIND` | `127.0.0.1` | RPC bind address |
 | `--rpc-token` | `ARXD_RPC_TOKEN` | none | Require `Authorization: Bearer <token>` |
 | `--admin-token` | `ARXD_ADMIN_TOKEN` | none | Mount `/admin/*` (operator routes) behind a separate bearer token |
+| `--rpc-token-file` / `--admin-token-file` | `ARXD_RPC_TOKEN_FILE` / `ARXD_ADMIN_TOKEN_FILE` | none | Read the token from a file instead |
 | `--bootnodes` | `ARXD_BOOTNODES` | chain spec | Comma-separated peer multiaddrs |
 | `--bootnode` | `ARXD_BOOTNODE` | `false` | Use the well-known seeded network identity |
 
@@ -119,7 +122,7 @@ An operator wallet can be authorized to submit staking actions on a
 validator's behalf without the signing key leaving the machine:
 
 ```sh
-arxd pair --node <host:port> --token <rpc-token>
+ARXD_RPC_TOKEN=<rpc-token> arxd pair --node <host:port>
 ```
 
 ### Bootstrapping from a snapshot
