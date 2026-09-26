@@ -146,6 +146,20 @@ impl<'a> BlockView<'a> {
         Ok(())
     }
 
+    /// Addresses whose `ValidatorStatusKey` row this block has put or
+    /// deleted so far. `db().all_validator_statuses()` can't see them (a
+    /// `JoinValidator` in this very block has no row on disk yet), so a
+    /// status scan adds these and reads every row back through the view.
+    pub fn written_validator_statuses(&self) -> Vec<Address> {
+        let prefix = b"validator_status:";
+        self.entries
+            .keys()
+            .filter_map(|key| key.strip_prefix(prefix.as_slice()))
+            .filter_map(|rest| std::str::from_utf8(rest).ok())
+            .filter_map(|s| Address::parse(s).ok())
+            .collect()
+    }
+
     /// Folds an `AuthorizeOperator`/`RevokeOperator` write into the view —
     /// both the forward record and the reverse index, so a same-block
     /// re-authorization sees the first one's effect.

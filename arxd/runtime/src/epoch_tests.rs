@@ -431,3 +431,50 @@ fn a_primary_that_misses_the_boundary_block_is_not_in_the_next_set() {
         Some(&Some(ValidatorStatus::Jailed { until_epoch: 2 }))
     );
 }
+
+/// Card 141: a join whose stake and `Pending` row exist only in the
+/// boundary block's own view (no row on disk yet) makes that boundary's
+/// set, not the next one. And a row deleted in-block counts as absent, not
+/// as its old on-disk value.
+#[test]
+fn a_join_in_the_boundary_block_itself_makes_that_boundary() {
+    let db = chain(&[1, 2, 4], MIN_VALIDATOR_STAKE);
+    let boundary = boundary_of(0, EPOCH);
+    let validators = db.validator_addresses_at(boundary).unwrap();
+    let proposer = xc_primitives::expected_proposer(&validators, boundary).unwrap();
+
+    let mut view = BlockView::new(&db);
+    let mut stakes = StakeUpdates::default();
+    stakes.allocations.insert(
+        (addr(3), addr(3)),
+        Some(xc_primitives::StakeAllocation {
+            master: addr(3),
+            validator: addr(3),
+            active_amount: MIN_VALIDATOR_STAKE,
+            unbonding: None,
+            created_at: 0,
+            updated_at: 0,
+        }),
+    );
+    stakes.validator_index.insert(addr(3), vec![addr(3)]);
+    view.apply_stakes(&stakes).unwrap();
+    let mut statuses = ValidatorStatusUpdates::default();
+    statuses.0.insert(addr(3), Some(ValidatorStatus::Pending));
+    // Not the proposer, so its missing row can't be confused with a jail.
+    let dropped = [addr(1), addr(2), addr(4)]
+        .into_iter()
+        .find(|a| *a != proposer)
+        .unwrap();
+    statuses.0.insert(dropped.clone(), None);
+    view.apply_validator_statuses(&statuses).unwrap();
+
+    let updates =
+        CoreChainRuntime::on_block_sealed(&view, &proposer, 0, &validators, boundary).unwrap();
+    let set = updates.validator_set.expect("boundary writes a set");
+    assert!(set.contains_key(&addr(3)), "same-block join is in: {set:?}");
+    assert!(
+        !set.contains_key(&dropped),
+        "in-block delete is out: {set:?}"
+    );
+    assert_eq!(set.len(), 3);
+}

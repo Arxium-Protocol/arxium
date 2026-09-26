@@ -151,7 +151,12 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         }
         // Epoch boundary: the one place the set changes. Runs last so it
         // sees this block's slash/jail above through `sealed`.
-        let boundary = epoch::boundary_hook(&sealed, view.db(), height)?;
+        let boundary = epoch::boundary_hook(
+            &sealed,
+            view.db(),
+            view.written_validator_statuses(),
+            height,
+        )?;
         updates
             .validator_statuses
             .0

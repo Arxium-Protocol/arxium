@@ -22,9 +22,15 @@ use xc_storage::{ArxiumDb, StorageError};
 /// when fewer than `min_validator_set` qualify, the previous one re-written
 /// with a warning — never a set that cannot reach quorum, and never a
 /// boundary without a row (see `xc_circuit::ValidatorSetKey`).
+///
+/// `written` is every address whose status row this block wrote
+/// (`BlockView::written_validator_statuses`): the db scan can't see a row
+/// first created in this block, like a `JoinValidator` in the boundary
+/// block itself.
 pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
     view: &V,
     db: &ArxiumDb,
+    written: Vec<Address>,
     height: u64,
 ) -> anyhow::Result<BlockUpdates> {
     let params = view.get(&ChainParamsKey)?.unwrap_or_default();
@@ -34,13 +40,19 @@ pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
     }
     let next_epoch = epoch_of(height, params.epoch_length) + 1;
 
-    // Candidates come from a db scan (the overlay can't iterate), each row
-    // then read back through the view so a status written earlier in this
-    // very block is honoured.
+    // Candidates: a db scan (the overlay can't iterate) plus the rows this
+    // block wrote, each read back through the view so an in-block write is
+    // honoured and an in-block delete drops the address.
+    let candidates: std::collections::BTreeSet<Address> = db
+        .all_validator_statuses()?
+        .into_keys()
+        .chain(written)
+        .collect();
     let mut statuses: BTreeMap<Address, ValidatorStatus> = BTreeMap::new();
-    for (address, scanned) in db.all_validator_statuses()? {
-        let status = view.get(&ValidatorStatusKey(&address))?.unwrap_or(scanned);
-        statuses.insert(address, status);
+    for address in candidates {
+        if let Some(status) = view.get(&ValidatorStatusKey(&address))? {
+            statuses.insert(address, status);
+        }
     }
 
     let mut eligible: Vec<(Address, u128)> = Vec::new();
