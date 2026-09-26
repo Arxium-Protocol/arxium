@@ -490,6 +490,12 @@ impl Snapshot {
                 self.height
             );
         }
+        if self.params.block_interval_secs == 0 {
+            anyhow::bail!("chain spec params.block_interval_secs must be positive");
+        }
+        if self.params.epoch_length == 0 {
+            anyhow::bail!("chain spec params.epoch_length must be positive");
+        }
         for addr in self.boot_nodes.iter() {
             if addr.trim().is_empty() {
                 anyhow::bail!("chain spec boot_nodes contains a blank entry");
@@ -564,6 +570,22 @@ mod tests {
             Some(bls),
             "the BLS key must survive the round trip, or genesis registers nothing",
         );
+    }
+
+    /// A 0s interval would spin `produce_loop`; a 0-block epoch divides by zero.
+    #[test]
+    fn a_spec_with_zero_interval_or_epoch_is_rejected() {
+        let spec: Snapshot = serde_json::from_str(
+            r#"{"height":0,"chain_name":"t","accounts":{},"validators":{},"boot_nodes":[]}"#,
+        )
+        .unwrap();
+        spec.validate().unwrap();
+        let mut bad = spec.clone();
+        bad.params.block_interval_secs = 0;
+        assert!(bad.validate().is_err());
+        let mut bad = spec;
+        bad.params.epoch_length = 0;
+        assert!(bad.validate().is_err());
     }
 
     /// Specs written before `bls_pubkey` existed must still parse — the field
