@@ -115,11 +115,11 @@ pub enum Command {
     /// bootstrapping a new node without replaying every block from genesis —
     /// point the new node's `--base-path` at a copy of `output` instead.
     ///
-    /// Trust-the-source only: the chain has no state root a receiving node
-    /// could check a snapshot against, so this proves nothing about whether
-    /// the data matches what the network actually finalized. Only use a
-    /// snapshot from an operator you already trust, the same way you'd trust
-    /// any other out-of-band chain data.
+    /// A copied checkpoint is trust-the-source: nothing checks it on boot,
+    /// so only use one from an operator you already trust. For a verified
+    /// bootstrap instead, start a fresh node with `--snapshot-trust-height`
+    /// and `--snapshot-trust-hash`: it downloads state from a peer and checks
+    /// it against that block's state root before using it.
     Snapshot {
         #[arg(long, env = "ARXD_BASE_PATH", default_value_os_t = default_base_path())]
         base_path: PathBuf,
