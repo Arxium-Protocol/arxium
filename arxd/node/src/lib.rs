@@ -1253,6 +1253,17 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     } = new_partial::<R>(&config)?;
     let chain_id = hex::encode(genesis_hash);
     info!("booted chain={chain_name} genesis={chain_id}");
+    // Loaded up front so a corrupt file stops boot before any networking.
+    let signed_height = identity
+        .as_ref()
+        .map(|_| validator::SignedHeight::load(&config.base_path, &genesis_hash))
+        .transpose()?;
+    if let Some(signed) = &signed_height {
+        info!(
+            "slashing protection: never signing at or below height {}",
+            signed.last()
+        );
+    }
 
     #[cfg(feature = "fault-injection")]
     if let Some(height) = inject_fault_at_height {
@@ -1409,7 +1420,7 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     produce::produce_loop::<R>(
         &db,
         &mempool,
-        identity,
+        identity.map(|(address, key)| (address, key, signed_height.expect("loaded with identity"))),
         &chain_lock,
         &finality_event_tx,
         &block_tx,

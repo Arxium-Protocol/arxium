@@ -79,6 +79,74 @@ pub fn load_or_generate_bls_key(base_path: &Path) -> Result<(BlsSecretKey, BlsPu
     xc_bls::keygen_from_seed(&seed).map_err(|_| anyhow::anyhow!("invalid BLS key seed"))
 }
 
+const SIGNED_HEIGHT_FILE: &str = "signed_height";
+
+/// Slashing protection: the highest height this validator has signed a
+/// block for, in `<base_path>/signed_height` beside the keys, not in the
+/// chain DB. A DB restored from a snapshot, rolled back by a crash, or
+/// rebuilt on a new machine forgets it proposed `tip+1`; signing a second,
+/// different block there is equivocation (`xc_evidence::verify_equivocation`
+/// only compares heights), which means a full slash and a tombstone. This
+/// file survives all of those, so the node refuses instead.
+///
+/// Tagged with the genesis hash, so a genesis reset (heights start over)
+/// starts from 0 rather than refusing to sign ever again.
+pub struct SignedHeight {
+    path: std::path::PathBuf,
+    genesis: String,
+    last: u64,
+}
+
+impl SignedHeight {
+    pub fn load(base_path: &Path, genesis_hash: &[u8; 32]) -> Result<Self> {
+        let path = base_path.join(SIGNED_HEIGHT_FILE);
+        let genesis = hex::encode(genesis_hash);
+        let last = match std::fs::read_to_string(&path) {
+            Ok(text) => match text.split_whitespace().collect::<Vec<_>>()[..] {
+                [g, h] if g == genesis => h
+                    .parse()
+                    .with_context(|| format!("{} holds a malformed height", path.display()))?,
+                [_, _] => 0,
+                _ => anyhow::bail!(
+                    "{} is malformed — expected \"<genesis> <height>\"; restore it rather \
+                     than deleting it, or this validator may sign a height twice",
+                    path.display()
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e).context("failed to read signed_height"),
+        };
+        Ok(Self {
+            path,
+            genesis,
+            last,
+        })
+    }
+
+    pub fn last(&self) -> u64 {
+        self.last
+    }
+
+    /// Durably claims `height` before the block is signed: temp file,
+    /// fsync, rename. A crash after this call only skips our turn at that
+    /// height; the reverse order could sign one and forget it.
+    pub fn claim(&mut self, height: u64) -> Result<()> {
+        anyhow::ensure!(
+            height > self.last,
+            "refusing to sign height {height}: already signed up to {}",
+            self.last
+        );
+        use std::io::Write;
+        let tmp = self.path.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp).context("failed to write signed_height")?;
+        write!(file, "{} {height}", self.genesis)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &self.path).context("failed to replace signed_height")?;
+        self.last = height;
+        Ok(())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -113,5 +181,44 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod signed_height_tests {
+    use super::*;
+
+    /// A restarted validator (fresh `SignedHeight` from the same file) must
+    /// refuse any height it already signed; a genesis reset must not.
+    #[test]
+    fn signed_height_survives_restart_and_resets_with_genesis() {
+        let dir = std::env::temp_dir().join(format!(
+            "arxium-test-signed-height-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut signed = SignedHeight::load(&dir, &[1; 32]).unwrap();
+        assert_eq!(signed.last(), 0);
+        signed.claim(5).unwrap();
+
+        let mut restarted = SignedHeight::load(&dir, &[1; 32]).unwrap();
+        assert_eq!(restarted.last(), 5);
+        assert!(restarted.claim(5).is_err(), "same height twice");
+        assert!(restarted.claim(4).is_err(), "going back");
+        restarted.claim(6).unwrap();
+
+        let reset = SignedHeight::load(&dir, &[2; 32]).unwrap();
+        assert_eq!(reset.last(), 0, "a new genesis starts over");
+
+        std::fs::write(dir.join(SIGNED_HEIGHT_FILE), "garbage").unwrap();
+        assert!(
+            SignedHeight::load(&dir, &[1; 32]).is_err(),
+            "corrupt file is fatal"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

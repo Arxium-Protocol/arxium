@@ -25,7 +25,7 @@ use libp2p::{Multiaddr, gossipsub, identify, mdns};
 use metrics::{counter, gauge, histogram};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -138,6 +138,17 @@ pub fn request_shutdown(code: u8) {
 /// bridges.
 pub fn shutdown_code() -> u8 {
     SHUTDOWN.load(Ordering::Relaxed)
+}
+
+/// Highest tip any peer has reported since boot, plus one (0 = no peer has
+/// answered yet). Read by `arxd/node`'s producer, which holds off proposing
+/// until it has caught up to this — see `best_peer_tip`.
+static BEST_PEER_TIP: AtomicU64 = AtomicU64::new(0);
+
+/// Highest tip any peer has reported since boot, or `None` before the first
+/// `Status` reply.
+pub fn best_peer_tip() -> Option<u64> {
+    BEST_PEER_TIP.load(Ordering::Relaxed).checked_sub(1)
 }
 
 #[cfg(test)]
@@ -1057,6 +1068,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             }
                             SyncResponse::Status { tip_height } => {
                                 peer_tips.insert(peer, tip_height);
+                                BEST_PEER_TIP.fetch_max(tip_height.saturating_add(1), Ordering::Relaxed);
                                 let local_tip = local_tip_height(&db);
                                 if tip_height > local_tip {
                                     info!(
