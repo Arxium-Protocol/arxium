@@ -194,7 +194,9 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
         let computed = merkle_gadget(cs.clone(), params, leaf, path, index)?;
         ((computed - root) * FpVar::from(requested.clone())).enforce_equal(&FpVar::zero())?;
 
-        let live = expiry.is_cmp(&today, Ordering::Greater, true)?;
+        // Strict, like `check_asset_claim`: a credential is expired on its
+        // expiry day.
+        let live = expiry.is_cmp(&today, Ordering::Greater, false)?;
         (&requested & &!live).enforce_equal(&Boolean::FALSE)?;
         let mut age_valid = Boolean::FALSE;
         for n in [13, 16, 18, 21] {
@@ -621,6 +623,13 @@ mod tests {
         p.claims_mask = KYC;
         w.opening.expiry_days = 100;
         assert!(!satisfies(p, w).0, "expired credential");
+        // Move `today`, not the expiry: the expiry is part of the leaf.
+        let (mut p, w) = fixture();
+        p.claims_mask = KYC;
+        p.today_days = w.opening.expiry_days;
+        assert!(!satisfies(p, w.clone()).0, "expires today");
+        p.today_days -= 1;
+        assert!(satisfies(p, w).0, "expires tomorrow");
         let (mut p, w) = fixture();
         p.claims_mask = KYC;
         p.scope = asker_scope(&poseidon_params(), "acct_other");
