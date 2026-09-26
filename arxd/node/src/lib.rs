@@ -391,22 +391,41 @@ struct SubsystemHandles<R: ChainRuntime> {
 /// that never received the disputed block has nothing to build a
 /// `BlockAttestation` from, and synthesizing one from fields it didn't
 /// actually read would turn the artifact into an unverified guess.
+/// The nonce for an action this node signs with its own validator key: past
+/// both the on-chain nonce and anything of ours still queued, so a second
+/// fault report (or one sent while an operator transaction is pending)
+/// doesn't take a slot that's already used and get dropped as a duplicate.
+/// ponytail: read and push aren't atomic; an RPC submission from the same
+/// key landing in between still collides, and that report is lost.
+fn next_own_nonce<P: serde::Serialize>(
+    db: &ArxiumDb,
+    mempool: &Mutex<Mempool<P>>,
+    address: &Address,
+) -> u64 {
+    let on_chain = db
+        .get_account(address)
+        .ok()
+        .flatten()
+        .map(|entry| entry.nonce)
+        .unwrap_or(0);
+    mempool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .next_nonce(address, on_chain)
+}
+
 /// Nonce-stamps and signs a `SubmitExecutionFault` action for
 /// `artifact_json`. Shared by the two fault kinds that reach the chain
 /// through that action — a block divergence (after local re-adjudication)
 /// and a precommit equivocation (which needs none).
 fn sign_fault_action<R: ChainRuntime>(
     db: &ArxiumDb,
+    mempool: &Mutex<Mempool<R::Payload>>,
     address: &Address,
     key: &ed25519_dalek::SigningKey,
     artifact_json: String,
 ) -> Option<Action<R::Payload>> {
-    let nonce = db
-        .get_account(address)
-        .ok()
-        .flatten()
-        .map(|entry| entry.nonce)
-        .unwrap_or(0);
+    let nonce = next_own_nonce(db, mempool, address);
     let mut action = R::build_execution_fault_action(artifact_json, address, nonce)
         .expect("probed Some for this runtime at startup");
     let signature = key.sign(&action.signing_bytes());
@@ -763,14 +782,10 @@ fn spawn_evidence<R: ChainRuntime>(
         let address = address.clone();
         let key = key.clone();
         let db = db.clone();
+        let mempool = mempool.clone();
         Some(
             move |evidence: EquivocationEvidence<R::Payload>| -> Action<R::Payload> {
-                let nonce = db
-                    .get_account(&address)
-                    .ok()
-                    .flatten()
-                    .map(|entry| entry.nonce)
-                    .unwrap_or(0);
+                let nonce = next_own_nonce(&db, &mempool, &address);
                 let mut action = R::build_evidence_action(evidence, &address, nonce)
                     .expect("probed Some for this runtime at startup");
                 let signature = key.sign(&action.signing_bytes());
@@ -787,6 +802,7 @@ fn spawn_evidence<R: ChainRuntime>(
         let address = address.clone();
         let key = key.clone();
         let db = db.clone();
+        let mempool = mempool.clone();
         Some(move |artifact: EvidenceArtifact| -> Option<Action<R::Payload>> {
             let artifact_json = serde_json::to_string(&artifact).expect("artifact always encodes");
             // A precommit equivocation is proved by its two signatures
@@ -796,7 +812,7 @@ fn spawn_evidence<R: ChainRuntime>(
             // only way this node reports itself is if it genuinely
             // double-signed, which is exactly the fault being reported.
             if matches!(artifact.fault, Fault::PrecommitEquivocation { .. }) {
-                return sign_fault_action::<R>(&db, &address, &key, artifact_json);
+                return sign_fault_action::<R>(&db, &mempool, &address, &key, artifact_json);
             }
             // The node writing this artifact is, by construction, the
             // dissenting party in it — if its own execution is the buggy
@@ -818,7 +834,7 @@ fn spawn_evidence<R: ChainRuntime>(
                 return None;
             }
 
-            sign_fault_action::<R>(&db, &address, &key, artifact_json)
+            sign_fault_action::<R>(&db, &mempool, &address, &key, artifact_json)
         })
     });
     spawn_supervised(
