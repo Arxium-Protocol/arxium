@@ -83,7 +83,7 @@ pub struct ValidatorEntry {
     /// spec author (or anyone who can edit a spec before launch) can seed a
     /// rogue key that forges finality certificates for the whole set, the
     /// same attack `RegisterBlsKey` is gated against. Enforced in
-    /// `arxd_genesis::register_genesis_bls_keys`, which has the `xc-bls`
+    /// `arxd_genesis::genesis_bls_registrations`, which has the `xc-bls`
     /// dependency this crate deliberately doesn't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bls_pop: Option<String>,

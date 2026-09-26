@@ -34,10 +34,17 @@ const BLS_KEY_PREFIX: &[u8] = b"blskey:";
 /// registered here, or they enter the validator set unable to vote — the
 /// chain then produces blocks but never finalizes anything. Same job as
 /// `session.keys` in a Substrate genesis config.
-pub fn register_genesis_bls_keys(
-    db: &ArxiumDb,
+///
+/// Returns the registrations instead of writing them, so `install_plain`
+/// commits them in the same atomic batch as the snapshot. Written separately,
+/// a crash after the snapshot left `is_initialized()` true with no keys, and
+/// every later boot skipped registration for good — a chain that could never
+/// reach finality quorum.
+pub fn genesis_bls_registrations(
     validators: &BTreeMap<Address, ValidatorEntry>,
-) -> Result<()> {
+) -> Result<Vec<xc_storage::BlsKeyRegistration>> {
+    let mut registrations = Vec::new();
+    let mut owners: BTreeMap<[u8; 48], &Address> = BTreeMap::new();
     for (address, entry) in validators {
         let Some(hex_pubkey) = &entry.bls_pubkey else {
             tracing::warn!(
@@ -82,19 +89,18 @@ pub fn register_genesis_bls_keys(
         // `RegisterBlsKey`/`JoinValidator` both reject a pubkey already
         // owned by another validator — genesis must enforce the same rule,
         // or two validators could unknowingly share a BLS identity.
-        if let Some(owner) = db.bls_pubkey_owner(&BlsPublicKey(bytes))?
-            && owner != *address
-        {
+        // Checked in memory: nothing is in the DB yet at genesis.
+        if let Some(owner) = owners.insert(bytes, address) {
             bail!("genesis validator {address} BLS pubkey is already owned by {owner}");
         }
-        db.write_batch(&xc_storage::BlsKeyRegistration {
+        registrations.push(xc_storage::BlsKeyRegistration {
             address: address.clone(),
             pubkey: BlsPublicKey(bytes),
             effective_height: 0,
             previous_pubkey: None,
-        })?;
+        });
     }
-    Ok(())
+    Ok(registrations)
 }
 
 /// Writes a plain chain spec's genesis state to `db` and returns the state
@@ -107,10 +113,10 @@ pub fn register_genesis_bls_keys(
 /// `execute_actions`/`dispatch` version of exactly this).
 ///
 /// Split into two independently-resumable steps — matching two separate
-/// `db.write_batch` calls under the hood — so a crash between them is
-/// recovered on the next call rather than left half-initialized: after the
-/// snapshot is written `db.is_initialized()` is already true, so only the
-/// block-0 check below still needs to run.
+/// atomic writes under the hood — so a crash between them is recovered on
+/// the next call rather than left half-initialized: the snapshot and its BLS
+/// registrations land together (after which `db.is_initialized()` is true),
+/// so only the block-0 check below still needs to run.
 ///
 /// On a DB that already holds a block 0, the spec's own genesis root is
 /// recomputed in a scratch DB and must match it — otherwise a node reusing a
@@ -137,8 +143,10 @@ pub fn write_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
 
 fn install_plain(db: &ArxiumDb, snapshot: &Snapshot) -> Result<String> {
     if !db.is_initialized()? {
-        db.write_batch(snapshot)?;
-        register_genesis_bls_keys(db, &snapshot.validators)?;
+        let registrations = genesis_bls_registrations(&snapshot.validators)?;
+        let mut items: Vec<&dyn BatchWritable> = vec![snapshot];
+        items.extend(registrations.iter().map(|r| r as &dyn BatchWritable));
+        db.write_batches(&items)?;
     }
     if db.get_block::<()>(0)?.is_none() {
         // Payload type `()`, not the caller's action-payload type: genesis
@@ -600,8 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn register_genesis_bls_keys_rejects_duplicate_pubkey() {
-        let (db, dir) = scratch_db();
+    fn genesis_bls_registrations_rejects_duplicate_pubkey() {
 
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
         let pubkey_hex = hex::encode(pk.0);
@@ -627,12 +634,31 @@ mod tests {
             },
         );
 
-        let err = register_genesis_bls_keys(&db, &validators).unwrap_err();
+        let err = genesis_bls_registrations(&validators).unwrap_err();
         assert!(
             err.to_string().contains("already owned by"),
             "expected an already-owned rejection, got {err:?}"
         );
+    }
 
+    /// A BLS key rejected at install must leave nothing behind: the snapshot
+    /// used to commit first, so the failed boot left `is_initialized()` true
+    /// and every retry skipped BLS registration for good.
+    #[test]
+    fn rejected_bls_key_leaves_db_uninitialized() {
+        let (_, pk) = xc_bls::keygen_from_seed(&[12u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[7u8; 32]).unwrap();
+        let spec = format!(
+            r#"{{"height":0,"chain_name":"t","accounts":{{}},"validators":{{
+                "{addr}": {{"stake": 1, "bls_pubkey": "{}", "bls_pop": "{}"}}
+            }},"boot_nodes":[]}}"#,
+            hex::encode(pk.0),
+            hex::encode([0u8; 96]),
+        );
+        let snapshot: Snapshot = serde_json::from_str(&spec).unwrap();
+        let (db, dir) = scratch_db();
+        assert!(write_plain(&db, &snapshot).is_err());
+        assert!(!db.is_initialized().unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

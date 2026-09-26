@@ -81,13 +81,13 @@ pub(crate) fn new_partial<R: ChainRuntime>(config: &NodeConfig) -> Result<NodeCo
     // decision, not an oversight: `arxd-node`'s consensus/finality path
     // (`arxd_finality`, wired into every `run::<R>()` regardless of `R`) is
     // BLS-quorum finality for every chain this crate runs, not something a
-    // `ChainRuntime` implementor opts into. `arxd_genesis::register_genesis_bls_keys`
+    // `ChainRuntime` implementor opts into. `arxd_genesis::genesis_bls_registrations`
     // registers exactly the keys that same finality path requires to reach
     // quorum, so it belongs with the other node-level, runtime-independent
     // setup here rather than behind a `ChainRuntime::write_genesis` hook — a
     // hook would let a runtime opt out of a requirement it doesn't actually
     // have the freedom to opt out of. A validator entry missing `bls_pubkey`
-    // does not fail this call; it only warns (see `register_genesis_bls_keys`)
+    // does not fail this call; it only warns (see `genesis_bls_registrations`)
     // and that validator simply cannot vote until it registers one.
     let in_data_path = || format!("genesis check on {}", data_path.display());
     let (chain_name, boot_nodes, state_root) = match &chain_spec {
