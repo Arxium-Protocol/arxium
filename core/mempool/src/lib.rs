@@ -248,6 +248,21 @@ impl<P: Serialize> Mempool<P> {
         }
     }
 
+    /// The nonce `sender`'s next action should use: one past its highest
+    /// queued nonce, or `on_chain_nonce` if nothing of its is queued. For
+    /// actions this node signs itself (fault reports), so two signed close
+    /// together, or one signed while the same key has a transaction
+    /// pending, don't collide on a (sender, nonce) slot.
+    /// ponytail: O(pending) scan, fine for rare self-signed actions; index by
+    /// sender if a hot path ever needs it.
+    pub fn next_nonce(&self, sender: &Address, on_chain_nonce: u64) -> u64 {
+        self.pending
+            .iter()
+            .filter(|action| &action.sender == sender)
+            .map(|action| action.nonce + 1)
+            .fold(on_chain_nonce, u64::max)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
@@ -373,6 +388,19 @@ mod tests {
             signature: Some(format!("sig-{nonce}")),
             payload: (),
         }
+    }
+
+    #[test]
+    fn next_nonce_skips_past_this_senders_queued_actions() {
+        let mut mempool: Mempool<()> = Mempool::new();
+        assert_eq!(mempool.next_nonce(&addr(1), 5), 5);
+        mempool.push(action(addr(1), 5)).unwrap();
+        mempool.push(action(addr(1), 6)).unwrap();
+        mempool.push(action(addr(2), 9)).unwrap();
+        assert_eq!(mempool.next_nonce(&addr(1), 5), 7);
+        assert_eq!(mempool.next_nonce(&addr(2), 3), 10);
+        // A queued nonce the chain has already passed doesn't pull it back.
+        assert_eq!(mempool.next_nonce(&addr(1), 20), 20);
     }
 
     /// A handful of large actions can exhaust the byte budget long before
