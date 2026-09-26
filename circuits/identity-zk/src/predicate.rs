@@ -4,8 +4,6 @@
 //! N*365 cutoff would incorrectly admit under-age users around leap years.
 
 use super::*;
-use ark_crypto_primitives::crh::CRHSchemeGadget;
-use ark_crypto_primitives::crh::poseidon::constraints::{CRHGadget, CRHParametersVar};
 use ark_r1cs_std::boolean::Boolean;
 use ark_r1cs_std::fields::FieldVar;
 use ark_r1cs_std::prelude::{CondSelectGadget, ToBitsGadget};
@@ -119,9 +117,15 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
         combined.enforce_equal(&mask)?;
         let requested = flags.iter().fold(Boolean::FALSE, |acc, flag| &acc | flag);
 
-        let params = CRHParametersVar::new_constant(cs.clone(), self.params)?;
-        let id_commitment = CRHGadget::<Fr>::evaluate(&params, &[secret.clone()])?;
-        CRHGadget::<Fr>::evaluate(&params, &[secret, scope])?.enforce_equal(&sub)?;
+        let params = &self.params;
+        let id_commitment = tagged_hash_gadget(
+            cs.clone(),
+            params,
+            Domain::IdCommitment,
+            std::slice::from_ref(&secret),
+        )?;
+        tagged_hash_gadget(cs.clone(), params, Domain::Sub, &[secret, scope])?
+            .enforce_equal(&sub)?;
         let opening = w.as_ref().map(|w| &w.opening);
         let flag =
             |f: fn(&CredentialOpening) -> bool| -> ark_relations::gr1cs::Result<Boolean<Fr>> {
@@ -167,8 +171,10 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
                 .map(|o| o.salt)
                 .ok_or(SynthesisError::AssignmentMissing)
         })?;
-        let leaf = CRHGadget::<Fr>::evaluate(
-            &params,
+        let leaf = tagged_hash_gadget(
+            cs.clone(),
+            params,
+            Domain::CredentialLeaf,
             &[
                 FpVar::constant(Fr::from(1u64)),
                 id_commitment.clone(),
@@ -185,7 +191,7 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
 
         let path = w.as_ref().map(|w| &w.leaf_path);
         let index = w.as_ref().map(|w| w.leaf_index);
-        let computed = merkle_gadget(cs.clone(), &params, leaf, path, index)?;
+        let computed = merkle_gadget(cs.clone(), params, leaf, path, index)?;
         ((computed - root) * FpVar::from(requested.clone())).enforce_equal(&FpVar::zero())?;
 
         let live = expiry.is_cmp(&today, Ordering::Greater, true)?;
@@ -203,7 +209,7 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
         // never match — the check zkPassport makes against its padding.
         let path = w.as_ref().map(|w| &w.country_path);
         let index = w.as_ref().map(|w| w.country_index);
-        let computed_countries = merkle_gadget(cs.clone(), &params, country.clone(), path, index)?;
+        let computed_countries = merkle_gadget(cs.clone(), params, country.clone(), path, index)?;
         ((computed_countries - countries_hash) * FpVar::from(flags[4].clone()))
             .enforce_equal(&FpVar::zero())?;
         (&flags[4] & &country.is_eq(&FpVar::zero())?).enforce_equal(&Boolean::FALSE)?;
@@ -212,7 +218,7 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
             .enforce_equal(&FpVar::zero())?;
         let member_path = w.as_ref().map(|w| &w.membership_path);
         let member_index = w.as_ref().map(|w| w.membership_index);
-        let computed_group = merkle_gadget(cs, &params, id_commitment, member_path, member_index)?;
+        let computed_group = merkle_gadget(cs, params, id_commitment, member_path, member_index)?;
         ((computed_group - group_root) * FpVar::from(flags[5].clone()))
             .enforce_equal(&FpVar::zero())
     }
@@ -220,7 +226,7 @@ impl ConstraintSynthesizer<Fr> for PredicateCircuit {
 
 fn merkle_gadget<const DEPTH: usize>(
     cs: ConstraintSystemRef<Fr>,
-    params: &CRHParametersVar<Fr>,
+    params: &PoseidonConfig<Fr>,
     mut node: FpVar<Fr>,
     path: Option<&[Fr; DEPTH]>,
     index: Option<u32>,
@@ -237,7 +243,7 @@ fn merkle_gadget<const DEPTH: usize>(
         })?;
         let left = FpVar::conditionally_select(&right, &sibling, &node)?;
         let right_node = FpVar::conditionally_select(&right, &node, &sibling)?;
-        node = CRHGadget::<Fr>::evaluate(params, &[left, right_node])?;
+        node = tagged_hash_gadget(cs.clone(), params, Domain::TreeNode, &[left, right_node])?;
     }
     Ok(node)
 }
@@ -470,7 +476,7 @@ mod tests {
     fn fixture() -> (Public, Witness) {
         let params = poseidon_params();
         let secret = Fr::from(123u64);
-        let commitment = CRH::<Fr>::evaluate(&params, vec![secret]).unwrap();
+        let commitment = id_commitment(&params, secret);
         let group = AttestedTree::from_leaves(&params, &[commitment]).unwrap();
         let opening = CredentialOpening {
             kyc: true,
