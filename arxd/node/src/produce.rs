@@ -491,6 +491,12 @@ pub fn produce_loop<R: ChainRuntime>(
                     .collect();
                 gauge!("arxium_validators_total").set(validators.len() as f64);
                 gauge!("arxium_validators_with_bls_key").set(keyed.len() as f64);
+                // This node's own standing; seeded at boot by
+                // `report_validator_readiness`, kept current here.
+                gauge!("arxium_validator_in_set")
+                    .set(f64::from(u8::from(validators.contains_key(address))));
+                gauge!("arxium_validator_bls_key_registered")
+                    .set(f64::from(u8::from(keyed.contains(&&*address))));
                 // Power, not heads: the alertable comparison is
                 //   arxium_voting_power_with_bls_key < arxium_finality_quorum
                 gauge!("arxium_voting_power_with_bls_key")

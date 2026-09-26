@@ -1317,6 +1317,52 @@ pub fn run<R: ChainRuntime>() -> Result<()> {
 
 /// No subcommand given: boot and run the node itself, same as always
 /// (`arxd --validator ...`).
+/// Says at boot whether this validator can actually produce and vote — both
+/// otherwise fail silently: out of the set it never produces, and without a
+/// matching on-chain BLS key its precommits never count. Read from local
+/// state, so a node still syncing reports where its tip is, not the network.
+fn report_validator_readiness(
+    db: &ArxiumDb,
+    base_path: &std::path::Path,
+    address: &Address,
+    tip: u64,
+) -> Result<()> {
+    let next = tip + 1;
+    let in_set = db.get_validator_set_at(next)?.contains_key(address);
+    let status = db.get_validator_status(address)?;
+    gauge!("arxium_validator_in_set").set(f64::from(u8::from(in_set)));
+    if in_set {
+        info!("validator {address} is in the set for height {next}");
+    } else {
+        warn!(
+            "validator {address} is NOT in the set for height {next} (status: {status:?}, local \
+             tip {tip}) — it will not produce blocks until it joins (`JoinValidator`) or is in \
+             the chain spec"
+        );
+    }
+
+    // ponytail: re-reads validator.bls.key rather than threading the pubkey
+    // through NodeComponents; the file already exists by now.
+    let (_, local) = validator::load_or_generate_bls_key(base_path)?;
+    let local_hex = format!("0x{}", hex::encode(local.0));
+    let registered = db.get_bls_pubkey(address)?;
+    gauge!("arxium_validator_bls_key_registered").set(f64::from(u8::from(registered.is_some())));
+    match registered {
+        None => warn!(
+            "validator {address} has no BLS key registered on chain — it can produce but its \
+             finality votes never count; register {local_hex} with `send-tx --action \
+             register-bls-key` (see `arxd bls-key --pop`)"
+        ),
+        Some(onchain) if onchain != local => warn!(
+            "validator {address}'s on-chain BLS key 0x{} does not match local validator.bls.key \
+             {local_hex} — its finality votes will be rejected",
+            hex::encode(onchain.0)
+        ),
+        Some(_) => info!("validator {address} BLS key registered and matches local key"),
+    }
+    Ok(())
+}
+
 fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     #[cfg(feature = "fault-injection")]
     let inject_fault_at_height = cli.run.inject_fault_at_height;
@@ -1365,6 +1411,9 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         .map(|b: Block<R::Payload>| b.timestamp)
         .unwrap_or(0);
     record_tip(startup_tip, startup_tip_timestamp);
+    if let Some((address, _)) = &identity {
+        report_validator_readiness(&db, &config.base_path, address, startup_tip)?;
+    }
 
     let SubsystemHandles {
         bootnodes,
