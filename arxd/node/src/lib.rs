@@ -1416,15 +1416,7 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         limits: config.limits.clone(),
         snapshot_trust: config
             .snapshot_trust
-            .clone()
-            .map(|(height, block_hash)| {
-                Ok::<_, xc_primitives::Hash32Error>(arxd_network::SnapshotTrust {
-                    height,
-                    block_hash: block_hash.parse()?,
-                })
-            })
-            .transpose()
-            .context("--snapshot-trust-hash is not a valid 32-byte hash")?,
+            .map(|(height, block_hash)| arxd_network::SnapshotTrust { height, block_hash }),
     })?;
 
     produce::produce_loop::<R>(

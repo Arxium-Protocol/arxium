@@ -248,13 +248,14 @@ pub struct RunArgs {
     )]
     pub snapshot_trust_height: Option<u64>,
 
-    /// The `0x…` hash of the block at `--snapshot-trust-height`.
+    /// The `0x…` hash of the block at `--snapshot-trust-height`. Parsed
+    /// here so a typo is rejected before the node opens its DB.
     #[arg(
         long,
         env = "ARXD_SNAPSHOT_TRUST_HASH",
         requires = "snapshot_trust_height"
     )]
-    pub snapshot_trust_hash: Option<String>,
+    pub snapshot_trust_hash: Option<xc_primitives::Hash32>,
 
     /// Harness-only, and only compiled in at all with `--features
     /// fault-injection` (never present in a normal build): corrupt this
@@ -434,6 +435,34 @@ mod tests {
             2,
             "a stray comma must not add an empty entry"
         );
+    }
+
+    /// A typo'd `--snapshot-trust-hash` must fail at parse time, not after
+    /// the node has opened its DB and started RPC.
+    #[test]
+    fn snapshot_trust_hash_parsed_by_clap() {
+        let err = Cli::try_parse_from([
+            "arxd",
+            "--snapshot-trust-height",
+            "5",
+            "--snapshot-trust-hash",
+            "0xabc",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+
+        let hash = format!("0x{}", "ab".repeat(32));
+        let cfg = Cli::try_parse_from([
+            "arxd",
+            "--snapshot-trust-height",
+            "5",
+            "--snapshot-trust-hash",
+            &hash,
+        ])
+        .unwrap()
+        .run
+        .into_config();
+        assert_eq!(cfg.snapshot_trust, Some((5, hash.parse().unwrap())));
     }
 
     /// `install.sh` sets the base path only via `ARXD_BASE_PATH`. A subcommand

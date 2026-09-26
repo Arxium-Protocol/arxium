@@ -184,7 +184,7 @@ pub struct NodeConfig {
     /// operator trusts (from an explorer or a node they run). A node still
     /// at genesis fetches state at that height instead of replaying from
     /// genesis; a node with history ignores it. `None`: replay.
-    pub snapshot_trust: Option<(u64, String)>,
+    pub snapshot_trust: Option<(u64, Hash32)>,
 }
 
 impl std::fmt::Debug for NodeConfig {
