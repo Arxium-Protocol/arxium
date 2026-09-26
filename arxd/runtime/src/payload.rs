@@ -99,7 +99,9 @@ pub enum ActionPayload {
     /// `xc_evidence::verify_equivocation` is what actually gates the slash, not
     /// who submitted it — so that's fine.
     SubmitEquivocationEvidence {
+        #[serde(deserialize_with = "nested_block")]
         block_a: Box<ChainBlock>,
+        #[serde(deserialize_with = "nested_block")]
         block_b: Box<ChainBlock>,
     },
     /// Registers `validator`'s BLS pubkey for finality-certificate
@@ -453,9 +455,85 @@ pub enum ActionPayload {
 pub type ChainAction = Action<ActionPayload>;
 pub type ChainBlock = xc_primitives::Block<ActionPayload>;
 
+/// How deep evidence may nest inside evidence: a block carried as evidence
+/// can itself hold a `SubmitEquivocationEvidence`, whose blocks can hold
+/// another, and so on. Real evidence nests once or twice. Without a cap, a
+/// crafted 1 MiB gossip or RPC message nests thousands deep (about 100
+/// bytes a level) and overflows the decoding thread's stack.
+const MAX_EVIDENCE_NESTING: u32 = 8;
+
+thread_local! {
+    static EVIDENCE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `deserialize_with` for the evidence blocks: counts nesting on this
+/// thread and refuses past `MAX_EVIDENCE_NESTING`, whatever the format.
+fn nested_block<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Box<ChainBlock>, D::Error> {
+    struct Level;
+    impl Drop for Level {
+        fn drop(&mut self) {
+            EVIDENCE_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    let depth = EVIDENCE_DEPTH.with(|d| {
+        d.set(d.get() + 1);
+        d.get()
+    });
+    let _level = Level;
+    if depth > MAX_EVIDENCE_NESTING {
+        return Err(serde::de::Error::custom(
+            "equivocation evidence nested too deep",
+        ));
+    }
+    Box::<ChainBlock>::deserialize(de)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Card 143: evidence whose blocks carry evidence, `levels` deep.
+    fn nested_evidence(levels: u32) -> ActionPayload {
+        let sender = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let mut payload = ActionPayload::Transfer {
+            to: sender.clone(),
+            amount: 1,
+        };
+        for _ in 0..levels {
+            let mut block: ChainBlock = xc_primitives::Block::genesis(0);
+            block.actions.push(Action {
+                sender: sender.clone(),
+                nonce: 0,
+                signature: None,
+                payload,
+            });
+            payload = ActionPayload::SubmitEquivocationEvidence {
+                block_a: Box::new(block.clone()),
+                block_b: Box::new(block),
+            };
+        }
+        payload
+    }
+
+    #[test]
+    fn evidence_nesting_is_capped_at_decode() {
+        let decode = |levels| {
+            let bytes = bincode::serde::encode_to_vec(
+                nested_evidence(levels),
+                xc_primitives::wire_config(),
+            )
+            .unwrap();
+            bincode::serde::decode_from_slice::<ActionPayload, _>(
+                &bytes,
+                xc_primitives::wire_config(),
+            )
+        };
+        decode(MAX_EVIDENCE_NESTING).expect("nesting at the cap decodes");
+        let err = decode(MAX_EVIDENCE_NESTING + 1).unwrap_err();
+        assert!(err.to_string().contains("nested too deep"), "{err}");
+        // The counter unwound on the error path: a legit payload still decodes.
+        decode(2).expect("counter reset after a refused decode");
+    }
 
     /// `VerifyClaimProof`'s exact bytes, pinned identically in Arx+ Swift's
     /// `ArxiumCodecTests`: variant 40, the ref as a string, `sub` as 32 raw
