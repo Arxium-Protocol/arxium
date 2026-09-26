@@ -104,9 +104,16 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             accounts: reward_updates,
             ..Default::default()
         };
+        // Each step below reads through what the steps before it produced:
+        // the reward and the downtime slash both rewrite the reward pool's
+        // row, and the boundary hook has to see this block's slash and jail.
+        // Reading `view` directly would hand each step the pre-seal row and
+        // the later `extend` would silently drop the earlier step's write.
+        let mut sealed = SealOverlay::new(view);
+        sealed.apply(&updates)?;
         if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
             let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
-                view,
+                &sealed,
                 &primary,
                 proposer,
                 height,
@@ -140,10 +147,11 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
                 .stakes
                 .validator_index
                 .extend(downtime_stakes.validator_index);
+            sealed.apply(&updates)?;
         }
         // Epoch boundary: the one place the set changes. Runs last so it
-        // sees this block's slash/jail above through the same view.
-        let boundary = epoch::boundary_hook(view, height)?;
+        // sees this block's slash/jail above through `sealed`.
+        let boundary = epoch::boundary_hook(&sealed, view.db(), height)?;
         updates
             .validator_statuses
             .0
@@ -214,6 +222,78 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
     }
 }
 
+/// `on_block_sealed`'s read path: `view` (the block's actions applied) plus
+/// whatever the seal itself has produced so far, folded with the same
+/// put/delete rules `BlockView::apply_*` use.
+struct SealOverlay<'a, V> {
+    base: &'a V,
+    entries: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl<'a, V> SealOverlay<'a, V> {
+    fn new(base: &'a V) -> Self {
+        Self {
+            base,
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    fn put<K: xc_circuit::KeySpec>(&mut self, key: &K, value: &K::Value) -> anyhow::Result<()> {
+        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
+        self.entries.insert(key.encode(), Some(bytes));
+        Ok(())
+    }
+
+    fn delete<K: xc_circuit::KeySpec>(&mut self, key: &K) {
+        self.entries.insert(key.encode(), None);
+    }
+
+    fn apply(&mut self, updates: &BlockUpdates) -> anyhow::Result<()> {
+        for (address, entry) in &updates.accounts.0 {
+            self.put(&AccountKey(address), entry)?;
+        }
+        for ((master, validator), allocation) in &updates.stakes.allocations {
+            let key = xc_circuit::StakeKey { master, validator };
+            match allocation {
+                Some(allocation) => self.put(&key, allocation)?,
+                None => self.delete(&key),
+            }
+        }
+        for (validator, masters) in &updates.stakes.validator_index {
+            let key = xc_circuit::StakeByValidatorKey(validator);
+            if masters.is_empty() {
+                self.delete(&key);
+            } else {
+                self.put(&key, masters)?;
+            }
+        }
+        for (address, status) in &updates.validator_statuses.0 {
+            let key = xc_circuit::ValidatorStatusKey(address);
+            match status {
+                Some(status) => self.put(&key, status)?,
+                None => self.delete(&key),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<V: KvRead<Error = StorageError>> KvRead for SealOverlay<'_, V> {
+    type Error = StorageError;
+
+    fn get<K: xc_circuit::KeySpec>(&self, key: &K) -> Result<Option<K::Value>, StorageError> {
+        match self.entries.get(&key.encode()) {
+            Some(None) => Ok(None),
+            Some(Some(bytes)) => {
+                let (value, _len) =
+                    bincode::serde::decode_from_slice(bytes, bincode::config::standard())?;
+                Ok(Some(value))
+            }
+            None => self.base.get(key),
+        }
+    }
+}
+
 /// Cheap pre-check for the payload variants whose `dispatch` rejection
 /// reason (bad `is_authorized`, below `MIN_VALIDATOR_STAKE`, not a current
 /// validator) previously only surfaced during block production — the
@@ -267,7 +347,7 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 .map(|a| a.active_amount)
                 .unwrap_or(0);
             let min_stake = params.min_validator_stake;
-            if existing_active + *stake < min_stake {
+            if existing_active.saturating_add(*stake) < min_stake {
                 anyhow::bail!("stake {stake} is below the minimum validator stake {min_stake}");
             }
         }

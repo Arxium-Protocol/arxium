@@ -59,6 +59,18 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     block_b: &ChainBlock,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
+    // Equivocation is two blocks for the same slot. A proposer the round
+    // rotation brings back at a later round of the same height (after
+    // enough timeouts, `eligible_proposer` wraps) legitimately signs a new
+    // block there; that pair differs only by round and is not a fault.
+    if block_a.round != block_b.round {
+        anyhow::bail!(
+            "invalid equivocation evidence: blocks are for different rounds ({} and {}) of height {}",
+            block_a.round,
+            block_b.round,
+            block_a.height
+        );
+    }
     let evidence = xc_evidence::EquivocationEvidence {
         block_a: block_a.clone(),
         block_b: block_b.clone(),
@@ -443,6 +455,24 @@ mod tests {
         let marker = updates.evidence.expect("must write an evidence marker");
         assert_eq!(marker.height, 5);
         assert_eq!(marker.proposer, equivocator);
+    }
+
+    /// The round rotation can hand the same proposer a later round of the
+    /// same height; its new block there is not equivocation.
+    #[test]
+    fn blocks_from_different_rounds_are_not_equivocation() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        let proposer = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let block_a = signed_chain_block(&key, 5, 100);
+        let mut block_b: ChainBlock = xc_primitives::Block::genesis(200);
+        block_b.height = 5;
+        block_b.round = 3;
+        block_b.sign(proposer.clone(), &key);
+
+        let db = temp_db();
+        let view = seeded_view(&db, HashMap::new(), HashMap::new());
+        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        assert!(err.to_string().contains("different rounds"), "{err}");
     }
 
     #[test]

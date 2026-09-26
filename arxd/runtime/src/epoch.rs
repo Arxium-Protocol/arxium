@@ -15,14 +15,18 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{
     Address, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary,
 };
-use xc_storage::{BlockView, StorageError};
+use xc_storage::{ArxiumDb, StorageError};
 
 /// Runs inside `on_block_sealed`. Off a boundary it does nothing. On one it
 /// always returns a set (and the status rows it changed): the next one, or,
 /// when fewer than `min_validator_set` qualify, the previous one re-written
 /// with a warning — never a set that cannot reach quorum, and never a
 /// boundary without a row (see `xc_circuit::ValidatorSetKey`).
-pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result<BlockUpdates> {
+pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
+    view: &V,
+    db: &ArxiumDb,
+    height: u64,
+) -> anyhow::Result<BlockUpdates> {
     let params = view.get(&ChainParamsKey)?.unwrap_or_default();
     let mut updates = BlockUpdates::default();
     if !is_boundary(height, params.epoch_length) {
@@ -34,7 +38,7 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
     // then read back through the view so a status written earlier in this
     // very block is honoured.
     let mut statuses: BTreeMap<Address, ValidatorStatus> = BTreeMap::new();
-    for (address, scanned) in view.db().all_validator_statuses()? {
+    for (address, scanned) in db.all_validator_statuses()? {
         let status = view.get(&ValidatorStatusKey(&address))?.unwrap_or(scanned);
         statuses.insert(address, status);
     }
@@ -73,7 +77,7 @@ pub(crate) fn boundary_hook(view: &BlockView<'_>, height: u64) -> anyhow::Result
         // location is what makes the set provable as one key
         // (`ValidatorSetKey(validator_set_effective_height(H))`), so every
         // boundary writes one whether or not the membership moved.
-        updates.validator_set = Some(view.db().get_validator_set_at(height)?);
+        updates.validator_set = Some(db.get_validator_set_at(height)?);
         return Ok(updates);
     }
 
