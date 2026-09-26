@@ -245,16 +245,18 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     // their BLS finality key, which must instead be resolved to the
     // `Address` it was registered under (`RegisterBlsKey`/`JoinValidator`) —
     // there is no direct BLS-pubkey-to-`Address` derivation.
-    let culprit = if culpable_pubkey == proposer_pubkey {
-        let bytes = hex::decode(
-            proposer_pubkey
-                .strip_prefix("0x")
-                .unwrap_or(&proposer_pubkey),
-        )?;
-        Address::from_pubkey_bytes(&bytes)?
-    } else if culpable_pubkey == voter_pubkey {
-        let bytes = hex::decode(voter_pubkey.strip_prefix("0x").unwrap_or(&voter_pubkey))?;
-        let bytes: [u8; 48] = bytes
+    //
+    // Compared as decoded bytes, not strings. Every adjudicator today echoes
+    // the artifact's own string back, so the two always match; one that
+    // normalised (`0x`, case) would otherwise turn a valid artifact into
+    // "matches neither party".
+    let decode = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok();
+    let culpable = decode(&culpable_pubkey)
+        .ok_or_else(|| anyhow::anyhow!("adjudicator named a malformed pubkey"))?;
+    let culprit = if decode(&proposer_pubkey).as_ref() == Some(&culpable) {
+        Address::from_pubkey_bytes(&culpable)?
+    } else if decode(&voter_pubkey).as_ref() == Some(&culpable) {
+        let bytes: [u8; 48] = culpable
             .try_into()
             .map_err(|_| anyhow::anyhow!("BLS public key must be 48 bytes"))?;
         bls_pubkey_owner_lookup(&BlsPublicKey(bytes))?
