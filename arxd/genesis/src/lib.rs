@@ -609,7 +609,6 @@ mod tests {
 
     #[test]
     fn genesis_bls_registrations_rejects_duplicate_pubkey() {
-
         let (sk, pk) = xc_bls::keygen_from_seed(&[7u8; 32]).unwrap();
         let pubkey_hex = hex::encode(pk.0);
         let pop_hex = hex::encode(xc_bls::prove_possession(&sk).0);

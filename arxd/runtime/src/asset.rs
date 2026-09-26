@@ -1247,8 +1247,17 @@ mod tests {
         freeze_only
             .put(&xc_circuit::AdminKey(AdminRole::Freeze), &stranger)
             .unwrap();
-        let err = forced_transfer(&freeze_only, &action, &gold, &issuer, &stranger, 1, "why", 0)
-            .unwrap_err();
+        let err = forced_transfer(
+            &freeze_only,
+            &action,
+            &gold,
+            &issuer,
+            &stranger,
+            1,
+            "why",
+            0,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("only the recovery admin"),
             "got: {err}"

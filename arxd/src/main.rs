@@ -10,8 +10,8 @@ const DEFAULT_LOG_FILTER: &str = "warn,arxd_node=info,arxd_network=info,arxd_fin
 arxd_genesis=info,arxd_runtime=info,xc_executor=info,xc_evidence=info,xc_rpc=info";
 
 fn main() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
