@@ -6,7 +6,7 @@
 //! runs *instead of* the node; booting the node itself is `run_node` in
 //! `lib.rs`.
 
-use crate::components::new_partial;
+use crate::components::{NodeComponents, chain_data_path, new_partial};
 use crate::validator;
 use anyhow::{Context, Result};
 use arxd_network::identity;
@@ -131,26 +131,52 @@ pub(crate) fn cmd_pair<R: ChainRuntime>(
     R::pair(&key.to_bytes(), &sender, node, token, revoke)
 }
 
+/// Opens an existing node's data for `snapshot`/`prune`. `new_partial`
+/// alone writes genesis into an empty path, so a wrong `--base-path` or
+/// `--chain` would export (or prune) a brand-new empty chain instead of
+/// failing. `is_validator: false` (`offline`'s default) means no key material
+/// gets generated either.
+fn open_existing<R: ChainRuntime>(
+    base_path: &std::path::Path,
+    chain: &str,
+) -> Result<NodeComponents<R>> {
+    let spec =
+        arxd_genesis::ChainSpec::parse(&xc_chain_spec::resolve_chain_spec(chain, R::presets())?)?;
+    let data_path = chain_data_path(base_path, spec.chain_name());
+    let initialized =
+        data_path.exists() && xc_storage::ArxiumDb::open(&data_path)?.is_initialized()?;
+    if !initialized {
+        anyhow::bail!(
+            "no initialized {chain} database at {} (check --base-path and --chain)",
+            data_path.display()
+        );
+    }
+    new_partial::<R>(&xc_primitives::NodeConfig::offline(
+        base_path.to_path_buf(),
+        chain,
+    ))
+}
+
 pub(crate) fn cmd_snapshot<R: ChainRuntime>(
     base_path: &std::path::Path,
     chain: &str,
     output: &std::path::Path,
 ) -> Result<()> {
-    // Read-only, so goes through `new_partial` like the running node
-    // does rather than opening the DB by hand — same tip-signature
-    // verification, same genesis-write-on-first-run behavior, so a
-    // snapshot taken from data nothing else has ever booted still works.
-    // `is_validator: false` (`offline`'s default) means no key material
-    // gets generated just to export a checkpoint.
-    let config = xc_primitives::NodeConfig::offline(base_path.to_path_buf(), chain);
-    let components = new_partial::<R>(&config)?;
+    // Goes through `new_partial` like the running node does rather than
+    // opening the DB by hand, for the same tip-signature verification.
+    let components = open_existing::<R>(base_path, chain)?;
+    let tip = components.db.get_tip_height()?.unwrap_or(0);
+    // A genesis-only snapshot would bootstrap a genesis-only node.
+    anyhow::ensure!(
+        tip > 0,
+        "nothing to snapshot: the chain is still at genesis"
+    );
     components.db.export_checkpoint(output).with_context(|| {
         format!(
             "failed to write checkpoint to {} (must not already exist)",
             output.display()
         )
     })?;
-    let tip = components.db.get_tip_height()?.unwrap_or(0);
     println!(
         "wrote checkpoint at tip height {tip} to {}",
         output.display()
@@ -163,8 +189,7 @@ pub(crate) fn cmd_prune<R: ChainRuntime>(
     chain: &str,
     retain_blocks: u64,
 ) -> Result<()> {
-    let config = xc_primitives::NodeConfig::offline(base_path.to_path_buf(), chain);
-    let components = new_partial::<R>(&config)?;
+    let components = open_existing::<R>(base_path, chain)?;
     let tip = components.db.get_tip_height()?.unwrap_or(0);
     let report = components
         .db
@@ -223,4 +248,48 @@ pub(crate) fn cmd_chain_spec<R: ChainRuntime>(chain: &str) -> Result<()> {
     let spec_json = xc_chain_spec::resolve_chain_spec(chain, R::presets())?;
     println!("{spec_json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arxd_runtime::CoreChainRuntime;
+
+    #[test]
+    fn snapshot_and_prune_refuse_a_path_with_no_chain() {
+        let base_path = std::env::temp_dir().join(format!(
+            "arxium-test-commands-no-chain-{}",
+            std::process::id()
+        ));
+        let out = base_path.join("snap");
+        let err = cmd_snapshot::<CoreChainRuntime>(&base_path, "devnet", &out).unwrap_err();
+        assert!(err.to_string().contains("no initialized"), "got: {err}");
+        let err = cmd_prune::<CoreChainRuntime>(&base_path, "devnet", 10).unwrap_err();
+        assert!(err.to_string().contains("no initialized"), "got: {err}");
+        assert!(
+            !base_path.exists(),
+            "nothing may be created on a wrong path"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_a_genesis_only_chain() {
+        let base_path = std::env::temp_dir().join(format!(
+            "arxium-test-commands-genesis-only-{}",
+            std::process::id()
+        ));
+        drop(
+            new_partial::<CoreChainRuntime>(&xc_primitives::NodeConfig::offline(
+                base_path.clone(),
+                "devnet",
+            ))
+            .unwrap(),
+        );
+        let err = cmd_snapshot::<CoreChainRuntime>(&base_path, "devnet", &base_path.join("snap"))
+            .unwrap_err();
+        assert!(err.to_string().contains("still at genesis"), "got: {err}");
+        cmd_prune::<CoreChainRuntime>(&base_path, "devnet", 10)
+            .expect("prune at genesis is a no-op");
+        std::fs::remove_dir_all(&base_path).ok();
+    }
 }
