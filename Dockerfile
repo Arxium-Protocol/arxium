@@ -2,7 +2,7 @@
 
 # rocksdb (core/storage) builds from source via librocksdb-sys — needs
 # clang/cmake/a C++ toolchain, not just rustc.
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1.94.0-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     clang cmake build-essential libclang-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*

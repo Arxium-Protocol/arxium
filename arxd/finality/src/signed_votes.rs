@@ -127,8 +127,18 @@ impl SignedVotes {
         self.claim(Kind::Timeout, height, round, parent_hash)
     }
 
+    /// Every refusal is counted in `arxium_finality_votes_refused_total{reason}`:
+    /// `floor` is routine catch-up, `conflict` means the file just saved this
+    /// validator from a slash (a restore or rollback happened), and
+    /// `write_failed` means the vote was skipped because the record couldn't
+    /// be made durable (disk full, permissions).
     fn claim(&mut self, kind: Kind, height: u64, round: u32, hash: &str) -> Result<(), String> {
+        let refused = |reason: &'static str| {
+            metrics::counter!("arxium_finality_votes_refused_total", "reason" => reason)
+                .increment(1);
+        };
         if height <= self.floor {
+            refused("floor");
             return Err(format!(
                 "height {height} is at or below the pruned floor {}",
                 self.floor
@@ -141,6 +151,7 @@ impl SignedVotes {
             .find(|e| e.height == height && e.round == round)
         {
             if e.kind != kind {
+                refused("conflict");
                 // S2: precommit and timeout in the same round, either order.
                 return Err(format!(
                     "already signed a {:?} vote at height {height} round {round}",
@@ -148,6 +159,7 @@ impl SignedVotes {
                 ));
             }
             if e.hash != hash {
+                refused("conflict");
                 return Err(format!(
                     "already signed a {kind:?} vote for {} at height {height} round {round}",
                     e.hash
@@ -161,7 +173,7 @@ impl SignedVotes {
             round,
             hash: hash.to_string(),
         });
-        self.persist()
+        self.persist().inspect_err(|_| refused("write_failed"))
     }
 
     /// Drops entries below `cutoff` and raises the floor to match, so a DB

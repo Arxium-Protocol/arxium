@@ -5,10 +5,12 @@
 # Boots NUM_VALIDATORS (default 4) local validators from a throwaway genesis:
 # node 0 is built with `--features fault-injection` and armed to corrupt its
 # own signed state_root at FAULT_HEIGHT; the rest are honest. The honest
-# majority's independent re-execution must disagree with node 0's block,
-# submit fault evidence, and drive node 0's stake to zero via on-chain
-# adjudication — all without node 0 ever landing a counter-slash against an
-# honest validator. This exercises three separate guards against real
+# majority's independent re-execution must disagree with node 0's block and
+# write fault evidence, and nobody may be slashed for it: a corrupted
+# state_root only yields ExecutionDisagreement (never slashes) and
+# BlockDivergence (slashing disabled until its replay checks the parent root
+# and replays sealing, Trello 138 — see adjudicate_block_divergence). Node 0
+# must never land a counter-slash against an honest validator either. This exercises three separate guards against real
 # processes instead of one test binary, and only two of them are actually
 # checked below:
 #   - Culprit resolution — checked: "honest nodes' stakes are untouched".
@@ -224,25 +226,11 @@ echo "chain reached height $tip"
 
 pass=true
 
-echo "checking node 0's (faulty) stake was slashed to zero..."
-stake_status=$(curl -s -o "$ROOT/stake_0.json" -w '%{http_code}' "http://127.0.0.1:$RPC_HONEST/accounts/${ADDRS[0]}/stake")
-if [ "$stake_status" = "404" ]; then
-    echo "  ok: node 0's stake allocation was removed (fully slashed)"
-elif [ "$stake_status" = "200" ] && [ "$(jq -r '.active_amount' "$ROOT/stake_0.json")" = "0" ]; then
-    echo "  ok: node 0's active_amount is 0"
-else
-    echo "  FAIL: node 0's stake was not zeroed (http $stake_status): $(cat "$ROOT/stake_0.json")"
-    pass=false
-fi
-
-# ponytail: this check is vacuous on its own — it passes trivially when no
-# slash lands at all, which is exactly today's state under the evidence
-# resubmission dedup gap (core/evidence/src/lib.rs:383). It only starts
-# distinguishing "correctly not slashed" from "nothing happened" once node
-# 0's stake check above actually reaches zero and `pass` is still riding on
-# this one too — a lone "ok" here proves nothing by itself.
-echo "checking honest nodes' stakes were left alone (culprit resolved to node 0 only)..."
-for i in $(seq 1 $((NUM_VALIDATORS - 1))); do
+# ponytail: BlockDivergence slashing is off (Trello 138), so the expected
+# outcome is that nobody's stake moves, node 0 included. When that slash is
+# turned back on, node 0 should reach 0 here again (404 or active_amount 0).
+echo "checking no validator was slashed (BlockDivergence slashing is disabled, Trello 138)..."
+for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     stake_status=$(curl -s -o "$ROOT/stake_$i.json" -w '%{http_code}' "http://127.0.0.1:$RPC_HONEST/accounts/${ADDRS[$i]}/stake")
     if [ "$stake_status" = "200" ] && [ "$(jq -r '.active_amount' "$ROOT/stake_$i.json")" != "0" ]; then
         echo "  ok: node $i's stake is untouched"
@@ -316,9 +304,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep 2
 done
 
-# 1. It reverted at all, and to a height it was allowed to revert to.
-if grep -q "reverted from height" "$ROOT/node-0.log"; then
-    echo "  ok: $(grep -o 'reverted from height.*' "$ROOT/node-0.log" | head -n 1)"
+# 1. It rolled its block back at all. Two paths can do it: finality unwinds
+#    its round-0 block once the round is certified timed out (the usual one
+#    now, before any peer serves a conflicting chain), or sync reverts to a
+#    peer's certified chain.
+if grep -qE "unwinding to|reverted from height" "$ROOT/node-0.log"; then
+    echo "  ok: $(grep -oE '(unwinding to|reverted from height).*' "$ROOT/node-0.log" | head -n 1)"
 else
     echo "  FAIL: node 0 never reverted (tip $faulty_tip); last lines:"
     tail -n 20 "$ROOT/node-0.log"
@@ -377,7 +368,7 @@ fi
 
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — culprit resolution, self-incrimination, the slash landing, and"
+    echo "PASS — no wrongful slash, self-incrimination, evidence written, and"
     echo "the diverged node's automatic rollback and reconvergence all held."
     echo "(Recursion guard not exercised by this scenario — see header comment.)"
     # Kept, not deleted. A passing run's logs are how a pass gets checked

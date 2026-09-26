@@ -365,17 +365,17 @@ fn verify_claim_payload<P: Payload>(state: &AppState<P>, input: &IdentityVerifyR
             today_days: today,
             age_cutoff_days: cutoff,
         };
-        if input.claims_mask & predicate::MEMBERSHIP != 0 {
-            if !valid_group_signature(
+        if input.claims_mask & predicate::MEMBERSHIP != 0
+            && !valid_group_signature(
                 state,
                 input.group.as_deref()?,
                 input.group_root.as_deref()?,
                 input.group_attestor.as_deref()?,
                 input.group_signature.as_deref()?,
                 input.group_sequence?,
-            ) {
-                return None;
-            }
+            )
+        {
+            return None;
         }
         let proof_bytes = hex::decode(&input.proof).ok()?;
         let proof =
@@ -830,9 +830,11 @@ mod tests {
             circuit_identity_zk::id_commitment(&params, secret),
             &opening,
         );
-        let mut account = xc_primitives::AccountEntry::default();
-        account.identity_hash = Some(field_hex(&leaf));
-        account.attested_by = Some(attestor.clone());
+        let mut account = xc_primitives::AccountEntry {
+            identity_hash: Some(field_hex(&leaf)),
+            attested_by: Some(attestor.clone()),
+            ..Default::default()
+        };
         state
             .db
             .write_batch(&xc_storage::AccountUpdates(
@@ -929,10 +931,14 @@ mod tests {
         let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
         let legacy = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
         let leaf = field_hex(&Fr::from(77u64));
-        let mut account = xc_primitives::AccountEntry::default();
-        account.identity_hash = Some(leaf);
-        let mut old = xc_primitives::AccountEntry::default();
-        old.identity_hash = Some("pre-v1-opaque-hash".into());
+        let account = xc_primitives::AccountEntry {
+            identity_hash: Some(leaf),
+            ..Default::default()
+        };
+        let old = xc_primitives::AccountEntry {
+            identity_hash: Some("pre-v1-opaque-hash".into()),
+            ..Default::default()
+        };
         state
             .db
             .write_batch(&xc_storage::AccountUpdates(

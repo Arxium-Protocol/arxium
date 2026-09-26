@@ -46,7 +46,8 @@ pub struct SnapshotTrust {
 /// snapshot's chunks in order, and a second client at another height simply
 /// replaces it. ponytail: refetched from `state_at` on a miss, which is
 /// exact (same undo records) just slower.
-static SERVED: Mutex<Option<(u64, Instant, std::sync::Arc<Vec<SnapshotEntry>>)>> = Mutex::new(None);
+type Served = (u64, Instant, std::sync::Arc<Vec<SnapshotEntry>>);
+static SERVED: Mutex<Option<Served>> = Mutex::new(None);
 const SERVED_TTL: Duration = Duration::from_secs(10 * 60);
 
 fn entries_at(db: &ArxiumDb, height: u64) -> Option<std::sync::Arc<Vec<SnapshotEntry>>> {
@@ -417,8 +418,11 @@ mod tests {
         db.write_batch(&GenesisHash(format!("0x{}", hex::encode(GENESIS))))
             .unwrap();
         db.write_batch(&ChainParamsRow(Default::default())).unwrap();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[validator.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&validator),
+        ))
+        .unwrap();
         db.write_batch(&BlsKeyRegistration {
             address: validator.clone(),
             pubkey: pk,

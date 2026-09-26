@@ -60,6 +60,38 @@ groups:
         annotations:
           summary: "{{ $value }} actions have been pending for at least 5 minutes"
 
+      # Honest traffic is a few items per block against a 1024-slot queue, so
+      # any drop means the swarm loop stalled (usually a slow on_block).
+      - alert: ArxiumOutboundDropped
+        expr: increase(arxium_network_outbound_dropped_total[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} outbound {{ $labels.channel }} message(s) dropped in the last 10 minutes"
+
+      # `floor` refusals are routine catch-up and not alerted on.
+      - alert: ArxiumVoteConflictRefused
+        expr: increase(arxium_finality_votes_refused_total{reason="conflict"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "signed_votes refused a conflicting vote"
+          description: >
+            The validator was about to sign a vote that conflicts with one it
+            already signed. The signed_votes file prevented a slash, which
+            means a restore or rollback happened. Find out why.
+
+      - alert: ArxiumVoteRecordWriteFailed
+        expr: increase(arxium_finality_votes_refused_total{reason="write_failed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Votes skipped: signed_votes could not be written"
+          description: >
+            The validator is not voting because it cannot persist its
+            signed-vote record. Check the disk space and permissions of the
+            base path.
+
   # Only fires on a host that also scrapes the `retracer` job in
   # prometheus.yml, i.e. one also running retracerd. Harmless if that job
   # isn't configured: these rules simply never match any series.

@@ -113,10 +113,10 @@ fn validate_opening(input: Opening, secret: Fr) -> Result<(zk::CredentialOpening
     let bytes = input.country_code.as_bytes();
     let params = zk::poseidon_params();
     let commitment = zk::id_commitment(&params, secret);
-    if let Some(expected) = &input.id_commitment {
-        if parse_field(expected)? != commitment {
-            return Err("opening is for another wallet".into());
-        }
+    if let Some(expected) = &input.id_commitment
+        && parse_field(expected)? != commitment
+    {
+        return Err("opening is for another wallet".into());
     }
     let opening = zk::CredentialOpening {
         kyc: input.kyc,
@@ -129,10 +129,10 @@ fn validate_opening(input: Opening, secret: Fr) -> Result<(zk::CredentialOpening
         salt: parse_field(&input.salt)?,
     };
     let leaf = zk::credential_leaf(&params, commitment, &opening);
-    if let Some(expected) = &input.leaf {
-        if parse_field(expected)? != leaf {
-            return Err("credential leaf does not match its opening".into());
-        }
+    if let Some(expected) = &input.leaf
+        && parse_field(expected)? != leaf
+    {
+        return Err("credential leaf does not match its opening".into());
     }
     Ok((opening, leaf))
 }
@@ -332,6 +332,11 @@ fn prove_asset_claim(input: Request, secret: Fr) -> Result<serde_json::Value, St
 
 /// Returned pointer belongs to the caller until `arx_id_free` is called.
 /// Only strings made by this library may be passed to the free function.
+///
+/// # Safety
+///
+/// `request` must be null or a valid NUL-terminated C string that stays
+/// readable for the duration of the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arx_id_json(request: *const c_char) -> *mut c_char {
     let result = std::panic::catch_unwind(|| {
@@ -354,6 +359,10 @@ pub unsafe extern "C" fn arx_id_json(request: *const c_char) -> *mut c_char {
         .into_raw()
 }
 
+/// # Safety
+///
+/// `pointer` must be null or a pointer returned by `arx_id_json` that hasn't
+/// been freed yet.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn arx_id_free(pointer: *mut c_char) {
     if !pointer.is_null() {

@@ -331,10 +331,14 @@ mod tests {
 
     /// Three validators at 60/30/10 % from genesis, 10-block voting window.
     fn db() -> ArxiumDb {
+        // The counter keeps parallel tests apart: macOS clocks tick in µs,
+        // so two tests can read the same nanos.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
-            .as_nanos();
+            .as_nanos()
+            + COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u128;
         let path = std::env::temp_dir().join(format!("arxium-test-governance-{nanos}"));
         let db = ArxiumDb::open(&path).unwrap();
         let set = BTreeMap::from([

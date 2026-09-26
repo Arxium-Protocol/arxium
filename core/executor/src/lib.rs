@@ -1389,8 +1389,11 @@ mod tests {
         let bob_key = SigningKey::from_bytes(&[8u8; 32]);
         let bob = Address::from_pubkey_bytes(bob_key.verifying_key().as_bytes()).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&alice),
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -1753,8 +1756,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let validator = Address::from_pubkey_bytes(&[12u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&alice),
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(
@@ -1802,8 +1808,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let validator = Address::from_pubkey_bytes(&[14u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&alice),
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(
@@ -1898,8 +1907,11 @@ mod tests {
         let key = SigningKey::from_bytes(&[11u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&addr),
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[&AccountUpdates(BTreeMap::new()), &genesis])
             .unwrap();
@@ -2365,8 +2377,11 @@ mod tests {
         let alice = Address::from_pubkey_bytes(alice_key.verifying_key().as_bytes()).unwrap();
         let bob = Address::from_pubkey_bytes(&[32u8; 32]).unwrap();
 
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[alice.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&alice),
+        ))
+        .unwrap();
         let genesis: Block<TestPayload> = Block::genesis(0);
         db.write_batches(&[
             &AccountUpdates(BTreeMap::from([(

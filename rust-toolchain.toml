@@ -1,0 +1,6 @@
+# One toolchain for local builds, CI and the Docker image, so clippy's lint
+# set only changes when this file does. Bump deliberately and fix new lints in
+# the same PR.
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
