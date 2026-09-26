@@ -4,10 +4,14 @@
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+/// Used when `RUST_LOG` is unset. Targets are crate names (module paths), so
+/// they must say `arxd_node`, not `node` — a wrong name silently matches nothing.
+const DEFAULT_LOG_FILTER: &str = "warn,arxd_node=info,arxd_network=info,arxd_finality=info,\
+arxd_genesis=info,arxd_runtime=info,xc_executor=info,xc_evidence=info,xc_rpc=info";
+
 fn main() -> Result<()> {
-    let filter_level =
-        EnvFilter::new("warn,node=debug,xc_storage=debug,xc_primitives=debug,network=debug");
-    let filter = EnvFilter::try_from_default_env().unwrap_or(filter_level);
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -19,4 +23,26 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     arxd_node::run::<arxd_runtime::CoreChainRuntime>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_LOG_FILTER;
+
+    #[test]
+    fn default_log_filter_targets_are_workspace_crates() {
+        let out = std::process::Command::new(env!("CARGO"))
+            .args(["metadata", "--no-deps", "--format-version", "1"])
+            .output()
+            .expect("cargo metadata");
+        let meta = String::from_utf8(out.stdout).unwrap();
+        for directive in DEFAULT_LOG_FILTER.split(',').filter(|d| d.contains('=')) {
+            let target = directive.split('=').next().unwrap();
+            let crate_name = target.replace('_', "-");
+            assert!(
+                meta.contains(&format!("\"name\":\"{crate_name}\"")),
+                "log target {target} is not a workspace crate"
+            );
+        }
+    }
 }
