@@ -988,8 +988,11 @@ mod tests {
 
         let key = SigningKey::from_bytes(&[22u8; 32]);
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
-        db.write_batch(&ValidatorSetSnapshot::equal_power(0, &[addr.clone()]))
-            .unwrap();
+        db.write_batch(&ValidatorSetSnapshot::equal_power(
+            0,
+            std::slice::from_ref(&addr),
+        ))
+        .unwrap();
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         db.write_batches(&[&genesis]).unwrap();
         db.write_batch(&xc_storage::GenesisHash(format!("0x{}", "a1".repeat(32))))

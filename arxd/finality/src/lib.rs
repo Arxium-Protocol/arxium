@@ -1706,7 +1706,7 @@ mod tests {
             let vote = PrecommitVote {
                 height: 5,
                 round: 0,
-                block_hash: block_hash,
+                block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
@@ -1730,7 +1730,7 @@ mod tests {
         let vote = PrecommitVote {
             height: 5,
             round: 0,
-            block_hash: block_hash,
+            block_hash,
             voter: addr.clone(),
             signature: xc_bls::sign(
                 sk,
@@ -1795,7 +1795,7 @@ mod tests {
             let vote = PrecommitVote {
                 height: 5,
                 round: 0,
-                block_hash: block_hash,
+                block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
@@ -1842,7 +1842,7 @@ mod tests {
         let vote = PrecommitVote {
             height: 5,
             round: 0,
-            block_hash: block_hash,
+            block_hash,
             voter: addr.clone(),
             signature: xc_bls::sign(
                 sk,
@@ -1911,7 +1911,7 @@ mod tests {
             let vote = PrecommitVote {
                 height: 5,
                 round: 0,
-                block_hash: block_hash,
+                block_hash,
                 voter: addr.clone(),
                 signature: xc_bls::sign(
                     sk,
@@ -2002,7 +2002,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
             0,
-            &[addr.clone()],
+            std::slice::from_ref(&addr),
         )])
         .unwrap();
 
@@ -2039,7 +2039,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
             0,
-            &[addr.clone()],
+            std::slice::from_ref(&addr),
         )])
         .unwrap();
 
@@ -2094,7 +2094,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
             0,
-            &[addr.clone()],
+            std::slice::from_ref(&addr),
         )])
         .unwrap();
 
@@ -2141,7 +2141,7 @@ mod tests {
         .unwrap();
         db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
             0,
-            &[addr.clone()],
+            std::slice::from_ref(&addr),
         )])
         .unwrap();
 
@@ -2586,7 +2586,7 @@ mod tests {
         let vote = |i: usize| PrecommitVote {
             height: 5,
             round: 0,
-            block_hash: block_hash,
+            block_hash,
             voter: keys[i].0.clone(),
             signature: xc_bls::sign(
                 &keys[i].1,

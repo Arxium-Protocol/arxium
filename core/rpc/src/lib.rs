@@ -1973,7 +1973,7 @@ mod tests {
                 .db
                 .write_batch(&xc_storage::ValidatorSetSnapshot::equal_power(
                     0,
-                    &[validator.clone()],
+                    std::slice::from_ref(&validator),
                 ))
                 .unwrap();
 
