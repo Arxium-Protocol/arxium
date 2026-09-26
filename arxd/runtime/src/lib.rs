@@ -599,7 +599,16 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             to,
             amount,
             reason,
-        } => asset::forced_transfer(view, action, asset, from, to, *amount, reason),
+        } => asset::forced_transfer(
+            view,
+            action,
+            asset,
+            from,
+            to,
+            *amount,
+            reason,
+            current_height,
+        ),
         ActionPayload::BurnAsset { asset, amount } => {
             asset::burn_asset(view, action, asset, *amount)
         }
@@ -696,7 +705,16 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             to,
             amount,
             reason,
-        } => asset::issuer_forced_transfer(view, action, asset, from, to, *amount, reason),
+        } => asset::issuer_forced_transfer(
+            view,
+            action,
+            asset,
+            from,
+            to,
+            *amount,
+            reason,
+            current_height,
+        ),
         ActionPayload::RecoverHolder {
             asset,
             lost,
@@ -738,7 +756,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
         ActionPayload::RedeemHolders {
             asset,
             snapshot_height,
-        } => asset::redeem(view, action, asset, *snapshot_height),
+        } => asset::redeem(view, action, asset, *snapshot_height, current_height),
         ActionPayload::SplitAsset {
             asset,
             snapshot_height,
