@@ -134,6 +134,14 @@ jobs:
           # couldn't decode. arxd-runtime is only a dev-dependency (tests).
           ! cargo tree -p arxd-node -e normal -i arxd-runtime 2>/dev/null | grep -q arxd-runtime
 
+      # ponytail: fmt only. Clippy lints change between toolchain releases
+      # and the toolchain isn't pinned, so a clippy gate could fail a release
+      # tag for nothing. Pin rust-toolchain.toml first, then add
+      # `cargo clippy --workspace --all-targets -- -D warnings`.
+      - name: Check formatting
+        shell: bash
+        run: cargo fmt --all --check
+
       - name: Test the workspace
         shell: bash
         run: cargo test --workspace --locked
