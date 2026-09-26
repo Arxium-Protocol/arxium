@@ -377,7 +377,7 @@ pub fn produce_loop<R: ChainRuntime>(
     mut identity: Option<(Address, SigningKey, SignedHeight)>,
     chain_lock: &Arc<Mutex<()>>,
     finality_event_tx: &std_mpsc::Sender<FinalityEvent<R::Payload>>,
-    block_tx: &tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
+    block_tx: &tokio::sync::mpsc::Sender<Block<R::Payload>>,
 ) -> Result<()> {
     // Rate-limit state for the skip log below. Local because `produce_loop`
     // owns its thread — no lock needed, and no risk of two producers sharing
@@ -620,7 +620,7 @@ pub fn produce_loop<R: ChainRuntime>(
                 // `accept_block`'s expected-proposer check to match.
                 if block.signature.is_some() {
                     let _ = finality_event_tx.send(FinalityEvent::BlockObserved(block.clone()));
-                    let _ = block_tx.send(block);
+                    arxd_network::send_outbound(block_tx, block, "block");
                 }
             }
             Err(err) => {

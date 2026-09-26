@@ -370,12 +370,12 @@ struct SubsystemHandles<R: ChainRuntime> {
     bootnodes: Vec<String>,
     chain_lock: Arc<Mutex<()>>,
     finality_event_tx: std_mpsc::Sender<FinalityEvent<R::Payload>>,
-    block_tx: tokio::sync::mpsc::UnboundedSender<Block<R::Payload>>,
-    block_rx: tokio::sync::mpsc::UnboundedReceiver<Block<R::Payload>>,
-    gossip_rx: tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>,
-    precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
-    dissent_rx: tokio::sync::mpsc::UnboundedReceiver<Dissent>,
-    round_timeout_rx: tokio::sync::mpsc::UnboundedReceiver<RoundTimeoutVote>,
+    block_tx: tokio::sync::mpsc::Sender<Block<R::Payload>>,
+    block_rx: tokio::sync::mpsc::Receiver<Block<R::Payload>>,
+    gossip_rx: tokio::sync::mpsc::Receiver<Action<R::Payload>>,
+    precommit_rx: tokio::sync::mpsc::Receiver<PrecommitVote>,
+    dissent_rx: tokio::sync::mpsc::Receiver<Dissent>,
+    round_timeout_rx: tokio::sync::mpsc::Receiver<RoundTimeoutVote>,
     on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
     on_dissent: Box<dyn Fn(Dissent) + Send>,
@@ -504,7 +504,7 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     address: &Address,
     bls_key: &xc_bls::BlsSecretKey,
     send_peer_event: &impl Fn(FinalityEvent<R::Payload>),
-    dissent_tx: &tokio::sync::mpsc::UnboundedSender<Dissent>,
+    dissent_tx: &tokio::sync::mpsc::Sender<Dissent>,
     evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
 ) {
     // Only these two variants should reach here — see
@@ -598,7 +598,7 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
         signature,
     };
     send_peer_event(FinalityEvent::DissentObserved(dissent.clone()));
-    let _ = dissent_tx.send(dissent.clone());
+    arxd_network::send_outbound(dissent_tx, dissent.clone(), "dissent");
     let Ok(Some(pubkey)) = db.get_bls_pubkey(address) else {
         return;
     };
@@ -692,7 +692,7 @@ fn handle_rejected_block<R: ChainRuntime>(
     genesis_hash: [u8; 32],
     bls_identity: &Option<(Address, xc_bls::BlsSecretKey)>,
     send_peer_event: &impl Fn(FinalityEvent<R::Payload>),
-    dissent_tx: &tokio::sync::mpsc::UnboundedSender<Dissent>,
+    dissent_tx: &tokio::sync::mpsc::Sender<Dissent>,
     evidence_tx: &std_mpsc::Sender<EvidenceEvent<R::Payload>>,
 ) {
     // A block strictly behind our tip is an ordinary, expected race —
@@ -878,10 +878,10 @@ impl<P> PeerEvents<P> {
 struct FinalityBridges<P> {
     event_tx: std_mpsc::Sender<FinalityEvent<P>>,
     peer_events: PeerEvents<P>,
-    dissent_tx: tokio::sync::mpsc::UnboundedSender<Dissent>,
-    dissent_rx: tokio::sync::mpsc::UnboundedReceiver<Dissent>,
-    precommit_rx: tokio::sync::mpsc::UnboundedReceiver<PrecommitVote>,
-    round_timeout_rx: tokio::sync::mpsc::UnboundedReceiver<RoundTimeoutVote>,
+    dissent_tx: tokio::sync::mpsc::Sender<Dissent>,
+    dissent_rx: tokio::sync::mpsc::Receiver<Dissent>,
+    precommit_rx: tokio::sync::mpsc::Receiver<PrecommitVote>,
+    round_timeout_rx: tokio::sync::mpsc::Receiver<RoundTimeoutVote>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
     on_dissent: Box<dyn Fn(Dissent) + Send>,
     on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
@@ -995,7 +995,8 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         })
     });
 
-    let (precommit_tx, precommit_rx) = tokio::sync::mpsc::unbounded_channel::<PrecommitVote>();
+    let (precommit_tx, precommit_rx) =
+        tokio::sync::mpsc::channel::<PrecommitVote>(arxd_network::OUTBOUND_CHANNEL_CAP);
     // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
     // network layer's tokio channel — same shape as `evidence`/`gossip_tx`
     // bridging elsewhere in this file.
@@ -1010,7 +1011,7 @@ fn spawn_finality_bridges<R: ChainRuntime>(
                 if arxd_network::shutdown_code() != 0 {
                     break;
                 }
-                if precommit_tx.send(vote).is_err() {
+                if !arxd_network::send_outbound(&precommit_tx, vote, "precommit") {
                     break;
                 }
             }
@@ -1018,7 +1019,7 @@ fn spawn_finality_bridges<R: ChainRuntime>(
     );
 
     let (round_timeout_tx, round_timeout_rx) =
-        tokio::sync::mpsc::unbounded_channel::<RoundTimeoutVote>();
+        tokio::sync::mpsc::channel::<RoundTimeoutVote>(arxd_network::OUTBOUND_CHANNEL_CAP);
     // Bridges the round-timeout equivalent of `finality_vote_rx` — same
     // shape as `precommit_bridge` above.
     spawn_supervised(
@@ -1028,7 +1029,7 @@ fn spawn_finality_bridges<R: ChainRuntime>(
                 if arxd_network::shutdown_code() != 0 {
                     break;
                 }
-                if round_timeout_tx.send(vote).is_err() {
+                if !arxd_network::send_outbound(&round_timeout_tx, vote, "round_timeout") {
                     break;
                 }
             }
@@ -1050,7 +1051,8 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         Box::new(move |dissent: Dissent| send.send(FinalityEvent::DissentObserved(dissent)))
     };
 
-    let (dissent_tx, dissent_rx) = tokio::sync::mpsc::unbounded_channel::<Dissent>();
+    let (dissent_tx, dissent_rx) =
+        tokio::sync::mpsc::channel::<Dissent>(arxd_network::OUTBOUND_CHANNEL_CAP);
 
     FinalityBridges {
         event_tx: finality_event_tx,
@@ -1074,8 +1076,11 @@ fn spawn_rpc<R: ChainRuntime>(
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
     metrics_handle: metrics_exporter_prometheus::PrometheusHandle,
     payload_precheck: &xc_mempool::PayloadPrecheck<R::Payload>,
-) -> Result<tokio::sync::mpsc::UnboundedReceiver<Action<R::Payload>>> {
-    let (gossip_tx, gossip_rx) = tokio::sync::mpsc::unbounded_channel();
+) -> Result<tokio::sync::mpsc::Receiver<Action<R::Payload>>> {
+    // Sized to the mempool: a gossip backlog bigger than the whole mempool
+    // means the swarm loop is stuck, not busy.
+    let (gossip_tx, gossip_rx) =
+        tokio::sync::mpsc::channel(config.limits.mempool_max_pending.max(1));
     spawn_http_ingest(IngestConfig {
         mempool: mempool.clone(),
         db: db.clone(),
@@ -1256,7 +1261,7 @@ fn spawn_subsystems<R: ChainRuntime>(
         metrics_handle,
         &payload_precheck,
     )?;
-    let (block_tx, block_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (block_tx, block_rx) = tokio::sync::mpsc::channel(arxd_network::OUTBOUND_CHANNEL_CAP);
     let on_block = build_on_block::<R>(
         db,
         mempool,
