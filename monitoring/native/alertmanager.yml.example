@@ -19,7 +19,10 @@ receivers:
     #     auth_password: "APP-PASSWORD"
     #     require_tls: true
 
-    # Telegram example:
+    # Telegram example. Every host scrapes 127.0.0.1, so name the host in the
+    # message. Keep the token out of this file: put it in the token file, mode
+    # 0640 root:prometheus.
     # telegram_configs:
-    #   - bot_token: "123456:ABC-DEF..."
+    #   - bot_token_file: /etc/arxium-monitoring/telegram-bot-token
     #     chat_id: 123456789
+    #     message: '[my-node] {{ template "telegram.default.message" . }}'
