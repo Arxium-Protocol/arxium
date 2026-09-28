@@ -267,6 +267,7 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
     amount: u128,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
+    let unbonding_blocks = unbonding_blocks(view)?;
     let (accounts, stakes) = circuit_staking::apply_unstake(
         view,
         &action.sender,
@@ -274,11 +275,18 @@ pub(crate) fn unstake<V: KvRead<Error = StorageError>>(
         validator,
         amount,
         current_height,
-        unbonding_blocks(view)?,
+        unbonding_blocks,
+    )?;
+    let governance = circuit_staking::index_unbonding(
+        view,
+        current_height + unbonding_blocks,
+        &action.sender,
+        validator,
     )?;
     Ok(BlockUpdates {
         accounts,
         stakes,
+        governance,
         ..Default::default()
     })
 }

@@ -400,6 +400,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root,
             round: 0,
             round_certificate: None,

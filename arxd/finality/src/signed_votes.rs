@@ -12,8 +12,9 @@
 //! it precommitted in, or the reverse. Every one of those is a full slash and
 //! a tombstone.
 //!
-//! This file lives beside the keys, outside `<chain>/data`, so wiping or
-//! restoring the DB doesn't touch it. Each vote is recorded (fsynced) before
+//! This file lives in `<base_path>/<chain>/`, outside `data/`, so wiping or
+//! restoring the DB doesn't touch it (the node picks the directory; see
+//! `slashing_protection_dir` in `arxd/node`). Each vote is recorded (fsynced) before
 //! it is signed; a crash in between only costs that vote.
 
 use std::path::{Path, PathBuf};
@@ -50,8 +51,8 @@ pub struct SignedVotes {
 impl SignedVotes {
     /// File format: first line `<genesis> <floor>`, then one
     /// `p|t <height> <round> <hash>` line per signed vote.
-    pub fn load(base_path: &Path, genesis_hex: &str) -> Result<Self, String> {
-        let path = base_path.join(SIGNED_VOTES_FILE);
+    pub fn load(dir: &Path, genesis_hex: &str) -> Result<Self, String> {
+        let path = dir.join(SIGNED_VOTES_FILE);
         let mut votes = Self {
             path,
             genesis: genesis_hex.to_string(),
@@ -173,7 +174,13 @@ impl SignedVotes {
             round,
             hash: hash.to_string(),
         });
-        self.persist().inspect_err(|_| refused("write_failed"))
+        self.persist().inspect_err(|_| {
+            // Not durable, so not claimed: otherwise a retry of the same vote
+            // would hit the "identical vote again" branch and get signed with
+            // no record on disk.
+            self.entries.pop();
+            refused("write_failed");
+        })
     }
 
     /// Drops entries below `cutoff` and raises the floor to match, so a DB
@@ -188,13 +195,12 @@ impl SignedVotes {
         self.persist()
     }
 
-    /// Temp file, fsync, rename — the whole file each time.
+    /// Temp file, fsync, rename, fsync dir — the whole file each time.
     ///
     /// ponytail: rewrites every entry per vote; that's ≤ a few hundred short
     /// lines (retention window × rounds). Append + periodic compaction if it
     /// ever shows up in a profile.
     fn persist(&self) -> Result<(), String> {
-        use std::io::Write;
         let mut text = format!("{} {}\n", self.genesis, self.floor);
         for e in &self.entries {
             let kind = match e.kind {
@@ -203,14 +209,8 @@ impl SignedVotes {
             };
             text.push_str(&format!("{kind} {} {} {}\n", e.height, e.round, e.hash));
         }
-        let tmp = self.path.with_extension("tmp");
-        let write = || -> std::io::Result<()> {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            std::fs::rename(&tmp, &self.path)
-        };
-        write().map_err(|e| format!("failed to write {}: {e}", self.path.display()))
+        xc_primitives::keyfile::replace_file_durably(&self.path, text.as_bytes())
+            .map_err(|e| format!("failed to write {}: {e}", self.path.display()))
     }
 }
 
@@ -278,5 +278,30 @@ mod tests {
         assert!(SignedVotes::load(&dir, "g1").is_err());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A vote whose record couldn't be written is not claimed: retrying it
+    /// must try the write again, not sign on the in-memory entry alone.
+    #[test]
+    fn a_failed_write_does_not_leave_the_vote_claimed() {
+        let dir = dir().join("missing");
+        let mut votes = SignedVotes::load(&dir, "g1").unwrap();
+        assert!(
+            votes.claim_precommit(10, 0, "A").is_err(),
+            "no dir to write to"
+        );
+        assert!(
+            votes.claim_precommit(10, 0, "A").is_err(),
+            "retry still refused"
+        );
+
+        std::fs::create_dir_all(&dir).unwrap();
+        votes.claim_precommit(10, 0, "A").unwrap();
+        let mut reloaded = SignedVotes::load(&dir, "g1").unwrap();
+        assert!(
+            reloaded.claim_precommit(10, 0, "B").is_err(),
+            "record is on disk"
+        );
+        std::fs::remove_dir_all(dir.parent().unwrap()).ok();
     }
 }

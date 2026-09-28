@@ -99,8 +99,8 @@ pub fn load_or_generate_bls_key(base_path: &Path) -> Result<(BlsSecretKey, BlsPu
 const SIGNED_HEIGHT_FILE: &str = "signed_height";
 
 /// Slashing protection: the highest height this validator has signed a
-/// block for, in `<base_path>/signed_height` beside the keys, not in the
-/// chain DB. A DB restored from a snapshot, rolled back by a crash, or
+/// block for, in `<base_path>/<chain>/signed_height` (see
+/// `slashing_protection_dir`), not in the chain DB. A DB restored from a snapshot, rolled back by a crash, or
 /// rebuilt on a new machine forgets it proposed `tip+1`; signing a second,
 /// different block there is equivocation (`xc_evidence::verify_equivocation`
 /// only compares heights), which means a full slash and a tombstone. This
@@ -145,23 +145,61 @@ impl SignedHeight {
     }
 
     /// Durably claims `height` before the block is signed: temp file,
-    /// fsync, rename. A crash after this call only skips our turn at that
-    /// height; the reverse order could sign one and forget it.
+    /// fsync, rename, fsync dir. A crash after this call only skips our turn
+    /// at that height; the reverse order could sign one and forget it.
     pub fn claim(&mut self, height: u64) -> Result<()> {
         anyhow::ensure!(
             height > self.last,
             "refusing to sign height {height}: already signed up to {}",
             self.last
         );
-        use std::io::Write;
-        let tmp = self.path.with_extension("tmp");
-        let mut file = std::fs::File::create(&tmp).context("failed to write signed_height")?;
-        write!(file, "{} {height}", self.genesis)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &self.path).context("failed to replace signed_height")?;
+        let text = format!("{} {height}", self.genesis);
+        xc_primitives::keyfile::replace_file_durably(&self.path, text.as_bytes())
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
         self.last = height;
         Ok(())
     }
+}
+
+/// Where `signed_height` and `signed_votes` live: `<base_path>/<chain>/`,
+/// beside `data/` rather than in it, so wiping or restoring the DB keeps
+/// them. Per chain because each file only holds one genesis: shared across
+/// chains, booting another one from the same base path (even a quick
+/// `--chain local`) would overwrite the real chain's record.
+///
+/// Also moves a file from where older versions kept it (`<base_path>/`)
+/// into place, but only if it belongs to this chain's genesis; another
+/// chain's file is left for that chain to pick up.
+pub fn slashing_protection_dir(
+    base_path: &Path,
+    chain_name: &str,
+    genesis_hash: &[u8; 32],
+) -> Result<std::path::PathBuf> {
+    let dir = base_path.join(chain_name);
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let genesis = hex::encode(genesis_hash);
+    for file in [SIGNED_HEIGHT_FILE, "signed_votes"] {
+        let (old, new) = (base_path.join(file), dir.join(file));
+        if new.exists() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&old) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", old.display())),
+        };
+        if text.split_whitespace().next() == Some(genesis.as_str()) {
+            std::fs::rename(&old, &new).with_context(|| {
+                format!("failed to move {} to {}", old.display(), new.display())
+            })?;
+            info!(
+                "slashing protection: moved {} to {}",
+                old.display(),
+                new.display()
+            );
+        }
+    }
+    Ok(dir)
 }
 
 #[cfg(all(test, unix))]
@@ -226,6 +264,35 @@ mod signed_height_tests {
 
     /// A restarted validator (fresh `SignedHeight` from the same file) must
     /// refuse any height it already signed; a genesis reset must not.
+    #[test]
+    fn slashing_protection_is_per_chain_and_migrates_the_old_location() {
+        let base =
+            std::env::temp_dir().join(format!("arxium-test-protection-dir-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+        let (real, other) = ([1; 32], [2; 32]);
+        // An old-layout file for the real chain, at the base path.
+        std::fs::write(
+            base.join(SIGNED_HEIGHT_FILE),
+            format!("{} 7", hex::encode(real)),
+        )
+        .unwrap();
+
+        // Booting another chain first must neither take nor clobber it.
+        let local = slashing_protection_dir(&base, "local", &other).unwrap();
+        SignedHeight::load(&local, &other)
+            .unwrap()
+            .claim(1)
+            .unwrap();
+        assert!(base.join(SIGNED_HEIGHT_FILE).exists());
+
+        let mainnet = slashing_protection_dir(&base, "mainnet", &real).unwrap();
+        assert!(!base.join(SIGNED_HEIGHT_FILE).exists(), "moved");
+        assert_eq!(SignedHeight::load(&mainnet, &real).unwrap().last(), 7);
+        assert_eq!(SignedHeight::load(&local, &other).unwrap().last(), 1);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn signed_height_survives_restart_and_resets_with_genesis() {
         let dir = std::env::temp_dir().join(format!(

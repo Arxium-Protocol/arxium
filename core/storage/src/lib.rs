@@ -16,8 +16,9 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AdminKey, AdminRole, AssetBalanceKey, AssetHolderStateKey,
     AssetHoldersKey, AssetIndexKey, AssetKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey,
-    ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KeySpec, KvRead, OperatorIndexKey,
-    OperatorKey, StakeByValidatorKey, StakeKey, ValidatorSetKey, ValidatorStatusKey,
+    ChainParamsKey, DisputedBlockKey, EvidenceMarkerKey, GenesisHashKey, KeySpec, KvRead,
+    OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorCandidatesKey,
+    ValidatorSetKey, ValidatorStatusKey,
 };
 use xc_circuit::{
     CF_ACCOUNTS, CF_ASSETS, CF_ATTESTORS, CF_BLOCKS, CF_EVIDENCE, CF_GOVERNANCE, CF_META,
@@ -359,7 +360,13 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// roots are unchanged and this binary still reads 64-byte-only tries, so
 /// 18 -> 19 is a re-stamp in `migrate_schema`, not a reset. The bump exists
 /// so that an older binary refuses a trie it can't read.
-pub const SCHEMA_VERSION: u32 = 19;
+///
+/// Bumped 19 -> 20: the challenge window (Trello 72). `ChainParams` gained
+/// `challenge_window_blocks` — positional bincode on the merkleized
+/// `chain_params` row, same trap as 13 -> 14 — and `EvidenceMarker` (in
+/// `BlockEffects`) gained `disputed`, which also writes the new
+/// `evidence:disputed:` rows. Devnet reset.
+pub const SCHEMA_VERSION: u32 = 20;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -655,22 +662,15 @@ impl ArxiumDb {
 
     /// Brings an older database up to `SCHEMA_VERSION`, or refuses it with
     /// `SchemaTooOld` when no migration exists from `found`.
+    ///
+    /// No arms today: 19 -> 20 re-encodes `chain_params`, so every older
+    /// database is reset-only. (The 18 -> 19 re-stamp went with it — an 18
+    /// database would also need 19 -> 20.)
     fn migrate_schema(&self, found: u32) -> Result<(), StorageError> {
-        match found {
-            // Read-compatible: existing 64-byte nodes stay valid.
-            18 => {
-                self.db.put_cf(
-                    self.cf(CF_META),
-                    SCHEMA_VERSION_KEY,
-                    SCHEMA_VERSION.to_le_bytes(),
-                )?;
-                Ok(())
-            }
-            _ => Err(StorageError::SchemaTooOld {
-                found,
-                supported: SCHEMA_VERSION,
-            }),
-        }
+        Err(StorageError::SchemaTooOld {
+            found,
+            supported: SCHEMA_VERSION,
+        })
     }
 
     /// Column family handle for `name` — always present since `open` creates
@@ -2014,6 +2014,21 @@ impl ArxiumDb {
         }
     }
 
+    /// Highest height that is FINAL in the PoE sense (v5 §3.3): certified,
+    /// and its challenge window closed. A dispute over block `h` has to land
+    /// by `h + challenge_window_blocks`, so once the final watermark is
+    /// there nothing can still be recorded against `h`. Blocks at or below
+    /// this that `is_block_disputed` are the exception — they never settle.
+    pub fn get_settled_height(&self) -> Result<u64, StorageError> {
+        let window = self.chain_params()?.challenge_window_blocks;
+        Ok(self.get_final_watermark()?.saturating_sub(window))
+    }
+
+    /// Whether block `height` lost an execution dispute (`DisputedBlockKey`).
+    pub fn is_block_disputed(&self, height: u64) -> Result<bool, StorageError> {
+        Ok(self.get(&DisputedBlockKey(height).encode())?.is_some())
+    }
+
     /// Highest height with a finality certificate, if any.
     ///
     /// Found by seeking backwards over the `meta:finality:` prefix rather than
@@ -2247,45 +2262,6 @@ impl ArxiumDb {
     ) -> Result<Vec<Address>, StorageError> {
         Ok(KvRead::get(self, &StakeByValidatorKey(validator))?.unwrap_or_default())
     }
-
-    /// Every allocation with an `Unbonding` batch matured as of `height`.
-    /// Full `stake:` prefix scan — every allocation on the chain, once per
-    /// block. Fine at the current scale (matches the doc's "walking skeleton"
-    /// allowance), and the likeliest of these three to stop being fine: it is
-    /// the only one on the per-block path, and the only one whose row count
-    /// grows with users rather than with the validator set. Measured as
-    /// `arxium_storage_scan_*{scan="unbonding_due"}`; the upgrade is an
-    /// unlock-height secondary index.
-    pub fn get_allocations_with_unbonding_due(
-        &self,
-        height: u64,
-    ) -> Result<Vec<StakeAllocation>, StorageError> {
-        let prefix = b"stake:";
-        let started = std::time::Instant::now();
-        let mut rows = 0u64;
-        let mut results = Vec::new();
-        let iter = self.db.iterator_cf(
-            self.cf(CF_VALIDATORS),
-            IteratorMode::From(prefix, Direction::Forward),
-        );
-        for item in iter {
-            let (key, value) = item?;
-            if !key.starts_with(prefix) {
-                break;
-            }
-            rows += 1;
-            let config = bincode::config::standard();
-            let (allocation, _len): (StakeAllocation, usize) =
-                bincode::serde::decode_from_slice(&value, config)?;
-            if let Some(unbonding) = &allocation.unbonding
-                && unbonding.unlock_at_height <= height
-            {
-                results.push(allocation);
-            }
-        }
-        record_scan("unbonding_due", rows, started);
-        Ok(results)
-    }
 }
 
 impl ArxiumDb {
@@ -2339,6 +2315,7 @@ mod explorer_index_tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -2442,25 +2419,21 @@ mod explorer_index_tests {
         assert_eq!(db.chain_params().unwrap(), ChainParams::default());
     }
 
-    /// A version-18 database (full 64-byte trie nodes only) opens as-is and
-    /// is re-stamped: this binary reads that trie, so no reset is needed.
+    /// A version-19 database is refused: its `chain_params` row predates
+    /// `challenge_window_blocks` and would fail to decode on the first block.
     #[test]
-    fn schema_18_database_is_restamped_not_refused() {
+    fn schema_19_database_is_refused_as_too_old() {
         let path = std::env::temp_dir().join(format!("arxium-test-storage-{}", uuid_like()));
         {
             let db = ArxiumDb::open(&path).unwrap();
             db.db
-                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 18u32.to_le_bytes())
+                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 19u32.to_le_bytes())
                 .unwrap();
         }
-        let db = ArxiumDb::open(&path).unwrap();
-        assert_eq!(
-            db.db
-                .get_cf(db.cf(CF_META), SCHEMA_VERSION_KEY)
-                .unwrap()
-                .unwrap(),
-            SCHEMA_VERSION.to_le_bytes()
-        );
+        assert!(matches!(
+            ArxiumDb::open(&path),
+            Err(StorageError::SchemaTooOld { found: 19, .. })
+        ));
     }
 
     /// A pre-10 database is refused, not migrated: the asset re-key cannot be
@@ -3567,6 +3540,7 @@ mod divergence_recovery_tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root,
             round: 0,
             round_certificate: None,
@@ -3655,6 +3629,7 @@ mod divergence_recovery_tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root,
             round: 0,
             round_certificate: None,
@@ -3772,6 +3747,7 @@ mod divergence_recovery_tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root,
             round: 0,
             round_certificate: None,

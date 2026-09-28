@@ -154,6 +154,13 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
                     "fee_proposer_bps + fee_treasury_bps is over 100%",
                 ));
             }
+            // Zero would make execution faults unslashable; at or past
+            // unbonding, a culprit could leave before its fault is due.
+            if p.challenge_window_blocks == 0 || p.challenge_window_blocks >= p.unbonding_blocks {
+                return Err(GovernanceError::InvalidParams(
+                    "challenge_window_blocks must be positive and below unbonding_blocks",
+                ));
+            }
         }
         GovernanceAction::SetAdmin { role, address } => {
             AdminRole::parse(role).ok_or_else(|| GovernanceError::UnknownRole(role.clone()))?;
@@ -541,6 +548,14 @@ mod tests {
             ChainParams {
                 fee_proposer_bps: 6_000,
                 fee_treasury_bps: 5_000,
+                ..Default::default()
+            },
+            ChainParams {
+                challenge_window_blocks: 0,
+                ..Default::default()
+            },
+            ChainParams {
+                challenge_window_blocks: ChainParams::default().unbonding_blocks,
                 ..Default::default()
             },
         ] {

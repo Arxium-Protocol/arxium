@@ -91,78 +91,14 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         validators: &[Address],
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
-        let params = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default();
-        let reward_updates = circuit_staking::apply_block_reward(
+        seal(
             view,
+            view.written_validator_statuses(),
             proposer,
             fees_collected,
-            params.reward_per_block,
-            params.fee_proposer_bps,
-            params.fee_treasury_bps,
-        )?;
-        let mut updates = BlockUpdates {
-            accounts: reward_updates,
-            ..Default::default()
-        };
-        // Each step below reads through what the steps before it produced:
-        // the reward and the downtime slash both rewrite the reward pool's
-        // row, and the boundary hook has to see this block's slash and jail.
-        // Reading `view` directly would hand each step the pre-seal row and
-        // the later `extend` would silently drop the earlier step's write.
-        let mut sealed = SealOverlay::new(view);
-        sealed.apply(&updates)?;
-        if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
-            let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
-                &sealed,
-                &primary,
-                proposer,
-                height,
-                params.downtime_slash_bps,
-            )?;
-            // A missed slot that actually cost stake also jails: out of the
-            // set from the next boundary, back the epoch after. Tombstoned
-            // stays tombstoned; a jail already running is left alone.
-            if !downtime_stakes.allocations.is_empty() {
-                let epoch_length = params.epoch_length;
-                let jailed = xc_primitives::ValidatorStatus::Jailed {
-                    until_epoch: xc_primitives::epoch_of(height, epoch_length) + 2,
-                };
-                match view.get(&xc_circuit::ValidatorStatusKey(&primary))? {
-                    Some(xc_primitives::ValidatorStatus::Tombstoned)
-                    | Some(xc_primitives::ValidatorStatus::Jailed { .. }) => {}
-                    _ => {
-                        updates
-                            .validator_statuses
-                            .0
-                            .insert(primary.clone(), Some(jailed));
-                    }
-                }
-            }
-            updates.accounts.0.extend(downtime_accounts.0);
-            updates
-                .stakes
-                .allocations
-                .extend(downtime_stakes.allocations);
-            updates
-                .stakes
-                .validator_index
-                .extend(downtime_stakes.validator_index);
-            sealed.apply(&updates)?;
-        }
-        // Epoch boundary: the one place the set changes. Runs last so it
-        // sees this block's slash/jail above through `sealed`.
-        let boundary = epoch::boundary_hook(
-            &sealed,
-            view.db(),
-            view.written_validator_statuses(),
+            validators,
             height,
-        )?;
-        updates
-            .validator_statuses
-            .0
-            .extend(boundary.validator_statuses.0);
-        updates.validator_set = boundary.validator_set;
-        Ok(updates)
+        )
     }
 
     fn build_evidence_action(
@@ -225,6 +161,116 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
     ) -> anyhow::Result<()> {
         pair::run(seed, sender, node, token, revoke)
     }
+}
+
+/// Whole-block economics (`ChainRuntime::on_block_sealed`) over any
+/// `KvRead`, so a dispute replays exactly this from proofs
+/// (`adjudicate::replay_block_divergence`). `written` is every address whose
+/// status row the block's actions wrote — the boundary hook and the
+/// candidate list both need it, and a proof-backed view can't enumerate it.
+pub(crate) fn seal<V: KvRead<Error = StorageError>>(
+    view: &V,
+    written: Vec<Address>,
+    proposer: &Address,
+    fees_collected: u128,
+    validators: &[Address],
+    height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let params = view.get(&xc_circuit::ChainParamsKey)?.unwrap_or_default();
+    let reward_updates = circuit_staking::apply_block_reward(
+        view,
+        proposer,
+        fees_collected,
+        params.reward_per_block,
+        params.fee_proposer_bps,
+        params.fee_treasury_bps,
+    )?;
+    let mut updates = BlockUpdates {
+        accounts: reward_updates,
+        ..Default::default()
+    };
+    // Each step below reads through what the steps before it produced:
+    // the reward and the downtime slash both rewrite the reward pool's
+    // row, and the boundary hook has to see this block's slash and jail.
+    // Reading `view` directly would hand each step the pre-seal row and
+    // the later `extend` would silently drop the earlier step's write.
+    let mut sealed = SealOverlay::new(view);
+    sealed.apply(&updates)?;
+    if let Some(primary) = xc_primitives::expected_proposer(validators, height) {
+        let (downtime_accounts, downtime_stakes) = circuit_staking::apply_downtime_slash(
+            &sealed,
+            &primary,
+            proposer,
+            height,
+            params.downtime_slash_bps,
+        )?;
+        // A missed slot that actually cost stake also jails: out of the
+        // set from the next boundary, back the epoch after. Tombstoned
+        // stays tombstoned; a jail already running is left alone.
+        if !downtime_stakes.allocations.is_empty() {
+            let epoch_length = params.epoch_length;
+            let jailed = xc_primitives::ValidatorStatus::Jailed {
+                until_epoch: xc_primitives::epoch_of(height, epoch_length) + 2,
+            };
+            match view.get(&xc_circuit::ValidatorStatusKey(&primary))? {
+                Some(xc_primitives::ValidatorStatus::Tombstoned)
+                | Some(xc_primitives::ValidatorStatus::Jailed { .. }) => {}
+                _ => {
+                    updates
+                        .validator_statuses
+                        .0
+                        .insert(primary.clone(), Some(jailed));
+                }
+            }
+        }
+        updates.accounts.0.extend(downtime_accounts.0);
+        updates
+            .stakes
+            .allocations
+            .extend(downtime_stakes.allocations);
+        updates
+            .stakes
+            .validator_index
+            .extend(downtime_stakes.validator_index);
+        sealed.apply(&updates)?;
+    }
+    // Epoch boundary: the one place the set changes. Runs last so it
+    // sees this block's slash/jail above through `sealed`.
+    let boundary = epoch::boundary_hook(&sealed, written.clone(), height)?;
+    updates
+        .validator_statuses
+        .0
+        .extend(boundary.validator_statuses.0);
+    updates.validator_set = boundary.validator_set;
+
+    // Keep `ValidatorCandidatesKey` equal to the set of status rows:
+    // every address whose row this block wrote, actions and seal alike,
+    // goes in if it still has one and out if it was deleted.
+    sealed.apply(&updates)?;
+    let before: Vec<Address> = view
+        .get(&xc_circuit::ValidatorCandidatesKey)?
+        .unwrap_or_default();
+    let mut after: std::collections::BTreeSet<Address> = before.iter().cloned().collect();
+    for address in written
+        .into_iter()
+        .chain(updates.validator_statuses.0.keys().cloned())
+    {
+        if sealed
+            .get(&xc_circuit::ValidatorStatusKey(&address))?
+            .is_some()
+        {
+            after.insert(address);
+        } else {
+            after.remove(&address);
+        }
+    }
+    let after: Vec<Address> = after.into_iter().collect();
+    if after != before {
+        updates
+            .governance
+            .put(&xc_circuit::ValidatorCandidatesKey, &after)?;
+    }
+    Ok(updates)
 }
 
 /// `on_block_sealed`'s read path: `view` (the block's actions applied) plus
@@ -1181,6 +1227,7 @@ mod tests {
                             timestamp: 0,
                             tx_root: format!("0x{}", hex::encode([0u8; 32])),
                             proposer: "arx1x".to_string(),
+                            parent_state_root: "0xp".to_string(),
                             state_root: "0xa".to_string(),
                             round: 0,
                         },
@@ -1193,6 +1240,7 @@ mod tests {
                             timestamp: 0,
                             tx_root: format!("0x{}", hex::encode([0u8; 32])),
                             proposer: "arx1x".to_string(),
+                            parent_state_root: "0xp".to_string(),
                             state_root: "0xb".to_string(),
                             round: 0,
                         },

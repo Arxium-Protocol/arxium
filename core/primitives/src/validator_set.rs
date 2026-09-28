@@ -261,6 +261,14 @@ pub struct ChainParams {
     pub fee_proposer_bps: u32,
     #[serde(default = "default_fee_treasury_bps")]
     pub fee_treasury_bps: u32,
+    /// How long, in blocks after height `h`, an execution fault against
+    /// block `h` may still be submitted (`SubmitExecutionFault`). A block is
+    /// ATTESTED once certified and FINAL once the final watermark is this
+    /// far past it with no upheld dispute (PoE v5 §3.3) — so this is also
+    /// settlement latency. Must stay below `unbonding_blocks`, or a culprit
+    /// could withdraw before its fault is due.
+    #[serde(default = "default_challenge_window_blocks")]
+    pub challenge_window_blocks: u64,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -334,6 +342,16 @@ fn default_fee_proposer_bps() -> u32 {
 fn default_fee_treasury_bps() -> u32 {
     2_000
 }
+/// 48h at 2s slots — CometBFT's default evidence age. Optimistic rollups
+/// run ~7 days because a challenger has to get through a possibly censored
+/// L1; here evidence lands on this chain, where any one honest proposer
+/// includes it, and dissenting validators auto-submit within seconds. 48h
+/// covers a human Guard noticing, and leaves 12 of the 14 unbonding days
+/// for the slash to find stake.
+pub const DEFAULT_CHALLENGE_WINDOW_BLOCKS: u64 = 48 * 60 * 60 / 2;
+fn default_challenge_window_blocks() -> u64 {
+    DEFAULT_CHALLENGE_WINDOW_BLOCKS
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -355,6 +373,7 @@ impl Default for ChainParams {
             downtime_slash_bps: default_downtime_slash_bps(),
             fee_proposer_bps: default_fee_proposer_bps(),
             fee_treasury_bps: default_fee_treasury_bps(),
+            challenge_window_blocks: default_challenge_window_blocks(),
         }
     }
 }

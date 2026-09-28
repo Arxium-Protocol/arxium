@@ -636,6 +636,13 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
         0
     });
 
+    // FINAL, as opposed to irreversible: `final_watermark` minus the
+    // challenge window, below which no execution dispute can still land.
+    let settled_height = state.db.get_settled_height().unwrap_or_else(|err| {
+        warn!("failed to read settled height for /status: {err}");
+        0
+    });
+
     Ok(Json(serde_json::json!({
         "chain_name": chain_name,
         // This crate's version — bumped whenever the JSON shape of a block
@@ -647,6 +654,7 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
         "tip_hash": tip_hash,
         "finalized_height": finalized_height,
         "final_watermark": final_watermark,
+        "settled_height": settled_height,
     }))
     .into_response())
 }
@@ -941,6 +949,7 @@ mod tests {
                 tx_root: [0u8; 32],
                 proposer: None,
                 signature: None,
+                parent_state_root: String::new(),
                 state_root: String::new(),
                 round: 0,
                 round_certificate: None,
@@ -1034,6 +1043,7 @@ mod tests {
                     tx_root: [0u8; 32],
                     proposer: None,
                     signature: None,
+                    parent_state_root: String::new(),
                     state_root: String::new(),
                     round: 0,
                     round_certificate: None,

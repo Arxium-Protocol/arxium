@@ -10,12 +10,16 @@
 use std::collections::BTreeMap;
 
 use tracing::warn;
-use xc_circuit::{ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorStatusKey};
+use xc_circuit::{
+    ChainParamsKey, KvRead, StakeByValidatorKey, StakeKey, ValidatorCandidatesKey, ValidatorSetKey,
+    ValidatorStatusKey,
+};
 use xc_executor::BlockUpdates;
 use xc_primitives::{
     Address, ValidatorStatus, VotingPower, assign_voting_power, epoch_of, is_boundary,
+    validator_set_effective_height,
 };
-use xc_storage::{ArxiumDb, StorageError};
+use xc_storage::StorageError;
 
 /// Runs inside `on_block_sealed`. Off a boundary it does nothing. On one it
 /// always returns a set (and the status rows it changed): the next one, or,
@@ -24,12 +28,12 @@ use xc_storage::{ArxiumDb, StorageError};
 /// boundary without a row (see `xc_circuit::ValidatorSetKey`).
 ///
 /// `written` is every address whose status row this block wrote
-/// (`BlockView::written_validator_statuses`): the db scan can't see a row
-/// first created in this block, like a `JoinValidator` in the boundary
-/// block itself.
+/// (`BlockView::written_validator_statuses`): the candidate list is only
+/// brought up to date at the end of the block, so it can't yet hold a row
+/// first created in this one, like a `JoinValidator` in the boundary block
+/// itself. Point reads only, so a dispute replays it from proofs.
 pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
     view: &V,
-    db: &ArxiumDb,
     written: Vec<Address>,
     height: u64,
 ) -> anyhow::Result<BlockUpdates> {
@@ -40,12 +44,13 @@ pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
     }
     let next_epoch = epoch_of(height, params.epoch_length) + 1;
 
-    // Candidates: a db scan (the overlay can't iterate) plus the rows this
-    // block wrote, each read back through the view so an in-block write is
-    // honoured and an in-block delete drops the address.
-    let candidates: std::collections::BTreeSet<Address> = db
-        .all_validator_statuses()?
-        .into_keys()
+    // Candidates: every status row as of the parent (`ValidatorCandidatesKey`)
+    // plus the rows this block wrote, each read back through the view so an
+    // in-block write is honoured and an in-block delete drops the address.
+    let candidates: std::collections::BTreeSet<Address> = view
+        .get(&ValidatorCandidatesKey)?
+        .unwrap_or_default()
+        .into_iter()
         .chain(written)
         .collect();
     let mut statuses: BTreeMap<Address, ValidatorStatus> = BTreeMap::new();
@@ -89,7 +94,8 @@ pub(crate) fn boundary_hook<V: KvRead<Error = StorageError>>(
         // location is what makes the set provable as one key
         // (`ValidatorSetKey(validator_set_effective_height(H))`), so every
         // boundary writes one whether or not the membership moved.
-        updates.validator_set = Some(db.get_validator_set_at(height)?);
+        let current = ValidatorSetKey(validator_set_effective_height(height, params.epoch_length));
+        updates.validator_set = Some(view.get(&current)?.unwrap_or_default());
         return Ok(updates);
     }
 

@@ -93,12 +93,12 @@ pub enum EvidenceEvent<P> {
     /// on execution grounds) but paired with a whole-block fraud proof
     /// instead of just a signed claim: `dissent_claim.proofs` covers every
     /// Merkleized key `BlockView::new_recording` saw touched while locally
-    /// replaying the block, checked against `parent_state_root`. Unlike
+    /// replaying the block, checked against the block's own signed
+    /// `parent_state_root`. Unlike
     /// `ExecutionDisagreement`, `arx-verify` can adjudicate this one to a
     /// named culpable party — see `core_adjudicate::adjudicate_block_divergence`.
     BlockDivergence {
         proposed: Block<P>,
-        parent_state_root: String,
         /// Bech32 address of the dissenting voter — used for the artifact's
         /// filename, same role `DissentAttestation::voter` plays for
         /// `ExecutionDisagreement`.
@@ -143,6 +143,7 @@ fn write_equivocation_artifact<P: Serialize>(
             timestamp: block.timestamp,
             tx_root: format!("0x{}", hex::encode(block.tx_root)),
             proposer: proposer.to_string(),
+            parent_state_root: block.parent_state_root.clone(),
             state_root: block.state_root.clone(),
             round: block.round,
         },
@@ -221,6 +222,7 @@ fn write_disagreement_artifact<P: Serialize>(
             timestamp: proposed.timestamp,
             tx_root: format!("0x{}", hex::encode(proposed.tx_root)),
             proposer: proposer.to_string(),
+            parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
         },
@@ -314,14 +316,13 @@ fn write_precommit_equivocation_artifact(
 /// counterpart to `write_disagreement_artifact`, to
 /// `<evidence_dir>/<height>-block-divergence-<voter>.json`. Unlike a plain
 /// disagreement, `arx-verify` can adjudicate this to a named culpable party
-/// once it lands, since `dissent_claim` carries proofs against
-/// `parent_state_root`, not just a signed assertion.
+/// once it lands, since `dissent_claim` carries proofs against the block's
+/// signed `parent_state_root`, not just a signed assertion.
 fn write_block_divergence_artifact<P: Serialize>(
     evidence_dir: &Path,
     genesis_hash: [u8; 32],
     proposer: &Address,
     proposed: &Block<P>,
-    parent_state_root: &str,
     voter: &str,
     voter_pubkey: &str,
     dissent_claim: &BlockDissentClaim,
@@ -342,6 +343,7 @@ fn write_block_divergence_artifact<P: Serialize>(
             timestamp: proposed.timestamp,
             tx_root: format!("0x{}", hex::encode(proposed.tx_root)),
             proposer: proposer.to_string(),
+            parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
         },
@@ -371,7 +373,6 @@ fn write_block_divergence_artifact<P: Serialize>(
             proposer_pubkey,
             voter_pubkey: voter_pubkey.to_string(),
             height: proposed.height,
-            parent_state_root: parent_state_root.to_string(),
             block_attestation,
             actions,
             dissent_claim: dissent_claim.clone(),
@@ -478,7 +479,6 @@ where
                 }
                 EvidenceEvent::BlockDivergence {
                     proposed,
-                    parent_state_root,
                     voter,
                     voter_pubkey,
                     dissent_claim,
@@ -495,7 +495,6 @@ where
                         genesis_hash,
                         &proposer,
                         &proposed,
-                        &parent_state_root,
                         &voter,
                         &voter_pubkey,
                         &dissent_claim,
@@ -860,7 +859,6 @@ mod tests {
 
         tx.send(EvidenceEvent::BlockDivergence {
             proposed: proposed.clone(),
-            parent_state_root: "0xparent".to_string(),
             voter: "arx1voter".to_string(),
             voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
             dissent_claim,
@@ -958,7 +956,6 @@ mod tests {
         for voter in ["arx1voter-a", "arx1voter-b"] {
             tx.send(EvidenceEvent::BlockDivergence {
                 proposed: proposed.clone(),
-                parent_state_root: "0xparent".to_string(),
                 voter: voter.to_string(),
                 voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
                 dissent_claim: dissent_claim.clone(),
@@ -1055,7 +1052,6 @@ mod tests {
         for proposed in [proposed_a, proposed_b] {
             tx.send(EvidenceEvent::BlockDivergence {
                 proposed,
-                parent_state_root: "0xparent".to_string(),
                 voter: "arx1voter".to_string(),
                 voter_pubkey: format!("0x{}", hex::encode([2u8; 48])),
                 dissent_claim: dissent_claim.clone(),

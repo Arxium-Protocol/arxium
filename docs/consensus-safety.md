@@ -6,7 +6,7 @@ behind the runbook's open question ("can an honest quorum recover from a
 rejected proposal via round change"). Model: `n = 3f + 1` validators by
 voting power, at most `f` Byzantine, quorum `2f + 1` (`QUORUM_POWER`).
 
-## 1. Two commit levels
+## 1. Commit levels
 
 - **Provisional tip.** `accept_block` commits the first valid block it sees
   at `tip + 1` to storage immediately (`core/executor`). It is served to
@@ -16,8 +16,11 @@ voting power, at most `f` Byzantine, quorum `2f + 1` (`QUORUM_POWER`).
   set has BLS-precommitted the same `(height, round, block_hash, ep)`
   (`arxd/finality::tally_vote` → `FinalityRecord`). The contiguous
   finalized watermark (`final_watermark`) is the irreversibility line:
-  `revert_to` refuses to cross it, and it is the only correct answer to "is
-  my transfer settled".
+  `revert_to` refuses to cross it. PoE calls this ATTESTED.
+- **Settled (FINAL).** A certified block whose challenge window has closed
+  with no upheld dispute: `height <= final_watermark -
+  challenge_window_blocks` (`settled_height` in `/status`, `settlement` on
+  each block). This is the answer to "is my transfer settled". See §5.
 
 So: **the provisional tip can fork under partition; the finalized chain
 cannot.** A partition that isolates fewer than `2f + 1` on either side
@@ -102,3 +105,40 @@ So `N1` unwinds `A` on seeing `B@1`'s certificate, commits `B`, votes it:
   than holding a set. Holding several candidates buys nothing for safety
   and only matters if the same height flips repeatedly, which needs
   repeated timeouts — acceptable until measured otherwise.
+
+## 5. The challenge window (execution disputes)
+
+A certified block can still be wrong if enough of the set signed a bad
+state root. Any validator that re-executes it and disagrees signs a
+`BlockDivergence` artifact, and anyone can submit it
+(`SubmitExecutionFault`) up to `challenge_window_blocks` after the block
+(`ChainParams`, default 86,400 blocks = 48h at 2s; must stay below
+`unbonding_blocks`, checked at `SetChainParams`). After that the block is
+FINAL and no longer open to one.
+
+Adjudication is a deterministic replay of `accept_block` from proofs alone
+(`arxd/runtime/src/adjudicate.rs`), so every node reaches the same verdict:
+
+- **Pre-state.** The block header signs `parent_state_root`, and
+  `accept_block` rejects a block whose value isn't its parent's
+  `state_root`. The dissenter supplies proofs against it, never the root
+  itself, so an honest proposer can't be framed with an invented pre-state.
+- **All three phases.** Matured unbonding (`UnbondingDueKey(height)`), every
+  action, and the seal (reward, downtime slash, epoch boundary over
+  `ValidatorCandidatesKey`) are point reads, so all of them replay. Neither
+  step scans the database any more.
+- **Verdict.** The side whose root matches the replay is cleared. A root
+  nobody's replay produces, or a block carrying an action honest nodes
+  reject, names the proposer. A replay that needs state the proofs don't
+  cover is a `Disagreement`: nobody is slashed on a guess.
+
+An upheld dispute that names the proposer slashes and tombstones it and
+writes `DisputedBlockKey(height)`: that block reports `settlement:
+"disputed"` and never becomes FINAL. The chain does not unwind a certified
+block on its own; what to do with the state after a disputed block is an
+operator and governance decision.
+
+W = 48h follows CometBFT's default evidence age. Optimistic rollups use ~7
+days because a challenger has to get through a possibly censored L1; here
+the evidence lands on this chain, where any one honest proposer includes
+it, and dissenting validators submit within seconds.

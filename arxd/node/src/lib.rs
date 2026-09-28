@@ -620,54 +620,23 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
     });
 
     // Alongside the plain dissent, try to build the stronger BlockDivergence
-    // fraud proof: a proof per touched key against parent_state_root lets
-    // arx-verify replay the block and name a culpable party instead of just
-    // recording disagreement. Proving can fail (key pruned, db error) — that
-    // just means no fraud proof this time, not a reason to skip the dissent
-    // already sent above. Plus the two rows the adjudicator reads that
-    // `dispatch` never touches through the view — the validator set is a
-    // parameter, and it is located via `chain_params` — so a block with a
-    // `LeaveValidator` can still be replayed.
-    let mut touched_keys = touched_keys;
-    let epoch_length = db
-        .chain_params()
-        .map(|p| p.epoch_length)
-        .unwrap_or_default();
-    touched_keys.push(xc_circuit::ChainParamsKey.encode());
-    touched_keys.push(
-        xc_circuit::ValidatorSetKey(xc_primitives::validator_set_effective_height(
-            height,
-            epoch_length,
-        ))
-        .encode(),
-    );
-    touched_keys.sort();
-    touched_keys.dedup();
-    let proofs: Result<Vec<xc_artifact::StateProof>, xc_storage::StorageError> = touched_keys
-        .iter()
-        .map(|key| {
-            db.prove(key, &parent_state_root)
-                .map(|proof| proof.into_state_proof())
-        })
-        .collect();
-    match proofs {
-        Ok(proofs) => {
-            let claim_msg = xc_artifact::block_divergence_signing_bytes(
-                &genesis_hash,
-                height,
-                &header_commitment,
-                &parent_state_root,
-                &state_root,
-            );
-            let claim_signature = xc_bls::sign(bls_key, &claim_msg);
-            let dissent_claim = xc_artifact::BlockDissentClaim {
-                computed_state_root: state_root.clone(),
-                proofs,
-                signature: format!("0x{}", hex::encode(claim_signature.0)),
-            };
+    // fraud proof: a proof per touched key against the block's signed parent
+    // root lets anyone replay the block and name a culpable party instead of
+    // just recording disagreement. Proving can fail (key pruned, db error) —
+    // that just means no fraud proof this time, not a reason to skip the
+    // dissent already sent above.
+    match block_dissent_claim(
+        db,
+        genesis_hash,
+        candidate,
+        touched_keys,
+        &state_root,
+        &header_commitment,
+        bls_key,
+    ) {
+        Ok(dissent_claim) => {
             let _ = evidence_tx.send(EvidenceEvent::BlockDivergence {
                 proposed: candidate.clone(),
-                parent_state_root: parent_state_root.clone(),
                 voter: address.to_string(),
                 voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
                 dissent_claim,
@@ -679,6 +648,53 @@ fn dissent_on_execution_disagreement<R: ChainRuntime>(
             );
         }
     }
+}
+
+/// The dissenter's half of a `BlockDivergence` artifact: a proof, against
+/// `candidate.parent_state_root`, of every key its rejection touched
+/// (`AcceptBlockError::StateRootMismatch::touched_keys`), plus the two rows
+/// the replay reads that execution never reads through a view — the
+/// validator set is a parameter, located via `chain_params` — and a BLS
+/// signature binding it all to `computed_root`.
+fn block_dissent_claim<P: serde::Serialize>(
+    db: &ArxiumDb,
+    genesis_hash: [u8; 32],
+    candidate: &Block<P>,
+    mut touched_keys: Vec<Vec<u8>>,
+    computed_root: &str,
+    header_commitment: &[u8; 32],
+    bls_key: &xc_bls::BlsSecretKey,
+) -> Result<xc_artifact::BlockDissentClaim, xc_storage::StorageError> {
+    let epoch_length = db.chain_params()?.epoch_length;
+    touched_keys.push(xc_circuit::ChainParamsKey.encode());
+    touched_keys.push(
+        xc_circuit::ValidatorSetKey(xc_primitives::validator_set_effective_height(
+            candidate.height,
+            epoch_length,
+        ))
+        .encode(),
+    );
+    touched_keys.sort();
+    touched_keys.dedup();
+    let proofs = touched_keys
+        .iter()
+        .map(|key| {
+            db.prove(key, &candidate.parent_state_root)
+                .map(|proof| proof.into_state_proof())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let claim_msg = xc_artifact::block_divergence_signing_bytes(
+        &genesis_hash,
+        candidate.height,
+        header_commitment,
+        &candidate.parent_state_root,
+        computed_root,
+    );
+    Ok(xc_artifact::BlockDissentClaim {
+        computed_state_root: computed_root.to_string(),
+        proofs,
+        signature: format!("0x{}", hex::encode(xc_bls::sign(bls_key, &claim_msg).0)),
+    })
 }
 
 /// The routine/not-routine, evidence-worthy classification `on_block`
@@ -766,6 +782,7 @@ fn spawn_evidence<R: ChainRuntime>(
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: String::new(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -1238,11 +1255,13 @@ fn spawn_subsystems<R: ChainRuntime>(
     // disagreement, so clone before `spawn_finality_bridges` consumes the
     // original.
     let bls_identity_for_dissent = bls_identity.clone();
-    // Slashing protection for finality votes, beside the keys like
-    // `signed_height`. Loaded here so a corrupt file stops boot.
+    // Slashing protection for finality votes, beside `signed_height`.
+    // Loaded here so a corrupt file stops boot.
     let bls_identity = bls_identity
         .map(|(address, key)| {
-            arxd_finality::SignedVotes::load(&config.base_path, &hex::encode(genesis_hash))
+            let dir =
+                validator::slashing_protection_dir(&config.base_path, chain_name, &genesis_hash)?;
+            arxd_finality::SignedVotes::load(&dir, &hex::encode(genesis_hash))
                 .map(|signed| (address, key, signed))
                 .map_err(anyhow::Error::msg)
         })
@@ -1430,7 +1449,11 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
     // Loaded up front so a corrupt file stops boot before any networking.
     let signed_height = identity
         .as_ref()
-        .map(|_| validator::SignedHeight::load(&config.base_path, &genesis_hash))
+        .map(|_| {
+            let dir =
+                validator::slashing_protection_dir(&config.base_path, &chain_name, &genesis_hash)?;
+            validator::SignedHeight::load(&dir, &genesis_hash)
+        })
         .transpose()?;
     if let Some(signed) = &signed_height {
         info!(
