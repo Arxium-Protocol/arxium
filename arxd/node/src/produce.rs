@@ -645,15 +645,26 @@ pub fn produce_loop<R: ChainRuntime>(
 /// `SignedHeight` still refuses every height already signed either way.
 const PEER_WAIT: Duration = Duration::from_secs(30);
 
+/// The most the startup sync gate ever holds a validator back, whatever
+/// peers claim. The gate is an optimisation, not a safety check —
+/// `SignedHeight` is what refuses a height already signed — so a peer
+/// claiming a tip it never serves must not be able to keep a validator out
+/// of production for good (Trello 174). Five minutes covers a normal
+/// restart's catch-up at devnet sync rates; past it, gossip keeps the node
+/// current like any other.
+const SYNC_WAIT_CAP: Duration = Duration::from_secs(5 * 60);
+
 /// Whether a freshly booted validator may start proposing: once it holds at
-/// least the best tip a peer has reported, or after `PEER_WAIT` with no peer
-/// heard from. Producing on a stale DB would sign heights the network
-/// already filled — wasted at best, equivocation at worst.
+/// least the best tip a peer has reported and backs, after `PEER_WAIT` with
+/// no such peer, and after `SYNC_WAIT_CAP` regardless. Producing on a stale
+/// DB would sign heights the network already filled — wasted at best,
+/// refused by `SignedHeight` at worst.
 fn caught_up(local_tip: u64, best_peer_tip: Option<u64>, waited: Duration) -> bool {
-    match best_peer_tip {
-        Some(best) => local_tip >= best,
-        None => waited >= PEER_WAIT,
-    }
+    waited >= SYNC_WAIT_CAP
+        || match best_peer_tip {
+            Some(best) => local_tip >= best,
+            None => waited >= PEER_WAIT,
+        }
 }
 
 /// Whether a full `interval` has passed since the parent's stamped time, so
@@ -738,8 +749,12 @@ mod tests {
         let early = Duration::from_secs(1);
         assert!(!caught_up(3, Some(10), early), "behind a peer");
         assert!(
-            !caught_up(3, Some(10), PEER_WAIT * 10),
-            "behind a peer, however long"
+            !caught_up(3, Some(10), PEER_WAIT * 9),
+            "behind a peer, within the cap"
+        );
+        assert!(
+            caught_up(3, Some(u64::MAX), SYNC_WAIT_CAP),
+            "a peer claiming a tip it never serves can't hold production past the cap"
         );
         assert!(caught_up(10, Some(10), early), "level with the best peer");
         assert!(!caught_up(0, None, early), "no peer heard yet");

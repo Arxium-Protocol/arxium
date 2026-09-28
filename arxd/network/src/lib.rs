@@ -23,7 +23,7 @@ use libp2p::request_response;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{Multiaddr, gossipsub, identify, mdns};
 use metrics::{counter, gauge, histogram};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
@@ -46,7 +46,7 @@ use gossip::{
 use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use sync::{
     MAX_CONSECUTIVE_SYNC_FAILURES, STATUS_INTERVAL, SyncRequest, SyncResponse, advance_stuck_tip,
-    is_stale_page, local_tip_height, send_sync_request,
+    backed_best_tip, is_stale_page, local_tip_height, send_sync_request,
 };
 use transport::{BehaviourEvent, build_swarm, identify_protocol_version};
 
@@ -163,13 +163,15 @@ pub fn shutdown_code() -> u8 {
     SHUTDOWN.load(Ordering::Relaxed)
 }
 
-/// Highest tip any peer has reported since boot, plus one (0 = no peer has
-/// answered yet). Read by `arxd/node`'s producer, which holds off proposing
-/// until it has caught up to this — see `best_peer_tip`.
+/// Highest tip a connected peer currently claims and hasn't failed to back
+/// (see `sync::backed_best_tip`), plus one (0 = none). Read by `arxd/node`'s
+/// producer, which holds off proposing until it has caught up to this — see
+/// `best_peer_tip`. Recomputed every swarm event, so it can go down: a claim
+/// is forgotten when its peer disconnects.
 static BEST_PEER_TIP: AtomicU64 = AtomicU64::new(0);
 
-/// Highest tip any peer has reported since boot, or `None` before the first
-/// `Status` reply.
+/// Highest tip a connected peer currently claims and backs, or `None` when
+/// there is none.
 pub fn best_peer_tip() -> Option<u64> {
     BEST_PEER_TIP.load(Ordering::Relaxed).checked_sub(1)
 }
@@ -435,6 +437,12 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
     // knows whether to request the next batch or stop — set on every
     // `Status` response, both the on-connect one and the periodic re-check.
     let mut peer_tips: HashMap<PeerId, u64> = HashMap::new();
+    // Peers that claimed a tip above ours and then served an empty page for
+    // the range below it. Their claims don't count towards `BEST_PEER_TIP`
+    // until they move our tip with a real page or reconnect — otherwise one
+    // peer answering `Status { tip_height: u64::MAX }` would hold a booting
+    // validator in "syncing" (Trello 174). Sync from them carries on.
+    let mut unbacked: HashSet<PeerId> = HashSet::new();
     // Consecutive sync-request failures per peer since its last success or
     // reconnect — see `MAX_CONSECUTIVE_SYNC_FAILURES`.
     let mut sync_failures: HashMap<PeerId, u32> = HashMap::new();
@@ -484,6 +492,11 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
     let mut catching_up_since: Option<Instant> = None;
 
     loop {
+        // Top of the loop, not the bottom: the select arms `continue`.
+        BEST_PEER_TIP.store(
+            backed_best_tip(&peer_tips, &unbacked).map_or(0, |tip| tip.saturating_add(1)),
+            Ordering::Relaxed,
+        );
         tokio::select! {
             // This runtime already exists, so ctrl-c rides it rather than
             // `arxd/node` spinning up a whole tokio runtime just to await it.
@@ -613,10 +626,15 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     // counts deliberately do NOT reset here — see
                     // `gossip::record_bad_gossip`.
                     sync_failures.remove(&peer_id);
+                    unbacked.remove(&peer_id);
                     // Ask immediately — a node that was offline and just
                     // reconnected shouldn't have to wait for the next
                     // STATUS_INTERVAL tick to start catching up.
                     send_sync_request(&mut swarm, &peer_id, &SyncRequest::Status);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                    peer_tips.remove(&peer_id);
+                    unbacked.remove(&peer_id);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                     dial_discovered(&mut swarm, peers);
@@ -1091,7 +1109,6 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             }
                             SyncResponse::Status { tip_height } => {
                                 peer_tips.insert(peer, tip_height);
-                                BEST_PEER_TIP.fetch_max(tip_height.saturating_add(1), Ordering::Relaxed);
                                 let local_tip = local_tip_height(&db);
                                 if tip_height > local_tip {
                                     info!(
@@ -1105,6 +1122,18 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             }
                             SyncResponse::Blocks(blocks) => {
                                 if blocks.is_empty() {
+                                    // Asked from our tip + 1 and got nothing, so
+                                    // it holds nothing past our tip: whatever it
+                                    // claimed above that it can't back (an
+                                    // honest peer serves `from..=tip`, see
+                                    // `blocks_page_end`; a revert in between
+                                    // clears on its next real page).
+                                    let local_tip = local_tip_height(&db);
+                                    if peer_tips.get(&peer).is_some_and(|&tip| tip > local_tip)
+                                        && unbacked.insert(peer)
+                                    {
+                                        warn!("peer {peer} claims tip {} but served nothing past {local_tip}; ignoring its claim for the startup sync gate", peer_tips[&peer]);
+                                    }
                                     continue;
                                 }
                                 // Same acceptance path as a gossiped block —
@@ -1155,6 +1184,8 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                     debug!("stale sync page {first_height}.. from {peer} (tip already {local_tip}), dropping");
                                     continue;
                                 }
+                                // It moved our tip: it holds real blocks.
+                                unbacked.remove(&peer);
                                 // B2 is unmeasured, and the pruning /
                                 // snapshot-sync decision should fall out of a
                                 // number rather than an intuition: `CF_MERKLE`
@@ -1176,7 +1207,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                 // advertised. Recorded once per catch-up and
                                 // then re-armed, so a node that falls behind
                                 // again measures that too.
-                                let best_peer_tip = peer_tips.values().copied().max().unwrap_or(0);
+                                let best_peer_tip = backed_best_tip(&peer_tips, &unbacked).unwrap_or(0);
                                 if let Some(started) = catching_up_since
                                     && local_tip >= best_peer_tip
                                 {
