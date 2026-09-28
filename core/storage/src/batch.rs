@@ -114,6 +114,12 @@ impl BatchWritable for Snapshot {
                 bincode::serde::encode_to_vec(&ValidatorStatus::Active, config)?,
             ));
         }
+        // The boundary hook's candidate pool: exactly the status rows above.
+        let candidates: Vec<&Address> = self.validators.keys().collect();
+        entries.push((
+            ValidatorCandidatesKey.encode(),
+            bincode::serde::encode_to_vec(&candidates, config)?,
+        ));
         entries.push((
             ChainParamsKey.encode(),
             bincode::serde::encode_to_vec(&self.params, config)?,
@@ -264,10 +270,15 @@ impl<P: Serialize> BatchWritable for Block<P> {
 /// so `ArxiumDb::evidence_processed` can reject a resubmission. Written
 /// alongside the slash's `AccountUpdates`/`StakeUpdates` in the same atomic
 /// batch — see `evidence_processed`.
+///
+/// `disputed` also marks block `height` itself as having lost an execution
+/// dispute (`DisputedBlockKey`) — set when the culprit is that block's
+/// proposer, not for a false dissent or a double-sign.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvidenceMarker {
     pub height: u64,
     pub proposer: Address,
+    pub disputed: bool,
 }
 
 impl BatchWritable for EvidenceMarker {
@@ -277,7 +288,11 @@ impl BatchWritable for EvidenceMarker {
             proposer: &self.proposer,
         }
         .encode();
-        Ok(vec![(key, vec![1u8])])
+        let mut entries = vec![(key, vec![1u8])];
+        if self.disputed {
+            entries.push((DisputedBlockKey(self.height).encode(), vec![1u8]));
+        }
+        Ok(entries)
     }
 }
 
@@ -889,19 +904,23 @@ impl BatchWritable for AttestorDeregistration {
 /// executing a proposal can touch proposals, votes, `chain_params` and
 /// `admin:*` in one action, and every new field costs a pass through the
 /// executor, producer, adjudicator and effects log.
+///
+/// For the same reason it also carries the two block-bookkeeping index rows
+/// in `CF_VALIDATORS` (`UnbondingDueKey`, `ValidatorCandidatesKey`): any
+/// merkleized row may ride here, the name is historical.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GovernanceUpdates(pub BTreeMap<Vec<u8>, Option<Vec<u8>>>);
 
 impl GovernanceUpdates {
     pub fn put<K: KeySpec>(&mut self, key: &K, value: &K::Value) -> Result<(), StorageError> {
-        debug_assert_eq!(K::CF, CF_GOVERNANCE);
+        debug_assert!(is_state_key(&key.encode()));
         let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
         self.0.insert(key.encode(), Some(bytes));
         Ok(())
     }
 
     pub fn delete<K: KeySpec>(&mut self, key: &K) {
-        debug_assert_eq!(K::CF, CF_GOVERNANCE);
+        debug_assert!(is_state_key(&key.encode()));
         self.0.insert(key.encode(), None);
     }
 
@@ -960,6 +979,7 @@ mod effects_tests {
             &[EvidenceMarker {
                 height: 3,
                 proposer: a.clone(),
+                disputed: true,
             }],
             &[BlsKeyRegistration {
                 address: a.clone(),

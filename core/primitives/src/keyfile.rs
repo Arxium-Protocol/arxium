@@ -23,6 +23,35 @@ pub fn write_new_key_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
+/// Replaces `path` with `contents` so that, once this returns `Ok`, a crash
+/// or power cut leaves the new contents: temp file, fsync, rename, then fsync
+/// the parent directory. Without that last step some filesystems can bring
+/// the old file back after a power cut, even though the rename returned.
+/// Used for the slashing-protection records, where an old file means signing
+/// something twice.
+pub fn replace_file_durably(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    sync_parent_dir(path)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    std::fs::File::open(dir.unwrap_or(Path::new(".")))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> io::Result<()> {
+    // ponytail: directories can't be opened for fsync on Windows; the rename
+    // is as durable as the platform makes it there.
+    Ok(())
+}
+
 #[cfg(unix)]
 fn create_owner_only(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -89,6 +118,18 @@ mod tests {
         );
         assert_eq!(std::fs::read(&path).unwrap(), b"deadbeef");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_file_durably_overwrites_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("arxium-test-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("signed_height");
+        replace_file_durably(&path, b"one").unwrap();
+        replace_file_durably(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert!(!path.with_extension("tmp").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

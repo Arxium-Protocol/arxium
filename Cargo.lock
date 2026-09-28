@@ -5411,7 +5411,7 @@ dependencies = [
 
 [[package]]
 name = "xc-rpc"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "ark-bls12-381",

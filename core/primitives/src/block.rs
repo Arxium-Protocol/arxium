@@ -34,6 +34,12 @@ pub struct Block<P> {
     /// genesis block, and for blocks produced by a non-validator solo node.
     pub proposer: Option<Address>,
     pub signature: Option<String>,
+    /// The parent block's `state_root` — the state this block executed on,
+    /// signed so the proposer is bound to it. `accept_block` rejects a block
+    /// whose value isn't its parent's `state_root`; an execution dispute
+    /// replays the block from it (`arxd_runtime::adjudicate`), so a proposer
+    /// can only ever be judged against a pre-state it signed itself.
+    pub parent_state_root: String,
     /// Root of the full account/validator/stake state *after* this block's
     /// actions apply — see `xc_storage::ArxiumDb::compute_state_root`. Lets
     /// a node verify a full state snapshot against what the chain actually
@@ -70,6 +76,7 @@ pub struct RawBlock {
     pub tx_root: [u8; 32],
     pub proposer: Option<Address>,
     pub signature: Option<String>,
+    pub parent_state_root: String,
     pub state_root: String,
     pub round: u32,
     pub round_certificate: Option<RoundCertificate>,
@@ -117,6 +124,7 @@ struct BlockSigningPayload<'a> {
     timestamp: u64,
     tx_root: &'a [u8; 32],
     proposer: &'a Address,
+    parent_state_root: &'a str,
     state_root: &'a str,
     round: u32,
 }
@@ -134,6 +142,8 @@ impl<P: Serialize> Block<P> {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
             state_root: "0x0000000000000000000000000000000000000000000000000000000000000000"
                 .to_string(),
             round: 0,
@@ -160,6 +170,7 @@ impl<P: Serialize> Block<P> {
             timestamp: self.timestamp,
             tx_root: &self.tx_root,
             proposer,
+            parent_state_root: &self.parent_state_root,
             state_root: &self.state_root,
             round: self.round,
         };
@@ -178,7 +189,7 @@ impl<P: Serialize> Block<P> {
 
     /// Verifies `signature` was produced by the private key behind `proposer`,
     /// over this block's (genesis_hash, height, parent_hash, timestamp,
-    /// tx_root, proposer, state_root, round) — so only for the chain whose
+    /// tx_root, proposer, parent_state_root, state_root, round) — so only for the chain whose
     /// genesis hash the caller passes. Proves nothing about `actions` on its own — a caller
     /// that trusts `actions` off a validly-signed block without separately
     /// checking `tx_root` against them is trusting an unverified field; see
@@ -293,6 +304,7 @@ mod tests {
             tx_root,
             proposer: Some(proposer.clone()),
             signature: None,
+            parent_state_root: header.parent_state_root,
             state_root: header.state_root,
             round: header.round,
             round_certificate: None,
@@ -321,7 +333,7 @@ mod tests {
         let (block, proposer) = block_matching_frozen_artifact_header();
         assert_eq!(
             hex::encode(block.signing_bytes(&xc_artifact::FROZEN_TEST_GENESIS, &proposer)),
-            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790f30787374617465726f6f744861736803",
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790c3078706172656e74526f6f740f30787374617465726f6f744861736803",
         );
     }
 }

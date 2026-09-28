@@ -65,6 +65,32 @@ impl KeySpec for StakeByValidatorKey<'_> {
     }
 }
 
+/// Every `(master, validator)` whose unbonding unlocks at this height —
+/// written by `Unstake`, read and deleted when that block runs. A point
+/// read instead of scanning every `stake:` row per block, and that is what
+/// lets a dispute replay the release from proofs. `stake_unbonding_due:`
+/// never matches the `stake:` scan prefix.
+pub struct UnbondingDueKey(pub u64);
+impl KeySpec for UnbondingDueKey {
+    const CF: &'static str = CF_VALIDATORS;
+    type Value = Vec<(Address, Address)>;
+    fn encode(&self) -> Vec<u8> {
+        format!("stake_unbonding_due:{:020}", self.0).into_bytes()
+    }
+}
+
+/// Every address with a `validator_status:` row, sorted — the boundary
+/// hook's candidate pool as one provable key rather than a prefix scan.
+/// Kept in step by `on_block_sealed` from the status rows each block wrote.
+pub struct ValidatorCandidatesKey;
+impl KeySpec for ValidatorCandidatesKey {
+    const CF: &'static str = CF_VALIDATORS;
+    type Value = Vec<Address>;
+    fn encode(&self) -> Vec<u8> {
+        b"validator_candidates".to_vec()
+    }
+}
+
 /// Shared between staking/validator-join logic and `arxd/finality` — not
 /// exclusively "owned" by one circuit. Lives in `CF_GOVERNANCE` (included in
 /// `is_state_key`) so `JoinValidator`/`RegisterBlsKey` are provable to the
@@ -264,6 +290,21 @@ impl KeySpec for EvidenceMarkerKey<'_> {
     type Value = ();
     fn encode(&self) -> Vec<u8> {
         format!("evidence:{:020}:{}", self.height, self.proposer).into_bytes()
+    }
+}
+
+/// Block `height` lost an execution dispute: an upheld `SubmitExecutionFault`
+/// named its proposer. Such a block never becomes FINAL (see
+/// `ChainParams::challenge_window_blocks`); it stays certified, so undoing
+/// it is an operator/governance decision, not something the chain does on
+/// its own. `CF_EVIDENCE`, merkleized. The `disputed:` segment can't collide
+/// with `EvidenceMarkerKey`'s zero-padded height.
+pub struct DisputedBlockKey(pub u64);
+impl KeySpec for DisputedBlockKey {
+    const CF: &'static str = CF_EVIDENCE;
+    type Value = ();
+    fn encode(&self) -> Vec<u8> {
+        format!("evidence:disputed:{:020}", self.0).into_bytes()
     }
 }
 

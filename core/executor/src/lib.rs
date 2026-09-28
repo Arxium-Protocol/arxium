@@ -107,18 +107,22 @@ pub struct BlockUpdates {
     pub governance: GovernanceUpdates,
 }
 
-/// Resolves every stake allocation whose unbonding batch matured at or
-/// before `height`, crediting masters back and clearing the allocation —
+/// Resolves every stake allocation whose unbonding batch matures at
+/// `height` (`circuit_staking::resolve_due_unbonding`), crediting masters
+/// back and clearing the allocation —
 /// meant to run *before* the action-dispatch loop each block (as the `seed`
 /// passed to `execute_actions`), so a same-block `Stake`/`Unstake` action
 /// against a pair that just cleared sees the cleared state instead of
 /// hitting "already unbonding".
-pub fn resolve_matured_unbonding(db: &ArxiumDb, height: u64) -> Result<BlockUpdates, StorageError> {
-    let due = db.get_allocations_with_unbonding_due(height)?;
-    let (accounts, stakes) = circuit_staking::resolve_due_unbonding(db, due)?;
+pub fn resolve_matured_unbonding<V: KvRead<Error = StorageError>>(
+    view: &V,
+    height: u64,
+) -> Result<BlockUpdates, StorageError> {
+    let (accounts, stakes, governance) = circuit_staking::resolve_due_unbonding(view, height)?;
     Ok(BlockUpdates {
         accounts,
         stakes,
+        governance,
         ..Default::default()
     })
 }
@@ -217,6 +221,12 @@ pub enum AcceptBlockError {
     },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
     ParentMismatch { local: Hash32, expected: String },
+    #[error("block {height} claims parent state root {claimed}, its parent's is {local}")]
+    ParentStateRootMismatch {
+        height: u64,
+        local: String,
+        claimed: String,
+    },
     #[error(
         "block {height} timestamp {timestamp} does not advance past its parent's {parent_timestamp}"
     )]
@@ -546,6 +556,16 @@ where
             expected: block.parent_hash.clone(),
         });
     }
+    // The pre-state the proposer signed must be the real one: a dispute
+    // replays the block from it, so a block that lied here would be judged
+    // against a state it never ran on.
+    if block.parent_state_root != parent.state_root {
+        return Err(AcceptBlockError::ParentStateRootMismatch {
+            height: block.height,
+            local: parent.state_root.clone(),
+            claimed: block.parent_state_root.clone(),
+        });
+    }
 
     // Timestamps are still consensus-critical, even though proposer
     // eligibility (below) no longer derives from them — B1b moved that to
@@ -651,7 +671,11 @@ where
     // exactly as claimed or be rejected outright; there's no partial credit
     // for a block the way there is for a fresh batch from the mempool.
     let claimed = block.actions.len();
-    let seed = resolve_matured_unbonding(db, block.height)?;
+    // Recording, like the action loop and the seal below: a
+    // `BlockDivergence` proof needs every key any of the three phases read.
+    let seed_view = BlockView::new_recording(db);
+    let seed = resolve_matured_unbonding(&seed_view, block.height)?;
+    let mut touched_keys = seed_view.touched_keys();
     let ExecutionOutcome {
         applied,
         accounts: mut account_updates,
@@ -665,8 +689,8 @@ where
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-        governance,
-        touched_keys,
+        mut governance,
+        touched_keys: action_keys,
         dropped: _,
         weight_used,
         fees_collected,
@@ -697,6 +721,7 @@ where
             &holder_states,
         ];
         let local_state_root = db.compute_state_root(&overlay).unwrap_or_default();
+        touched_keys.extend(action_keys);
         return Err(AcceptBlockError::ActionMismatch {
             block_height: block.height,
             claimed,
@@ -705,6 +730,7 @@ where
             touched_keys,
         });
     }
+    touched_keys.extend(action_keys);
 
     // `verify_proposer_signature` above already guarantees `Some` — an
     // unsigned block never reaches this point.
@@ -712,15 +738,23 @@ where
         .proposer
         .as_ref()
         .expect("signed block always has a proposer");
-    let mut view = BlockView::new(db);
-    view.apply_accounts(&account_updates)?;
-    view.apply_stakes(&stake_updates)?;
-    view.apply_asset_balances(&asset_updates)?;
-    view.apply_holder_states(&holder_states)?;
-    view.apply_validator_statuses(&validator_statuses)?;
+    let view = seal_view(
+        db,
+        true,
+        &account_updates,
+        &stake_updates,
+        &asset_updates,
+        &holder_states,
+        &validator_statuses,
+        &attestor_registrations,
+        &attestor_deregistrations,
+        &governance,
+    )?;
     let sealed_updates =
         on_block_sealed(&view, proposer, fees_collected, &validators, block.height)
             .map_err(|e| AcceptBlockError::BlockSealed(e.to_string()))?;
+    touched_keys.extend(view.touched_keys());
+    governance.extend(sealed_updates.governance);
     account_updates.0.extend(sealed_updates.accounts.0);
     stake_updates
         .allocations
@@ -789,6 +823,16 @@ where
     };
     let expected_state_root = db.compute_state_root(&state_root_overlay)?;
     if block.state_root != expected_state_root {
+        // Every merkleized key the block wrote, too: the seal's writes (a
+        // validator-set row, the candidate list) never pass through a
+        // recording view, and a replay can only write keys it has proofs for.
+        for part in &state_root_overlay {
+            touched_keys.extend(part.batch_entries()?.into_iter().map(|(key, _)| key));
+            touched_keys.extend(part.batch_deletes()?);
+        }
+        touched_keys.retain(|key| xc_storage::is_state_key(key));
+        touched_keys.sort();
+        touched_keys.dedup();
         return Err(AcceptBlockError::StateRootMismatch {
             height: block.height,
             expected: expected_state_root,
@@ -862,6 +906,45 @@ where
     // the ability to roll all of it back have to land together or not at all.
     db.write_block_batches(block.height, &writables, !sync)?;
     Ok(block)
+}
+
+/// What `on_block_sealed` reads through: the block's state after its seed
+/// and actions. Everything the seal can read (balances, stakes, statuses,
+/// `chain_params`, attestor records) has to be here, not just balances —
+/// a dispute replays the seal on one proof-backed trie that already holds
+/// every action's writes, and the two must see the same state. Shared by
+/// `accept_block` and the node's producer so they cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+pub fn seal_view<'a>(
+    db: &'a ArxiumDb,
+    recording: bool,
+    accounts: &AccountUpdates,
+    stakes: &StakeUpdates,
+    assets: &AssetBalanceUpdates,
+    holder_states: &HolderStateUpdates,
+    statuses: &ValidatorStatusUpdates,
+    attestor_registrations: &[AttestorRegistration],
+    attestor_deregistrations: &[AttestorDeregistration],
+    governance: &GovernanceUpdates,
+) -> Result<BlockView<'a>, StorageError> {
+    let mut view = if recording {
+        BlockView::new_recording(db)
+    } else {
+        BlockView::new(db)
+    };
+    view.apply_accounts(accounts)?;
+    view.apply_stakes(stakes)?;
+    view.apply_asset_balances(assets)?;
+    view.apply_holder_states(holder_states)?;
+    view.apply_validator_statuses(statuses)?;
+    for registration in attestor_registrations {
+        view.apply_attestor_registration(registration)?;
+    }
+    for deregistration in attestor_deregistrations {
+        view.apply_attestor_deregistration(deregistration);
+    }
+    view.apply_governance(governance);
+    Ok(view)
 }
 
 /// `ChainParams.max_block_weight` as of current state — read here (not
@@ -1406,6 +1489,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -1427,6 +1511,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: accepted.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -1782,6 +1867,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -1848,6 +1934,9 @@ mod tests {
             .validator_index
             .insert(validator.clone(), vec![alice.clone()]);
         db.write_batch(&stake_updates).unwrap();
+        // Indexed for height 1, as the `Unstake` that started it would have.
+        db.write_batch(&circuit_staking::index_unbonding(&db, 1, &alice, &validator).unwrap())
+            .unwrap();
         // Sub-account must actually hold the unbonding amount — it's what
         // `resolve_due_unbonding` debits back to alice.
         let sub_account = circuit_staking::stake_subaccount(&validator);
@@ -1870,6 +1959,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -1935,6 +2025,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
@@ -1978,6 +2069,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: parent.state_root.clone(),
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
@@ -2169,6 +2261,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
@@ -2245,6 +2338,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: block1.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -2274,6 +2368,7 @@ mod tests {
                 tx_root: [0u8; 32],
                 proposer: None,
                 signature: None,
+                parent_state_root: block1.state_root.clone(),
                 state_root: String::new(),
                 round: 0,
                 round_certificate: None,
@@ -2318,6 +2413,7 @@ mod tests {
             tx_root: [0u8; 32],
             proposer: None,
             signature: None,
+            parent_state_root: block1.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,
@@ -2411,6 +2507,7 @@ mod tests {
             tx_root,
             proposer: None,
             signature: None,
+            parent_state_root: genesis.state_root.clone(),
             state_root: String::new(),
             round: 0,
             round_certificate: None,

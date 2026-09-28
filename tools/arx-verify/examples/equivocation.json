@@ -1,5 +1,5 @@
 {
-  "artifact_version": 4,
+  "artifact_version": 5,
   "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
   "fault": "equivocation",
   "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
@@ -12,10 +12,11 @@
         "timestamp": 1234,
         "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
         "proposer": "arx1proposer",
+        "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "state_root": "0xstate",
         "round": 0
       },
-      "signature": "0xbe2e43e63089e3ff7d636f78e695573979678fccf2700d69ecb12ad924ec42410c20ef932f18993e4abd0f3bd1cd26ccf0cd4c29ec6defa3d0e8e14224646d0d"
+      "signature": "0x07857de23eabc2bc47a61849a2f63a9bbcc85733a7fbb6560c14da7296ff109a1b7a769c3f75bc166f143176652b5694533eec2dfaf2ed397a2ed3987739e30c"
     },
     {
       "header": {
@@ -24,10 +25,11 @@
         "timestamp": 1234,
         "tx_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
         "proposer": "arx1proposer",
+        "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "state_root": "0xstate",
         "round": 0
       },
-      "signature": "0x14901b6587d70467bf63c0db508fd3b7c270f42623a4edb1055e6a26954077ed761d97ca9a1732e3834e600f4d8598c1f6325ea7a136ea4a5c214f43be290900"
+      "signature": "0xc2e04037a23d1be4c2e0bd856a1b063651f3f0f335fb18f3b4d48904cbf7753009dc5a87b32142834bc80e5aa693e425d4cfa983957febe8276f589661419c05"
     }
   ],
   "human_readable": {

@@ -109,6 +109,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     updates.evidence = Some(EvidenceMarker {
         height: block_a.height,
         proposer: equivocator,
+        disputed: false,
     });
     Ok(updates)
 }
@@ -154,6 +155,25 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
             "evidence artifact was produced against genesis {}, this chain's genesis is {chain_genesis}",
             artifact.genesis_hash,
         );
+    }
+
+    // The challenge window: an execution dispute over block `height` must
+    // land within `challenge_window_blocks` of it, after which that block is
+    // FINAL (once certified) and no longer open to one. Checked before the
+    // replay so a stale artifact costs nothing to refuse. A precommit
+    // equivocation is a double-sign, not a dispute over the block, so it is
+    // bounded by unbonding like `SubmitEquivocationEvidence` instead.
+    if let xc_artifact::Fault::ActionDivergence { height, .. }
+    | xc_artifact::Fault::BlockDivergence { height, .. } = &artifact.fault
+    {
+        let window = view
+            .get(&ChainParamsKey)?
+            .unwrap_or_default()
+            .challenge_window_blocks;
+        let closes = height.saturating_add(window);
+        if current_height > closes {
+            anyhow::bail!("challenge window for height {height} closed at height {closes}");
+        }
     }
 
     // `reason` rides along with the culprit because not every fault that
@@ -233,6 +253,8 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         }
     };
 
+    let is_dispute = !matches!(reason, circuit_staking::SlashReason::DoubleSign);
+
     let culpable_pubkey = match outcome {
         crate::adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey } => culpable_pubkey,
         crate::adjudicate::AdjudicationOutcome::Disagreement { reason } => {
@@ -253,7 +275,8 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     let decode = |s: &str| hex::decode(s.strip_prefix("0x").unwrap_or(s)).ok();
     let culpable = decode(&culpable_pubkey)
         .ok_or_else(|| anyhow::anyhow!("adjudicator named a malformed pubkey"))?;
-    let culprit = if decode(&proposer_pubkey).as_ref() == Some(&culpable) {
+    let proposer_culpable = decode(&proposer_pubkey).as_ref() == Some(&culpable);
+    let culprit = if proposer_culpable {
         Address::from_pubkey_bytes(&culpable)?
     } else if decode(&voter_pubkey).as_ref() == Some(&culpable) {
         let bytes: [u8; 48] = culpable
@@ -281,6 +304,9 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     updates.evidence = Some(EvidenceMarker {
         height,
         proposer: culprit,
+        // The proposer's own post-state was shown wrong, so block `height`
+        // is. A culpable voter (false dissent) leaves the block standing.
+        disputed: is_dispute && proposer_culpable,
     });
     Ok(updates)
 }
@@ -958,6 +984,7 @@ mod tests {
                 "timestamp": 0,
                 "tx_root": "0x00",
                 "proposer": "",
+                "parent_state_root": "",
                 "state_root": "",
                 "round": 0,
             },

@@ -97,7 +97,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         asset_registrations,
         attestor_registrations,
         attestor_deregistrations,
-        governance,
+        mut governance,
         touched_keys: _,
         dropped,
         weight_used,
@@ -132,14 +132,21 @@ pub fn produce_block_reporting<R: ChainRuntime>(
     // validator would never see its own reward pool debited/credited.
     let mut snapshot = None;
     if let Some((address, _)) = proposer {
-        let mut view = xc_storage::BlockView::new(db);
-        view.apply_accounts(&account_updates)?;
-        view.apply_stakes(&stake_updates)?;
-        view.apply_asset_balances(&asset_updates)?;
-        view.apply_holder_states(&holder_states)?;
-        view.apply_validator_statuses(&validator_statuses)?;
+        let view = xc_executor::seal_view(
+            db,
+            false,
+            &account_updates,
+            &stake_updates,
+            &asset_updates,
+            &holder_states,
+            &validator_statuses,
+            &attestor_registrations,
+            &attestor_deregistrations,
+            &governance,
+        )?;
         let sealed_updates =
             R::on_block_sealed(&view, address, fees_collected, &validators, next_height)?;
+        governance.extend(sealed_updates.governance);
         account_updates.0.extend(sealed_updates.accounts.0);
         stake_updates
             .allocations
@@ -262,6 +269,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         tx_root,
         proposer: None,
         signature: None,
+        parent_state_root: parent.state_root.clone(),
         state_root,
         round,
         round_certificate,

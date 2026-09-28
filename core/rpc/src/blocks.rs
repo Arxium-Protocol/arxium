@@ -84,10 +84,22 @@ fn block_with_finality<P: Payload>(
     block: &Block<P>,
 ) -> Result<serde_json::Value, StorageError> {
     let finalized = db.get_finality_record(block.height)?.is_some();
+    // PoE v5 §3.3: certified is ATTESTED; FINAL waits out the challenge
+    // window too. `finalized` keeps meaning "certified" for old readers.
+    let settlement = if db.is_block_disputed(block.height)? {
+        "disputed"
+    } else if block.height <= db.get_settled_height()? {
+        "final"
+    } else if finalized {
+        "attested"
+    } else {
+        "pending"
+    };
     let weight_used = db.get_block_weight(block.height)?;
     let mut value = serde_json::to_value(block).unwrap_or(serde_json::Value::Null);
     if let Some(object) = value.as_object_mut() {
         object.insert("finalized".into(), serde_json::Value::Bool(finalized));
+        object.insert("settlement".into(), settlement.into());
         // PoE `resources_used`: the metered weight this block carried.
         object.insert("weight_used".into(), serde_json::Value::from(weight_used));
         // For an HTTP-only reader (Retracer): the wire hash, so it never has

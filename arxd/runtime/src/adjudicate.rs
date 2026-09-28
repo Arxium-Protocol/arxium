@@ -95,6 +95,8 @@ pub enum AdjudicateError {
     BadAction(String),
     #[error("state root is not well-formed: {0}")]
     BadRoot(String),
+    #[error("replay failed: {0}")]
+    Replay(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,8 +180,8 @@ pub fn adjudicate_action_divergence(
 /// sides' claims. The counterpart to [`adjudicate_action_divergence`] for
 /// [`Fault::BlockDivergence`] — same replay-and-compare shape, but over a
 /// whole block instead of one action, and against a single shared
-/// pre-state (the block's parent root) instead of two separately-claimed
-/// pre-states, since both proposer and dissenter agree on the parent.
+/// pre-state (the parent root the proposer signed) instead of two
+/// separately-claimed pre-states.
 ///
 /// `xc_artifact::verify()` already confirms the artifact is well-formed
 /// (both signatures check out, the parent-state proofs verify, the two
@@ -189,36 +191,25 @@ pub fn adjudicate_action_divergence(
 /// that first, by recomputing `tx_root` and checking it against the
 /// header's signed value, before trusting anything replayed from it.
 ///
-/// **Never returns `Culpable` for now.** Every caller routes through here —
-/// on-chain slashing (`SubmitExecutionFault`), the node's auto-submit
-/// pre-check, and `arx-verify` — and the replay can't yet be trusted to
-/// name a culprit, for two reasons:
+/// Every caller routes through here — on-chain slashing
+/// (`SubmitExecutionFault`), the node's auto-submit pre-check, and
+/// `arx-verify` — and the replay is the whole of `accept_block`'s state
+/// transition, from proofs alone:
 ///
-/// 1. `parent_state_root` is chosen by the dissenter and never checked
-///    against the chain's real parent state, so a dissenter can invent a
-///    parent, replay on it, and frame an honest proposer.
-/// 2. The replay skips `on_block_sealed` (block reward, downtime slash,
-///    epoch boundary), which every real `header.state_root` includes, so an
-///    honest proposer's root never matches the replay. Sealing can't be
-///    replayed from proofs as-is: the boundary hook scans the whole DB.
+/// - It starts from `header.parent_state_root`, which the proposer signed
+///   and `accept_block` checks against the real parent. The dissenter
+///   supplies proofs, never the pre-state, so it can't frame anyone.
+/// - Matured unbonding (`UnbondingDueKey`), every action, and the seal —
+///   reward, downtime slash, epoch boundary (`ValidatorCandidatesKey`) —
+///   are all point reads, so all of them replay.
 ///
-/// A replay that would name someone is downgraded to `Disagreement`; the
-/// artifact is still written to disk and inspectable, it just can't slash.
-// ponytail: slashing off until parent_state_root is bound to the stored
-// header at height-1 and sealing is replayed; then return the replay's
-// outcome directly.
+/// A block no honest node would accept (bad action signature, over
+/// weight, an action `dispatch` rejects) names the proposer. Anything the
+/// proofs don't cover is a `Disagreement`, never a guess.
 pub fn adjudicate_block_divergence(
     artifact: &EvidenceArtifact,
 ) -> Result<AdjudicationOutcome, AdjudicateError> {
-    Ok(match replay_block_divergence(artifact)? {
-        AdjudicationOutcome::Culpable { culpable_pubkey } => AdjudicationOutcome::Disagreement {
-            reason: format!(
-                "replay names {culpable_pubkey}, but BlockDivergence adjudication is disabled: the \
-                 parent state root isn't bound to the chain and block sealing isn't replayed"
-            ),
-        },
-        disagreement => disagreement,
-    })
+    replay_block_divergence(artifact)
 }
 
 fn replay_block_divergence(
@@ -229,7 +220,6 @@ fn replay_block_divergence(
         proposer_pubkey,
         voter_pubkey,
         height,
-        parent_state_root,
         block_attestation,
         actions,
         dissent_claim,
@@ -237,14 +227,23 @@ fn replay_block_divergence(
     else {
         return Err(AdjudicateError::WrongFaultKind);
     };
+    let header = &block_attestation.header;
+    let height = *height;
+    let disagreement = |reason: String| Ok(AdjudicationOutcome::Disagreement { reason });
+    // The proposer signed a block that honest nodes reject outright
+    // (`accept_block` refuses any block with an action it can't apply):
+    // that alone is the fault, whatever root the dissenter computed.
+    let proposer_culpable = || {
+        Ok(AdjudicationOutcome::Culpable {
+            culpable_pubkey: proposer_pubkey.clone(),
+        })
+    };
 
     if actions.len() > MAX_ADJUDICATED_ACTIONS {
-        return Ok(AdjudicationOutcome::Disagreement {
-            reason: format!(
-                "action list ({} actions) exceeds MAX_ADJUDICATED_ACTIONS ({MAX_ADJUDICATED_ACTIONS}), refusing to replay",
-                actions.len()
-            ),
-        });
+        return disagreement(format!(
+            "action list ({} actions) exceeds MAX_ADJUDICATED_ACTIONS ({MAX_ADJUDICATED_ACTIONS}), refusing to replay",
+            actions.len()
+        ));
     }
 
     let decoded_actions = actions
@@ -265,52 +264,89 @@ fn replay_block_divergence(
 
     let computed_tx_root = xc_poe::tx_root(&decoded_actions)
         .map_err(|err| AdjudicateError::BadAction(err.to_string()))?;
-    if computed_tx_root != decode_root(&block_attestation.header.tx_root)? {
-        return Ok(AdjudicationOutcome::Disagreement {
-            reason: "the supplied action list doesn't hash to the block header's signed tx_root"
+    if computed_tx_root != decode_root(&header.tx_root)? {
+        return disagreement(
+            "the supplied action list doesn't hash to the block header's signed tx_root"
                 .to_string(),
-        });
+        );
     }
 
-    let parent_root = decode_root(parent_state_root)?;
+    // The seal pays `header.proposer`; it has to be the key that signed.
+    let proposer = match hex::decode(
+        proposer_pubkey
+            .strip_prefix("0x")
+            .unwrap_or(proposer_pubkey),
+    )
+    .ok()
+    .and_then(|bytes| Address::from_pubkey_bytes(&bytes).ok())
+    {
+        Some(address) if address.to_string() == header.proposer => address,
+        _ => {
+            return disagreement(
+                "the header's proposer is not the address of the key that signed it".to_string(),
+            );
+        }
+    };
+
+    // Everything from here mirrors `xc_executor::accept_block`, on one trie
+    // built from proofs against the parent root the proposer signed:
+    // matured unbonding, then each action, then the seal.
     let proofs = decode_proofs(&dissent_claim.proofs)?;
-    let trie = match ProofBackedTrie::from_proofs(parent_root, &proofs) {
-        Ok(trie) => trie,
-        Err(_) => {
-            return Ok(AdjudicationOutcome::Disagreement {
-                reason: "a supplied proof does not verify".to_string(),
-            });
-        }
+    let Ok(trie) = ProofBackedTrie::from_proofs(decode_root(&header.parent_state_root)?, &proofs)
+    else {
+        return disagreement("a supplied proof does not verify".to_string());
+    };
+    let mut view = ProofBackedView { trie };
+    let unprovable = |err: &anyhow::Error| {
+        matches!(
+            err.downcast_ref::<StorageError>(),
+            Some(StorageError::UnprovenRead)
+        )
+    };
+    let not_proven = |phase: &str| {
+        format!("this block's {phase} needs unprovable state; the proof set is incomplete")
     };
 
-    // The set in force at `height` — the same one `accept_block` hands
-    // `dispatch` — read from the proven parent state, but only if something
-    // in the block reads it: every other block's proof set stays as small
-    // as it was.
-    let view = ProofBackedView { trie };
-    let needs_set = decoded_actions
-        .iter()
-        .any(|a| matches!(a.payload, crate::ActionPayload::LeaveValidator { .. }));
-    let validators = if needs_set {
-        match proven_validators(&view, *height) {
-            Ok(validators) => validators,
-            Err(reason) => return Ok(AdjudicationOutcome::Disagreement { reason }),
-        }
-    } else {
-        Vec::new()
+    // 1. Matured unbonding — `accept_block`'s seed.
+    let seed = match xc_executor::resolve_matured_unbonding(&view, height) {
+        Ok(seed) => seed,
+        Err(StorageError::UnprovenRead) => return disagreement(not_proven("unbonding release")),
+        Err(err) => return Err(AdjudicateError::Replay(err.to_string())),
     };
-    let mut trie = view.trie;
+    if !apply_entries(&mut view.trie, &state_entries(&seed)) {
+        return disagreement(not_proven("unbonding release"));
+    }
 
+    // The set `dispatch` and the seal are handed, and the metering in force.
+    let validators = match proven_validators(&view, height) {
+        Ok(validators) => validators,
+        Err(reason) => return disagreement(reason),
+    };
+    let Ok(params) = view.get(&ChainParamsKey).map(Option::unwrap_or_default) else {
+        return disagreement(not_proven("metering"));
+    };
+
+    // 2. The actions, as `execute_actions` runs them.
+    let mut written_statuses: Vec<Address> = Vec::new();
+    let mut weight_used = 0u64;
+    let mut fees_collected = 0u128;
     for action in &decoded_actions {
         if is_unreplayable_fault_submission(&action.payload) {
-            return Ok(AdjudicationOutcome::Disagreement {
-                reason: "a fault-submission action (SubmitExecutionFault/SubmitEquivocationEvidence) cannot itself \
-                         be replayed during adjudication"
+            return disagreement(
+                "a fault-submission action (SubmitExecutionFault/SubmitEquivocationEvidence) cannot itself \
+                 be replayed during adjudication"
                     .to_string(),
-            });
+            );
+        }
+        if action.verify_signature().is_err() {
+            return proposer_culpable();
+        }
+        let weight = crate::metering::action_weight(action);
+        weight_used = weight_used.saturating_add(weight);
+        if weight_used > params.max_block_weight {
+            return proposer_culpable();
         }
 
-        let view = ProofBackedView { trie };
         let operator_lookup =
             |v: &Address| -> Result<Option<Address>, StorageError> { view.get(&OperatorKey(v)) };
         let operator_validators_lookup = |o: &Address| -> Result<Vec<Address>, StorageError> {
@@ -320,67 +356,84 @@ fn replay_block_divergence(
             |pk: &xc_bls::BlsPublicKey| -> Result<Option<Address>, StorageError> {
                 view.get(&BlsPubkeyOwnerKey(pk))
             };
-        let updates = crate::dispatch(
+        let updates = match crate::dispatch(
             action,
             &view,
             &operator_lookup,
             &operator_validators_lookup,
             &validators,
-            *height,
+            height,
             &bls_pubkey_owner_lookup,
             // Signed by the proposer as part of the header — the same value
             // `accept_block` handed `dispatch`.
-            block_attestation.header.timestamp,
-        );
-        trie = view.trie;
-
-        let updates = match updates {
+            header.timestamp,
+        ) {
             Ok(updates) => updates,
-            Err(err) => match err.downcast_ref::<StorageError>() {
-                Some(StorageError::UnprovenRead) => {
-                    return Ok(AdjudicationOutcome::Disagreement {
-                        reason: format!("this block's replay needs unprovable state: {err}"),
-                    });
-                }
-                // A real, deterministic rejection — dropped by `execute_actions`
-                // just like at the single-action level, so state is unchanged
-                // and replay simply moves on to the next action.
-                _ => continue,
-            },
+            Err(err) if unprovable(&err) => return disagreement(not_proven("actions")),
+            // Deterministic from proven state: no honest node would have
+            // accepted a block carrying this action.
+            Err(_) => return proposer_culpable(),
         };
-
-        for (key, value) in state_entries(&updates) {
-            match trie.apply(xc_poe::state_trie::hash_key(&key), value) {
-                Ok(_) => {}
-                Err(_) => {
-                    return Ok(AdjudicationOutcome::Disagreement {
-                        reason: "an update touches a key outside the proven set".to_string(),
-                    });
-                }
-            }
+        written_statuses.extend(updates.validator_statuses.0.keys().cloned());
+        fees_collected =
+            fees_collected.saturating_add(crate::metering::action_fee_for(&params, weight));
+        if !apply_entries(&mut view.trie, &state_entries(&updates)) {
+            return disagreement(not_proven("actions"));
         }
     }
 
-    let computed_root = trie.root();
-    let proposed_matches = computed_root == decode_root(&block_attestation.header.state_root)?;
+    // 3. The seal: reward, downtime slash, epoch boundary, candidate list.
+    let sealed = match crate::seal(
+        &view,
+        written_statuses,
+        &proposer,
+        fees_collected,
+        &validators,
+        height,
+    ) {
+        Ok(sealed) => sealed,
+        Err(err) if unprovable(&err) => return disagreement(not_proven("seal")),
+        Err(err) => return disagreement(format!("the seal failed on replay: {err}")),
+    };
+    let mut entries = state_entries(&sealed);
+    if let Some(validators) = &sealed.validator_set {
+        let snapshot = xc_storage::ValidatorSetSnapshot {
+            effective_height: height + 1,
+            validators: validators.clone(),
+        };
+        entries.extend(write_entries(&snapshot));
+    }
+    if !apply_entries(&mut view.trie, &entries) {
+        return disagreement(not_proven("seal"));
+    }
+
+    let computed_root = view.trie.root();
+    let proposed_matches = computed_root == decode_root(&header.state_root)?;
     let dissent_matches = computed_root == decode_root(&dissent_claim.computed_state_root)?;
     match (proposed_matches, dissent_matches) {
         (true, false) => Ok(AdjudicationOutcome::Culpable {
             culpable_pubkey: voter_pubkey.clone(),
         }),
-        (false, true) => Ok(AdjudicationOutcome::Culpable {
-            culpable_pubkey: proposer_pubkey.clone(),
-        }),
+        (false, true) => proposer_culpable(),
+        // Both wrong: the proposer still signed a root no honest replay
+        // produces, and that alone is its fault.
+        (false, false) => proposer_culpable(),
         // `verify()` already requires the two claimed roots to differ, so
-        // both matching independent replay is not reachable; kept as a
-        // `Disagreement` rather than `unreachable!()` so a bug upstream
-        // fails safe instead of panicking an adjudicator.
-        _ => Ok(AdjudicationOutcome::Disagreement {
-            reason:
-                "neither party's claimed final state root matches independently replaying the block"
-                    .to_string(),
-        }),
+        // both matching is not reachable; kept as a `Disagreement` rather
+        // than `unreachable!()` so a bug upstream fails safe.
+        (true, true) => {
+            disagreement("both parties' claimed final state roots match the replay".to_string())
+        }
     }
+}
+
+/// Applies `entries` to `trie`; `false` when one touches a key the proofs
+/// don't cover.
+fn apply_entries(trie: &mut ProofBackedTrie, entries: &[(Vec<u8>, Option<Vec<u8>>)]) -> bool {
+    entries.iter().all(|(key, value)| {
+        trie.apply(xc_poe::state_trie::hash_key(key), value.clone())
+            .is_ok()
+    })
 }
 
 enum ReplayResult {
@@ -569,8 +622,8 @@ fn replay(
 /// real commit goes through, filtered by `xc_storage::is_state_key`, so this
 /// cannot drift from what `write_block_batches` puts in the trie (it used to
 /// be a hand-maintained copy that silently skipped validator statuses).
-/// `validator_set` is not here: only the boundary hook produces it, and that
-/// runs in `on_block_sealed`, never per action.
+/// `validator_set` is not here: only the boundary hook produces it, and the
+/// block replay writes it as the `ValidatorSetSnapshot` `accept_block` does.
 fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     let mut parts: Vec<&dyn xc_storage::BatchWritable> = vec![
         &updates.accounts,
@@ -611,26 +664,24 @@ fn state_entries(updates: &BlockUpdates) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
             .map(|d| d as &dyn xc_storage::BatchWritable),
     );
     parts.push(&updates.governance);
-    let mut entries = Vec::new();
-    for part in parts {
-        for (key, value) in part
-            .batch_entries()
-            .expect("in-memory updates always encode")
-        {
-            if xc_storage::is_state_key(&key) {
-                entries.push((key, Some(value)));
-            }
-        }
-        for key in part
-            .batch_deletes()
-            .expect("in-memory updates always encode")
-        {
-            if xc_storage::is_state_key(&key) {
-                entries.push((key, None));
-            }
-        }
-    }
-    entries
+    parts.into_iter().flat_map(write_entries).collect()
+}
+
+/// One writable's merkleized puts (`Some`) and deletes (`None`).
+fn write_entries(part: &dyn xc_storage::BatchWritable) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+    let puts = part
+        .batch_entries()
+        .expect("in-memory updates always encode")
+        .into_iter()
+        .map(|(key, value)| (key, Some(value)));
+    let deletes = part
+        .batch_deletes()
+        .expect("in-memory updates always encode")
+        .into_iter()
+        .map(|key| (key, None));
+    puts.chain(deletes)
+        .filter(|(key, _)| xc_storage::is_state_key(key))
+        .collect()
 }
 
 /// The validator set `dispatch` must see at `height`, read from proofs: the
@@ -1465,149 +1516,214 @@ mod tests {
         );
     }
 
-    /// Builds a real single-action `BlockDivergence` block: alice sends bob
-    /// `real_amount`, against a fresh `ArxiumDb`, with the proposer signing
-    /// the real result and the dissenter (BLS-)signing `dissent_amount`'s
-    /// result instead — same shape as `build_scenario` above, one level up.
-    fn build_block_scenario(dissent_amount: u128) -> (EvidenceArtifact, String, String) {
-        let db = temp_db();
-        let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let bob = xc_primitives::Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
-            (alice.clone(), entry(1_000_000_000)),
-            (bob.clone(), entry(0)),
-        ])))
-        .unwrap();
-        let parent_root = db.compute_state_root(&[]).unwrap();
-
-        let action: crate::ChainAction = xc_primitives::Action {
-            sender: alice.clone(),
-            nonce: 0,
-            signature: None,
-            payload: crate::ActionPayload::Transfer {
-                to: bob.clone(),
-                amount: 40,
-            },
-        };
-        let actions = vec![action.clone()];
-
-        let view = xc_storage::BlockView::new(&db);
-        let real_updates = crate::dispatch(
-            &action,
-            &view,
-            &no_operator,
-            &no_operator_validators,
-            &[],
-            5,
-            &no_bls_owner,
-            0,
-        )
-        .unwrap();
-        db.write_batch(&real_updates.accounts).unwrap();
-        let real_state_root = db.compute_state_root(&[]).unwrap();
-
-        let dissent_db = temp_db();
-        dissent_db
-            .write_batch(&AccountUpdates(std::collections::BTreeMap::from([
-                (alice.clone(), entry(1_000_000_000)),
-                (bob.clone(), entry(0)),
-            ])))
-            .unwrap();
-        let dissent_action: crate::ChainAction = xc_primitives::Action {
-            sender: alice.clone(),
-            nonce: 0,
-            signature: None,
-            payload: crate::ActionPayload::Transfer {
-                to: bob.clone(),
-                amount: dissent_amount,
-            },
-        };
-        let dissent_view = xc_storage::BlockView::new(&dissent_db);
-        let dissent_updates = crate::dispatch(
-            &dissent_action,
-            &dissent_view,
-            &no_operator,
-            &no_operator_validators,
-            &[],
-            5,
-            &no_bls_owner,
-            0,
-        )
-        .unwrap();
-        dissent_db.write_batch(&dissent_updates.accounts).unwrap();
-        let dissent_state_root = dissent_db.compute_state_root(&[]).unwrap();
-
-        let alice_key = format!("account:{alice}").into_bytes();
-        let bob_key = format!("account:{bob}").into_bytes();
-        let proofs = vec![
-            hex_proof(db.prove(&alice_key, &parent_root).unwrap()),
-            hex_proof(db.prove(&bob_key, &parent_root).unwrap()),
-        ];
-
-        sign_block_divergence(
-            parent_root,
-            &actions,
-            1234,
-            real_state_root,
-            dissent_state_root,
-            proofs,
-        )
+    /// A one-validator chain at height 0, as `arxd/genesis` leaves one: the
+    /// proposer (key `[7; 32]`) staked and `Active`, the candidate list, the
+    /// reward pool and every `funded` address seeded, plus whatever `seed`
+    /// writes before block 0's root is taken.
+    struct Chain {
+        db: ArxiumDb,
+        proposer_key: SigningKey,
+        genesis: crate::ChainBlock,
     }
 
-    /// A `BlockDivergence` artifact for a height-5 block of `actions` stamped
-    /// `timestamp`: the proposer signs a header claiming `proposer_root`, a
-    /// dissenter BLS-signs `dissent_root` with `proofs` against `parent_root`.
-    fn sign_block_divergence(
-        parent_root: String,
-        actions: &[crate::ChainAction],
-        timestamp: u64,
-        proposer_root: String,
-        dissent_root: String,
-        proofs: Vec<StateProof>,
-    ) -> (EvidenceArtifact, String, String) {
-        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
-        let tx_root = xc_poe::tx_root(actions).unwrap();
-        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+    fn key_address(key: &SigningKey) -> Address {
+        Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap()
+    }
 
-        let header = xc_artifact::CanonicalHeader {
-            height: 5,
-            parent_hash: "0xparent".to_string(),
+    fn chain(
+        funded: &[&Address],
+        params: xc_primitives::ChainParams,
+        seed: impl FnOnce(&ArxiumDb),
+    ) -> Chain {
+        let db = temp_db();
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut snapshot: xc_primitives::Snapshot = serde_json::from_value(serde_json::json!({
+            "height": 0,
+            "chain_name": "test",
+            "accounts": {},
+            "validators": {},
+        }))
+        .unwrap();
+        snapshot.params = params;
+        snapshot.accounts = funded
+            .iter()
+            .map(|a| ((*a).clone(), entry(1_000_000_000_000)))
+            .collect();
+        snapshot.accounts.insert(
+            xc_primitives::reward_pool_account(),
+            entry(1_000_000_000_000),
+        );
+        snapshot.validators.insert(
+            key_address(&proposer_key),
+            xc_primitives::ValidatorEntry {
+                stake: 2 * crate::test_support::MIN_VALIDATOR_STAKE,
+                bls_pubkey: None,
+                bls_pop: None,
+            },
+        );
+        db.write_batch(&snapshot).unwrap();
+        db.write_batch(&xc_storage::GenesisHash(genesis_hex()))
+            .unwrap();
+        seed(&db);
+        let mut genesis = crate::ChainBlock::genesis(0);
+        genesis.state_root = db.compute_state_root(&[]).unwrap();
+        db.write_batches(&[&genesis]).unwrap();
+        Chain {
+            db,
+            proposer_key,
+            genesis,
+        }
+    }
+
+    fn signed(key: &SigningKey, nonce: u64, payload: crate::ActionPayload) -> crate::ChainAction {
+        let mut action = xc_primitives::Action {
+            sender: key_address(key),
+            nonce,
+            signature: None,
+            payload,
+        };
+        action.signature = Some(hex::encode(key.sign(&action.signing_bytes()).to_bytes()));
+        action
+    }
+
+    /// Block 1 of `actions` stamped `timestamp`, run through the real
+    /// `accept_block` under a wrong root — exactly how a dissenting node
+    /// meets a bad block. Returns the block signed with the root
+    /// `accept_block` computed (what an honest proposer would have signed;
+    /// the parent root if an action was rejected) and the keys it touched.
+    fn run_block(
+        chain: &Chain,
+        actions: Vec<crate::ChainAction>,
+        timestamp: u64,
+    ) -> (crate::ChainBlock, Vec<Vec<u8>>) {
+        let mut block = crate::ChainBlock {
+            height: 1,
+            parent_hash: chain.genesis.hash().to_string(),
             timestamp,
-            tx_root: format!("0x{}", hex::encode(tx_root)),
-            proposer: "arx1proposer".to_string(),
-            state_root: proposer_root,
+            tx_root: xc_poe::tx_root(&actions).unwrap(),
+            actions,
+            proposer: None,
+            signature: None,
+            parent_state_root: chain.genesis.state_root.clone(),
+            state_root: format!("0x{}", "00".repeat(32)),
             round: 0,
+            round_certificate: None,
+        };
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let params = chain.db.chain_params().unwrap();
+        let meter = |action: &crate::ChainAction| {
+            let weight = crate::metering::action_weight(action);
+            (weight, crate::metering::action_fee_for(&params, weight))
+        };
+        let err = xc_executor::accept_block(
+            &chain.db,
+            block.clone(),
+            false,
+            &meter,
+            |action, view, operator_lookup, operator_validators_lookup, validators| {
+                crate::dispatch(
+                    action,
+                    view,
+                    operator_lookup,
+                    operator_validators_lookup,
+                    validators,
+                    1,
+                    &no_bls_owner,
+                    timestamp,
+                )
+            },
+            <crate::CoreChainRuntime as xc_runtime_api::ChainRuntime>::on_block_sealed,
+        )
+        .unwrap_err();
+        let (root, touched) = match err {
+            xc_executor::AcceptBlockError::StateRootMismatch {
+                expected,
+                touched_keys,
+                ..
+            } => (expected, touched_keys),
+            xc_executor::AcceptBlockError::ActionMismatch { touched_keys, .. } => {
+                (chain.genesis.state_root.clone(), touched_keys)
+            }
+            other => panic!("unexpected rejection: {other:?}"),
+        };
+        block.state_root = root;
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        (block, touched)
+    }
+
+    /// A `BlockDivergence` artifact against `block` as signed, with a
+    /// dissenter (BLS seed `[11; 32]`) claiming `dissent_root` and proving
+    /// `touched` — plus the two rows every replay reads, as
+    /// `arxd/node`'s `block_dissent_claim` adds them. Returns it with the
+    /// proposer's and the voter's pubkeys.
+    fn divergence(
+        chain: &Chain,
+        block: &crate::ChainBlock,
+        mut touched: Vec<Vec<u8>>,
+        dissent_root: &str,
+    ) -> (EvidenceArtifact, String, String) {
+        let epoch_length = chain.db.chain_params().unwrap().epoch_length;
+        touched.push(ChainParamsKey.encode());
+        touched.push(
+            ValidatorSetKey(xc_primitives::validator_set_effective_height(
+                block.height,
+                epoch_length,
+            ))
+            .encode(),
+        );
+        touched.sort();
+        touched.dedup();
+        let proofs = touched
+            .iter()
+            .map(|key| hex_proof(chain.db.prove(key, &block.parent_state_root).unwrap()))
+            .collect();
+        let proposer = key_address(&chain.proposer_key);
+        let header = xc_artifact::CanonicalHeader {
+            height: block.height,
+            parent_hash: block.parent_hash.clone(),
+            timestamp: block.timestamp,
+            tx_root: format!("0x{}", hex::encode(block.tx_root)),
+            proposer: proposer.to_string(),
+            parent_state_root: block.parent_state_root.clone(),
+            state_root: block.state_root.clone(),
+            round: block.round,
         };
         let header_bytes = xc_artifact::signing_bytes_for(&GENESIS, &header).unwrap();
-        let block_attestation = xc_artifact::BlockAttestation {
-            header: header.clone(),
-            signature: format!(
-                "0x{}",
-                hex::encode(proposer_key.sign(&header_bytes).to_bytes())
-            ),
-        };
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
+        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
         let dissent_msg = xc_artifact::block_divergence_signing_bytes(
             &GENESIS,
-            5,
+            block.height,
             &header_commitment,
-            &parent_root,
-            &dissent_root,
+            &block.parent_state_root,
+            dissent_root,
         );
-
+        let proposer_pubkey = format!(
+            "0x{}",
+            hex::encode(chain.proposer_key.verifying_key().as_bytes())
+        );
         let voter_pubkey = format!("0x{}", hex::encode(voter_pk.0));
-        let proposer_pubkey = format!("0x{}", hex::encode(proposer_key.verifying_key().as_bytes()));
-
         let artifact = EvidenceArtifact {
             artifact_version: ARTIFACT_VERSION,
             genesis_hash: genesis_hex(),
             fault: Fault::BlockDivergence {
                 proposer_pubkey: proposer_pubkey.clone(),
                 voter_pubkey: voter_pubkey.clone(),
-                height: 5,
-                parent_state_root: parent_root,
-                block_attestation,
-                actions: actions
+                height: block.height,
+                block_attestation: xc_artifact::BlockAttestation {
+                    header,
+                    signature: format!("0x{}", block.signature.clone().unwrap()),
+                },
+                actions: block
+                    .actions
                     .iter()
                     .map(|action| {
                         format!(
@@ -1620,7 +1736,7 @@ mod tests {
                     })
                     .collect(),
                 dissent_claim: xc_artifact::BlockDissentClaim {
-                    computed_state_root: dissent_root,
+                    computed_state_root: dissent_root.to_string(),
                     proofs,
                     signature: format!(
                         "0x{}",
@@ -1630,8 +1746,173 @@ mod tests {
             },
             human_readable: serde_json::json!({}),
         };
-
         (artifact, proposer_pubkey, voter_pubkey)
+    }
+
+    fn bogus_root(byte: u8) -> String {
+        format!("0x{}", hex::encode([byte; 32]))
+    }
+
+    /// Alice sends bob 40 in block 1 of a real chain.
+    fn transfer_block() -> (Chain, crate::ChainBlock, Vec<Vec<u8>>) {
+        let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let chain = chain(&[&key_address(&alice_key)], Default::default(), |_| {});
+        let action = signed(
+            &alice_key,
+            0,
+            crate::ActionPayload::Transfer {
+                to: bob,
+                amount: 40,
+            },
+        );
+        let (block, touched) = run_block(&chain, vec![action], 1_000);
+        (chain, block, touched)
+    }
+
+    /// The invariant everything else rests on: replaying an honest block
+    /// from proofs lands on the exact root `accept_block` computed — seal
+    /// (reward, fee split) included — so a dissenter claiming anything
+    /// else is the one named.
+    #[test]
+    fn a_dissenter_with_a_wrong_block_result_is_named_culpable() {
+        let (chain, block, touched) = transfer_block();
+        let (artifact, _, voter_pubkey) = divergence(&chain, &block, touched, &bogus_root(0xCC));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter_pubkey
+            }
+        );
+    }
+
+    #[test]
+    fn a_proposer_with_a_wrong_block_result_is_named_culpable() {
+        let (chain, mut block, touched) = transfer_block();
+        let honest_root = block.state_root.clone();
+        block.state_root = bogus_root(0xCC);
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let (artifact, proposer_pubkey, _) = divergence(&chain, &block, touched, &honest_root);
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: proposer_pubkey
+            }
+        );
+    }
+
+    /// A proposer who signs an invented pre-state is caught by
+    /// `accept_block`, and one who signs the real pre-state can't be
+    /// judged against any other: the dissenter's proofs must verify against
+    /// the root in the signed header.
+    #[test]
+    fn proofs_against_another_parent_root_do_not_verify() {
+        let (chain, block, touched) = transfer_block();
+        let (mut artifact, _, _) = divergence(&chain, &block, touched, &bogus_root(0xCC));
+        let Fault::BlockDivergence { dissent_claim, .. } = &mut artifact.fault else {
+            unreachable!()
+        };
+        // A proof for a key against the empty trie, not the signed parent.
+        let other = temp_db();
+        let empty_root = other.compute_state_root(&[]).unwrap();
+        dissent_claim.proofs[0] = hex_proof(other.prove(b"account:x", &empty_root).unwrap());
+        assert!(adjudicate_block_divergence(&artifact).is_err());
+    }
+
+    /// Matured unbonding before the actions, an `Unstake` among them, and
+    /// an epoch boundary after — every phase that used to scan the
+    /// database — replay to the same root `accept_block` computes.
+    #[test]
+    fn unbonding_release_and_an_epoch_boundary_replay_exactly() {
+        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
+        let proposer = key_address(&proposer_key);
+        let params = xc_primitives::ChainParams {
+            epoch_length: 2,
+            min_validator_set: 1,
+            unbonding_blocks: 10,
+            ..Default::default()
+        };
+        let chain = chain(&[&proposer], params, |db| {
+            // An unbonding that unlocks at height 1, indexed as `Unstake`
+            // would have left it.
+            let mut stakes = xc_storage::StakeUpdates::default();
+            let mut allocation = KvRead::get(
+                db,
+                &xc_circuit::StakeKey {
+                    master: &proposer,
+                    validator: &proposer,
+                },
+            )
+            .unwrap()
+            .unwrap();
+            allocation.active_amount -= 1_000;
+            allocation.unbonding = Some(xc_primitives::Unbonding {
+                amount: 1_000,
+                unlock_at_height: 1,
+            });
+            stakes
+                .allocations
+                .insert((proposer.clone(), proposer.clone()), Some(allocation));
+            db.write_batch(&stakes).unwrap();
+            db.write_batch(&circuit_staking::index_unbonding(db, 1, &proposer, &proposer).unwrap())
+                .unwrap();
+        });
+        let unstake = signed(
+            &proposer_key,
+            0,
+            crate::ActionPayload::Unstake {
+                validator: proposer.clone(),
+                amount: 500,
+            },
+        );
+        let (block, touched) = run_block(&chain, vec![unstake], 1_000);
+        assert!(
+            xc_primitives::is_boundary(1, 2),
+            "block 1 closes epoch 0 at this length"
+        );
+        let (artifact, _, voter_pubkey) = divergence(&chain, &block, touched, &bogus_root(0xCC));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter_pubkey
+            }
+        );
+    }
+
+    /// An action no honest node would apply (here an overdraft) makes the
+    /// block invalid, and signing it is the proposer's fault whatever root
+    /// either side names.
+    #[test]
+    fn a_block_with_an_action_honest_nodes_reject_names_the_proposer() {
+        let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+        let broke_key = SigningKey::from_bytes(&[3u8; 32]);
+        let chain = chain(&[&key_address(&alice_key)], Default::default(), |_| {});
+        let overdraft = signed(
+            &broke_key,
+            0,
+            crate::ActionPayload::Transfer {
+                to: key_address(&alice_key),
+                amount: 1,
+            },
+        );
+        let (mut block, touched) = run_block(&chain, vec![overdraft], 1_000);
+        block.state_root = bogus_root(0xCC);
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let (artifact, proposer_pubkey, _) = divergence(&chain, &block, touched, &bogus_root(0xDD));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: proposer_pubkey
+            }
+        );
     }
 
     /// `VerifyClaimProof` checks credential expiry against the block's own
@@ -1642,28 +1923,14 @@ mod tests {
     fn claim_proof_blocks_replay_at_the_signed_header_timestamp() {
         use crate::test_support::{CLAIM_DAY, claim_proof, day_start};
         let issuer = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let holder = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let holder_key = SigningKey::from_bytes(&[2u8; 32]);
+        let holder = key_address(&holder_key);
         let mut bond = xc_primitives::Asset::new("bond", issuer, false);
         bond.required_claims = vec![xc_primitives::ClaimTopic::Kyc];
         bond.allowed_jurisdictions = Some(vec!["CH".into()]);
         bond.private_claims = true;
         let (leaf, sub, proof) = claim_proof(&holder, &bond.asset_ref, CLAIM_DAY);
-        let action: crate::ChainAction = xc_primitives::Action {
-            sender: holder.clone(),
-            nonce: 0,
-            signature: None,
-            payload: crate::ActionPayload::VerifyClaimProof {
-                asset: bond.asset_ref.clone(),
-                sub,
-                today_days: CLAIM_DAY,
-                proof,
-            },
-        };
-
-        // The proposer applies the proof as of `applied_at` and signs a
-        // header stamped `stamped`; the dissenter says it was rejected.
-        let scenario = |applied_at: u64, stamped: u64| {
-            let db = temp_db();
+        let chain = chain(&[], Default::default(), |db| {
             db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
                 holder.clone(),
                 xc_primitives::AccountEntry {
@@ -1674,59 +1941,194 @@ mod tests {
             )])))
             .unwrap();
             db.write_batch(&bond).unwrap();
-            let parent_root = db.compute_state_root(&[]).unwrap();
-            let view = xc_storage::BlockView::new_recording(&db);
-            let updates = crate::dispatch(
-                &action,
-                &view,
-                &no_operator,
-                &no_operator_validators,
-                &[],
-                5,
-                &no_bls_owner,
-                applied_at,
-            )
-            .unwrap();
-            let proofs = view
-                .touched_keys()
-                .iter()
-                .map(|key| hex_proof(db.prove(key, &parent_root).unwrap()))
-                .collect();
-            db.write_batch(&updates.accounts).unwrap();
-            db.write_batch(&updates.holder_states).unwrap();
-            let proposer_root = db.compute_state_root(&[]).unwrap();
-            sign_block_divergence(
-                parent_root.clone(),
-                std::slice::from_ref(&action),
-                stamped,
-                proposer_root,
-                parent_root,
-                proofs,
-            )
-        };
+        });
+        let action = signed(
+            &holder_key,
+            0,
+            crate::ActionPayload::VerifyClaimProof {
+                asset: bond.asset_ref.clone(),
+                sub,
+                today_days: CLAIM_DAY,
+                proof,
+            },
+        );
 
-        let (artifact, _, voter) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY));
+        let (block, touched) = run_block(&chain, vec![action], day_start(CLAIM_DAY));
+        let (artifact, _, voter) = divergence(&chain, &block, touched.clone(), &bogus_root(0xCC));
         assert_eq!(
-            replay_block_divergence(&artifact).unwrap(),
+            adjudicate_block_divergence(&artifact).unwrap(),
             AdjudicationOutcome::Culpable {
                 culpable_pubkey: voter
             },
             "an on-day proof was valid; the dissenter who rejected it is wrong"
         );
-        let (artifact, proposer, _) = scenario(day_start(CLAIM_DAY), day_start(CLAIM_DAY + 5));
+
+        // Same root, but a header stamped five days later: the proof had
+        // expired by the time the proposer signed for.
+        let mut late = block.clone();
+        late.timestamp = day_start(CLAIM_DAY + 5);
+        late.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let (artifact, proposer, _) = divergence(&chain, &late, touched, &bogus_root(0xCC));
         assert_eq!(
-            replay_block_divergence(&artifact).unwrap(),
+            adjudicate_block_divergence(&artifact).unwrap(),
             AdjudicationOutcome::Culpable {
                 culpable_pubkey: proposer
             },
             "a proof dated five days before the signed block time must be rejected"
         );
-        // The public entry point every slashing path uses must not name
-        // anyone, even when the replay does (see its doc comment).
+    }
+
+    /// If the dissenter's supplied `actions` don't actually hash to the
+    /// block header's signed `tx_root`, that's a proof gap, not a verdict —
+    /// `xc_artifact::verify()` never decodes `actions` so it can't catch
+    /// this itself; must be checked before any replay happens.
+    #[test]
+    fn a_mismatched_action_list_resolves_to_disagreement() {
+        let (chain, block, touched) = transfer_block();
+        let (mut artifact, _, _) = divergence(&chain, &block, touched, &bogus_root(0xCC));
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
+            unreachable!()
+        };
+        let other = signed(
+            &SigningKey::from_bytes(&[9u8; 32]),
+            0,
+            crate::ActionPayload::Transfer {
+                to: Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
+                amount: 1,
+            },
+        );
+        actions[0] = format!(
+            "0x{}",
+            hex::encode(
+                bincode::serde::encode_to_vec(&other, bincode::config::standard()).unwrap()
+            )
+        );
         assert!(matches!(
             adjudicate_block_divergence(&artifact).unwrap(),
             AdjudicationOutcome::Disagreement { .. }
         ));
+    }
+
+    /// The recursion guard: a `BlockDivergence` artifact whose disputed
+    /// block contains a `SubmitExecutionFault` action would, without the
+    /// `is_unreplayable_fault_submission` check, get replayed straight into
+    /// `crate::dispatch` → `submit_execution_fault` → back into this module —
+    /// unbounded recursion for the cost of one artifact. This asserts it
+    /// resolves to `Disagreement` (and, implicitly, returns at all — a
+    /// regression here hangs or stack-overflows the test process instead of
+    /// failing an assertion).
+    #[test]
+    fn a_nested_submit_execution_fault_action_resolves_to_disagreement_not_recursion() {
+        let alice_key = SigningKey::from_bytes(&[1u8; 32]);
+        let chain = chain(&[&key_address(&alice_key)], Default::default(), |_| {});
+        let nested = signed(
+            &alice_key,
+            0,
+            crate::ActionPayload::SubmitExecutionFault {
+                artifact_json: "{}".to_string(),
+            },
+        );
+        let (mut block, touched) = run_block(&chain, vec![nested], 1_000);
+        block.state_root = bogus_root(0xAA);
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let (artifact, _, _) = divergence(&chain, &block, touched, &bogus_root(0xBB));
+        assert!(matches!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Disagreement { .. }
+        ));
+    }
+
+    /// [`MAX_ADJUDICATED_ACTIONS`]: a `BlockDivergence` artifact claiming
+    /// more actions than any real block could ever contain is refused
+    /// before decoding a single one of them.
+    #[test]
+    fn an_oversized_action_list_resolves_to_disagreement_without_decoding() {
+        let (chain, block, touched) = transfer_block();
+        let (mut artifact, _, _) = divergence(&chain, &block, touched, &bogus_root(0xCC));
+        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
+            unreachable!()
+        };
+        // Not valid encodings — proves the cap is checked before decoding.
+        *actions = vec!["0xnot-a-real-action".to_string(); MAX_ADJUDICATED_ACTIONS + 1];
+        assert!(matches!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Disagreement { .. }
+        ));
+    }
+
+    /// The challenge window end to end through `dispatch`: a dispute that
+    /// names the proposer slashes it and marks block 1 disputed, up to and
+    /// including the window's last height; one height later it is refused.
+    #[test]
+    fn an_upheld_dispute_marks_the_block_until_the_window_closes() {
+        use crate::test_support::*;
+        let (chain, mut block, touched) = transfer_block();
+        let honest_root = block.state_root.clone();
+        block.state_root = bogus_root(0xCC);
+        block.sign(
+            &GENESIS,
+            key_address(&chain.proposer_key),
+            &chain.proposer_key,
+        );
+        let (artifact, _, _) = divergence(&chain, &block, touched, &honest_root);
+
+        let proposer = key_address(&chain.proposer_key);
+        let reporter = Address::from_pubkey_bytes(&[5u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            std::collections::HashMap::from([
+                (circuit_staking::stake_subaccount(&proposer), funded(10_000)),
+                (reporter.clone(), funded(FEE_BUDGET)),
+            ]),
+            std::collections::HashMap::from([(
+                (proposer.clone(), proposer.clone()),
+                self_allocation(&proposer, 10_000),
+            )]),
+        );
+        view.put(
+            &xc_circuit::StakeByValidatorKey(&proposer),
+            &vec![proposer.clone()],
+        )
+        .unwrap();
+        view.put(&xc_circuit::GenesisHashKey, &hex::encode(GENESIS))
+            .unwrap();
+        let action = xc_primitives::Action {
+            sender: reporter,
+            nonce: 0,
+            signature: None,
+            payload: crate::ActionPayload::SubmitExecutionFault {
+                artifact_json: serde_json::to_string(&artifact).unwrap(),
+            },
+        };
+        let at = |height| {
+            crate::dispatch(
+                &action,
+                &view,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &[],
+                height,
+                &no_bls_owner,
+                0,
+            )
+        };
+        let last = 1 + xc_primitives::ChainParams::default().challenge_window_blocks;
+
+        let marker = at(last).unwrap().evidence.expect("slash writes a marker");
+        assert_eq!(marker.proposer, proposer);
+        assert!(marker.disputed, "the proposer was wrong, so block 1 is");
+
+        let err = at(last + 1).unwrap_err().to_string();
+        assert!(err.contains("challenge window"), "{err}");
     }
 
     /// An `ActionClaim` signs no block timestamp, so a disputed
@@ -1757,231 +2159,6 @@ mod tests {
             }
             other => panic!("expected Disagreement, got {other:?}"),
         }
-    }
-
-    /// The block-level counterpart to
-    /// `a_dissenter_with_a_wrong_claimed_amount_is_named_culpable`: a
-    /// dissenter claiming the wrong transfer amount for the whole block is
-    /// named culpable, using proofs and roots from a real `ArxiumDb`.
-    #[test]
-    fn a_dissenter_with_a_wrong_block_result_is_named_culpable() {
-        let (artifact, _proposer_pubkey, voter_pubkey) = build_block_scenario(999);
-        let outcome = replay_block_divergence(&artifact).unwrap();
-        assert_eq!(
-            outcome,
-            AdjudicationOutcome::Culpable {
-                culpable_pubkey: voter_pubkey
-            }
-        );
-    }
-
-    /// Same scenario, but this time the *proposer*'s claimed final root is
-    /// wrong (built by corrupting `block_attestation.header.state_root`
-    /// after signing — the same "attacker" trick a real malicious proposer
-    /// would need to pull off, i.e. none, since they can't forge a
-    /// signature over a root they didn't actually commit to; this just
-    /// exercises the comparison branch directly).
-    #[test]
-    fn a_proposer_with_a_wrong_block_result_is_named_culpable() {
-        // dissent_amount == the real amount, so the dissenter is honest;
-        // the proposer's claim is made wrong instead, below.
-        let (mut artifact, proposer_pubkey, _voter_pubkey) = build_block_scenario(40);
-        let Fault::BlockDivergence {
-            parent_state_root,
-            block_attestation,
-            dissent_claim,
-            ..
-        } = &mut artifact.fault
-        else {
-            unreachable!()
-        };
-
-        let mut bogus_header = block_attestation.header.clone();
-        bogus_header.state_root = format!("0x{}", hex::encode([0xCCu8; 32]));
-        let bogus_bytes = xc_artifact::signing_bytes_for(&GENESIS, &bogus_header).unwrap();
-        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
-        block_attestation.signature = format!(
-            "0x{}",
-            hex::encode(proposer_key.sign(&bogus_bytes).to_bytes())
-        );
-        block_attestation.header = bogus_header;
-
-        // Re-bind the (still honest, unchanged) dissent claim to the new
-        // header commitment so `verify()`'s signature check still passes.
-        let header_commitment: [u8; 32] = sha2::Sha256::digest(&bogus_bytes).into();
-        let (voter_sk, _) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
-        let dissent_msg = xc_artifact::block_divergence_signing_bytes(
-            &GENESIS,
-            5,
-            &header_commitment,
-            parent_state_root,
-            &dissent_claim.computed_state_root,
-        );
-        dissent_claim.signature =
-            format!("0x{}", hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0));
-
-        let outcome = replay_block_divergence(&artifact).unwrap();
-        assert_eq!(
-            outcome,
-            AdjudicationOutcome::Culpable {
-                culpable_pubkey: proposer_pubkey
-            }
-        );
-    }
-
-    /// If the dissenter's supplied `actions` don't actually hash to the
-    /// block header's signed `tx_root`, that's a proof gap, not a verdict —
-    /// `xc_artifact::verify()` never decodes `actions` so it can't catch
-    /// this itself; must be checked before any replay happens.
-    #[test]
-    fn a_mismatched_action_list_resolves_to_disagreement() {
-        let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
-        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
-            unreachable!()
-        };
-        let other_action: crate::ChainAction = xc_primitives::Action {
-            sender: xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
-            nonce: 0,
-            signature: None,
-            payload: crate::ActionPayload::Transfer {
-                to: xc_primitives::Address::from_pubkey_bytes(&[8u8; 32]).unwrap(),
-                amount: 1,
-            },
-        };
-        actions[0] = format!(
-            "0x{}",
-            hex::encode(
-                bincode::serde::encode_to_vec(&other_action, bincode::config::standard()).unwrap()
-            )
-        );
-
-        let outcome = replay_block_divergence(&artifact).unwrap();
-        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
-    }
-
-    /// The recursion guard: a `BlockDivergence` artifact whose disputed
-    /// block contains a `SubmitExecutionFault` action would, without the
-    /// `is_unreplayable_fault_submission` check, get replayed straight into
-    /// `crate::dispatch` → `submit_execution_fault` → back into this module —
-    /// unbounded recursion for the cost of one artifact. This asserts it
-    /// resolves to `Disagreement` (and, implicitly, returns at all — a
-    /// regression here hangs or stack-overflows the test process instead of
-    /// failing an assertion).
-    #[test]
-    fn a_nested_submit_execution_fault_action_resolves_to_disagreement_not_recursion() {
-        let db = temp_db();
-        let alice = xc_primitives::Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
-        let bob = xc_primitives::Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
-        db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([
-            (alice.clone(), entry(1_000_000_000)),
-            (bob.clone(), entry(0)),
-        ])))
-        .unwrap();
-        let parent_root = db.compute_state_root(&[]).unwrap();
-
-        // The nested action: a well-formed `SubmitExecutionFault` carrying
-        // another (never-decoded, since the guard fires first) artifact.
-        let nested_action: crate::ChainAction = xc_primitives::Action {
-            sender: alice.clone(),
-            nonce: 0,
-            signature: None,
-            payload: crate::ActionPayload::SubmitExecutionFault {
-                artifact_json: "{}".to_string(),
-            },
-        };
-        let actions = vec![nested_action.clone()];
-        let tx_root = xc_poe::tx_root(&actions).unwrap();
-
-        let alice_key = format!("account:{alice}").into_bytes();
-        let bob_key = format!("account:{bob}").into_bytes();
-        let proofs = vec![
-            hex_proof(db.prove(&alice_key, &parent_root).unwrap()),
-            hex_proof(db.prove(&bob_key, &parent_root).unwrap()),
-        ];
-
-        let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
-        let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
-        // Two different (fabricated) post-roots — only their difference
-        // matters, to pass verify()'s "must actually diverge" check; the
-        // guard fires long before either would ever need to be reproduced.
-        let fake_post_a = format!("0x{}", hex::encode([0xAAu8; 32]));
-        let fake_post_b = format!("0x{}", hex::encode([0xBBu8; 32]));
-
-        let header = xc_artifact::CanonicalHeader {
-            height: 5,
-            parent_hash: "0xparent".to_string(),
-            timestamp: 1234,
-            tx_root: format!("0x{}", hex::encode(tx_root)),
-            proposer: "arx1proposer".to_string(),
-            state_root: fake_post_a,
-            round: 0,
-        };
-        let header_bytes = xc_artifact::signing_bytes_for(&GENESIS, &header).unwrap();
-        let block_attestation = xc_artifact::BlockAttestation {
-            header: header.clone(),
-            signature: format!(
-                "0x{}",
-                hex::encode(proposer_key.sign(&header_bytes).to_bytes())
-            ),
-        };
-        let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
-        let dissent_msg = xc_artifact::block_divergence_signing_bytes(
-            &GENESIS,
-            5,
-            &header_commitment,
-            &parent_root,
-            &fake_post_b,
-        );
-
-        let artifact = EvidenceArtifact {
-            artifact_version: ARTIFACT_VERSION,
-            genesis_hash: genesis_hex(),
-            fault: Fault::BlockDivergence {
-                proposer_pubkey: format!(
-                    "0x{}",
-                    hex::encode(proposer_key.verifying_key().as_bytes())
-                ),
-                voter_pubkey: format!("0x{}", hex::encode(voter_pk.0)),
-                height: 5,
-                parent_state_root: parent_root,
-                block_attestation,
-                actions: vec![format!(
-                    "0x{}",
-                    hex::encode(
-                        bincode::serde::encode_to_vec(&nested_action, bincode::config::standard())
-                            .unwrap()
-                    )
-                )],
-                dissent_claim: xc_artifact::BlockDissentClaim {
-                    computed_state_root: fake_post_b,
-                    proofs,
-                    signature: format!(
-                        "0x{}",
-                        hex::encode(xc_bls::sign(&voter_sk, &dissent_msg).0)
-                    ),
-                },
-            },
-            human_readable: serde_json::json!({}),
-        };
-
-        let outcome = replay_block_divergence(&artifact).unwrap();
-        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
-    }
-
-    /// [`MAX_ADJUDICATED_ACTIONS`]: a `BlockDivergence` artifact claiming
-    /// more actions than any real block could ever contain is refused
-    /// before decoding a single one of them.
-    #[test]
-    fn an_oversized_action_list_resolves_to_disagreement_without_decoding() {
-        let (mut artifact, _proposer_pubkey, _voter_pubkey) = build_block_scenario(999);
-        let Fault::BlockDivergence { actions, .. } = &mut artifact.fault else {
-            unreachable!()
-        };
-        // Not valid encodings — proves the cap is checked before decoding.
-        *actions = vec!["0xnot-a-real-action".to_string(); MAX_ADJUDICATED_ACTIONS + 1];
-
-        let outcome = replay_block_divergence(&artifact).unwrap();
-        assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
     /// Regression guard, formerly a diagnostic-only print: measures how big
@@ -2066,6 +2243,7 @@ mod tests {
             tx_root,
             proposer: Some(addrs[0].clone()),
             signature: Some(hex::encode([0xCDu8; 64])),
+            parent_state_root: String::new(),
             state_root: parent_root.clone(),
             round: 0,
             round_certificate: None,
@@ -2090,7 +2268,6 @@ mod tests {
                 proposer_pubkey: format!("0x{}", hex::encode([0u8; 32])),
                 voter_pubkey: format!("0x{}", hex::encode([0u8; 48])),
                 height: block.height,
-                parent_state_root: parent_root.clone(),
                 block_attestation: xc_artifact::BlockAttestation {
                     header: xc_artifact::CanonicalHeader {
                         height: block.height,
@@ -2098,6 +2275,7 @@ mod tests {
                         timestamp: block.timestamp,
                         tx_root: format!("0x{}", hex::encode(block.tx_root)),
                         proposer: addrs[0].to_string(),
+                        parent_state_root: parent_root.clone(),
                         state_root: block.state_root.clone(),
                         round: block.round,
                     },

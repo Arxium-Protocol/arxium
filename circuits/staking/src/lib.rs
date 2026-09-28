@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 
 use thiserror::Error;
-use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey};
+use xc_circuit::{AccountKey, KvRead, StakeByValidatorKey, StakeKey, UnbondingDueKey};
 use xc_primitives::{AccountEntry, Address, StakeAllocation, Unbonding};
-use xc_storage::{AccountUpdates, StakeUpdates, StorageError};
+use xc_storage::{AccountUpdates, GovernanceUpdates, StakeUpdates, StorageError};
 
 /// Re-exported so existing callers (`circuit_staking::stake_subaccount`, etc.)
 /// keep working unchanged — the implementations moved to `xc_primitives`
@@ -475,17 +475,54 @@ pub fn apply_downtime_slash<V: KvRead<Error = StorageError>>(
     }
 }
 
-/// Folds every `due` allocation's matured unbonding batch back to its
-/// master's spendable balance. `due` must already be filtered by the
-/// caller (`unlock_at_height <= current height`) — this is a pure fold,
-/// not a lookup, so multiple due allocations sharing a master accumulate
-/// correctly in one call.
+/// Records that `(master, validator)`'s unbonding unlocks at `unlock`, so
+/// `resolve_due_unbonding` finds it with one read at that height. Every
+/// `apply_unstake` caller must write this beside it.
+pub fn index_unbonding<V: KvRead<Error = StorageError>>(
+    view: &V,
+    unlock: u64,
+    master: &Address,
+    validator: &Address,
+) -> Result<GovernanceUpdates, StorageError> {
+    let mut due = view.get(&UnbondingDueKey(unlock))?.unwrap_or_default();
+    let pair = (master.clone(), validator.clone());
+    if !due.contains(&pair) {
+        due.push(pair);
+    }
+    let mut updates = GovernanceUpdates::default();
+    updates.put(&UnbondingDueKey(unlock), &due)?;
+    Ok(updates)
+}
+
+/// Folds every unbonding that unlocks at `height` back to its master's
+/// spendable balance, and drops that height's index row. Found through
+/// `UnbondingDueKey(height)` — point reads only, so a dispute can replay
+/// it from proofs. An indexed pair whose allocation is gone (slashed away)
+/// or no longer unlocks here is skipped. Multiple due allocations sharing a
+/// master accumulate correctly in one call.
 pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
     view: &V,
-    due: Vec<StakeAllocation>,
-) -> Result<(AccountUpdates, StakeUpdates), StorageError> {
+    height: u64,
+) -> Result<(AccountUpdates, StakeUpdates, GovernanceUpdates), StorageError> {
     let mut overlay: BTreeMap<Address, AccountEntry> = BTreeMap::new();
     let mut stake_updates = StakeUpdates::default();
+    let mut index = GovernanceUpdates::default();
+    let Some(pairs) = view.get(&UnbondingDueKey(height))? else {
+        return Ok((AccountUpdates(overlay), stake_updates, index));
+    };
+    index.delete(&UnbondingDueKey(height));
+    let mut due = Vec::new();
+    for (master, validator) in &pairs {
+        let allocation = view.get(&StakeKey { master, validator })?;
+        if let Some(allocation) = allocation
+            && allocation
+                .unbonding
+                .as_ref()
+                .is_some_and(|u| u.unlock_at_height == height)
+        {
+            due.push(allocation);
+        }
+    }
 
     for mut allocation in due {
         let Some(unbonding) = allocation.unbonding.take() else {
@@ -528,7 +565,7 @@ pub fn resolve_due_unbonding<V: KvRead<Error = StorageError>>(
         }
     }
 
-    Ok((AccountUpdates(overlay), stake_updates))
+    Ok((AccountUpdates(overlay), stake_updates, index))
 }
 
 #[cfg(test)]
@@ -807,6 +844,8 @@ mod tests {
         let (accounts, stakes) =
             apply_unstake(&db, &master, 1, &validator, 200, 2, UNBONDING_BLOCKS).unwrap();
         commit(&db, accounts, stakes);
+        db.write_batch(&index_unbonding(&db, 2 + UNBONDING_BLOCKS, &master, &validator).unwrap())
+            .unwrap();
         assert_eq!(
             supply(&db),
             1000,
@@ -822,11 +861,24 @@ mod tests {
             "slash moves stake to the pool — supply must not change"
         );
 
-        let due = db
-            .get_allocations_with_unbonding_due(2 + UNBONDING_BLOCKS)
-            .unwrap();
-        let (accounts, stakes) = resolve_due_unbonding(&db, due).unwrap();
+        assert_eq!(
+            resolve_due_unbonding(&db, 1 + UNBONDING_BLOCKS)
+                .unwrap()
+                .0
+                .0
+                .len(),
+            0,
+            "nothing unlocks a block early"
+        );
+        let (accounts, stakes, index) = resolve_due_unbonding(&db, 2 + UNBONDING_BLOCKS).unwrap();
         commit(&db, accounts, stakes);
+        db.write_batch(&index).unwrap();
+        assert!(
+            KvRead::get(&db, &UnbondingDueKey(2 + UNBONDING_BLOCKS))
+                .unwrap()
+                .is_none(),
+            "the row is dropped once released"
+        );
         assert_eq!(
             supply(&db),
             1000,

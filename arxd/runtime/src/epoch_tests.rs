@@ -43,12 +43,10 @@ fn chain(members: &[u8], stake: u128) -> ArxiumDb {
     let addrs: Vec<Address> = members.iter().map(|n| addr(*n)).collect();
     db.write_batch(&ValidatorSetSnapshot::equal_power(0, &addrs))
         .unwrap();
-    let mut statuses = ValidatorStatusUpdates::default();
     for a in &addrs {
-        statuses.0.insert(a.clone(), Some(ValidatorStatus::Active));
+        set_status(&db, a, Some(ValidatorStatus::Active));
         stake_to(&db, a, stake);
     }
-    db.write_batch(&statuses).unwrap();
     db.write_batch(&ChainParamsRow(params())).unwrap();
     db
 }
@@ -72,7 +70,28 @@ fn stake_to(db: &ArxiumDb, validator: &Address, amount: u128) {
     db.write_batch(&updates).unwrap();
 }
 
+/// Writes a status row outside any block, keeping `ValidatorCandidatesKey`
+/// in step the way `on_block_sealed` does for rows a block writes.
 fn set_status(db: &ArxiumDb, validator: &Address, status: Option<ValidatorStatus>) {
+    let mut candidates: std::collections::BTreeSet<Address> =
+        xc_circuit::KvRead::get(db, &xc_circuit::ValidatorCandidatesKey)
+            .unwrap()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    if status.is_some() {
+        candidates.insert(validator.clone());
+    } else {
+        candidates.remove(validator);
+    }
+    let mut index = xc_storage::GovernanceUpdates::default();
+    index
+        .put(
+            &xc_circuit::ValidatorCandidatesKey,
+            &candidates.into_iter().collect::<Vec<_>>(),
+        )
+        .unwrap();
+    db.write_batch(&index).unwrap();
     let mut updates = ValidatorStatusUpdates::default();
     updates.0.insert(validator.clone(), status);
     db.write_batch(&updates).unwrap();
@@ -89,6 +108,7 @@ fn seal(db: &ArxiumDb, height: u64) -> Option<BTreeMap<Address, VotingPower>> {
     db.write_batch(&updates.accounts).unwrap();
     db.write_batch(&updates.stakes).unwrap();
     db.write_batch(&updates.validator_statuses).unwrap();
+    db.write_batch(&updates.governance).unwrap();
     if let Some(set) = &updates.validator_set {
         db.write_batch(&ValidatorSetSnapshot {
             effective_height: height + 1,
