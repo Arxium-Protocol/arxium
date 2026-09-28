@@ -129,7 +129,7 @@ pub trait ChainRuntime: Send + Sync + 'static {
         nonce: u64,
     ) -> Option<Action<Self::Payload>>;
 
-    /// Builds the action that submits an `ActionDivergence`/`BlockDivergence`
+    /// Builds the action that submits a `BlockDivergence`
     /// evidence artifact for on-chain adjudication and slashing, or `None`
     /// if this chain has no such adjudication path — in which case the node
     /// still writes the artifact to disk but never auto-submits it.
@@ -143,7 +143,7 @@ pub trait ChainRuntime: Send + Sync + 'static {
         None
     }
 
-    /// Locally replays a `BlockDivergence`/`ActionDivergence` evidence
+    /// Locally replays a `BlockDivergence` evidence
     /// artifact exactly the way on-chain adjudication would (see
     /// `arxd_runtime::adjudicate`), without touching the mempool or a live
     /// database — used by the node to decide whether it's actually safe to

@@ -138,6 +138,18 @@ writes `DisputedBlockKey(height)`: that block reports `settlement:
 block on its own; what to do with the state after a disputed block is an
 operator and governance decision.
 
+Whoever submitted an upheld fault (this action or
+`SubmitEquivocationEvidence`) gets `challenger_reward_bps` of what was
+slashed (default 5%, capped at 10% by `SetChainParams`), so an outside
+Guard has a reason to submit and not only the dissenting validator. The
+rest goes to the reward pool like any slash. Nothing is burned. An artifact
+against an already-tombstoned validator slashes nothing and pays nothing.
+
+`Fault::ActionDivergence` (one action, two separately claimed pre-states)
+has no on-chain path. No node signs the per-action claims it needs, and
+`BlockDivergence` covers the whole block from the pre-state the proposer
+signed. `arx-verify` still checks it offline.
+
 W = 48h follows CometBFT's default evidence age. Optimistic rollups use ~7
 days because a challenger has to get through a possibly censored L1; here
 the evidence lands on this chain, where any one honest proposer includes

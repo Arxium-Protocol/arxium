@@ -228,15 +228,15 @@ pub enum ActionPayload {
         attestor: Address,
         reason: String,
     },
-    /// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
-    /// artifact (JSON-serialized `xc_artifact::EvidenceArtifact`) for
-    /// on-chain adjudication and slashing — the counterpart to
-    /// `SubmitEquivocationEvidence` for the two fault kinds that need
-    /// chain-specific replay (see `adjudicate`) rather than a
-    /// context-free signature/proof check to name a culprit. Anyone may
-    /// submit one, same as equivocation evidence — `adjudicate::*` and the
-    /// artifact's own signatures are what gate the slash, not who
-    /// submitted it.
+    /// Submits a `Fault::BlockDivergence` (or `Fault::PrecommitEquivocation`)
+    /// evidence artifact (JSON-serialized `xc_artifact::EvidenceArtifact`)
+    /// for on-chain adjudication and slashing — the counterpart to
+    /// `SubmitEquivocationEvidence` for a fault that needs chain-specific
+    /// replay (see `adjudicate`) rather than a context-free signature check
+    /// to name a culprit. Anyone may submit one, same as equivocation
+    /// evidence — `adjudicate::*` and the artifact's own signatures are what
+    /// gate the slash, not who submitted it. An upheld one pays the sender
+    /// `ChainParams::challenger_reward_bps` of the slash.
     SubmitExecutionFault {
         artifact_json: String,
     },
