@@ -3,8 +3,8 @@
 
 use xc_bls::BlsPublicKey;
 use xc_circuit::{
-    BlsKeyKey, ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KvRead, StakeByValidatorKey,
-    StakeKey, ValidatorStatusKey,
+    AccountKey, BlsKeyKey, ChainParamsKey, EvidenceMarkerKey, GenesisHashKey, KvRead,
+    StakeByValidatorKey, StakeKey, ValidatorStatusKey,
 };
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, Hash32, ValidatorStatus};
@@ -63,6 +63,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     block_a: &ChainBlock,
     block_b: &ChainBlock,
     current_height: u64,
+    challenger: &Address,
 ) -> anyhow::Result<BlockUpdates> {
     // Equivocation is two blocks for the same slot. A proposer the round
     // rotation brings back at a later round of the same height (after
@@ -105,6 +106,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
         &equivocator,
         circuit_staking::SlashReason::DoubleSign,
         current_height,
+        challenger,
     )?;
     updates.evidence = Some(EvidenceMarker {
         height: block_a.height,
@@ -114,10 +116,10 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     Ok(updates)
 }
 
-/// Submits a `Fault::ActionDivergence`/`Fault::BlockDivergence` evidence
-/// artifact for adjudication and slashing — the counterpart to
-/// `submit_equivocation_evidence` for the two fault kinds that can't name a
-/// culprit from signatures/proofs alone and need chain-specific replay
+/// Submits a `Fault::BlockDivergence` (or `Fault::PrecommitEquivocation`)
+/// evidence artifact for adjudication and slashing — the counterpart to
+/// `submit_equivocation_evidence` for a fault that can't name a culprit
+/// from signatures alone and needs chain-specific replay
 /// (`crate::adjudicate`) instead. `Fault::Equivocation` artifacts are
 /// rejected here — that kind goes through `SubmitEquivocationEvidence` with
 /// the real blocks, not a JSON artifact.
@@ -141,6 +143,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     artifact_json: &str,
     current_height: u64,
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
+    challenger: &Address,
 ) -> anyhow::Result<BlockUpdates> {
     let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json)
         .map_err(|err| anyhow::anyhow!("malformed evidence artifact JSON: {err}"))?;
@@ -163,9 +166,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     // replay so a stale artifact costs nothing to refuse. A precommit
     // equivocation is a double-sign, not a dispute over the block, so it is
     // bounded by unbonding like `SubmitEquivocationEvidence` instead.
-    if let xc_artifact::Fault::ActionDivergence { height, .. }
-    | xc_artifact::Fault::BlockDivergence { height, .. } = &artifact.fault
-    {
+    if let xc_artifact::Fault::BlockDivergence { height, .. } = &artifact.fault {
         let window = view
             .get(&ChainParamsKey)?
             .unwrap_or_default()
@@ -180,22 +181,6 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     // arrives here is an execution fault: a precommit equivocation is a
     // double-sign (whitepaper §9.3), and the slash record must say so.
     let (outcome, height, proposer_pubkey, voter_pubkey, reason) = match &artifact.fault {
-        xc_artifact::Fault::ActionDivergence {
-            proposer_pubkey,
-            voter_pubkey,
-            height,
-            ..
-        } => {
-            let outcome = crate::adjudicate::adjudicate_action_divergence(&artifact)
-                .map_err(|err| anyhow::anyhow!("adjudication failed: {err}"))?;
-            (
-                outcome,
-                *height,
-                proposer_pubkey.clone(),
-                voter_pubkey.clone(),
-                circuit_staking::SlashReason::ExecutionFault,
-            )
-        }
         xc_artifact::Fault::BlockDivergence {
             proposer_pubkey,
             voter_pubkey,
@@ -251,6 +236,17 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         xc_artifact::Fault::ExecutionDisagreement { .. } => {
             anyhow::bail!("ExecutionDisagreement has no on-chain adjudication path");
         }
+        // No node ever signs a per-action claim (`action_claim_signing_bytes`
+        // has no caller outside tests), so a genuine one can't exist, and
+        // `BlockDivergence` already covers the whole block from the pre-state
+        // the proposer signed in the header. The variant stays in the artifact
+        // format for offline tooling (`arx-verify` still adjudicates it); a
+        // slashing path for a message nobody signs is only attack surface.
+        xc_artifact::Fault::ActionDivergence { .. } => {
+            anyhow::bail!(
+                "ActionDivergence has no on-chain adjudication path; submit a BlockDivergence"
+            );
+        }
     };
 
     let is_dispute = !matches!(reason, circuit_staking::SlashReason::DoubleSign);
@@ -300,7 +296,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         );
     }
 
-    let mut updates = fault_slash(view, &culprit, reason, current_height)?;
+    let mut updates = fault_slash(view, &culprit, reason, current_height, challenger)?;
     updates.evidence = Some(EvidenceMarker {
         height,
         proposer: culprit,
@@ -315,13 +311,18 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
 /// `Tombstoned` is not slashed again — it was punished once for the class
 /// of fault, and every further artifact against it (a misconfigured signer
 /// replaying hundreds of old heights) records its marker and nothing else.
-/// Otherwise burns `xc_evidence::slash_amount` of its whole stake and
-/// tombstones it: permanent, address-scoped, no re-entry with any stake.
+/// Otherwise slashes `xc_evidence::slash_amount` of its whole stake into
+/// the reward pool, pays `challenger_reward_bps` of it back out to
+/// `challenger` (the action's sender), and tombstones it: permanent,
+/// address-scoped, no re-entry with any stake. No slash, no reward — an
+/// artifact against an already-tombstoned validator pays nothing, so old
+/// faults can't be farmed.
 fn fault_slash<V: KvRead<Error = StorageError>>(
     view: &V,
     culprit: &Address,
     reason: circuit_staking::SlashReason,
     current_height: u64,
+    challenger: &Address,
 ) -> anyhow::Result<BlockUpdates> {
     debug_assert!(reason.tombstones());
     let mut updates = BlockUpdates::default();
@@ -341,17 +342,40 @@ fn fault_slash<V: KvRead<Error = StorageError>>(
         .ok_or_else(|| anyhow::anyhow!("{culprit} has no active stake allocation to slash"))?;
     let total =
         allocation.active_amount + allocation.unbonding.as_ref().map(|u| u.amount).unwrap_or(0);
-    let slash_bps = view
-        .get(&xc_circuit::ChainParamsKey)?
-        .unwrap_or_default()
-        .equivocation_slash_bps;
-    let (accounts, stakes) = circuit_staking::apply_slash(
+    let params = view.get(&ChainParamsKey)?.unwrap_or_default();
+    let (mut accounts, stakes) = circuit_staking::apply_slash(
         view,
         culprit,
-        xc_evidence::slash_amount(total, slash_bps),
+        xc_evidence::slash_amount(total, params.equivocation_slash_bps),
         reason,
         current_height,
     )?;
+    // The reward is a share of what the pool actually received, not of the
+    // nominal slash: `apply_slash` can move less than asked (a genesis
+    // allocation with no sub-account balance), and paying more than was
+    // taken would mint.
+    let pool = xc_primitives::reward_pool_account();
+    let pool_before = view.get(&AccountKey(&pool))?.map_or(0, |e| e.balance);
+    let pool_entry = accounts
+        .0
+        .get_mut(&pool)
+        .ok_or_else(|| anyhow::anyhow!("slash did not credit the reward pool"))?;
+    let reward = xc_evidence::slash_amount(
+        pool_entry.balance - pool_before,
+        params.challenger_reward_bps,
+    );
+    if reward > 0 {
+        pool_entry.balance -= reward;
+        let mut entry = match accounts.0.get(challenger) {
+            Some(entry) => entry.clone(),
+            None => view.get(&AccountKey(challenger))?.unwrap_or_default(),
+        };
+        entry.balance = entry
+            .balance
+            .checked_add(reward)
+            .ok_or_else(|| anyhow::anyhow!("challenger reward overflows {challenger}'s balance"))?;
+        accounts.0.insert(challenger.clone(), entry);
+    }
     updates.accounts = accounts;
     updates.stakes = stakes;
     updates
@@ -514,7 +538,8 @@ mod tests {
 
         let db = temp_db();
         let view = seeded_view(&db, HashMap::new(), HashMap::new());
-        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        let err =
+            submit_equivocation_evidence(&view, &block_a, &block_b, 10, &nobody()).unwrap_err();
         assert!(err.to_string().contains("different rounds"), "{err}");
     }
 
@@ -530,7 +555,8 @@ mod tests {
         let db = temp_db();
         let mut view = seeded_view(&db, HashMap::new(), HashMap::new());
         view.put(&GenesisHashKey, &hex::encode(GENESIS)).unwrap();
-        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        let err =
+            submit_equivocation_evidence(&view, &block_a, &block_b, 10, &nobody()).unwrap_err();
         assert!(
             err.to_string().contains("invalid equivocation evidence"),
             "{err}"
@@ -540,7 +566,8 @@ mod tests {
         let block_a = signed_chain_block(&key, 5, 100, &GENESIS);
         let block_b = signed_chain_block(&key, 5, 200, &GENESIS);
         let view = seeded_view(&db, HashMap::new(), HashMap::new());
-        let err = submit_equivocation_evidence(&view, &block_a, &block_b, 10).unwrap_err();
+        let err =
+            submit_equivocation_evidence(&view, &block_a, &block_b, 10, &nobody()).unwrap_err();
         assert!(err.to_string().contains("no seeded genesis hash"), "{err}");
     }
 
@@ -1018,6 +1045,7 @@ mod tests {
             &foreign_artifact_json(&format!("0x{}", "bb".repeat(32))),
             1,
             &no_bls_owner,
+            &nobody(),
         )
         .unwrap_err();
         assert!(err.to_string().contains(&"bb".repeat(32)), "{err}");
@@ -1030,6 +1058,7 @@ mod tests {
             &foreign_artifact_json(&format!("0x{}", "AA".repeat(32))),
             1,
             &no_bls_owner,
+            &nobody(),
         )
         .unwrap_err();
         assert!(
@@ -1044,8 +1073,19 @@ mod tests {
         let view = seeded_view(&db, HashMap::new(), HashMap::new());
         let no_bls_owner = |_: &BlsPublicKey| -> Result<Option<Address>, StorageError> { Ok(None) };
 
-        let err = submit_execution_fault(&view, &foreign_artifact_json("0xaaaa"), 1, &no_bls_owner)
-            .unwrap_err();
+        let err = submit_execution_fault(
+            &view,
+            &foreign_artifact_json("0xaaaa"),
+            1,
+            &no_bls_owner,
+            &nobody(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("no seeded genesis hash"), "{err}");
+    }
+
+    /// A challenger for rejection tests, which never reach the payout.
+    fn nobody() -> Address {
+        Address::from_pubkey_bytes(&[5u8; 32]).unwrap()
     }
 }

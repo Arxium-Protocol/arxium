@@ -990,6 +990,31 @@ mod tests {
         );
     }
 
+    /// `ActionDivergence` is offline-only: even a well-formed artifact that
+    /// names a culprit here is refused on-chain, because no node signs the
+    /// per-action claims it is built from.
+    #[test]
+    fn an_action_divergence_is_refused_on_chain() {
+        let scenario = build_scenario(999);
+        let db = crate::test_support::temp_db();
+        let mut view = crate::test_support::seeded_view(
+            &db,
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        );
+        view.put(&xc_circuit::GenesisHashKey, &hex::encode(GENESIS))
+            .unwrap();
+        let err = crate::consensus::submit_execution_fault(
+            &view,
+            &serde_json::to_string(&scenario.artifact).unwrap(),
+            1,
+            &|_| Ok(None),
+            &Address::from_pubkey_bytes(&[5u8; 32]).unwrap(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("BlockDivergence"), "{err}");
+    }
+
     /// Both sides computing the identical (correct) result isn't actually
     /// possible to construct as an `ActionDivergence` artifact —
     /// `xc_artifact::verify()` itself rejects equal post-state roots as "not
@@ -2121,11 +2146,32 @@ mod tests {
                 0,
             )
         };
-        let last = 1 + xc_primitives::ChainParams::default().challenge_window_blocks;
+        let params = xc_primitives::ChainParams::default();
+        let last = 1 + params.challenge_window_blocks;
 
-        let marker = at(last).unwrap().evidence.expect("slash writes a marker");
+        let updates = at(last).unwrap();
+        let marker = updates.evidence.expect("slash writes a marker");
         assert_eq!(marker.proposer, proposer);
         assert!(marker.disputed, "the proposer was wrong, so block 1 is");
+
+        // The reporter gets `challenger_reward_bps` of the 10,000 slashed,
+        // net of its fee; the pool keeps the rest. Nothing is minted.
+        let fee = crate::metering::action_fee_for(&params, crate::metering::action_weight(&action));
+        let reward = 10_000 * u128::from(params.challenger_reward_bps) / 10_000;
+        assert_eq!(reward, 500);
+        assert_eq!(
+            updates.accounts.0[&action.sender].balance,
+            FEE_BUDGET + reward - fee
+        );
+        let pool = xc_primitives::reward_pool_account();
+        let pool_before = view
+            .get(&xc_circuit::AccountKey(&pool))
+            .unwrap()
+            .map_or(0, |e| e.balance);
+        assert_eq!(
+            updates.accounts.0[&pool].balance - pool_before,
+            10_000 - reward
+        );
 
         let err = at(last + 1).unwrap_err().to_string();
         assert!(err.contains("challenge window"), "{err}");

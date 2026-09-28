@@ -133,17 +133,17 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
     fn locally_adjudicate_execution_fault(artifact_json: &str) -> Option<String> {
         let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json).ok()?;
         let outcome = match &artifact.fault {
-            xc_artifact::Fault::ActionDivergence { .. } => {
-                adjudicate::adjudicate_action_divergence(&artifact).ok()?
-            }
             xc_artifact::Fault::BlockDivergence { .. } => {
                 adjudicate::adjudicate_block_divergence(&artifact).ok()?
             }
             // Neither is an execution fault: both are settled by signature
             // checks alone (`xc_artifact::verify`), with nothing for the
             // adjudicator to replay.
+            // `ActionDivergence` has no on-chain path to pre-check (see
+            // `consensus::submit_execution_fault`).
             xc_artifact::Fault::Equivocation { .. }
             | xc_artifact::Fault::PrecommitEquivocation { .. }
+            | xc_artifact::Fault::ActionDivergence { .. }
             | xc_artifact::Fault::ExecutionDisagreement { .. } => return None,
         };
         match outcome {
@@ -565,7 +565,13 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             staking::unstake(view, action, validator, *amount, current_height)
         }
         ActionPayload::SubmitEquivocationEvidence { block_a, block_b } => {
-            consensus::submit_equivocation_evidence(view, block_a, block_b, current_height)
+            consensus::submit_equivocation_evidence(
+                view,
+                block_a,
+                block_b,
+                current_height,
+                &action.sender,
+            )
         }
         ActionPayload::RegisterBlsKey {
             validator,
@@ -822,6 +828,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             artifact_json,
             current_height,
             bls_pubkey_owner_lookup,
+            &action.sender,
         ),
     }
 }

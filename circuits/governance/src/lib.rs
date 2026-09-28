@@ -161,6 +161,11 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
                     "challenge_window_blocks must be positive and below unbonding_blocks",
                 ));
             }
+            if p.challenger_reward_bps > 1_000 {
+                return Err(GovernanceError::InvalidParams(
+                    "challenger_reward_bps is over 10%",
+                ));
+            }
         }
         GovernanceAction::SetAdmin { role, address } => {
             AdminRole::parse(role).ok_or_else(|| GovernanceError::UnknownRole(role.clone()))?;
@@ -556,6 +561,10 @@ mod tests {
             },
             ChainParams {
                 challenge_window_blocks: ChainParams::default().unbonding_blocks,
+                ..Default::default()
+            },
+            ChainParams {
+                challenger_reward_bps: 1_001,
                 ..Default::default()
             },
         ] {

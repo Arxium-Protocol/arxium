@@ -269,6 +269,14 @@ pub struct ChainParams {
     /// could withdraw before its fault is due.
     #[serde(default = "default_challenge_window_blocks")]
     pub challenge_window_blocks: u64,
+    /// Share of an upheld fault's slash paid to whoever submitted the
+    /// evidence, in bps; the rest goes to the reward pool like any slash.
+    /// PoE v5 §6/§8: without it only a dissenting validator (whose node
+    /// submits automatically) has a reason to submit, and an outside Guard
+    /// has none. Capped at 10% by governance: the higher it is, the less a
+    /// validator loses by reporting itself through a second key.
+    #[serde(default = "default_challenger_reward_bps")]
+    pub challenger_reward_bps: u32,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -352,6 +360,11 @@ pub const DEFAULT_CHALLENGE_WINDOW_BLOCKS: u64 = 48 * 60 * 60 / 2;
 fn default_challenge_window_blocks() -> u64 {
     DEFAULT_CHALLENGE_WINDOW_BLOCKS
 }
+/// 5%: the low end of PoE v5's 5–10%. On a full-stake slash of the
+/// 100,000 ARX minimum that is 5,000 ARX, far above the fee.
+fn default_challenger_reward_bps() -> u32 {
+    500
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -374,6 +387,7 @@ impl Default for ChainParams {
             fee_proposer_bps: default_fee_proposer_bps(),
             fee_treasury_bps: default_fee_treasury_bps(),
             challenge_window_blocks: default_challenge_window_blocks(),
+            challenger_reward_bps: default_challenger_reward_bps(),
         }
     }
 }
