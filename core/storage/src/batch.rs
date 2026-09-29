@@ -679,6 +679,31 @@ impl BatchWritable for RoundCertificate {
     }
 }
 
+/// Proof of lock (Tendermint's POL): a quorum of `height`'s validator set
+/// prevoted `block_hash` at `round` (`arxd_finality::tally_prevote`). A
+/// validator precommits only on one of these, and the highest one at a height
+/// is the block every node holds there and prevotes in later rounds
+/// (`docs/consensus-safety.md` §2). Formed only from prevotes this node
+/// verified itself, never accepted from a peer as a record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolRecord {
+    pub height: u64,
+    pub round: u32,
+    pub block_hash: Hash32,
+    pub signers: Vec<Address>,
+    pub aggregate_signature: BlsSignature,
+}
+
+impl BatchWritable for PolRecord {
+    fn batch_entries(&self) -> Result<BatchEntries, StorageError> {
+        // Round zero-padded so key order is round order.
+        let key = format!("meta:pol:{:020}:{:010}", self.height, self.round).into_bytes();
+        let config = bincode::config::standard();
+        let value = bincode::serde::encode_to_vec(self, config)?;
+        Ok(vec![(key, value)])
+    }
+}
+
 /// One validator's persisted vote that `round` at `height` timed out —
 /// mirrors `PrecommitVoteRecord` exactly, including the
 /// `TALLY_RETENTION_HEIGHTS`-driven pruning; see

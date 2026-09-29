@@ -3,20 +3,20 @@
 # it already voted that round timed out leaves a permanent certificate hole.
 #
 # Two validators, the relaunched devnet's shape: quorum is 6,667 of 10,000
-# and each holds 5,000, so every height needs both precommits. The run cuts
-# node 1 off (a restart with ARXD_BLOCK_PEERS) while the tips are level at T
-# and T+1 is node 0's round-0 slot — a restarted node with no peers sits in
-# the boot sync gate for minutes, so it must not be the one expected to
-# produce. Node 0 builds and precommits T+1 alone; node 1 signs a
-# round-timeout vote for (T+1, 0) once ROUND_TIMEOUT (8s) passes. Neither
-# side has a quorum. On heal the late side
-# receives the block but S2 (docs/consensus-safety.md §2) forbids it to
-# precommit a round it declared timed out, so T+1 never certifies — while
-# T+2 onward do, since both vote those normally.
+# and each holds 5,000, so every height needs both votes. The run cuts node 1
+# off (a restart with ARXD_BLOCK_PEERS) while the tips are level at T and T+1
+# is node 0's round-0 slot — a restarted node with no peers sits in the boot
+# sync gate for minutes, so it must not be the one expected to produce. Node
+# 0 builds and prevotes T+1 alone; node 1 signs a round-timeout vote for
+# (T+1, 0) once ROUND_TIMEOUT (8s) passes. On heal the late side receives the
+# block but may not vote a round it timed out.
 #
-# Pass means final_watermark followed finalized_height past T+1. Until the
-# round-change redesign lands (docs/consensus-round-change.md) this harness
-# is EXPECTED TO FAIL: it is the reproduction, kept so the fix has a check.
+# Before the round-change fix (docs/consensus-round-change.md) S2 left T+1
+# with neither a precommit quorum nor a timeout quorum while T+2 onward
+# certified: a permanent hole under the watermark. Now node 0 may time the
+# round out too, the height moves to round 1 and finalizes there, and
+# nothing is built on T+1 until it does. Pass means final_watermark followed
+# finalized_height past T+1.
 #
 # Exit codes: 0 pass, 1 fail, 3 INCONCLUSIVE (the split never happened —
 # same convention and reasoning as partition-heal-harness.sh).
@@ -192,7 +192,7 @@ for i in 0 1; do
         pass=false
     fi
 done
-grep -h "already voted that round timed out" "$ROOT"/node-*.log | head -n 1 | sed 's/^/  note: /' || true
+grep -h "already left round" "$ROOT"/node-*.log | head -n 1 | sed 's/^/  note: /' || true
 
 if [ "$pass" = true ]; then
     echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"

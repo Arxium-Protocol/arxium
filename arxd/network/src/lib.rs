@@ -33,15 +33,17 @@ use std::time::Instant;
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{debug, error, info, warn};
 
-use arxd_finality::{Dissent, PrecommitVote, RoundTimeoutVote, verify_finality_record};
+use arxd_finality::{
+    Dissent, PrecommitVote, PrevoteVote, RoundTimeoutVote, verify_finality_record,
+};
 use xc_mempool::{Mempool, PayloadPrecheck, validate_action};
 use xc_primitives::{Action, Block};
 use xc_storage::{ArxiumDb, FinalityRecord};
 
 use discovery::{dial_bootnodes, dial_discovered};
 use gossip::{
-    actions_topic, blocks_topic, dissents_topic, precommits_topic, record_bad_gossip,
-    round_timeouts_topic,
+    actions_topic, blocks_topic, dissents_topic, precommits_topic, prevotes_topic,
+    record_bad_gossip, round_timeouts_topic,
 };
 use recovery::{Recovery, RecoveryStep, allow_revert, first_divergent_height, plan};
 use sync::{
@@ -75,6 +77,7 @@ pub struct P2pConfig<'a, P: Payload> {
     pub db: ArxiumDb,
     pub gossip_rx: tokio_mpsc::Receiver<Action<P>>,
     pub block_rx: tokio_mpsc::Receiver<Block<P>>,
+    pub prevote_rx: tokio_mpsc::Receiver<PrevoteVote>,
     pub precommit_rx: tokio_mpsc::Receiver<PrecommitVote>,
     pub dissent_rx: tokio_mpsc::Receiver<Dissent>,
     pub round_timeout_rx: tokio_mpsc::Receiver<RoundTimeoutVote>,
@@ -86,6 +89,8 @@ pub struct P2pConfig<'a, P: Payload> {
     pub on_block: OnBlock<P>,
     /// Undecodable-bytes handling only — `arxd/finality` owns signature and
     /// quorum validation, this crate just moves bytes.
+    pub on_prevote_vote: OnPrevoteVote,
+    /// Same rule as `on_prevote_vote`.
     pub on_precommit_vote: OnPrecommitVote,
     /// Same "undecodable bytes only" rule as `on_precommit_vote` —
     /// `arxd/finality` owns signature/voter/one-per-height validation for
@@ -129,6 +134,7 @@ pub fn send_outbound<T>(tx: &tokio_mpsc::Sender<T>, item: T, channel: &'static s
 }
 
 pub type OnBlock<P> = Box<dyn Fn(Block<P>, bool) -> bool + Send>;
+pub type OnPrevoteVote = Box<dyn Fn(PrevoteVote) + Send>;
 pub type OnPrecommitVote = Box<dyn Fn(PrecommitVote) + Send>;
 pub type OnDissent = Box<dyn Fn(Dissent) + Send>;
 pub type OnRoundTimeoutVote = Box<dyn Fn(RoundTimeoutVote) + Send>;
@@ -249,10 +255,12 @@ pub fn spawn_p2p_node<P: Payload>(config: P2pConfig<'_, P>) -> Result<PeerId> {
         db,
         gossip_rx,
         block_rx,
+        prevote_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
         on_block,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -303,10 +311,12 @@ pub fn spawn_p2p_node<P: Payload>(config: P2pConfig<'_, P>) -> Result<PeerId> {
                 db,
                 gossip_rx,
                 block_rx,
+                prevote_rx,
                 precommit_rx,
                 dissent_rx,
                 round_timeout_rx,
                 on_block,
+                on_prevote_vote,
                 on_precommit_vote,
                 on_dissent,
                 on_round_timeout_vote,
@@ -336,10 +346,12 @@ struct SwarmParams<'a, P: Payload> {
     db: ArxiumDb,
     gossip_rx: tokio_mpsc::Receiver<Action<P>>,
     block_rx: tokio_mpsc::Receiver<Block<P>>,
+    prevote_rx: tokio_mpsc::Receiver<PrevoteVote>,
     precommit_rx: tokio_mpsc::Receiver<PrecommitVote>,
     dissent_rx: tokio_mpsc::Receiver<Dissent>,
     round_timeout_rx: tokio_mpsc::Receiver<RoundTimeoutVote>,
     on_block: OnBlock<P>,
+    on_prevote_vote: OnPrevoteVote,
     on_precommit_vote: OnPrecommitVote,
     on_dissent: OnDissent,
     on_round_timeout_vote: OnRoundTimeoutVote,
@@ -358,10 +370,12 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
         db,
         mut gossip_rx,
         mut block_rx,
+        mut prevote_rx,
         mut precommit_rx,
         mut dissent_rx,
         mut round_timeout_rx,
         on_block,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -390,6 +404,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
 
     let actions_topic = gossipsub::IdentTopic::new(actions_topic(chain_id));
     let blocks_topic = gossipsub::IdentTopic::new(blocks_topic(chain_id));
+    let prevotes_topic = gossipsub::IdentTopic::new(prevotes_topic(chain_id));
     let precommits_topic = gossipsub::IdentTopic::new(precommits_topic(chain_id));
     let dissents_topic = gossipsub::IdentTopic::new(dissents_topic(chain_id));
     let round_timeouts_topic = gossipsub::IdentTopic::new(round_timeouts_topic(chain_id));
@@ -399,6 +414,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
     for topic in [
         &actions_topic,
         &blocks_topic,
+        &prevotes_topic,
         &precommits_topic,
         &dissents_topic,
         &round_timeouts_topic,
@@ -568,6 +584,20 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                         }
                     }
                     Err(err) => warn!("failed to encode block for gossip: {err}"),
+                }
+            }
+            vote = prevote_rx.recv() => {
+                let Some(vote) = vote else {
+                    // Sender side (finality subsystem) is gone — nothing left to publish.
+                    continue;
+                };
+                match bincode::serde::encode_to_vec(&vote, xc_primitives::wire_config()) {
+                    Ok(bytes) => {
+                        if let Err(err) = swarm.behaviour_mut().gossipsub.publish(prevotes_topic.clone(), bytes) {
+                            log_publish_error("prevote", &err);
+                        }
+                    }
+                    Err(err) => warn!("failed to encode prevote for gossip: {err}"),
                 }
             }
             vote = precommit_rx.recv() => {
@@ -751,6 +781,27 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     } else {
                         counter!("arxium_gossip_accepted_total", "topic" => "blocks").increment(1);
                     }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message,
+                    ..
+                })) if message.topic == prevotes_topic.hash() => {
+                    let vote: PrevoteVote = match decode_wire(&message.data) {
+                        Ok(vote) => vote,
+                        Err(err) => {
+                            record_bad_gossip(
+                                &mut swarm,
+                                &mut bad_gossip,
+                                propagation_source,
+                                "prevotes",
+                                &format!("undecodable gossiped prevote: {err}"),
+                            );
+                            continue;
+                        }
+                    };
+                    counter!("arxium_gossip_accepted_total", "topic" => "prevotes").increment(1);
+                    on_prevote_vote(vote);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,
@@ -1309,6 +1360,7 @@ mod tests {
         let db = ArxiumDb::open(&base_path.join("data")).unwrap();
         let (_gossip_tx, gossip_rx) = tokio_mpsc::channel(1);
         let (_block_tx, block_rx) = tokio_mpsc::channel(1);
+        let (_prevote_tx, prevote_rx) = tokio_mpsc::channel(1);
         let (_precommit_tx, precommit_rx) = tokio_mpsc::channel(1);
         let (_dissent_tx, dissent_rx) = tokio_mpsc::channel(1);
         let (_round_timeout_tx, round_timeout_rx) = tokio_mpsc::channel(1);
@@ -1323,10 +1375,12 @@ mod tests {
             db,
             gossip_rx,
             block_rx,
+            prevote_rx,
             precommit_rx,
             dissent_rx,
             round_timeout_rx,
             on_block: Box::new(|_, _| false),
+            on_prevote_vote: Box::new(|_| {}),
             on_precommit_vote: Box::new(|_| {}),
             on_dissent: Box::new(|_| {}),
             on_round_timeout_vote: Box::new(|_| {}),

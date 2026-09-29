@@ -25,7 +25,7 @@ pub fn slash_amount(total_stake: u128, slash_bps: u32) -> u128 {
     total_stake * u128::from(slash_bps) / 10_000
 }
 
-/// Two blocks a validator signed for the same height — necessarily full
+/// Two blocks a validator signed for the same height and round — necessarily full
 /// blocks, not a compact digest: `Block::sign` covers the entire action
 /// list, so there's no smaller unit that still proves the signature.
 pub struct EquivocationEvidence<P> {
@@ -37,6 +37,10 @@ pub struct EquivocationEvidence<P> {
 pub enum EvidenceError {
     #[error("blocks are at different heights ({0} vs {1}), not equivocation")]
     HeightMismatch(u64, u64),
+    #[error(
+        "blocks are for different rounds ({0} vs {1}) of one height — a later round may re-propose, not equivocation"
+    )]
+    RoundMismatch(u32, u32),
     #[error("blocks have different proposers, not equivocation")]
     ProposerMismatch,
     #[error("blocks are identical, not equivocation")]
@@ -46,7 +50,7 @@ pub enum EvidenceError {
 }
 
 /// Checks both blocks are validly signed by the same proposer, at the same
-/// height, with different content — the only way that's possible under
+/// height and round, with different content — the only way that's possible under
 /// plain Ed25519 is the proposer having signed twice. Returns the offending
 /// validator's address.
 ///
@@ -61,6 +65,12 @@ pub fn verify_equivocation<P: Serialize>(
     let b = &evidence.block_b;
     if a.height != b.height {
         return Err(EvidenceError::HeightMismatch(a.height, b.height));
+    }
+    // Same rule as the chain's own gate (`submit_equivocation_evidence`):
+    // the round rotation can bring a proposer back to a height it already
+    // signed, and its new block there is legitimate.
+    if a.round != b.round {
+        return Err(EvidenceError::RoundMismatch(a.round, b.round));
     }
     let proposer_a = a.proposer.clone().ok_or(SignatureError::Missing)?;
     let proposer_b = b.proposer.clone().ok_or(SignatureError::Missing)?;
@@ -711,6 +721,24 @@ mod tests {
         let err =
             verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
         assert!(matches!(err, EvidenceError::HeightMismatch(5, 6)));
+    }
+
+    #[test]
+    fn verify_equivocation_rejects_different_rounds() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let block_a = signed_block(&key, 5, 100);
+        let mut block_b: Block<()> = Block::genesis(200);
+        block_b.height = 5;
+        block_b.round = 2;
+        block_b.sign(
+            &GENESIS,
+            Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap(),
+            &key,
+        );
+
+        let err =
+            verify_equivocation(&GENESIS, &EquivocationEvidence { block_a, block_b }).unwrap_err();
+        assert!(matches!(err, EvidenceError::RoundMismatch(0, 2)));
     }
 
     #[test]

@@ -115,14 +115,17 @@ done
 # block is the provisional tip node 1 will have missed.
 # Round-robin: kill node 1 right after it proposed, so the next height is
 # node 0's slot and node 0 produces alone (the devnet shape: server2 proposed
-# 61914 while server1 was down).
-echo "waiting for a block proposed by node 1, then killing node 1 ..."
+# 61914 while server1 was down). Only once that block is final: a producer
+# builds on a finalized parent only (docs/consensus-safety.md N1), so a kill
+# between the block and its certificate leaves node 0 nothing to build on.
+echo "waiting for a finalized block proposed by node 1, then killing node 1 ..."
+watermark() { curl -sf "http://127.0.0.1:${RPC_PORTS[$1]}/status" | jq -r '.final_watermark // 0'; }
 deadline=$(($(date +%s) + 60))
 while [ "$(date +%s)" -lt "$deadline" ]; do
     t="$(tip 0)"
     proposer="$(curl -sf "http://127.0.0.1:${RPC_PORTS[0]}/blocks/$t" | jq -r '.proposer // ""')"
-    [ "$proposer" = "${ADDRS[1]}" ] && break
-    sleep 0.2
+    [ "$proposer" = "${ADDRS[1]}" ] && [ "$(watermark 0)" = "$t" ] && break
+    sleep 0.1
 done
 kill -9 "${PIDS[1]}"; wait "${PIDS[1]}" 2>/dev/null || true
 PIDS[1]=""

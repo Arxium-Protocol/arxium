@@ -1,118 +1,153 @@
-# Consensus: forks, rounds and finality-gated commit (B1c)
+# Consensus: rounds, locks and finality-gated production
 
-Answers "can this chain fork under partition", states the invariants the
-code enforces, and records the B1c change that closed the liveness hole
-behind the runbook's open question ("can an honest quorum recover from a
-rejected proposal via round change"). Model: `n = 3f + 1` validators by
-voting power, at most `f` Byzantine, quorum `2f + 1` (`QUORUM_POWER`).
+Answers "can this chain fork under partition" and states the rules the code
+enforces. Model: `n = 3f + 1` validators by voting power, at most `f`
+Byzantine, quorum `2f + 1` (`QUORUM_POWER`). The voting protocol is
+Tendermint's (Buchman, Kwon, Milosevic, *The latest gossip on BFT
+consensus*, 2018), restated in this codebase's terms. It replaced a
+single-phase protocol (rule "S2") that could leave a height permanently
+uncertified (D-25; the history is in `docs/consensus-round-change.md`).
 
 ## 1. Commit levels
 
-- **Provisional tip.** `accept_block` commits the first valid block it sees
-  at `tip + 1` to storage immediately (`core/executor`). It is served to
-  peers and built on. It can be *unwound* (`ArxiumDb::revert_to`) as long as
-  it is above the finalized watermark.
+- **Provisional tip.** `accept_block` commits a valid block at `tip + 1`
+  immediately (`core/executor`). It is served to peers and voted on. It can
+  be *unwound* (`ArxiumDb::revert_to`) as long as it is above the finalized
+  watermark.
 - **Finalized.** A height is final when a quorum of that height's validator
   set has BLS-precommitted the same `(height, round, block_hash, ep)`
-  (`arxd/finality::tally_vote` → `FinalityRecord`). The contiguous
-  finalized watermark (`final_watermark`) is the irreversibility line:
-  `revert_to` refuses to cross it. PoE calls this ATTESTED.
+  (`arxd/finality::tally_vote` → `FinalityRecord`). The contiguous finalized
+  watermark (`final_watermark`) is the irreversibility line: `revert_to`
+  refuses to cross it. PoE calls this ATTESTED.
 - **Settled (FINAL).** A certified block whose challenge window has closed
   with no upheld dispute: `height <= final_watermark -
   challenge_window_blocks` (`settled_height` in `/status`, `settlement` on
-  each block). This is the answer to "is my transfer settled". See §5.
+  each block). See §5.
 
-So: **the provisional tip can fork under partition; the finalized chain
-cannot.** A partition that isolates fewer than `2f + 1` on either side
-finalizes nothing until it heals; whichever side holds a quorum keeps
-finalizing and the minority is unwound to the watermark on rejoin
-(`arxd/network` divergence recovery, or `enforce_certificate` when it
-tallies the majority's votes itself).
+Production waits for finality (N1 below), so the provisional tip is at most
+one block above the watermark. **The provisional tip can change under
+partition; the finalized chain cannot.** A partition that leaves neither
+side a quorum finalizes nothing and produces nothing until it heals.
 
-## 2. Safety argument
+## 2. The protocol
 
-Invariants an honest validator keeps (`arxd/finality::spawn_finality`):
+Per height `h`, a validator votes only at `h = final_watermark + 1`, and in
+rounds `r = 0, 1, …`. The round-`r` block is the one its eligible proposer
+(`eligible_proposer(h, r)`) signs for round `r`; a block at `r > 0` carries
+the `RoundCertificate` for `r − 1` (S3, unchanged).
 
-- **S1.** At most one precommit per `(height, round)`. Two precommits at the
-  same `(height, round)` for different hashes is `PrecommitEquivocation` —
-  provable from the two signatures, slashed.
-- **S2.** Never sign a round-timeout vote for `(height, r)` after
-  precommitting at `(height, r)`, and never precommit at `(height, r)` after
-  signing a timeout for it.
-- **S3.** A block at round `r > 0` is only valid with an embedded
-  `RoundCertificate` for `r − 1` (quorum of timeout votes) —
-  `accept_block::verify_round_certificate`, recomputable by any node from
-  the block alone.
+Three signed votes, each tallied per `(height, round)`:
 
-Claim: two different blocks cannot both finalize at one height.
+- **Prevote** `(h, r, block)`. A quorum of prevotes for one block at one
+  round is a **lock** (`PolRecord`, Tendermint's "proof of lock").
+- **Precommit** `(h, r, block, ep)`. A quorum at one round finalizes.
+- **Round timeout** `(h, r, parent)`. A quorum is a `RoundCertificate`,
+  which moves the height to round `r + 1`.
 
-- Same round: two certificates need `2f + 1` each, so `f + 1` validators
-  voted both — at least one honest, contradicting S1.
-- Different rounds `r < r'`: the round-`r'` block carries a certificate for
-  round `r' − 1`. An honest signer of a timeout for round `k` was in round
-  `k`, so had seen a certificate for `k − 1`; by induction a certificate for
-  round `r` exists. Its `2f + 1` signers overlap the `2f + 1` precommitters
-  of the round-`r` block in `f + 1`, at least one honest — contradicting S2.
-  So no round-`r` block can have a finality certificate once round `r` is
-  certified as timed out.
+Validator rules (`arxd/finality`; the safety-critical ones are enforced
+durably by `SignedVotes` before anything is signed):
 
-Hence at most one finalized block per height, under `≤ f` faults, with no
-assumption about timing. `ep` (execution proof) is part of the signed vote,
-so two quorums for the same hash with different execution outcomes never
-merge either.
+- **V1.** At most one prevote and one precommit per `(h, r)`. Two different
+  precommits is `PrecommitEquivocation`, slashed.
+- **V2.** No prevote or precommit at `(h, r)` after signing a timeout for
+  `(h, r)`, or after any vote at a later round of `h`.
+- **V3.** A validator's **lock** is its latest precommit at `h`, `(lr,
+  lv)`. It prevotes a block other than `lv` only with a lock (a quorum of
+  prevotes) for that block at a round `vr` with `lr ≤ vr ≤ r`.
+- **V4.** It precommits a block at round `r` only on a lock for that block at
+  round `r`, and only once it holds and executed the block.
+- **V5.** It prevotes, in the current round, the block of the highest lock at
+  `h` if there is one, else the round's own block.
+- **V6.** A round that runs `timeout_for(r)` (8s, growing with the round to
+  40s) without finalizing gets a timeout vote. Signing it after prevoting or
+  precommitting in the round is allowed; it ends the validator's votes in
+  that round (V2).
 
-## 3. The liveness hole B1c closed
+Node rules:
 
-Before B1c, precommit votes did not carry a round and `my_votes` was keyed
-by height alone: a validator that precommitted *any* block at `h` could
-never vote at `h` again. With `n = 4`: proposer `P0` (Byzantine) sends a
-valid `A@0` to `N1` only. `P0 + N1` vote `A` (2 < 3). `N2, N3` time out and,
-with `P0` signing too, certify round 0. `N2` proposes `B@1`; `N2, N3` vote
-it; `N1` holds `A` as its tip, rejects `B` as `NotNextHeight`, and could
-not vote it anyway. `P0` withholds. `A` = 2 votes, `B` = 2 votes — the
-height is stuck forever with a single faulty validator.
+- **N1.** A producer builds on a finalized parent only, never at a height
+  locked on another block, and claims `(height, round)` in `signed_height`
+  first. A later round of the same height is not equivocation
+  (`submit_equivocation_evidence`, `xc_evidence::verify_equivocation`), so a
+  proposer the rotation brings back proposes again.
+- **N2.** The block held at `h` follows, in order: a finality certificate
+  (`enforce_certificate`), the highest lock (the finality thread unwinds any
+  other block and sync fetches the locked one), then a later round's block
+  (dead-tip replacement, below).
+- **N3.** `accept_block` refuses a block at `h` that contradicts a stored
+  finality certificate or the highest lock there, and one from a round `h`
+  already left that no lock names (`DeadRound`) — so sync can't hand back a
+  dead tip this node just unwound.
+- **N4.** A round certificate for the round of the block held at `h`, or a
+  later-round block carrying one, unwinds it — unless it is locked
+  (`unwind_dead_tip`, `supersede_dead_tip`).
 
-After B1c:
+## 3. Safety argument
 
-- Votes carry `round` (signed; `DOMAIN_PRECOMMIT` v3), tallies and
-  equivocation are per `(height, round)` — S1 as stated above. `N1` may
-  vote `B@1` after `A@0`: different round, not equivocation. Safe because
-  the round-0 certificate `B` carries proves `A` can never finalize (§2).
-- **Dead-tip replacement.** When a node holds an unfinalized tip at
-  `(h, r)` and either (a) it persists a `RoundCertificate` for `(h, r)`
-  (`tally_round_timeout`), or (b) a block arrives at height `h` with
-  `round > r` and a valid embedded certificate (`accept_block`), the tip is
-  dead — §2 says it cannot finalize — and is unwound to `h − 1` so the
-  higher-round candidate can be committed and voted. A block at height `h`
-  with `round ≤ r` is still rejected (`NotNextHeight`), and a finalized tip
-  is never touched (`ContradictsCertificate` / the watermark floor).
-- The producer likewise builds on `h − 1` at the certified round rather
-  than on a dead tip, because the dead tip is gone before its next tick.
+Claim: two different blocks cannot both finalize at one height, under at
+most `f` faults and with no timing assumption.
 
-So `N1` unwinds `A` on seeing `B@1`'s certificate, commits `B`, votes it:
-`N1, N2, N3` = 3, `B` finalizes. Exercised live by
-`scripts/withholding-proposer-harness.sh`.
+Suppose `B` finalizes at `(h, r)`: a quorum precommitted it, so by V4 a lock
+for `B` at `r` exists, and at least `f + 1` honest validators precommitted
+`B` at `r`, so are locked on `B` with `lr ≥ r` (V3 lets a lock move only to
+a later round).
 
-## 4. What remains provisional-only (accepted)
+- **No lock on another block at `r`.** It would need a quorum of prevotes at
+  `r` for `C ≠ B`; with the lock for `B` that is `f + 1` validators prevoting
+  twice at `r`, one of them honest — against V1.
+- **No lock on another block at any `r' > r`**, by induction on `r'`. A lock
+  for `C` at `r'` needs a quorum of prevotes, which includes at least one of
+  the `f + 1` locked honest validators. By V3 it prevoted `C` only with a lock
+  for `C` at some `vr` with `r ≤ vr ≤ r'`. `vr < r'` contradicts the
+  induction hypothesis. `vr = r'` means the lock for `C` at `r'` existed
+  before any locked honest validator prevoted `C` at `r'`, so a quorum formed
+  from the other validators alone — at most `2f` of the power, below quorum.
 
-- `ep` disagreement (honest execution divergence) splits a round's votes
-  and cannot be resolved by rounds — that is a determinism bug, surfaced
-  as dissent / evidence, not something consensus should paper over.
-- Round timeouts are wall-clock (`ROUND_TIMEOUT`); under asynchrony a round
-  can time out although its block would have finalized. That costs a round,
-  never safety (§2).
-- Storage keeps one candidate per height (the tip), replacing it rather
-  than holding a set. Holding several candidates buys nothing for safety
-  and only matters if the same height flips repeatedly, which needs
-  repeated timeouts — acceptable until measured otherwise.
+With no lock for any other block at a round `≥ r`, V4 means no honest
+validator precommits another block at those rounds, so none can finalize.
+A block finalizing at a round `< r` is excluded by the same argument with
+the two blocks swapped. `ep` is part of the signed precommit, so two quorums
+for the same hash with different execution outcomes never merge either.
 
-**Open liveness gap (D-25), not accepted.** S2 can leave a round with
-neither kind of quorum: some validators precommitted its block, others
-(which got it late) had already timed it out, and neither side may sign the
-other vote. The height never certifies while later heights do, so
-`final_watermark` stops for good. Reproduced by
-`scripts/late-block-harness.sh`, alerted on as `ArxiumFinalityGap`. The
-proposed fix is in `docs/consensus-round-change.md`.
+What safety no longer depends on: round certificates. A timeout vote now
+means only "this validator is done with the round" and can be signed after
+precommitting, so a round-`r` certificate does not prove the round-`r` block
+can't finalize — which is why N2/N4 keep a locked block through a round
+change.
+
+**Liveness.** Once the network is synchronous for long enough, the growing
+round timeouts exceed the real message delay, every validator sees the same
+highest lock and round (a validator re-sends its prevotes and timeout votes
+every 4s until the height finalizes — past its own round certificate, and
+reloaded from disk after a restart, since a peer that missed one can't form
+the certificate from anything else), and
+a round whose proposer is honest — or whose lock everyone holds — gets a
+quorum of prevotes and then precommits. Sequential voting (only at
+`final_watermark + 1`) plus N1 make the D-25 state impossible: nothing is
+built or voted on top of a height that has not finalized.
+
+**Accepted costs.** One more gossip hop per height (the prevote) before
+finality. With 2 or 3 validators the quorum needs everyone, so any one slow
+or offline validator stops finality — and, through N1, production — under
+any protocol; mainnet needs at least 4 roughly equal validators.
+
+## 4. What remains open
+
+- `ep` disagreement (honest execution divergence) splits a round's votes and
+  cannot be resolved by rounds — a determinism bug, surfaced as dissent and
+  evidence, not something consensus should paper over.
+- Prevote equivocation is detected and counted
+  (`arxium_prevote_equivocations_detected_total`) but not yet turned into a
+  slashing artifact. Safety doesn't depend on it (the argument above holds
+  for at most `f` equivocators); accountability for it is a follow-up.
+- A chain whose registered BLS keys can't reach quorum finalizes nothing;
+  there N1 does not wait for finality, so the chain keeps producing
+  provisional blocks instead of halting before it can register keys.
+- Monitoring: `arxium_finalized_height - arxium_final_watermark > 0` for 5
+  minutes fires `ArxiumFinalityGap` (`monitoring/prometheus/alerts.yml`).
+  Regression checks: `scripts/late-block-harness.sh` (D-25),
+  `partition-heal-harness.sh`, `withholding-proposer-harness.sh`,
+  `two-node-fault-harness.sh`.
 
 ## 5. The challenge window (execution disputes)
 
