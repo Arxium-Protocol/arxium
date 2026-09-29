@@ -151,7 +151,9 @@ pub fn treasury_account() -> Address {
 
 /// Broad regulatory category, recorded so downstream consumers (Retracer's
 /// listings, Console's filters) don't have to infer it from the asset id.
-/// Purely descriptive — nothing in the runtime gates on it.
+/// Descriptive for the six regulated classes. `Token` is the one the runtime
+/// does gate on: a `Token` is created and moved only through
+/// `circuit-token`, and every regulated-asset handler refuses it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AssetClass {
     #[default]
@@ -161,6 +163,9 @@ pub enum AssetClass {
     Bond,
     Stablecoin,
     Commodity,
+    /// A permissionless crypto token (`ActionPayload::Token`). Appended last:
+    /// bincode encodes the variant index, so existing classes keep theirs.
+    Token,
 }
 
 /// A single attestable property of a holder. `Asset.required_claims` lists

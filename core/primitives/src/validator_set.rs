@@ -277,6 +277,11 @@ pub struct ChainParams {
     /// validator loses by reporting itself through a second key.
     #[serde(default = "default_challenger_reward_bps")]
     pub challenger_reward_bps: u32,
+    /// Flat IUM `TokenAction::Create` pays to `treasury_account()` on top of
+    /// the metered action fee. Token creation is open to anyone, so this is
+    /// the spam floor; governable like every other fee.
+    #[serde(default = "default_token_create_fee")]
+    pub token_create_fee: u128,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -365,6 +370,11 @@ fn default_challenge_window_blocks() -> u64 {
 fn default_challenger_reward_bps() -> u32 {
     500
 }
+/// 100 ARX in IUM. Devnet's spec sets its own, faucet-sized value.
+pub const DEFAULT_TOKEN_CREATE_FEE: u128 = 100 * 1_000_000_000;
+fn default_token_create_fee() -> u128 {
+    DEFAULT_TOKEN_CREATE_FEE
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -388,6 +398,7 @@ impl Default for ChainParams {
             fee_treasury_bps: default_fee_treasury_bps(),
             challenge_window_blocks: default_challenge_window_blocks(),
             challenger_reward_bps: default_challenger_reward_bps(),
+            token_create_fee: default_token_create_fee(),
         }
     }
 }

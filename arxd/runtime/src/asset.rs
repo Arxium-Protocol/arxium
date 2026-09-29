@@ -3,7 +3,7 @@
 
 use xc_circuit::{AdminRole, AssetKey, KvRead};
 use xc_executor::BlockUpdates;
-use xc_primitives::{Address, Asset, AssetMetadata, AssetRef, CapTable};
+use xc_primitives::{Address, Asset, AssetClass, AssetMetadata, AssetRef, CapTable};
 use xc_storage::StorageError;
 
 use crate::ChainAction;
@@ -114,7 +114,7 @@ fn validate_metadata_uri(uri: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
+pub(crate) fn validate_metadata(metadata: &AssetMetadata) -> anyhow::Result<()> {
     validate_symbol(&metadata.symbol)?;
     if metadata.name.is_empty() || metadata.name.len() > MAX_NAME_LEN {
         anyhow::bail!(
@@ -149,6 +149,9 @@ pub(crate) fn register_asset<V: KvRead<Error = StorageError>>(
 ) -> anyhow::Result<BlockUpdates> {
     validate_asset_id(asset_id)?;
     validate_metadata(metadata)?;
+    if metadata.asset_class == AssetClass::Token {
+        anyhow::bail!("tokens are created with TokenAction::Create, not RegisterAsset");
+    }
     // The ref commits to `(sender, asset_id)`, so an existing record at it is
     // exactly "this issuer already has this slug" — the per-issuer uniqueness
     // check needs no alias index.
@@ -174,13 +177,20 @@ pub(crate) fn register_asset<V: KvRead<Error = StorageError>>(
 }
 
 /// Every handler but registration goes through here: an unknown ref is a
-/// clean rejection, never an implicit create.
+/// clean rejection, never an implicit create. Tokens are refused, so no
+/// regulated action (freeze, forced transfer, lock, split…) can reach one —
+/// they move only through `crate::token`.
 fn resolve_asset<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &AssetRef,
 ) -> anyhow::Result<Asset> {
-    view.get(&AssetKey(asset))?
-        .ok_or_else(|| anyhow::anyhow!("unknown asset {asset}"))
+    let found = view
+        .get(&AssetKey(asset))?
+        .ok_or_else(|| anyhow::anyhow!("unknown asset {asset}"))?;
+    if found.asset_class == AssetClass::Token {
+        anyhow::bail!("{asset} is a token: use the Token actions");
+    }
+    Ok(found)
 }
 
 pub(crate) fn issue_asset<V: KvRead<Error = StorageError>>(

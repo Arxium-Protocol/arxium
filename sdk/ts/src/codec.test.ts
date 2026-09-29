@@ -49,6 +49,7 @@ for (const fixture of golden.fixtures) {
   assert.throws(() => actions.decodePayload(Uint8Array.from([...transfer, 0])), /trailing/);
   assert.throws(() => actions.decodePayload(Uint8Array.from([0xfb, 0x00, 0x00, ...transfer.slice(1)])), /canonical/);
   assert.throws(() => actions.decodePayload(Uint8Array.from([99])), /unknown action variant/);
+  assert.throws(() => actions.decodePayload(Uint8Array.from([actions.TOKEN_ACTION, 99])), /unknown token action/);
   assert.throws(() => actions.decodePayload(transfer.slice(0, -1)), /end of payload/);
 }
 console.log("sdk codec tests passed");

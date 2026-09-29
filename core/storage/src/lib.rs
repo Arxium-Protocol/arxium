@@ -375,7 +375,10 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// commitment (`Option<[u8; 32]>`, was `bool`) and `evidence:disputed:` rows
 /// are keyed by it (Trello 179). Positional bincode in `BlockEffects` and a
 /// merkleized key format — devnet reset (still not reset to 21).
-pub const SCHEMA_VERSION: u32 = 22;
+///
+/// Bumped 22 -> 23: `ChainParams` gained `token_create_fee` (the token
+/// circuit) — positional bincode on the `chain_params` row. Devnet reset.
+pub const SCHEMA_VERSION: u32 = 23;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -672,7 +675,7 @@ impl ArxiumDb {
     /// Brings an older database up to `SCHEMA_VERSION`, or refuses it with
     /// `SchemaTooOld` when no migration exists from `found`.
     ///
-    /// No arms today: 19 -> 20 and 20 -> 21 each re-encode `chain_params`,
+    /// No arms today: 19 -> 20, 20 -> 21 and 22 -> 23 each re-encode `chain_params`,
     /// so every older database is reset-only. (The 18 -> 19 re-stamp went with it — an 18
     /// database would also need 19 -> 20.)
     fn migrate_schema(&self, found: u32) -> Result<(), StorageError> {
@@ -2502,20 +2505,20 @@ mod explorer_index_tests {
         assert_eq!(db.chain_params().unwrap(), ChainParams::default());
     }
 
-    /// A version-20 database is refused: its `chain_params` row predates
-    /// `challenger_reward_bps` and would fail to decode on the first block.
+    /// A version-22 database is refused: its `chain_params` row predates
+    /// `token_create_fee` and would fail to decode on the first block.
     #[test]
-    fn schema_20_database_is_refused_as_too_old() {
+    fn schema_22_database_is_refused_as_too_old() {
         let path = std::env::temp_dir().join(format!("arxium-test-storage-{}", uuid_like()));
         {
             let db = ArxiumDb::open(&path).unwrap();
             db.db
-                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 20u32.to_le_bytes())
+                .put_cf(db.cf(CF_META), SCHEMA_VERSION_KEY, 22u32.to_le_bytes())
                 .unwrap();
         }
         assert!(matches!(
             ArxiumDb::open(&path),
-            Err(StorageError::SchemaTooOld { found: 20, .. })
+            Err(StorageError::SchemaTooOld { found: 22, .. })
         ));
     }
 

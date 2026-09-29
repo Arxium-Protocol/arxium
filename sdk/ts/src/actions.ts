@@ -10,7 +10,10 @@ export const ACTION_VARIANT = {
   issuerForcedTransfer: 25, recoverHolder: 26, issueAssetTo: 27,
   setAssetLimits: 31, verifyClaimProof: 40, setPrivateClaims: 41,
 } as const;
-const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5 } as const;
+/** `ActionPayload::Token(TokenAction)` is variant 42; these are `TokenAction`'s own discriminants, written after it. */
+export const TOKEN_ACTION = 42;
+export const TOKEN_VARIANT = { createToken: 0, mintToken: 1, transferToken: 2, burnToken: 3, renounceMint: 4 } as const;
+const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5, token: 6 } as const;
 const TOPIC = { kyc: 0, aml: 1, accredited: 2, jurisdiction: 3 } as const;
 export type AssetClass = keyof typeof CLASS;
 export type ClaimTopic = keyof typeof TOPIC;
@@ -42,10 +45,18 @@ export function encodeIssueAssetTo(asset: string, to: string, amount: bigint): U
 export function encodeVerifyClaimProof(asset: string, sub: Uint8Array, todayDays: number, proof: Uint8Array): Uint8Array { if (sub.length !== 32) throw new Error("sub must be 32 bytes"); return new Writer().varint(ACTION_VARIANT.verifyClaimProof).string(asset).raw(sub).varint(todayDays).vec(Array.from(proof), (w, b) => w.u8(b)).bytes(); }
 /** Issuer opt-in: whether holders may clear `asset`'s gate with a claim proof instead of clear-text claims. */
 export function encodeSetPrivateClaims(asset: string, enabled: boolean): Uint8Array { return new Writer().varint(ACTION_VARIANT.setPrivateClaims).string(asset).bool(enabled).bytes(); }
+const token = (name: keyof typeof TOKEN_VARIANT): Writer => new Writer().varint(TOKEN_ACTION).varint(TOKEN_VARIANT[name]);
+/** Permissionless token (`circuits/token`); its ref is `deriveAssetRef(sender, symbol.toLowerCase())`. `mintable: false` fixes supply at creation. Costs `token_create_fee` on top of the action fee. */
+export function encodeCreateToken(symbol: string, name: string, decimals: number, initialSupply: bigint, maxSupply: bigint | null, mintable: boolean): Uint8Array { return token("createToken").string(symbol).string(name).u8(decimals).varint(initialSupply).option(maxSupply, (w, cap) => w.varint(cap)).bool(mintable).bytes(); }
+export function encodeMintToken(tokenRef: string, to: string, amount: bigint): Uint8Array { return token("mintToken").string(tokenRef).string(to).varint(amount).bytes(); }
+export function encodeTransferToken(tokenRef: string, to: string, amount: bigint): Uint8Array { return token("transferToken").string(tokenRef).string(to).varint(amount).bytes(); }
+export function encodeBurnToken(tokenRef: string, amount: bigint): Uint8Array { return token("burnToken").string(tokenRef).varint(amount).bytes(); }
+export function encodeRenounceMint(tokenRef: string): Uint8Array { return token("renounceMint").string(tokenRef).bytes(); }
 export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
 
 /** `{ name, input }` names and shapes match `fixtures/signed-actions.json`: amounts are decimal strings, byte fields are number arrays. */
-export type DecodedPayload = { name: keyof typeof ACTION_VARIANT; input: Record<string, any> };
+export type ActionName = keyof typeof ACTION_VARIANT | keyof typeof TOKEN_VARIANT;
+export type DecodedPayload = { name: ActionName; input: Record<string, any> };
 const nullableBig = (value: unknown): bigint | null => value == null ? null : BigInt(value as string);
 export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
   switch (name) {
@@ -72,17 +83,23 @@ export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
     case "setAssetLimits": return encodeSetAssetLimits(input.asset, input.maxHolders, nullableBig(input.maxBalancePerHolder), nullableBig(input.maxAttestationAge));
     case "verifyClaimProof": return encodeVerifyClaimProof(input.asset, Uint8Array.from(input.sub), input.todayDays, Uint8Array.from(input.proof));
     case "setPrivateClaims": return encodeSetPrivateClaims(input.asset, input.enabled);
+    case "createToken": return encodeCreateToken(input.symbol, input.name, input.decimals, BigInt(input.initialSupply), nullableBig(input.maxSupply), input.mintable);
+    case "mintToken": return encodeMintToken(input.token, input.to, BigInt(input.amount));
+    case "transferToken": return encodeTransferToken(input.token, input.to, BigInt(input.amount));
+    case "burnToken": return encodeBurnToken(input.token, BigInt(input.amount));
+    case "renounceMint": return encodeRenounceMint(input.token);
   }
 }
 const invert = <K extends string>(table: Record<K, number>): Record<number, K> => Object.fromEntries(Object.entries(table).map(([key, value]) => [value, key])) as Record<number, K>;
-const VARIANT_NAME = invert(ACTION_VARIANT), CLASS_NAME = invert(CLASS), TOPIC_NAME = invert(TOPIC);
+const VARIANT_NAME = invert(ACTION_VARIANT), TOKEN_NAME = invert(TOKEN_VARIANT), CLASS_NAME = invert(CLASS), TOPIC_NAME = invert(TOPIC);
 const known = <T>(value: T | undefined, what: string): T => { if (value === undefined) throw new Error(`unknown ${what}`); return value; };
 /**
  * Decodes a payload the SDK can encode, then re-encodes it and throws unless the bytes match, so what
  * a co-signer is shown is exactly what they sign. Unknown variants throw rather than display partially.
  */
 export function decodePayload(payload: Uint8Array): DecodedPayload {
-  const r = new Reader(payload), name = known(VARIANT_NAME[Number(r.varint())], "action variant");
+  const r = new Reader(payload), outer = Number(r.varint());
+  const name: ActionName = outer === TOKEN_ACTION ? known(TOKEN_NAME[Number(r.varint())], "token action") : known(VARIANT_NAME[outer], "action variant");
   const str = () => r.string(), amount = () => r.varint().toString(), bytes = () => r.vec((rr) => rr.u8()), topics = () => r.vec((rr) => known(TOPIC_NAME[Number(rr.varint())], "claim topic"));
   const read: Record<DecodedPayload["name"], () => Record<string, unknown>> = {
     transfer: () => ({ to: str(), amount: amount() }),
@@ -110,6 +127,11 @@ export function decodePayload(payload: Uint8Array): DecodedPayload {
     setAssetLimits: () => ({ asset: str(), maxHolders: r.option((rr) => Number(rr.varint())), maxBalancePerHolder: r.option(amount), maxAttestationAge: r.option(amount) }),
     verifyClaimProof: () => ({ asset: str(), sub: Array.from({ length: 32 }, () => r.u8()), todayDays: Number(r.varint()), proof: bytes() }),
     setPrivateClaims: () => ({ asset: str(), enabled: r.bool() }),
+    createToken: () => ({ symbol: str(), name: str(), decimals: r.u8(), initialSupply: amount(), maxSupply: r.option(amount), mintable: r.bool() }),
+    mintToken: () => ({ token: str(), to: str(), amount: amount() }),
+    transferToken: () => ({ token: str(), to: str(), amount: amount() }),
+    burnToken: () => ({ token: str(), amount: amount() }),
+    renounceMint: () => ({ token: str() }),
   };
   const decoded = { name, input: read[name]() };
   r.done();

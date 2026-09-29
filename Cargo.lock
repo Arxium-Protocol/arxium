@@ -533,6 +533,7 @@ dependencies = [
  "circuit-identity-zk",
  "circuit-rwa-asset",
  "circuit-staking",
+ "circuit-token",
  "ed25519-dalek",
  "hex",
  "qrcode",
@@ -1106,6 +1107,16 @@ name = "circuit-staking"
 version = "0.1.0"
 dependencies = [
  "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "xc-circuit",
+ "xc-primitives",
+ "xc-storage",
+]
+
+[[package]]
+name = "circuit-token"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.19",
  "xc-circuit",
  "xc-primitives",

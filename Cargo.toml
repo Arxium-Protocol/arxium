@@ -7,6 +7,7 @@ members = [
     "mobile/arx-id-ffi",
     "circuits/identity",
     "circuits/governance",
+    "circuits/token",
     #
     "core/primitives",
     "core/bls",
@@ -79,6 +80,7 @@ circuit-staking = { path = "circuits/staking" }
 circuit-identity-zk = { path = "circuits/identity-zk" }
 circuit-identity = { path = "circuits/identity" }
 circuit-governance = { path = "circuits/governance" }
+circuit-token = { path = "circuits/token" }
 xc-executor = { path = "core/executor" }
 xc-chain-spec = { path = "core/chain-spec" }
 xc-rpc = { path = "core/rpc" }
