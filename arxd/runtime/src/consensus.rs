@@ -111,7 +111,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     updates.evidence = Some(EvidenceMarker {
         height: block_a.height,
         proposer: equivocator,
-        disputed: false,
+        disputed: None,
     });
     Ok(updates)
 }
@@ -296,13 +296,26 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         );
     }
 
+    // The proposer's own post-state was shown wrong, so *that* block is —
+    // named by its header, since it may not be the block this chain kept
+    // at `height`. A culpable voter (false dissent) leaves the block standing.
+    let disputed = match &artifact.fault {
+        xc_artifact::Fault::BlockDivergence {
+            block_attestation, ..
+        } if is_dispute && proposer_culpable => {
+            let genesis = Hash32::parse(&chain_genesis)?.into_bytes();
+            let bytes = xc_artifact::signing_bytes_for(&genesis, &block_attestation.header)
+                .map_err(|err| anyhow::anyhow!("disputed header: {err}"))?;
+            Some(<sha2::Sha256 as sha2::Digest>::digest(bytes).into())
+        }
+        _ => None,
+    };
+
     let mut updates = fault_slash(view, &culprit, reason, current_height, challenger)?;
     updates.evidence = Some(EvidenceMarker {
         height,
         proposer: culprit,
-        // The proposer's own post-state was shown wrong, so block `height`
-        // is. A culpable voter (false dissent) leaves the block standing.
-        disputed: is_dispute && proposer_culpable,
+        disputed,
     });
     Ok(updates)
 }

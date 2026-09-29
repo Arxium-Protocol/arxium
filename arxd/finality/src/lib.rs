@@ -451,9 +451,13 @@ where
         // `ROUND_TIMEOUT`, this node signs a round-timeout vote for the
         // current round of the next height. Starts at "now" rather than a
         // zero `Instant` so a freshly-started node gets one full
-        // `ROUND_TIMEOUT` of grace before it starts accusing round 0 of the
-        // chain's very first height.
-        let mut last_progress: (u64, Instant) = (0, Instant::now());
+        // `ROUND_TIMEOUT` of grace before it starts accusing the round after
+        // its tip. Seeded from the stored tip, not 0: a restarted validator
+        // otherwise kept timing out height 1 (refused by `SignedVotes`) and
+        // never `tip + 1`, so a set that restarted while the next proposer
+        // was down could never certify a round change.
+        let mut last_progress: (u64, Instant) =
+            (db.get_tip_height().ok().flatten().unwrap_or(0), Instant::now());
 
         // Pruning watermark. Only ever raised from locally-validated chain
         // state — accepted blocks, and the records this node itself persisted
@@ -2844,6 +2848,43 @@ mod tests {
         assert_eq!(vote.height, 1); // last_progress starts at height 0, so next_height is 1
         assert_eq!(vote.round, 0);
         assert_eq!(vote.voter, addr);
+        drop(event_tx);
+        handle.join().expect("finality worker should stop cleanly");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A restarted validator times out the height after its stored tip,
+    /// not height 1: it gets no `BlockObserved` for blocks it already holds.
+    #[test]
+    fn a_restarted_node_times_out_the_height_after_its_tip() {
+        let (db, dir) = open_test_db();
+        for h in 0..=3 {
+            parent_block_for(&db, h);
+        }
+        let (sk, _pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let addr = Address::from_pubkey_bytes(&[4u8; 32]).unwrap();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (vote_tx, _vote_rx) = mpsc::channel();
+        let (round_timeout_tx, round_timeout_rx) = mpsc::channel();
+        let (dissent_tx, _dissent_rx) = mpsc::channel();
+        let handle = spawn_finality::<()>(
+            db,
+            Some((addr, sk, SignedVotes::scratch())),
+            event_rx,
+            vote_tx,
+            round_timeout_tx,
+            dissent_tx,
+            equivocation_tx_for_test(),
+            Arc::new(Mutex::new(())),
+            Arc::new(AtomicUsize::new(0)),
+        );
+
+        let vote = round_timeout_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("expected a round-timeout vote");
+        assert_eq!(vote.height, 4);
         drop(event_tx);
         handle.join().expect("finality worker should stop cleanly");
 

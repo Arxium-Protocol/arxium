@@ -106,6 +106,14 @@ So `N1` unwinds `A` on seeing `B@1`'s certificate, commits `B`, votes it:
   and only matters if the same height flips repeatedly, which needs
   repeated timeouts — acceptable until measured otherwise.
 
+**Open liveness gap (D-25), not accepted.** S2 can leave a round with
+neither kind of quorum: some validators precommitted its block, others
+(which got it late) had already timed it out, and neither side may sign the
+other vote. The height never certifies while later heights do, so
+`final_watermark` stops for good. Reproduced by
+`scripts/late-block-harness.sh`, alerted on as `ArxiumFinalityGap`. The
+proposed fix is in `docs/consensus-round-change.md`.
+
 ## 5. The challenge window (execution disputes)
 
 A certified block can still be wrong if enough of the set signed a bad
@@ -133,8 +141,12 @@ Adjudication is a deterministic replay of `accept_block` from proofs alone
   cover is a `Disagreement`: nobody is slashed on a guess.
 
 An upheld dispute that names the proposer slashes and tombstones it and
-writes `DisputedBlockKey(height)`: that block reports `settlement:
-"disputed"` and never becomes FINAL. The chain does not unwind a certified
+writes `DisputedBlockKey { height, header }`, where `header` is the sha256
+of the disputed header's signing bytes: that block reports `settlement:
+"disputed"` and never becomes FINAL. The key names the block, not the
+height, because the culprit's block is often one the chain dropped (its
+round timed out and another block was certified at that height), and that
+other block must still settle. The chain does not unwind a certified
 block on its own; what to do with the state after a disputed block is an
 operator and governance decision.
 

@@ -299,12 +299,26 @@ impl KeySpec for EvidenceMarkerKey<'_> {
 /// it is an operator/governance decision, not something the chain does on
 /// its own. `CF_EVIDENCE`, merkleized. The `disputed:` segment can't collide
 /// with `EvidenceMarkerKey`'s zero-padded height.
-pub struct DisputedBlockKey(pub u64);
+///
+/// Keyed by the disputed header too (`sha256` of its signing bytes, which
+/// identify the block without its actions), not the height alone: the
+/// culprit's block is often one the chain never kept — the honest set timed
+/// its round out and certified another block at that height — and a
+/// height-only key marked that honest block disputed instead (Trello 179).
+pub struct DisputedBlockKey {
+    pub height: u64,
+    pub header: [u8; 32],
+}
 impl KeySpec for DisputedBlockKey {
     const CF: &'static str = CF_EVIDENCE;
     type Value = ();
     fn encode(&self) -> Vec<u8> {
-        format!("evidence:disputed:{:020}", self.0).into_bytes()
+        format!(
+            "evidence:disputed:{:020}:{}",
+            self.height,
+            hex::encode(self.header)
+        )
+        .into_bytes()
     }
 }
 
