@@ -25,6 +25,7 @@ mod pair;
 pub mod payload;
 mod specs;
 mod staking;
+mod token;
 
 use xc_bls::BlsPublicKey;
 use xc_chain_spec::presets::PresetRegistry;
@@ -33,7 +34,7 @@ use xc_executor::BlockUpdates;
 use xc_primitives::{Action, Address, ChainParams};
 use xc_storage::{ArxiumDb, BlockView, StorageError};
 
-pub use payload::{ActionPayload, ChainAction, ChainBlock};
+pub use payload::{ActionPayload, ChainAction, ChainBlock, TokenAction};
 
 /// CoreChain's `ChainRuntime` implementation — see `xc_runtime_api::ChainRuntime`
 /// for what this makes `arxd/node` generic over.
@@ -561,9 +562,14 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             validators,
             current_height,
         ),
-        ActionPayload::Stake { validator, amount } => {
-            staking::stake(view, action, validator, *amount, operator_lookup, current_height)
-        }
+        ActionPayload::Stake { validator, amount } => staking::stake(
+            view,
+            action,
+            validator,
+            *amount,
+            operator_lookup,
+            current_height,
+        ),
         ActionPayload::Unstake { validator, amount } => {
             staking::unstake(view, action, validator, *amount, current_height)
         }
@@ -833,6 +839,9 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             bls_pubkey_owner_lookup,
             &action.sender,
         ),
+        ActionPayload::Token(token_action) => {
+            token::dispatch(view, action, token_action, current_height)
+        }
     }
 }
 

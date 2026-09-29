@@ -450,6 +450,44 @@ pub enum ActionPayload {
         asset: AssetRef,
         enabled: bool,
     },
+    /// Permissionless crypto tokens (`circuits/token`). Variant 42, and the
+    /// first family nested under one variant: new token actions extend
+    /// `TokenAction` without moving anything in this enum.
+    Token(TokenAction),
+}
+
+/// `ActionPayload::Token`'s actions. Same rule as the outer enum: variant
+/// order is the wire format, append only.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum TokenAction {
+    /// Creates `AssetClass::Token` asset `AssetRef::derive(sender,
+    /// symbol.to_lowercase())` — one token per ticker per creator — mints
+    /// `initial_supply` to the sender and pays
+    /// `ChainParams.token_create_fee` to the treasury. `mintable: false`
+    /// fixes supply at creation.
+    Create {
+        symbol: String,
+        name: String,
+        decimals: u8,
+        initial_supply: u128,
+        max_supply: Option<u128>,
+        mintable: bool,
+    },
+    /// Creator only, while the token is still mintable.
+    Mint {
+        token: AssetRef,
+        to: Address,
+        amount: u128,
+    },
+    Transfer {
+        token: AssetRef,
+        to: Address,
+        amount: u128,
+    },
+    /// Any holder, from their own balance.
+    Burn { token: AssetRef, amount: u128 },
+    /// Creator only; permanent.
+    RenounceMint { token: AssetRef },
 }
 
 pub type ChainAction = Action<ActionPayload>;
@@ -566,7 +604,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 42] = [
+        const EXPECTED: [&str; 43] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -609,6 +647,7 @@ mod tests {
             "SplitAsset",
             "VerifyClaimProof",
             "SetPrivateClaims",
+            "Token",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {
@@ -618,7 +657,7 @@ mod tests {
             let (decoded, _): (ActionPayload, _) = bincode::serde::decode_from_slice(&bytes, cfg)
                 .unwrap_or_else(|e| panic!("variant {idx} ({name}) failed to decode: {e}"));
             let debug = format!("{decoded:?}");
-            let got = debug.split([' ', '{']).next().unwrap();
+            let got = debug.split([' ', '{', '(']).next().unwrap();
             assert_eq!(got, *name, "variant index {idx}");
         }
         let past_end = [EXPECTED.len() as u8, 0];

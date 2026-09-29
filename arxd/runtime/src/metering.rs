@@ -21,7 +21,7 @@
 
 use xc_primitives::ChainParams;
 
-use crate::{ActionPayload, ChainAction};
+use crate::{ActionPayload, ChainAction, payload::TokenAction};
 
 /// Weight per encoded byte, so an action's size is paid for regardless of
 /// variant — an `artifact_json` or `metadata_uri` cannot be free just because
@@ -80,6 +80,10 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         // Verifies the artifact's BLS signatures and replays up to
         // `MAX_ADJUDICATED_ACTIONS` of dispatch: budgeted as a block.
         SubmitExecutionFault { .. } => 500_000,
+        // Same reads/writes as the regulated equivalents; Create also
+        // writes the registry row and two native accounts for the fee.
+        Token(TokenAction::Create { .. }) => 150,
+        Token(_) => 100,
     }
 }
 
