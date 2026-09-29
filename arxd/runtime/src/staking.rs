@@ -725,7 +725,8 @@ mod tests {
                 0,
             )
         };
-        let with_operator = make_operator_lookup(HashMap::from([(validator.clone(), operator.clone())]));
+        let with_operator =
+            make_operator_lookup(HashMap::from([(validator.clone(), operator.clone())]));
 
         let err = stake(&stranger, &with_operator, None).unwrap_err();
         assert!(err.to_string().contains("has not authorized"), "{err}");
