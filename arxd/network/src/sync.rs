@@ -53,6 +53,20 @@ pub(crate) fn local_tip_height(db: &ArxiumDb) -> u64 {
 /// frontier a live peer would reach by gossip, and the provisional tip is
 /// what it is missing — gossip delivers once, and a validator that was down
 /// for that delivery would otherwise never see the block it has to vote on.
+/// Highest tip a connected peer claims, leaving out peers in `unbacked`
+/// (claimed above our tip, then served nothing past it). `None` when no
+/// peer counts.
+pub(crate) fn backed_best_tip(
+    peer_tips: &std::collections::HashMap<PeerId, u64>,
+    unbacked: &std::collections::HashSet<PeerId>,
+) -> Option<u64> {
+    peer_tips
+        .iter()
+        .filter(|(peer, _)| !unbacked.contains(peer))
+        .map(|(_, &tip)| tip)
+        .max()
+}
+
 pub(crate) fn blocks_page_end(from: u64, watermark: u64, tip: u64) -> u64 {
     if watermark == 0 || from > watermark {
         tip
@@ -237,6 +251,22 @@ pub(crate) fn send_sync_request(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Trello 174: a peer claiming an absurd tip only holds the startup gate
+    /// until it fails to serve a page past our tip; the honest peer's claim
+    /// is what's left, and a disconnect forgets a claim entirely.
+    #[test]
+    fn a_lying_peers_tip_stops_counting_once_it_serves_nothing() {
+        use std::collections::{HashMap, HashSet};
+        let (liar, honest) = (PeerId::random(), PeerId::random());
+        let mut tips = HashMap::from([(liar, 1_000_000_000), (honest, 50)]);
+        let mut unbacked = HashSet::new();
+        assert_eq!(backed_best_tip(&tips, &unbacked), Some(1_000_000_000));
+        unbacked.insert(liar);
+        assert_eq!(backed_best_tip(&tips, &unbacked), Some(50));
+        tips.remove(&honest);
+        assert_eq!(backed_best_tip(&tips, &unbacked), None);
+    }
 
     #[test]
     fn progress_resets_the_stuck_counter() {
