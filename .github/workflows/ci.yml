@@ -364,9 +364,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang cmake build-essential libclang-dev pkg-config
 
+      # x86-64-v2, not the runner's CPU: blst enables ADX when the build host
+      # has it and no target-cpu is set, and the devnet's OVH hosts are
+      # Haswell without ADX. A default build dies there with SIGILL on the
+      # first BLS operation (verified 2026-09-28, Trello A-33).
       - name: Build arxd (release)
         shell: bash
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v2
         run: cargo build --release --locked -p arxd
+
+      # Generates a validator, BLS key and proof of possession in a throwaway
+      # directory: the exact path that crashed. The runner has ADX, so this
+      # cannot reproduce the SIGILL; it proves the binary works, the flag
+      # above is what keeps it portable.
+      - name: Smoke-test key generation
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          scratch="$(mktemp -d)"
+          target/release/arxd keys --json --base-path "$scratch" >/dev/null
+          rm -rf "$scratch"
 
       - name: Package binary
         shell: bash
