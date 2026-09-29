@@ -686,7 +686,8 @@ async fn get_min_stake<P: Payload>(State(state): State<AppState<P>>) -> Result<R
 /// client can show it before submitting. `404` for a chain with no fee.
 /// `action_fee` is the base; a client estimates a real fee as
 /// `action_fee + weight × weight_fee` (see `arxd_runtime::metering`), and
-/// `max_block_weight` is the cap any single action must fit under.
+/// `max_block_weight` is the cap any single action must fit under, and
+/// `token_create_fee` is what `TokenAction::Create` pays on top.
 async fn get_action_fee<P: Payload>(
     State(state): State<AppState<P>>,
 ) -> Result<Response, ApiError> {
@@ -698,6 +699,7 @@ async fn get_action_fee<P: Payload>(
         "action_fee": action_fee,
         "weight_fee": weight_fee,
         "max_block_weight": params.max_block_weight,
+        "token_create_fee": params.token_create_fee,
     }))
     .into_response())
 }

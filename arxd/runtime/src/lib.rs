@@ -1966,7 +1966,7 @@ mod sdk_golden_fixtures {
                 nonce,
                 ActionPayload::IssueAssetTo {
                     asset: asset.clone(),
-                    to: recipient,
+                    to: recipient.clone(),
                     amount,
                 },
             ),
@@ -1990,9 +1990,67 @@ mod sdk_golden_fixtures {
                 &key,
                 nonce,
                 ActionPayload::SetPrivateClaims {
-                    asset,
+                    asset: asset.clone(),
                     enabled: true,
                 },
+            ),
+            fixture(
+                "createToken",
+                json!({"symbol": "ARXD", "name": "Arx Dollar", "decimals": 6, "initialSupply": amount.to_string(), "maxSupply": "5000000", "mintable": true}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Token(TokenAction::Create {
+                    symbol: "ARXD".into(),
+                    name: "Arx Dollar".into(),
+                    decimals: 6,
+                    initial_supply: amount,
+                    max_supply: Some(5_000_000),
+                    mintable: true,
+                }),
+            ),
+            fixture(
+                "mintToken",
+                json!({"token": asset, "to": recipient, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Token(TokenAction::Mint {
+                    token: asset.clone(),
+                    to: recipient.clone(),
+                    amount,
+                }),
+            ),
+            fixture(
+                "transferToken",
+                json!({"token": asset, "to": recipient, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Token(TokenAction::Transfer {
+                    token: asset.clone(),
+                    to: recipient.clone(),
+                    amount,
+                }),
+            ),
+            fixture(
+                "burnToken",
+                json!({"token": asset, "amount": amount.to_string()}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Token(TokenAction::Burn {
+                    token: asset.clone(),
+                    amount,
+                }),
+            ),
+            fixture(
+                "renounceMint",
+                json!({"token": asset}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::Token(TokenAction::RenounceMint { token: asset }),
             ),
         ];
         let document = json!({
