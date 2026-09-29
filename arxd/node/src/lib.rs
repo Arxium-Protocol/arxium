@@ -27,7 +27,7 @@ use xc_runtime_api::ChainRuntime;
 
 use arxd_finality::{
     Dissent, DissentReason, FinalityEvent, PEER_EVENT_BACKLOG_CAP, PrecommitEquivocation,
-    PrecommitVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
+    PrecommitVote, PrevoteVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{P2pConfig, spawn_p2p_node};
 use cli::{Cli, Command};
@@ -55,6 +55,12 @@ fn is_routine_reject(err: &xc_executor::AcceptBlockError) -> bool {
         err,
         xc_executor::AcceptBlockError::NotNextHeight { block_height, tip_height }
             if block_height < tip_height
+    ) || matches!(
+        // A peer still serving a block its round or a lock has left behind:
+        // expected for a few sync ticks around every round change.
+        err,
+        xc_executor::AcceptBlockError::DeadRound { .. }
+            | xc_executor::AcceptBlockError::ContradictsLock { .. }
     )
 }
 
@@ -373,10 +379,12 @@ struct SubsystemHandles<R: ChainRuntime> {
     block_tx: tokio::sync::mpsc::Sender<Block<R::Payload>>,
     block_rx: tokio::sync::mpsc::Receiver<Block<R::Payload>>,
     gossip_rx: tokio::sync::mpsc::Receiver<Action<R::Payload>>,
+    prevote_rx: tokio::sync::mpsc::Receiver<PrevoteVote>,
     precommit_rx: tokio::sync::mpsc::Receiver<PrecommitVote>,
     dissent_rx: tokio::sync::mpsc::Receiver<Dissent>,
     round_timeout_rx: tokio::sync::mpsc::Receiver<RoundTimeoutVote>,
     on_block: Box<dyn Fn(Block<R::Payload>, bool) -> bool + Send>,
+    on_prevote_vote: Box<dyn Fn(PrevoteVote) + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
     on_dissent: Box<dyn Fn(Dissent) + Send>,
     on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
@@ -897,8 +905,10 @@ struct FinalityBridges<P> {
     peer_events: PeerEvents<P>,
     dissent_tx: tokio::sync::mpsc::Sender<Dissent>,
     dissent_rx: tokio::sync::mpsc::Receiver<Dissent>,
+    prevote_rx: tokio::sync::mpsc::Receiver<PrevoteVote>,
     precommit_rx: tokio::sync::mpsc::Receiver<PrecommitVote>,
     round_timeout_rx: tokio::sync::mpsc::Receiver<RoundTimeoutVote>,
+    on_prevote_vote: Box<dyn Fn(PrevoteVote) + Send>,
     on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send>,
     on_dissent: Box<dyn Fn(Dissent) + Send>,
     on_round_timeout_vote: Box<dyn Fn(RoundTimeoutVote) + Send>,
@@ -918,6 +928,7 @@ fn spawn_finality_bridges<R: ChainRuntime>(
     // freshly-signed votes come back out on `finality_vote_rx` to be
     // gossiped over the network layer's precommit topic.
     let (finality_event_tx, finality_event_rx) = std_mpsc::channel::<FinalityEvent<R::Payload>>();
+    let (finality_prevote_tx, finality_prevote_rx) = std_mpsc::channel::<PrevoteVote>();
     let (finality_vote_tx, finality_vote_rx) = std_mpsc::channel::<PrecommitVote>();
     let (finality_round_timeout_tx, finality_round_timeout_rx) =
         std_mpsc::channel::<RoundTimeoutVote>();
@@ -947,6 +958,7 @@ fn spawn_finality_bridges<R: ChainRuntime>(
             db.clone(),
             bls_identity,
             finality_event_rx,
+            finality_prevote_tx,
             finality_vote_tx,
             finality_round_timeout_tx,
             dissent_recorded_tx,
@@ -1012,6 +1024,23 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         })
     });
 
+    let (prevote_tx, prevote_rx) =
+        tokio::sync::mpsc::channel::<PrevoteVote>(arxd_network::OUTBOUND_CHANNEL_CAP);
+    // Same shape as `precommit_bridge` below.
+    spawn_supervised(
+        "prevote_bridge",
+        thread::spawn(move || {
+            for vote in finality_prevote_rx {
+                if arxd_network::shutdown_code() != 0 {
+                    break;
+                }
+                if !arxd_network::send_outbound(&prevote_tx, vote, "prevote") {
+                    break;
+                }
+            }
+        }),
+    );
+
     let (precommit_tx, precommit_rx) =
         tokio::sync::mpsc::channel::<PrecommitVote>(arxd_network::OUTBOUND_CHANNEL_CAP);
     // Bridges `spawn_finality`'s blocking std::sync::mpsc output onto the
@@ -1053,6 +1082,11 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         }),
     );
 
+    let on_prevote_vote: Box<dyn Fn(PrevoteVote) + Send> = {
+        let send = peer_events.clone();
+        Box::new(move |vote: PrevoteVote| send.send(FinalityEvent::PrevoteObserved(vote)))
+    };
+
     let on_precommit_vote: Box<dyn Fn(PrecommitVote) + Send> = {
         let send = peer_events.clone();
         Box::new(move |vote: PrecommitVote| send.send(FinalityEvent::VoteObserved(vote)))
@@ -1076,8 +1110,10 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         peer_events,
         dissent_tx,
         dissent_rx,
+        prevote_rx,
         precommit_rx,
         round_timeout_rx,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -1293,8 +1329,10 @@ fn spawn_subsystems<R: ChainRuntime>(
     let FinalityBridges {
         event_tx: finality_event_tx,
         dissent_rx,
+        prevote_rx,
         precommit_rx,
         round_timeout_rx,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -1320,10 +1358,12 @@ fn spawn_subsystems<R: ChainRuntime>(
         block_tx,
         block_rx,
         gossip_rx,
+        prevote_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
         on_block,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -1456,10 +1496,8 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         })
         .transpose()?;
     if let Some(signed) = &signed_height {
-        info!(
-            "slashing protection: never signing at or below height {}",
-            signed.last()
-        );
+        let (height, round) = signed.last();
+        info!("slashing protection: never signing at or below height {height} round {round}");
     }
 
     #[cfg(feature = "fault-injection")]
@@ -1491,10 +1529,12 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         block_tx,
         block_rx,
         gossip_rx,
+        prevote_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
         on_block,
+        on_prevote_vote,
         on_precommit_vote,
         on_dissent,
         on_round_timeout_vote,
@@ -1524,10 +1564,12 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         db: db.clone(),
         gossip_rx,
         block_rx,
+        prevote_rx,
         precommit_rx,
         dissent_rx,
         round_timeout_rx,
         on_block: Box::new(on_block),
+        on_prevote_vote: Box::new(on_prevote_vote),
         on_precommit_vote: Box::new(on_precommit_vote),
         on_dissent: Box::new(on_dissent),
         on_round_timeout_vote: Box::new(on_round_timeout_vote),

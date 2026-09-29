@@ -41,6 +41,12 @@ pub(crate) fn blocks_topic(chain_id: &str) -> String {
 pub(crate) fn precommits_topic(chain_id: &str) -> String {
     format!("arxium/precommits/v1/{chain_id}")
 }
+/// One pub/sub topic for prevotes (`arxd_finality::PrevoteVote`) — same rule
+/// as precommits: signature/voter/quorum validation happens in
+/// `arxd/finality`, not here.
+pub(crate) fn prevotes_topic(chain_id: &str) -> String {
+    format!("arxium/prevotes/v1/{chain_id}")
+}
 /// One pub/sub topic for dissents (`arxd_finality::Dissent`) — same rule as
 /// precommits: signature/voter/one-per-height validation happens in
 /// `arxd/finality`, not here.

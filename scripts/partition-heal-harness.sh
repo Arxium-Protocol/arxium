@@ -346,8 +346,10 @@ done
     || inconclusive "the set never reached steady state (victim tip $victim_tip, majority tip $majority_tip, majority watermark $majority_watermark)"
 echo "  steady at victim tip $victim_tip, majority watermark $majority_watermark"
 
-# The victim must be cut off while its tip is exactly TARGET_H - 1, so the one
-# height it can produce alone is TARGET_H. The target is picked off the live
+# The victim must be cut off while its tip is exactly TARGET_H - 1, and
+# finalized there, so the one height it can produce alone is TARGET_H: a
+# producer builds only on a finalized parent (docs/consensus-safety.md N1),
+# so a victim cut off between a block and its certificate builds nothing. The target is picked off the live
 # tip, never from a constant: the further ahead it is, the more chances the
 # victim has to apply a multi-block sync page and skip straight over the
 # height we are waiting for. Nearest own slot at least two heights out, so
@@ -367,11 +369,12 @@ for attempt in $(seq 1 "${CUT_ATTEMPTS:-4}"); do
     deadline=$(($(date +%s) + CHAIN_TIMEOUT))
     while [ "$(date +%s)" -lt "$deadline" ]; do
         victim_tip="$(status_field "$RPC_VICTIM" tip_height)"
-        [ "$victim_tip" -ge $((TARGET_H - 1)) ] && break
+        victim_watermark="$(status_field "$RPC_VICTIM" final_watermark)"
+        [ "$victim_watermark" -ge $((TARGET_H - 1)) ] && break
         sleep 0.2
     done
     sample_majority || true
-    if [ "$victim_tip" -eq $((TARGET_H - 1)) ]; then
+    if [ "$victim_tip" -eq $((TARGET_H - 1)) ] && [ "$victim_watermark" -eq $((TARGET_H - 1)) ]; then
         cut_ready=true
         break
     fi

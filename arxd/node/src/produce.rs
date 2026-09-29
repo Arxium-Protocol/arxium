@@ -377,8 +377,15 @@ const MAX_BLOCK_ACTION_BYTES: usize = xc_primitives::MAX_WIRE_MESSAGE_SIZE - 64 
 /// exits the process with `HALT_EXIT_CODE` so a supervisor can alert on it
 /// instead of reading a silent exit as an ordinary crash.
 ///
-/// `identity` carries the validator's `SignedHeight` record: no height at or
-/// below it is ever signed, and each new one is claimed on disk first.
+/// `identity` carries the validator's `SignedHeight` record: no (height,
+/// round) at or below it is ever signed, and each new one is claimed on disk
+/// first.
+///
+/// Builds only on a finalized parent (`docs/consensus-safety.md` §2, N1): a
+/// block on an unfinalized parent is what let the chain run on past a height
+/// that never certified (D-25). Also never builds at a height a quorum has
+/// locked on another block — that block is the only one that can finalize
+/// there, and the finality thread fetches it.
 pub fn produce_loop<R: ChainRuntime>(
     db: &ArxiumDb,
     mempool: &Arc<Mutex<Mempool<R::Payload>>>,
@@ -509,9 +516,22 @@ pub fn produce_loop<R: ChainRuntime>(
                     .set(f64::from(u8::from(keyed.contains(&&*address))));
                 // Power, not heads: the alertable comparison is
                 //   arxium_voting_power_with_bls_key < arxium_finality_quorum
-                gauge!("arxium_voting_power_with_bls_key")
-                    .set(signed_power(&validators, keyed) as f64);
+                let keyed_power = signed_power(&validators, keyed);
+                gauge!("arxium_voting_power_with_bls_key").set(keyed_power as f64);
                 gauge!("arxium_finality_quorum").set(QUORUM_POWER as f64);
+
+                // Wait for the parent to finalize. Only where finality is
+                // reachable at all: a set whose BLS keys can't make quorum
+                // finalizes nothing, and waiting would stop it at height 1
+                // with no way to register the keys it lacks.
+                if keyed_power >= QUORUM_POWER && db.get_final_watermark()? < tip_height {
+                    drop(guard);
+                    continue;
+                }
+                if db.get_highest_pol(next_height)?.is_some() {
+                    drop(guard);
+                    continue;
+                }
                 let validators: Vec<Address> = validators.into_keys().collect();
 
                 // Eligibility itself no longer comes from `elapsed` — see
@@ -528,7 +548,7 @@ pub fn produce_loop<R: ChainRuntime>(
                         gauge!("arxium_is_expected_proposer").set(1.0);
                         // Claimed before signing; a refusal here is the
                         // slashing protection doing its job, not an error.
-                        if let Err(err) = signed.claim(next_height) {
+                        if let Err(err) = signed.claim(next_height, round) {
                             warn!("not producing height {next_height}: {err:#}");
                             counter!("arxium_production_refused_already_signed_total").increment(1);
                             drop(guard);

@@ -1,9 +1,25 @@
-# Design draft: round change with locks (D-25)
+# Round change with locks (D-25)
 
-Status: **draft for decision**, not implemented. Replaces the S2 rule of
-`docs/consensus-safety.md` §2 with Tendermint's locking rules, and makes
-finality strictly sequential. The reproduction is
-`scripts/late-block-harness.sh`, which fails today and must pass after this.
+Status: **implemented** (2026-09-29). The rules as built are in
+`docs/consensus-safety.md` §2–3; this file keeps the reasoning for the
+change. Decisions taken against §7 below:
+
+1. In-house, not Malachite: the rules fit the existing heights, rounds,
+   round certificates and BLS aggregation with one new vote type, so the
+   spike's integration cost would have been larger than the change.
+2. Pipelining depth **0**, not 1: a producer builds only on a finalized
+   parent. Finality lands well inside a 2s slot, so block time barely moves,
+   and nothing is ever built on a height that might not certify.
+3. Mainnet: at least 4 roughly equal validators (§6), unchanged.
+
+Two things differ from the draft below. A lock needs no POL certificate
+inside the block (§3.1): each node forms locks from the prevotes it tallies,
+and every validator prevotes the highest lock it knows, so no proposer has
+to re-propose. And a proposer's slashing protection is per (height, round),
+so the rotation can bring it back to a height it already signed.
+
+The reproduction, `scripts/late-block-harness.sh`, failed before the change
+and must pass after it.
 
 ## 1. The problem
 

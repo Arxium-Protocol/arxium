@@ -440,9 +440,10 @@ having one.
    base path still has them, copy them over the restored files. (Older
    versions kept them directly in `<base-path>/`; the node moves such a file
    into its chain's directory on first boot.) `signed_height`
-   records the last height this validator proposed, and `signed_votes` the
-   finality votes (precommits and round timeouts) it signed; a backup's
-   copies are older. Starting with an older one lets the node sign a second,
+   records the last height and round this validator proposed, and
+   `signed_votes` the finality votes (prevotes, precommits and round
+   timeouts) it signed — its latest precommit there is also its lock; a
+   backup's copies are older. Starting with an older one lets the node sign a second,
    conflicting block or vote, which is equivocation: a full slash and a
    permanent ban.
 3. Start the node normally, with its peers reachable. It reads the tip

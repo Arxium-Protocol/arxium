@@ -1191,6 +1191,48 @@ impl ArxiumDb {
         }
     }
 
+    /// The highest-round `PolRecord` at `height`, if any.
+    pub fn get_highest_pol(&self, height: u64) -> Result<Option<PolRecord>, StorageError> {
+        let prefix = format!("meta:pol:{height:020}:");
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+        );
+        let mut highest = None;
+        for item in iter {
+            let (key, value) = item?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let (record, _len): (PolRecord, usize) =
+                bincode::serde::decode_from_slice(&value, bincode::config::standard())?;
+            highest = Some(record); // keys ascend by round
+        }
+        Ok(highest)
+    }
+
+    /// Deletes every `PolRecord` at or below `height` — a lock is spent once
+    /// its height finalizes. Scans only the records that exist, so calling it
+    /// as the watermark moves costs a seek when there is nothing to delete.
+    pub fn delete_pols_through(&self, height: u64) -> Result<(), StorageError> {
+        let prefix = b"meta:pol:";
+        let end = format!("meta:pol:{:020}", height.saturating_add(1));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix, Direction::Forward),
+        );
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix) || *key >= *end.as_bytes() {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_META), key);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     pub fn get_finality_record(&self, height: u64) -> Result<Option<FinalityRecord>, StorageError> {
         let key = format!("meta:finality:{height:020}");
         match self.get(key.as_bytes())? {
@@ -1403,8 +1445,13 @@ impl ArxiumDb {
     /// `CF_META` read indexes all come back because the block's own batch wrote
     /// them. What the block batch never wrote is handled explicitly:
     ///
-    /// * `meta:precommit`/`meta:roundcert`/`meta:roundtimeout` above `height`
-    ///   are deleted — they are round state for blocks that no longer exist.
+    /// * `meta:precommit`/`meta:roundcert`/`meta:roundtimeout`/`meta:pol`
+    ///   from `height + 2` up are deleted — they bind parents that no longer
+    ///   exist. At `height + 1` they are **kept**: that height's parent is
+    ///   `height` itself, still held, and its rounds are about the height, not
+    ///   the block this node happened to hold there. Swapping the tip at
+    ///   `height + 1` for the locked block (`arxd_finality`'s step) must not
+    ///   reset the round to 0 or forget the lock that caused the swap.
     /// * `meta:finality` is **kept**. A certificate is a fact about what the
     ///   network finalized at a height, not about which block this node
     ///   happens to hold there, and the watermark already cross-checks the two
@@ -1467,8 +1514,9 @@ impl ArxiumDb {
             b"meta:precommit:".as_slice(),
             b"meta:roundcert:".as_slice(),
             b"meta:roundtimeout:".as_slice(),
+            b"meta:pol:".as_slice(),
         ] {
-            let seek = [prefix, format!("{:020}", height + 1).as_bytes()].concat();
+            let seek = [prefix, format!("{:020}", height + 2).as_bytes()].concat();
             let iter = self.db.iterator_cf(
                 self.cf(CF_META),
                 IteratorMode::From(&seek, Direction::Forward),
@@ -2170,6 +2218,29 @@ impl ArxiumDb {
         for item in iter {
             let (key, _value) = item?;
             if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            batch.delete_cf(self.cf(CF_META), key);
+        }
+        self.db.write(batch)?;
+        Ok(())
+    }
+
+    /// Deletes every persisted round-timeout vote at or below `height` — they
+    /// are kept past their round's certificate (a peer that missed one needs
+    /// it re-sent) and spent once the height finalizes. Scans only what
+    /// exists, like `delete_pols_through`.
+    pub fn delete_round_timeout_votes_through(&self, height: u64) -> Result<(), StorageError> {
+        let prefix = b"meta:roundtimeout:";
+        let end = format!("meta:roundtimeout:{:020}", height.saturating_add(1));
+        let iter = self.db.iterator_cf(
+            self.cf(CF_META),
+            IteratorMode::From(prefix, Direction::Forward),
+        );
+        let mut batch = WriteBatch::default();
+        for item in iter {
+            let (key, _value) = item?;
+            if !key.starts_with(prefix) || *key >= *end.as_bytes() {
                 break;
             }
             batch.delete_cf(self.cf(CF_META), key);
@@ -3699,6 +3770,58 @@ mod divergence_recovery_tests {
             db.get_block::<()>(20).unwrap().unwrap().state_root,
             db.compute_state_root(&[]).unwrap()
         );
+    }
+
+    /// D-25: swapping the block at `h` (revert to `h - 1`) keeps `h`'s round
+    /// certificates and locks — they describe the height, and the swap is
+    /// usually *because* of a lock — but drops `h + 1`'s, whose parent is gone.
+    #[test]
+    fn a_revert_keeps_round_state_at_the_next_height_only() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        for height in 0..=6 {
+            commit(&db, height, 1, height as u128);
+        }
+        let sig = BlsSignature([0u8; 96]);
+        for height in [5, 6] {
+            db.write_batches(&[
+                &RoundCertificate {
+                    height,
+                    round: 0,
+                    signers: vec![],
+                    aggregate_signature: sig.clone(),
+                },
+                &PolRecord {
+                    height,
+                    round: 1,
+                    block_hash: Hash32::from_bytes([height as u8; 32]),
+                    signers: vec![],
+                    aggregate_signature: sig.clone(),
+                },
+            ])
+            .unwrap();
+        }
+
+        db.revert_to::<()>(4).unwrap();
+
+        assert_eq!(db.current_round(5).unwrap(), 1, "height 5 stays at round 1");
+        assert_eq!(db.get_highest_pol(5).unwrap().unwrap().round, 1);
+        assert_eq!(db.current_round(6).unwrap(), 0);
+        assert!(db.get_highest_pol(6).unwrap().is_none());
+
+        // Spent locks go once their height finalizes; later ones stay.
+        for height in [4, 5] {
+            db.write_batch(&PolRecord {
+                height,
+                round: 2,
+                block_hash: Hash32::from_bytes([9; 32]),
+                signers: vec![],
+                aggregate_signature: sig.clone(),
+            })
+            .unwrap();
+        }
+        db.delete_pols_through(4).unwrap();
+        assert!(db.get_highest_pol(4).unwrap().is_none());
+        assert_eq!(db.get_highest_pol(5).unwrap().unwrap().round, 2);
     }
 
     /// The safety property. A node that would revert below its watermark has

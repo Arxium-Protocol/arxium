@@ -219,6 +219,22 @@ pub enum AcceptBlockError {
         certified: Hash32,
         offered: Hash32,
     },
+    #[error(
+        "block {height} hashes to {offered}, but a quorum of prevotes locked this height on {locked} — only that block can finalize here now"
+    )]
+    ContradictsLock {
+        height: u64,
+        locked: Hash32,
+        offered: Hash32,
+    },
+    #[error(
+        "block {height} is for round {round}, but this height is at round {current_round} and no quorum locked it — that round is over"
+    )]
+    DeadRound {
+        height: u64,
+        round: u32,
+        current_round: u32,
+    },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
     ParentMismatch { local: Hash32, expected: String },
     #[error("block {height} claims parent state root {claimed}, its parent's is {local}")]
@@ -346,6 +362,16 @@ where
     let Some(cert) = &block.round_certificate else {
         return Ok(());
     };
+    // A round certificate no longer proves the tip can't finalize: a quorum
+    // may have prevoted it, and then it is the block every later round has to
+    // re-vote (`docs/consensus-safety.md` §2). Only a tip without that lock is
+    // dead.
+    if db
+        .get_highest_pol(tip_height)?
+        .is_some_and(|pol| pol.block_hash == tip.hash())
+    {
+        return Ok(());
+    }
     let validator_set = db.get_validator_set_at(block.height)?;
     verify_round_certificate(
         db,
@@ -538,6 +564,31 @@ where
                 height: block.height,
                 certified: record.block_hash,
                 offered,
+            });
+        }
+    } else if let Some(pol) = db.get_highest_pol(block.height)? {
+        // Lock gate, same shape: once a quorum prevoted a block here, no
+        // other block can finalize at this height unless a later round locks
+        // it instead, so holding anything else only stalls this node's vote.
+        let offered = block.hash();
+        if pol.block_hash != offered {
+            return Err(AcceptBlockError::ContradictsLock {
+                height: block.height,
+                locked: pol.block_hash,
+                offered,
+            });
+        }
+    } else {
+        // A block from a round this height already moved past, with no
+        // lock on it, is one nobody will vote for again — `unwind_dead_tip`
+        // drops it when the round certifies, and without this a peer still
+        // holding it would hand it straight back through sync.
+        let current_round = db.current_round(block.height)?;
+        if block.round < current_round {
+            return Err(AcceptBlockError::DeadRound {
+                height: block.height,
+                round: block.round,
+                current_round,
             });
         }
     }
@@ -2459,6 +2510,112 @@ mod tests {
         );
     }
 
+    /// A block from a round the height already left, with nothing locking
+    /// it, is refused — so sync can't hand back a dead tip this node just
+    /// unwound. A lock on it (a later round re-voting it) lets it through.
+    #[test]
+    fn a_block_from_a_round_already_left_is_refused_unless_locked() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+        let mut block2 = Block {
+            height: 2,
+            parent_hash: block1.hash().to_string(),
+            timestamp: block1.timestamp + 1,
+            actions: vec![],
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            parent_state_root: block1.state_root.clone(),
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        };
+        block2.sign(&GENESIS, addr.clone(), &key);
+        db.write_batch(&RoundCertificate {
+            height: 2,
+            round: 0,
+            signers: vec![addr.clone()],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        })
+        .unwrap();
+
+        let err = accept_block(&db, block2.clone(), false, &flat, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AcceptBlockError::DeadRound {
+                    round: 0,
+                    current_round: 1,
+                    ..
+                }
+            ),
+            "got {err:?}",
+        );
+
+        db.write_batch(&xc_storage::PolRecord {
+            height: 2,
+            round: 1,
+            block_hash: block2.hash(),
+            signers: vec![addr],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        })
+        .unwrap();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::StateRootMismatch { .. }),
+            "the gate must be past, got {err:?}",
+        );
+    }
+
+    /// D-25: the lock gate is the finality gate's twin. Once a quorum
+    /// prevoted one block at a height, any other block there is refused, so
+    /// sync can't keep handing this node a block it will never vote for.
+    #[test]
+    fn a_block_contradicting_a_lock_is_refused() {
+        let (db, key, addr, block1) = chain_at_height_one(now_secs() - 10);
+        let mut block2 = Block {
+            height: 2,
+            parent_hash: block1.hash().to_string(),
+            timestamp: block1.timestamp + 1,
+            actions: vec![],
+            tx_root: [0u8; 32],
+            proposer: None,
+            signature: None,
+            parent_state_root: block1.state_root.clone(),
+            state_root: String::new(),
+            round: 0,
+            round_certificate: None,
+        };
+        block2.sign(&GENESIS, addr.clone(), &key);
+        let pol = |block_hash| xc_storage::PolRecord {
+            height: 2,
+            round: 0,
+            block_hash,
+            signers: vec![addr.clone()],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        };
+
+        db.write_batch(&pol(Hash32::from_bytes([0xee; 32])))
+            .unwrap();
+        let err = accept_block(&db, block2.clone(), false, &flat, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::ContradictsLock { .. }),
+            "got {err:?}",
+        );
+
+        // A later round locking this block instead lets it through to the
+        // ordinary checks (the empty state root here).
+        db.write_batch(&xc_storage::PolRecord {
+            round: 1,
+            ..pol(block2.hash())
+        })
+        .unwrap();
+        let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
+        assert!(
+            matches!(err, AcceptBlockError::StateRootMismatch { .. }),
+            "the gate must be past, got {err:?}",
+        );
+    }
+
     /// A proposer's block hash commits to its full claimed action list. If an
     /// action in that list fails to apply locally (here: a corrupted
     /// signature) `execute_actions` silently drops it rather than erroring,
@@ -2687,8 +2844,22 @@ mod tests {
         supersede_dead_tip(&db, &candidate(1, Some(cert(0)))).unwrap();
         assert_eq!(db.get_tip_height().unwrap(), Some(0), "dead tip unwound");
 
-        // Finalized tip: untouchable even with a valid certificate.
+        // Locked tip (a quorum prevoted it): the round certificate no longer
+        // proves it can't finalize, so it stays for later rounds to re-vote.
         db.write_block_batches(1, &[&tip], true).unwrap();
+        db.write_batch(&xc_storage::PolRecord {
+            height: 1,
+            round: 0,
+            block_hash: tip.hash(),
+            signers: vec![],
+            aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+        })
+        .unwrap();
+        supersede_dead_tip(&db, &candidate(1, Some(cert(0)))).unwrap();
+        assert_eq!(db.get_tip_height().unwrap(), Some(1), "locked tip stays");
+        db.delete_pols_through(1).unwrap();
+
+        // Finalized tip: untouchable even with a valid certificate.
         db.write_batch(&xc_storage::FinalityRecord {
             height: 1,
             round: 0,

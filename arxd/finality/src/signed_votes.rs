@@ -6,11 +6,12 @@
 //!
 //! What this validator already signed used to live only in the chain DB. A DB
 //! restored from a backup or checkpoint, moved to a new machine, or rolled
-//! back by a crash forgets it, and the node could then precommit a different
-//! block at a (height, round) it already voted on (`PrecommitEquivocation`),
-//! or break S2 (`docs/consensus-safety.md` §2) by voting timeout on a round
-//! it precommitted in, or the reverse. Every one of those is a full slash and
-//! a tombstone.
+//! back by a crash forgets it, and the node could then sign a second,
+//! different prevote or precommit at a (height, round) it already voted on
+//! (`PrecommitEquivocation`: a full slash and a tombstone), vote in a round it
+//! already left, or forget its lock and prevote against it
+//! (`docs/consensus-safety.md` §2, V1–V3). The lock is not stored separately:
+//! it *is* the latest precommit recorded here.
 //!
 //! This file lives in `<base_path>/<chain>/`, outside `data/`, so wiping or
 //! restoring the DB doesn't touch it (the node picks the directory; see
@@ -23,6 +24,7 @@ const SIGNED_VOTES_FILE: &str = "signed_votes";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kind {
+    Prevote,
     Precommit,
     Timeout,
 }
@@ -32,8 +34,8 @@ struct Entry {
     kind: Kind,
     height: u64,
     round: u32,
-    /// Block hash for a precommit, parent hash for a timeout — what the
-    /// signature binds besides height/round.
+    /// Block hash for a prevote or precommit, parent hash for a timeout —
+    /// what the signature binds besides height/round.
     hash: String,
 }
 
@@ -50,7 +52,8 @@ pub struct SignedVotes {
 
 impl SignedVotes {
     /// File format: first line `<genesis> <floor>`, then one
-    /// `p|t <height> <round> <hash>` line per signed vote.
+    /// `v|p|t <height> <round> <hash>` line per signed vote (prevote,
+    /// precommit, timeout).
     pub fn load(dir: &Path, genesis_hex: &str) -> Result<Self, String> {
         let path = dir.join(SIGNED_VOTES_FILE);
         let mut votes = Self {
@@ -87,6 +90,7 @@ impl SignedVotes {
             };
             votes.entries.push(Entry {
                 kind: match kind {
+                    "v" => Kind::Prevote,
                     "p" => Kind::Precommit,
                     "t" => Kind::Timeout,
                     _ => return Err(malformed()),
@@ -110,15 +114,55 @@ impl SignedVotes {
         self.floor
     }
 
+    /// This validator's lock at `height`: its latest precommit there, as
+    /// `(round, block_hash)`.
+    pub fn lock(&self, height: u64) -> Option<(u32, &str)> {
+        self.entries
+            .iter()
+            .filter(|e| e.height == height && e.kind == Kind::Precommit)
+            .max_by_key(|e| e.round)
+            .map(|e| (e.round, e.hash.as_str()))
+    }
+
+    /// Records a prevote for `hash` at `(height, round)` before it is signed.
+    /// `pol_round` is the round of the quorum of prevotes (a `PolRecord`) the
+    /// caller holds for `hash`, if any: it is what lets a locked validator
+    /// prevote a block other than the one it is locked on (V3). `Err` means
+    /// signing would break a rule (or the record couldn't be made durable) —
+    /// don't sign.
+    pub fn claim_prevote(
+        &mut self,
+        height: u64,
+        round: u32,
+        hash: &str,
+        pol_round: Option<u32>,
+    ) -> Result<(), String> {
+        if let Some((locked_round, locked)) = self.lock(height)
+            && locked != hash
+            && !pol_round.is_some_and(|pol| locked_round <= pol && pol <= round)
+        {
+            metrics::counter!("arxium_finality_votes_refused_total", "reason" => "lock")
+                .increment(1);
+            return Err(format!(
+                "locked on {locked} since round {locked_round} at height {height}, and no \
+                 quorum of prevotes for {hash} at or after that round"
+            ));
+        }
+        self.claim(Kind::Prevote, height, round, hash)
+    }
+
     /// Records a precommit for `hash` at `(height, round)` before it is
-    /// signed. `Err` means signing it would be a slashable fault (or the
-    /// record couldn't be made durable) — don't sign.
+    /// signed — which also makes it this validator's lock. The caller must
+    /// hold a quorum of prevotes for `hash` at this round (V4). Same contract
+    /// as `claim_prevote`.
     pub fn claim_precommit(&mut self, height: u64, round: u32, hash: &str) -> Result<(), String> {
         self.claim(Kind::Precommit, height, round, hash)
     }
 
     /// Records a round-timeout vote (against `parent_hash`) before it is
-    /// signed. Same contract as `claim_precommit`.
+    /// signed. Allowed after prevoting or precommitting in the same round —
+    /// safety rests on the lock now, not on S2 — but it ends this
+    /// validator's voting in that round. Same contract as `claim_prevote`.
     pub fn claim_timeout(
         &mut self,
         height: u64,
@@ -145,20 +189,13 @@ impl SignedVotes {
                 self.floor
             ));
         }
-        // At most one entry per (height, round): a second one is always refused.
+        // At most one entry per (height, round, kind): a second, different
+        // one is equivocation (V1).
         if let Some(e) = self
             .entries
             .iter()
-            .find(|e| e.height == height && e.round == round)
+            .find(|e| e.height == height && e.round == round && e.kind == kind)
         {
-            if e.kind != kind {
-                refused("conflict");
-                // S2: precommit and timeout in the same round, either order.
-                return Err(format!(
-                    "already signed a {:?} vote at height {height} round {round}",
-                    e.kind
-                ));
-            }
             if e.hash != hash {
                 refused("conflict");
                 return Err(format!(
@@ -167,6 +204,21 @@ impl SignedVotes {
                 ));
             }
             return Ok(()); // the identical vote again: same message, no fault
+        }
+        // V2: a round this validator left — timed out, or voted past — gets
+        // no more prevotes or precommits. Locking in round `r` after acting
+        // in `r + 1` is what would let two blocks finalize.
+        if kind != Kind::Timeout
+            && let Some(e) = self.entries.iter().find(|e| {
+                e.height == height
+                    && (e.round > round || (e.round == round && e.kind == Kind::Timeout))
+            })
+        {
+            refused("conflict");
+            return Err(format!(
+                "already left round {round} at height {height} ({:?} vote at round {})",
+                e.kind, e.round
+            ));
         }
         self.entries.push(Entry {
             kind,
@@ -204,6 +256,7 @@ impl SignedVotes {
         let mut text = format!("{} {}\n", self.genesis, self.floor);
         for e in &self.entries {
             let kind = match e.kind {
+                Kind::Prevote => "v",
                 Kind::Precommit => "p",
                 Kind::Timeout => "t",
             };
@@ -242,12 +295,12 @@ mod tests {
         assert!(votes.claim_precommit(10, 0, "A").is_ok(), "same vote again");
         assert!(votes.claim_precommit(10, 0, "B").is_err(), "equivocation");
         assert!(
-            votes.claim_timeout(10, 0, "P").is_err(),
-            "S2: precommit then timeout"
+            votes.claim_timeout(10, 0, "P").is_ok(),
+            "D-25: a precommitter may still time the round out"
         );
         assert!(
             votes.claim_precommit(11, 0, "C").is_err(),
-            "S2: timeout then precommit"
+            "V2: no precommit in a round already timed out"
         );
         assert!(
             votes.claim_timeout(11, 0, "Z").is_err(),
@@ -277,6 +330,49 @@ mod tests {
         std::fs::write(dir.join(SIGNED_VOTES_FILE), "garbage").unwrap();
         assert!(SignedVotes::load(&dir, "g1").is_err());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// V3 and V2 across a restart: the lock is the latest precommit, it
+    /// survives a reload, only a quorum of prevotes at or after its round
+    /// releases it, and a round left behind gets no more votes.
+    #[test]
+    fn the_lock_survives_a_restart_and_only_a_later_quorum_releases_it() {
+        let dir = dir();
+        let mut votes = SignedVotes::load(&dir, "g1").unwrap();
+        votes.claim_prevote(7, 1, "A", None).unwrap();
+        votes.claim_precommit(7, 1, "A").unwrap();
+
+        let mut votes = SignedVotes::load(&dir, "g1").unwrap();
+        assert_eq!(votes.lock(7), Some((1, "A")));
+        assert!(
+            votes.claim_prevote(7, 2, "A", None).is_ok(),
+            "the locked block"
+        );
+        assert!(
+            votes.claim_prevote(7, 3, "B", None).is_err(),
+            "another block with no quorum behind it"
+        );
+        assert!(
+            votes.claim_prevote(7, 3, "B", Some(0)).is_err(),
+            "a quorum older than the lock doesn't release it"
+        );
+        assert!(votes.claim_prevote(7, 3, "B", Some(2)).is_ok());
+        assert!(
+            votes.claim_prevote(7, 3, "C", Some(2)).is_err(),
+            "equivocation"
+        );
+        assert!(
+            votes.claim_precommit(7, 2, "B").is_err(),
+            "V2: round 2 is behind a round-3 prevote"
+        );
+        votes.claim_timeout(7, 3, "P").unwrap();
+        assert!(
+            votes.claim_precommit(7, 3, "B").is_err(),
+            "V2: round 3 was timed out"
+        );
+        votes.claim_precommit(7, 4, "B").unwrap();
+        assert_eq!(votes.lock(7), Some((4, "B")), "the lock moves forward");
         std::fs::remove_dir_all(&dir).ok();
     }
 

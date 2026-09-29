@@ -545,6 +545,10 @@ pub enum VerifyError {
     HeightMismatch(u64, u64),
     #[error("fault claims height {claimed} but the cited headers are at height {actual}")]
     FaultHeightMismatch { claimed: u64, actual: u64 },
+    #[error(
+        "the two cited headers are for different rounds ({0} vs {1}) of one height, not equivocation"
+    )]
+    RoundMismatch(u32, u32),
     #[error("the two cited headers sign identical bytes, not distinct evidence")]
     SameBlock,
     #[error("signature over block {0} does not verify against proposer_pubkey")]
@@ -881,6 +885,14 @@ fn verify_equivocation(
             claimed: height,
             actual: blocks[0].header.height,
         });
+    }
+    // A later round may re-propose the height; the chain doesn't slash that
+    // (`submit_equivocation_evidence`), so neither may this.
+    if blocks[0].header.round != blocks[1].header.round {
+        return Err(VerifyError::RoundMismatch(
+            blocks[0].header.round,
+            blocks[1].header.round,
+        ));
     }
 
     let mut signed = Vec::with_capacity(2);
@@ -1384,6 +1396,25 @@ mod tests {
                 fault: "equivocation",
                 ..
             }
+        ));
+    }
+
+    /// Two blocks for different rounds of one height are a re-proposal after
+    /// a round change, not a double sign — the chain's rule too.
+    #[test]
+    fn headers_for_different_rounds_are_not_equivocation() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let a = attestation(&key, header(5, 1, "arx1proposer"));
+        let b = attestation(
+            &key,
+            CanonicalHeader {
+                round: 2,
+                ..header(5, 2, "arx1proposer")
+            },
+        );
+        assert!(matches!(
+            verify(&artifact(&key, [a, b], 5)),
+            Err(VerifyError::RoundMismatch(0, 2))
         ));
     }
 
