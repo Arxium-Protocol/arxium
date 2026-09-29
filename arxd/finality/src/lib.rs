@@ -331,10 +331,16 @@ pub struct RoundTimeoutVote {
 /// values are small, rarely-changed constants.
 #[cfg(not(test))]
 const ROUND_TIMEOUT: Duration = Duration::from_secs(8);
-// ponytail: short so timeout-triggering tests don't sleep 8s, long enough
-// that a prevote → lock → precommit exchange (a few fsyncs) fits inside it.
+
+// D-27: tests used a real 400ms timeout, which a prevote → lock → precommit
+// exchange (a few fsyncs) overran on a slow disk under parallel load. Tests
+// now say when a round expires instead: each test thread owns a switch, and
+// `spawn_finality` hands the caller's to the thread it spawns.
 #[cfg(test)]
-const ROUND_TIMEOUT: Duration = Duration::from_millis(400);
+thread_local! {
+    static ROUNDS_EXPIRE: std::cell::RefCell<Arc<std::sync::atomic::AtomicBool>> =
+        Default::default();
+}
 
 /// `ROUND_TIMEOUT`, except a `fault-injection` build lets a harness widen it
 /// through `ARXD_ROUND_TIMEOUT_SECS`.
@@ -421,9 +427,18 @@ fn round_timeout() -> Duration {
     }
 }
 
-#[cfg(any(test, not(feature = "fault-injection")))]
+#[cfg(all(not(test), not(feature = "fault-injection")))]
 fn round_timeout() -> Duration {
     ROUND_TIMEOUT
+}
+
+#[cfg(test)]
+fn round_timeout() -> Duration {
+    if ROUNDS_EXPIRE.with(|e| e.borrow().load(Ordering::Relaxed)) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(3600)
+    }
 }
 
 /// Rounds after the first run longer, up to this many extra `ROUND_TIMEOUT`s.
@@ -486,7 +501,11 @@ pub fn spawn_finality<P>(
 where
     P: Serialize + DeserializeOwned + Send + 'static,
 {
+    #[cfg(test)]
+    let rounds_expire = ROUNDS_EXPIRE.with(|e| e.borrow().clone());
     thread::spawn(move || {
+        #[cfg(test)]
+        ROUNDS_EXPIRE.with(|e| *e.borrow_mut() = rounds_expire);
         // Read once: it never changes, and every vote this thread signs
         // binds it. An unseeded chain can't sign for anyone, so stop here.
         let genesis = match db.genesis_hash_bytes() {
@@ -2965,6 +2984,7 @@ mod tests {
         votes: mpsc::Receiver<PrecommitVote>,
         timeouts: mpsc::Receiver<RoundTimeoutVote>,
         handle: thread::JoinHandle<()>,
+        rounds_expire: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Running {
@@ -2974,6 +2994,8 @@ mod tests {
             let (vote_tx, votes) = mpsc::channel();
             let (round_timeout_tx, timeouts) = mpsc::channel();
             let (dissent_tx, _dissent_rx) = mpsc::channel();
+            let rounds_expire = Arc::default();
+            ROUNDS_EXPIRE.with(|e| *e.borrow_mut() = Arc::clone(&rounds_expire));
             let handle = spawn_finality::<()>(
                 db.clone(),
                 Some((me.0.clone(), me.1.clone(), signed)),
@@ -2992,7 +3014,14 @@ mod tests {
                 votes,
                 timeouts,
                 handle,
+                rounds_expire,
             }
+        }
+
+        /// Rounds never time out until a test asks; then every round does
+        /// at once, until it asks them to stop.
+        fn expire_rounds(&self, expire: bool) {
+            self.rounds_expire.store(expire, Ordering::Relaxed);
         }
 
         fn send(&self, event: FinalityEvent<()>) {
@@ -3217,6 +3246,7 @@ mod tests {
             .unwrap();
 
         let node = Running::start(&db, &keys[0], signed);
+        node.expire_rounds(true);
         let timeout = node
             .timeouts
             .recv_timeout(WAIT)
@@ -3239,6 +3269,7 @@ mod tests {
         genesis_block(&db);
 
         let node = Running::start(&db, &keys[0], SignedVotes::scratch());
+        node.expire_rounds(true);
         let vote = node
             .timeouts
             .recv_timeout(WAIT)
@@ -3268,6 +3299,7 @@ mod tests {
         assert_eq!(db.get_final_watermark().unwrap(), 3);
 
         let node = Running::start(&db, &keys[0], SignedVotes::scratch());
+        node.expire_rounds(true);
         let vote = node
             .timeouts
             .recv_timeout(WAIT)
@@ -3287,9 +3319,11 @@ mod tests {
         let keys = round_timeout_validators(&db, 2);
         let genesis = genesis_block(&db);
         let node = Running::start(&db, &keys[0], SignedVotes::scratch());
+        node.expire_rounds(true);
 
         let own = node.timeouts.recv_timeout(WAIT).expect("round 0 times out");
         assert_eq!((own.height, own.round), (1, 0));
+        node.expire_rounds(false);
 
         // The block arrives late; the peer, which had it, times out too.
         let late = child_of(&genesis, 0, 0);
@@ -3361,11 +3395,13 @@ mod tests {
         let precommit = node.votes.recv_timeout(WAIT).expect("a round-0 precommit");
         assert_eq!(precommit.round, 0);
 
+        node.expire_rounds(true);
         let timeout = node
             .timeouts
             .recv_timeout(WAIT)
             .expect("a precommitter may still time the round out");
         assert_eq!((timeout.height, timeout.round), (1, 0));
+        node.expire_rounds(false);
         node.send(FinalityEvent::RoundTimeoutObserved(round_timeout_vote(
             &keys[1].0,
             &keys[1].1,
