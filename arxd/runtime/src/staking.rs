@@ -233,13 +233,37 @@ pub(crate) fn leave_validator<V: KvRead<Error = StorageError>>(
 
 /// MW-signature-only stake into a validator's sub-account
 /// (`circuit_staking::stake_subaccount`). See `circuit_staking::apply_stake`.
+/// Only the validator, or the operator it authorized, may become a
+/// validator's first master. A validator has one master, and without this
+/// anyone could stake 1 unit to a validator before it joins and hold the
+/// slot, failing its own `JoinValidator` with `ValidatorHasOtherMaster`
+/// (Trello 144). Topping up an existing allocation is unaffected — the
+/// circuit already refuses anyone but the current master.
+pub(crate) fn check_stake_consent<V: KvRead<Error = StorageError>>(
+    view: &V,
+    sender: &Address,
+    validator: &Address,
+    operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+) -> anyhow::Result<()> {
+    let has_master = !view
+        .get(&StakeByValidatorKey(validator))?
+        .unwrap_or_default()
+        .is_empty();
+    if !has_master && !is_authorized(sender, validator, operator_lookup)? {
+        anyhow::bail!("{validator} has not authorized {sender} to stake to it");
+    }
+    Ok(())
+}
+
 pub(crate) fn stake<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
     validator: &Address,
     amount: u128,
+    operator_lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
+    check_stake_consent(view, &action.sender, validator, operator_lookup)?;
     let (accounts, stakes) = circuit_staking::apply_stake(
         view,
         &action.sender,
@@ -659,6 +683,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("already has an unbonding batch"));
+    }
+
+    /// Trello 144: nobody but the validator (or its operator) can take an
+    /// unclaimed validator's master slot; an existing master still tops up.
+    #[test]
+    fn only_the_validator_or_its_operator_can_claim_its_master_slot() {
+        let validator = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let operator = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let stranger = Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
+        let stake = |sender: &Address,
+                     lookup: &dyn Fn(&Address) -> Result<Option<Address>, StorageError>,
+                     existing_master: Option<&Address>| {
+            let db = temp_db();
+            let mut view = seeded_view(
+                &db,
+                HashMap::from([(sender.clone(), funded(1_000 + FEE_BUDGET))]),
+                HashMap::new(),
+            );
+            if let Some(master) = existing_master {
+                view.put(&StakeByValidatorKey(&validator), &vec![master.clone()])
+                    .unwrap();
+            }
+            let action = Action {
+                sender: sender.clone(),
+                nonce: 0,
+                signature: None,
+                payload: ActionPayload::Stake {
+                    validator: validator.clone(),
+                    amount: 1,
+                },
+            };
+            crate::dispatch(
+                &action,
+                &view,
+                lookup,
+                &operator_validators_lookup,
+                &[],
+                10,
+                &no_bls_owner,
+                0,
+            )
+        };
+        let with_operator = make_operator_lookup(HashMap::from([(validator.clone(), operator.clone())]));
+
+        let err = stake(&stranger, &with_operator, None).unwrap_err();
+        assert!(err.to_string().contains("has not authorized"), "{err}");
+        stake(&validator, &operator_lookup, None).expect("the validator itself");
+        stake(&operator, &with_operator, None).expect("its authorized operator");
+        // A master whose operator rights were since revoked keeps topping up.
+        stake(&operator, &operator_lookup, Some(&operator)).expect("existing master tops up");
     }
 
     #[test]

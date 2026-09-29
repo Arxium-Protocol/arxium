@@ -415,6 +415,9 @@ pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result
                 anyhow::bail!("cannot remove the last validator, chain would stall forever");
             }
         }
+        ActionPayload::Stake { validator, .. } => {
+            staking::check_stake_consent(db, &action.sender, validator, &operator_lookup)?;
+        }
         ActionPayload::RegisterBlsKey {
             validator,
             pubkey,
@@ -559,7 +562,7 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
             current_height,
         ),
         ActionPayload::Stake { validator, amount } => {
-            staking::stake(view, action, validator, *amount, current_height)
+            staking::stake(view, action, validator, *amount, operator_lookup, current_height)
         }
         ActionPayload::Unstake { validator, amount } => {
             staking::unstake(view, action, validator, *amount, current_height)
