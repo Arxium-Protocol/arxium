@@ -6,6 +6,7 @@
 //! the single guess-the-kind lookup endpoint.
 
 use super::*;
+use sha2::{Digest, Sha256};
 
 /// Status of a submitted action: "pending" while it's still queued in the
 /// mempool, "confirmed" once a block including it is on the chain, and
@@ -86,7 +87,17 @@ fn block_with_finality<P: Payload>(
     let finalized = db.get_finality_record(block.height)?.is_some();
     // PoE v5 §3.3: certified is ATTESTED; FINAL waits out the challenge
     // window too. `finalized` keeps meaning "certified" for old readers.
-    let settlement = if db.is_block_disputed(block.height)? {
+    // A dispute names the block by its header (`DisputedBlockKey`), so a
+    // culprit's orphaned block at this height never marks this one. No
+    // genesis hash means no dispute could ever have been recorded.
+    let disputed = match (&block.proposer, db.genesis_hash_bytes()) {
+        (Some(proposer), Ok(genesis)) => {
+            let header = block.signing_bytes(&genesis, proposer);
+            db.is_block_disputed(block.height, Sha256::digest(header).into())?
+        }
+        _ => false,
+    };
+    let settlement = if disputed {
         "disputed"
     } else if block.height <= db.get_settled_height()? {
         "final"
@@ -282,4 +293,57 @@ pub(super) async fn search<P: Payload>(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{TestPayload, test_state};
+    use ed25519_dalek::SigningKey;
+
+    /// Trello 179: the culprit's block is usually one the chain dropped (its
+    /// round timed out and another block was certified at that height).
+    /// Disputing it must not mark the block this node actually serves.
+    #[test]
+    fn a_dispute_marks_only_the_block_it_names() {
+        let state = test_state();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        state.db.write_batch(&genesis).unwrap();
+        state
+            .db
+            .write_batch(&xc_storage::GenesisHash(genesis.state_root.clone()))
+            .unwrap();
+        let genesis_bytes = state.db.genesis_hash_bytes().unwrap();
+
+        let key = SigningKey::from_bytes(&[4u8; 32]);
+        let proposer = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let signed = |state_root: &str| {
+            let mut block: Block<TestPayload> = Block::genesis(1);
+            block.height = 1;
+            block.state_root = state_root.to_string();
+            block.sign(&genesis_bytes, proposer.clone(), &key);
+            block
+        };
+        let kept = signed(&"11".repeat(32));
+        let orphan = signed(&"22".repeat(32));
+        let commitment = |block: &Block<TestPayload>| -> [u8; 32] {
+            Sha256::digest(block.signing_bytes(&genesis_bytes, &proposer)).into()
+        };
+        let mark = |block: &Block<TestPayload>| {
+            state
+                .db
+                .write_batch(&xc_storage::EvidenceMarker {
+                    height: 1,
+                    proposer: proposer.clone(),
+                    disputed: Some(commitment(block)),
+                })
+                .unwrap();
+        };
+        let settlement = || block_with_finality(&state.db, &kept).unwrap()["settlement"].clone();
+
+        mark(&orphan);
+        assert_eq!(settlement(), "pending");
+        mark(&kept);
+        assert_eq!(settlement(), "disputed");
+    }
 }

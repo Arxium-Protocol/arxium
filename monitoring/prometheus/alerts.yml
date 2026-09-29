@@ -69,6 +69,21 @@ groups:
         annotations:
           summary: "{{ $value }} outbound {{ $labels.channel }} message(s) dropped in the last 10 minutes"
 
+      # A height that never got a certificate while later ones did (D-25).
+      # Certificates can land out of order for a few seconds; a gap that
+      # lasts minutes is permanent and nothing past it ever settles.
+      - alert: ArxiumFinalityGap
+        expr: arxium_finalized_height - arxium_final_watermark > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "final_watermark is {{ $value }} height(s) behind finalized_height"
+          description: >
+            A height below finalized_height has no finality certificate, so
+            final_watermark and settled_height have stopped. See Trello D-25
+            and docs/consensus-round-change.md.
+
       # `floor` refusals are routine catch-up and not alerted on.
       - alert: ArxiumVoteConflictRefused
         expr: increase(arxium_finality_votes_refused_total{reason="conflict"}[10m]) > 0

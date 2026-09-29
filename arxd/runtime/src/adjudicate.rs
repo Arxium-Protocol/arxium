@@ -2152,7 +2152,12 @@ mod tests {
         let updates = at(last).unwrap();
         let marker = updates.evidence.expect("slash writes a marker");
         assert_eq!(marker.proposer, proposer);
-        assert!(marker.disputed, "the proposer was wrong, so block 1 is");
+        // Named by the same commitment `/blocks` recomputes from the block
+        // itself, so exactly this block reads "disputed" and not whatever
+        // else the chain holds at height 1.
+        let header: [u8; 32] =
+            <sha2::Sha256 as sha2::Digest>::digest(block.signing_bytes(&GENESIS, &proposer)).into();
+        assert_eq!(marker.disputed, Some(header), "the proposer was wrong, so block 1 is");
 
         // The reporter gets `challenger_reward_bps` of the 10,000 slashed,
         // net of its fee; the pool keeps the rest. Nothing is minted.

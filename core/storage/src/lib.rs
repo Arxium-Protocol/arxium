@@ -370,7 +370,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// Bumped 20 -> 21: `ChainParams` gained `challenger_reward_bps` (Trello
 /// 184) — positional bincode on the merkleized `chain_params` row again.
 /// Devnet reset (the devnet had not yet been reset to 20).
-pub const SCHEMA_VERSION: u32 = 21;
+///
+/// Bumped 21 -> 22: `EvidenceMarker::disputed` became the disputed header's
+/// commitment (`Option<[u8; 32]>`, was `bool`) and `evidence:disputed:` rows
+/// are keyed by it (Trello 179). Positional bincode in `BlockEffects` and a
+/// merkleized key format — devnet reset (still not reset to 21).
+pub const SCHEMA_VERSION: u32 = 22;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -2028,9 +2033,12 @@ impl ArxiumDb {
         Ok(self.get_final_watermark()?.saturating_sub(window))
     }
 
-    /// Whether block `height` lost an execution dispute (`DisputedBlockKey`).
-    pub fn is_block_disputed(&self, height: u64) -> Result<bool, StorageError> {
-        Ok(self.get(&DisputedBlockKey(height).encode())?.is_some())
+    /// Whether the block at `height` whose header signing bytes hash to
+    /// `header` lost an execution dispute (`DisputedBlockKey`).
+    pub fn is_block_disputed(&self, height: u64, header: [u8; 32]) -> Result<bool, StorageError> {
+        Ok(self
+            .get(&DisputedBlockKey { height, header }.encode())?
+            .is_some())
     }
 
     /// Highest height with a finality certificate, if any.

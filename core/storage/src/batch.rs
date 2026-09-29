@@ -271,14 +271,15 @@ impl<P: Serialize> BatchWritable for Block<P> {
 /// alongside the slash's `AccountUpdates`/`StakeUpdates` in the same atomic
 /// batch — see `evidence_processed`.
 ///
-/// `disputed` also marks block `height` itself as having lost an execution
-/// dispute (`DisputedBlockKey`) — set when the culprit is that block's
-/// proposer, not for a false dissent or a double-sign.
+/// `disputed` also marks the block with that header commitment at `height`
+/// as having lost an execution dispute (`DisputedBlockKey`) — set when the
+/// culprit is that block's proposer, not for a false dissent or a
+/// double-sign.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EvidenceMarker {
     pub height: u64,
     pub proposer: Address,
-    pub disputed: bool,
+    pub disputed: Option<[u8; 32]>,
 }
 
 impl BatchWritable for EvidenceMarker {
@@ -289,8 +290,15 @@ impl BatchWritable for EvidenceMarker {
         }
         .encode();
         let mut entries = vec![(key, vec![1u8])];
-        if self.disputed {
-            entries.push((DisputedBlockKey(self.height).encode(), vec![1u8]));
+        if let Some(header) = self.disputed {
+            entries.push((
+                DisputedBlockKey {
+                    height: self.height,
+                    header,
+                }
+                .encode(),
+                vec![1u8],
+            ));
         }
         Ok(entries)
     }
@@ -979,7 +987,7 @@ mod effects_tests {
             &[EvidenceMarker {
                 height: 3,
                 proposer: a.clone(),
-                disputed: true,
+                disputed: Some([4u8; 32]),
             }],
             &[BlsKeyRegistration {
                 address: a.clone(),

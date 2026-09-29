@@ -285,6 +285,17 @@ fn record_request(path: &str, status: StatusCode) {
 /// meant to be internet-facing — see `docker-compose.prod.yml`, whose gateway
 /// returns 404 for it rather than proxying it).
 async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
+    // Read at scrape time so every node reports them, not just a producing
+    // validator. `finalized_height` above `final_watermark` is a certificate
+    // hole (Trello D-25): later heights certify but the watermark, and with
+    // it `settled_height`, never moves past the gap. Alerted on as
+    // `arxium_finalized_height - arxium_final_watermark`.
+    if let Ok(Some(height)) = state.db.get_finalized_height() {
+        metrics::gauge!("arxium_finalized_height").set(height as f64);
+    }
+    if let Ok(watermark) = state.db.get_final_watermark() {
+        metrics::gauge!("arxium_final_watermark").set(watermark as f64);
+    }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics_handle.render(),

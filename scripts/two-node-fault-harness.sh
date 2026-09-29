@@ -6,14 +6,15 @@
 # node 0 is built with `--features fault-injection` and armed to corrupt its
 # own signed state_root at FAULT_HEIGHT; the rest are honest. The honest
 # majority's independent re-execution must disagree with node 0's block and
-# write fault evidence, and nobody may be slashed for it: a corrupted
-# state_root only yields ExecutionDisagreement (never slashes) and
-# BlockDivergence (slashing disabled until its replay checks the parent root
-# and replays sealing, Trello 138 — see adjudicate_block_divergence). Node 0
-# must never land a counter-slash against an honest validator either. This exercises three separate guards against real
-# processes instead of one test binary, and only two of them are actually
-# checked below:
-#   - Culprit resolution — checked: "honest nodes' stakes are untouched".
+# write fault evidence, and an honest node's auto-submitted
+# SubmitExecutionFault must slash and tombstone node 0 (BlockDivergence
+# adjudication is back on since PR #45, Trello 72/179). Node 0's block never
+# certifies — the honest set times its round out and keeps another block at
+# FAULT_HEIGHT — so that kept block must not read "disputed". Node 0 must
+# never land a counter-slash against an honest validator either. This
+# exercises three separate guards against real processes instead of one test
+# binary, and only two of them are actually checked below:
+#   - Culprit resolution — checked: node 0 tombstoned, honest stakes kept.
 #   - Self-incrimination (node 0 must not *submit* a fault action naming an
 #     honest validator) — checked at the action level below, by scanning
 #     mined blocks for a `SubmitExecutionFault` sent by node 0.
@@ -226,19 +227,72 @@ echo "chain reached height $tip"
 
 pass=true
 
-# ponytail: BlockDivergence slashing is off (Trello 138), so the expected
-# outcome is that nobody's stake moves, node 0 included. When that slash is
-# turned back on, node 0 should reach 0 here again (404 or active_amount 0).
-echo "checking no validator was slashed (BlockDivergence slashing is disabled, Trello 138)..."
-for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
-    stake_status=$(curl -s -o "$ROOT/stake_$i.json" -w '%{http_code}' "http://127.0.0.1:$RPC_HONEST/accounts/${ADDRS[$i]}/stake")
-    if [ "$stake_status" = "200" ] && [ "$(jq -r '.active_amount' "$ROOT/stake_$i.json")" != "0" ]; then
-        echo "  ok: node $i's stake is untouched"
+# Waited on, not read once: the honest fault action lands a few blocks after
+# the dispute, not necessarily by the time the chain passes CONFIRM_HEIGHT.
+echo "waiting for node 0 to be tombstoned (timeout ${CHAIN_TIMEOUT}s)..."
+deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+node0_status=""
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    node0_status="$({ curl -sf "http://127.0.0.1:$RPC_HONEST/validators/${ADDRS[0]}" || echo '{}'; } | jq -r '.status // empty')"
+    [ "$node0_status" = "Tombstoned" ] && break
+    sleep 2
+done
+tip="$(curl -sf "http://127.0.0.1:$RPC_HONEST/status" | jq -r '.tip_height // 0')"
+# 404-tolerant reads: a tombstoned validator's stake row may be gone, and a
+# bare `curl -sf` exits 22 under pipefail and takes the whole run with it.
+rpc() { curl -sf "http://127.0.0.1:$RPC_HONEST/$1" || echo '{}'; }
+stake_of() { rpc "accounts/$1/stake" | jq -r '.active_amount // 0'; }
+
+echo "checking node 0 was slashed and tombstoned..."
+node0_stake="$(stake_of "${ADDRS[0]}")"
+honest_stake="$(stake_of "${ADDRS[1]}")"
+if [ "$node0_status" = "Tombstoned" ] && [ "$node0_stake" -lt "$honest_stake" ]; then
+    echo "  ok: node 0 is Tombstoned, stake $node0_stake (honest node 1: $honest_stake)"
+else
+    echo "  FAIL: node 0 status '${node0_status:-none}', stake $node0_stake (honest node 1: $honest_stake)"
+    pass=false
+fi
+
+echo "checking no honest validator was slashed..."
+for i in $(seq 1 $((NUM_VALIDATORS - 1))); do
+    status="$(rpc "validators/${ADDRS[$i]}" | jq -r '.status // "none"')"
+    stake="$(stake_of "${ADDRS[$i]}")"
+    if [ "$status" != "Tombstoned" ] && [ "$status" != "Jailed" ] && [ "$stake" -gt 0 ]; then
+        echo "  ok: node $i keeps its stake ($stake, status $status)"
     else
-        echo "  FAIL: node $i's stake was affected (http $stake_status): $(cat "$ROOT/stake_$i.json" 2>/dev/null)"
+        echo "  FAIL: node $i was hit: status $status, stake $stake"
         pass=false
     fi
 done
+
+# The dispute names node 0's header, not the height: the block the chain kept
+# at FAULT_HEIGHT is the honest one and must still settle normally.
+echo "checking the kept block at height $FAULT_HEIGHT is not marked disputed..."
+settlement="$(rpc "blocks/$FAULT_HEIGHT" | jq -r '.settlement // "missing"')"
+if [ "$settlement" != "disputed" ] && [ "$settlement" != "missing" ]; then
+    echo "  ok: height $FAULT_HEIGHT settlement is $settlement"
+else
+    echo "  FAIL: height $FAULT_HEIGHT settlement is $settlement"
+    pass=false
+fi
+
+# Genesis sets no ChainParams, so the window is the default 86,400 blocks —
+# this only fails if the action never landed at all, which the tombstone
+# check above would already show; kept to report where it landed.
+CHALLENGE_WINDOW=86400
+echo "checking an honest SubmitExecutionFault landed inside the challenge window..."
+fault_height=""
+for h in $(seq "$FAULT_HEIGHT" "$tip"); do
+    hits="$(rpc "blocks/$h" \
+        | jq --arg addr "${ADDRS[0]}" '[.actions[]? | select(.sender != $addr) | select(.payload_json | objects | has("SubmitExecutionFault"))] | length')"
+    if [ "${hits:-0}" -gt 0 ]; then fault_height=$h; break; fi
+done
+if [ -n "$fault_height" ] && [ "$fault_height" -le $((FAULT_HEIGHT + CHALLENGE_WINDOW)) ]; then
+    echo "  ok: landed at height $fault_height ($((fault_height - FAULT_HEIGHT)) block(s) after the fault)"
+else
+    echo "  FAIL: no honest SubmitExecutionFault found in heights $FAULT_HEIGHT..$tip"
+    pass=false
+fi
 
 echo "checking an honest node submitted fault evidence..."
 evidence_honest="$(curl -sf "http://127.0.0.1:$RPC_HONEST/evidence")"
@@ -262,7 +316,7 @@ echo "checking node 0 never submitted a fault action naming another validator (s
 self_incrimination=0
 for h in $(seq 1 "$tip"); do
     block="$(curl -sf "http://127.0.0.1:$RPC_HONEST/blocks/$h")"
-    hits="$(echo "$block" | jq --arg addr "${ADDRS[0]}" '[.actions[]? | select(.sender == $addr) | select(.payload | has("SubmitExecutionFault"))]')"
+    hits="$(echo "$block" | jq --arg addr "${ADDRS[0]}" '[.actions[]? | select(.sender == $addr) | select(.payload_json | objects | has("SubmitExecutionFault"))]')"
     if [ "$(echo "$hits" | jq 'length')" -gt 0 ]; then
         echo "  FAIL: node 0 submitted a SubmitExecutionFault action at height $h: $hits"
         self_incrimination=1
@@ -368,7 +422,8 @@ fi
 
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — no wrongful slash, self-incrimination, evidence written, and"
+    echo "PASS — faulty proposer slashed, no wrongful slash or self-incrimination,"
+    echo "evidence written, kept block not disputed, and"
     echo "the diverged node's automatic rollback and reconvergence all held."
     echo "(Recursion guard not exercised by this scenario — see header comment.)"
     # Kept, not deleted. A passing run's logs are how a pass gets checked
