@@ -1,0 +1,62 @@
+name: Workspace tests
+
+# The `test` job in ci.yml runs these same checks, but that workflow is the
+# release pipeline: it triggers only on a version tag and its later jobs
+# publish a GitHub release and dispatch a deployment to Arxium-Ops. Without
+# this file main is first tested when a release is tagged, so a regression
+# merged in between (a flaky test, a clippy error) only shows up as a failed
+# release. This workflow runs the checks on every pull request and push to
+# main, and deliberately does nothing else: no build artifact, no release,
+# no dispatch, no secrets.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workspace-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test the workspace
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out Arxium
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Show the Rust toolchain
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rustc --version
+          cargo --version
+
+      - name: arxd-node must not depend on CoreChain in production
+        shell: bash
+        run: |
+          # Same guard as the release pipeline: arxd-runtime is only a
+          # dev-dependency of the generic node.
+          ! cargo tree -p arxd-node -e normal -i arxd-runtime 2>/dev/null | grep -q arxd-runtime
+
+      # rustup reads rust-toolchain.toml, so this is the pinned toolchain and
+      # its lint set, not whatever the runner image ships.
+      - name: Check formatting
+        shell: bash
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test the workspace
+        shell: bash
+        run: cargo test --workspace --locked
