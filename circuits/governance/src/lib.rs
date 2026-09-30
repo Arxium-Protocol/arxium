@@ -19,12 +19,12 @@ use std::collections::BTreeMap;
 
 use thiserror::Error;
 use xc_circuit::{
-    AccountKey, AdminKey, AdminRole, ChainParamsKey, KvRead, NextProposalIdKey, ProposalKey,
-    ValidatorSetKey, VoteKey,
+    AccountKey, AdminKey, AdminRole, ChainParamsKey, DisputeOpenKey, KvRead, NextProposalIdKey,
+    ProposalKey, ValidatorSetKey, VoteKey,
 };
 use xc_primitives::{
-    Address, ChainParams, GovernanceAction, Proposal, ProposalStatus, TOTAL_VOTING_POWER,
-    treasury_account, validator_set_effective_height,
+    Address, ChainParams, DisputeResolution, GovernanceAction, Proposal, ProposalStatus,
+    TOTAL_VOTING_POWER, treasury_account, validator_set_effective_height,
 };
 use xc_storage::{AccountUpdates, GovernanceUpdates, StorageError};
 
@@ -52,6 +52,8 @@ pub enum GovernanceError {
     ZeroSpend,
     #[error("{0} is not a valid address")]
     InvalidAddress(Address),
+    #[error("a forked resolution carries no corrections")]
+    ForkedWithCorrections,
     #[error("chain params rejected: {0}")]
     InvalidParams(&'static str),
 }
@@ -182,6 +184,19 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
             }
             to.pubkey_bytes()
                 .map_err(|_| GovernanceError::InvalidAddress(to.clone()))?;
+        }
+        GovernanceAction::ResolveDispute {
+            resolution,
+            corrections,
+            ..
+        } => {
+            if *resolution == DisputeResolution::Forked && !corrections.is_empty() {
+                return Err(GovernanceError::ForkedWithCorrections);
+            }
+            for (who, _) in corrections {
+                who.pubkey_bytes()
+                    .map_err(|_| GovernanceError::InvalidAddress(who.clone()))?;
+            }
         }
     }
     Ok(())
@@ -324,6 +339,27 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                     proposal.status = ProposalStatus::Executed;
                 }
                 // Short treasury: falls through as Rejected — see doc.
+            }
+            GovernanceAction::ResolveDispute {
+                height,
+                header,
+                corrections,
+                ..
+            } => {
+                let key = DisputeOpenKey {
+                    height: *height,
+                    header: *header,
+                };
+                // Nothing open (already resolved) falls through as Rejected.
+                if view.get(&key)?.is_some() {
+                    for (who, balance) in corrections {
+                        let mut entry = view.get(&AccountKey(who))?.unwrap_or_default();
+                        entry.balance = *balance;
+                        accounts.0.insert(who.clone(), entry);
+                    }
+                    updates.delete(&key);
+                    proposal.status = ProposalStatus::Executed;
+                }
             }
         }
     }
@@ -638,5 +674,63 @@ mod tests {
         db.write_batch(&up).unwrap();
         assert_eq!(proposal(&db, 0).unwrap().status, ProposalStatus::Rejected);
         assert_eq!(chain_params(&db).unwrap(), before);
+    }
+
+    /// A passed `ResolveDispute` deletes the open marker (settlement
+    /// resumes), applies its balance corrections, and can't run twice.
+    #[test]
+    fn resolving_a_dispute_resumes_settlement_and_applies_corrections() {
+        let db = db();
+        let header = [7u8; 32];
+        db.write_batch(&xc_storage::EvidenceMarker {
+            height: 3,
+            proposer: addr(3),
+            disputed: Some(header),
+        })
+        .unwrap();
+        assert_eq!(db.lowest_open_dispute().unwrap(), Some(3));
+
+        let resolve = |resolution, corrections| GovernanceAction::ResolveDispute {
+            height: 3,
+            header,
+            resolution,
+            corrections,
+        };
+        assert!(matches!(
+            apply_submit(
+                &db,
+                &addr(1),
+                resolve(DisputeResolution::Forked, vec![(addr(2), 5)]),
+                "",
+                0
+            )
+            .unwrap_err(),
+            GovernanceError::ForkedWithCorrections
+        ));
+
+        let run = |id_hint: u64| {
+            let (id, up) = apply_submit(
+                &db,
+                &addr(1),
+                resolve(DisputeResolution::Accept, vec![(addr(2), 42)]),
+                "",
+                0,
+            )
+            .unwrap();
+            assert_eq!(id, id_hint);
+            db.write_batch(&up).unwrap();
+            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+                .unwrap();
+            let (up, accounts) = apply_execute(&db, id, 10).unwrap();
+            db.write_batch(&up).unwrap();
+            db.write_batch(&accounts).unwrap();
+            let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
+            p.status
+        };
+        assert_eq!(run(0), ProposalStatus::Executed);
+        assert_eq!(db.lowest_open_dispute().unwrap(), None);
+        assert_eq!(db.get_account(&addr(2)).unwrap().unwrap().balance, 42);
+        // Nothing left to resolve: the second proposal rejects.
+        assert_eq!(run(1), ProposalStatus::Rejected);
     }
 }

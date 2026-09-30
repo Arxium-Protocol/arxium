@@ -320,6 +320,14 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         _ => None,
     };
 
+    if disputed.is_some() {
+        // The alert hook: settlement is now paused below this height until
+        // governance resolves it (docs/consensus-safety.md §5).
+        tracing::error!(
+            %culprit, height,
+            "execution dispute upheld: block marked disputed, settlement paused"
+        );
+    }
     let mut updates = fault_slash(view, &culprit, reason, current_height, challenger)?;
     updates.evidence = Some(EvidenceMarker {
         height,

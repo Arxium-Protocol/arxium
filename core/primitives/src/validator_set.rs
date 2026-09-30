@@ -417,6 +417,23 @@ pub enum GovernanceAction {
     SetAdmin { role: String, address: Address },
     /// Pay `amount` IUM out of `treasury_account()` to `to`.
     TreasurySpend { to: Address, amount: u128 },
+    /// Close an upheld dispute so settlement resumes past it. `header` is
+    /// the disputed header's commitment (`DisputedBlockKey`). `Accept`
+    /// applies `corrections` (each address's balance set to the amount);
+    /// `Forked` records that operators rebased instead and takes none —
+    /// see docs/consensus-safety.md §5.
+    ResolveDispute {
+        height: u64,
+        header: [u8; 32],
+        resolution: DisputeResolution,
+        corrections: Vec<(Address, u128)>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisputeResolution {
+    Accept,
+    Forked,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
