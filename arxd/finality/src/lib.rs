@@ -304,6 +304,22 @@ pub struct PrecommitEquivocation {
     pub votes: [PrecommitVote; 2],
 }
 
+/// Two prevotes one validator signed for different blocks at one (height,
+/// round), checked by `tally_prevote` exactly as `PrecommitEquivocation`'s
+/// votes are by `tally_vote`.
+#[derive(Clone)]
+pub struct PrevoteEquivocation {
+    pub votes: [PrevoteVote; 2],
+}
+
+/// What `spawn_finality`'s `equivocation_tx` carries: a double-sign in
+/// either voting phase.
+#[derive(Clone)]
+pub enum Equivocation {
+    Prevote(PrevoteEquivocation),
+    Precommit(PrecommitEquivocation),
+}
+
 /// One validator's BLS-signed claim that `round` at `height` ran out of time
 /// without finalizing — gossiped over `arxd/network`'s round-timeout topic
 /// and fed back into `spawn_finality` on every node, including the signer's
@@ -408,6 +424,21 @@ pub fn withheld_height_error() -> Option<String> {
     WITHHOLD_AT_HEIGHT.as_ref().err().cloned()
 }
 
+/// Harness-only (`--features fault-injection`): from
+/// `ARXD_DOUBLE_PREVOTE_AT_HEIGHT`, the height at which this node also
+/// gossips a second prevote for a made-up block alongside every honest one —
+/// the Byzantine voter `scripts/two-node-fault-harness.sh`'s prevote mode
+/// needs slashed. See `Engine::prevote`.
+#[cfg(feature = "fault-injection")]
+static DOUBLE_PREVOTE_AT_HEIGHT: std::sync::LazyLock<Result<Option<u64>, String>> =
+    std::sync::LazyLock::new(|| env_u64("ARXD_DOUBLE_PREVOTE_AT_HEIGHT"));
+
+/// Same boot-time check as `withheld_height_error`.
+#[cfg(feature = "fault-injection")]
+pub fn double_prevote_height_error() -> Option<String> {
+    DOUBLE_PREVOTE_AT_HEIGHT.as_ref().err().cloned()
+}
+
 /// `Some(complaint)` if `ARXD_ROUND_TIMEOUT_SECS` is set but unreadable.
 ///
 /// Call it from the node's boot path so a typo refuses to start rather than
@@ -489,9 +520,10 @@ pub fn spawn_finality<P>(
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
     dissent_tx: Sender<DissentRecord>,
-    // Every precommit equivocation this node observes, for `arxd/node` to
-    // turn into an evidence artifact and an on-chain slash report.
-    equivocation_tx: Sender<PrecommitEquivocation>,
+    // Every prevote or precommit equivocation this node observes, for
+    // `arxd/node` to turn into an evidence artifact and an on-chain slash
+    // report.
+    equivocation_tx: Sender<Equivocation>,
     chain_lock: Arc<Mutex<()>>,
     // Count of peer-sourced events (votes, dissents, round-timeouts) sitting
     // in `events` — see `PEER_EVENT_BACKLOG_CAP`. Decremented here as each
@@ -604,7 +636,7 @@ struct Engine<P> {
     vote_tx: Sender<PrecommitVote>,
     round_timeout_tx: Sender<RoundTimeoutVote>,
     dissent_tx: Sender<DissentRecord>,
-    equivocation_tx: Sender<PrecommitEquivocation>,
+    equivocation_tx: Sender<Equivocation>,
     chain_lock: Arc<Mutex<()>>,
     // (height, round) -> ((block_hash, ep) -> (voter -> signature)); a round
     // can only ever have one canonical (hash, ep) pair in practice, but keyed
@@ -761,7 +793,12 @@ impl<P: Serialize + DeserializeOwned> Engine<P> {
         match event {
             FinalityEvent::BlockObserved(_) => {}
             FinalityEvent::PrevoteObserved(vote) => {
-                if let Err(err) = tally_prevote(&self.db, &mut self.prevote_tallies, vote) {
+                if let Err(err) = tally_prevote(
+                    &self.db,
+                    &mut self.prevote_tallies,
+                    &self.equivocation_tx,
+                    vote,
+                ) {
                     warn!("finality: failed to process prevote: {err}");
                 }
             }
@@ -1043,8 +1080,30 @@ impl<P: Serialize + DeserializeOwned> Engine<P> {
         self.my_prevotes.insert(key, vote.clone());
         // Count our own vote locally before gossiping it. Gossipsub
         // publication is not a local loopback mechanism.
-        if let Err(err) = tally_prevote(&self.db, &mut self.prevote_tallies, vote.clone()) {
+        if let Err(err) = tally_prevote(
+            &self.db,
+            &mut self.prevote_tallies,
+            &self.equivocation_tx,
+            vote.clone(),
+        ) {
             warn!("finality: failed to process local prevote: {err}");
+        }
+        #[cfg(feature = "fault-injection")]
+        if DOUBLE_PREVOTE_AT_HEIGHT.as_ref().ok().copied().flatten() == Some(height) {
+            // Gossiped only, never tallied here: the peers are the ones
+            // that must catch it.
+            let bogus = Hash32::from_bytes([0xee; 32]);
+            let msg = prevote_signing_bytes(&self.genesis, height, round, &bogus.to_string());
+            warn!("fault-injection: double-prevoting {bogus} at height {height} round {round}");
+            send(
+                &self.prevote_tx,
+                PrevoteVote {
+                    block_hash: bogus,
+                    signature: xc_bls::sign(secret_key, &msg),
+                    ..vote.clone()
+                },
+                "prevote",
+            )?;
         }
         send(&self.prevote_tx, vote, "prevote")?;
         Ok(true)
@@ -1178,6 +1237,7 @@ fn block_ep<P: Serialize + DeserializeOwned>(db: &ArxiumDb, block: &Block<P>) ->
 fn tally_prevote(
     db: &ArxiumDb,
     tallies: &mut PrevoteTallies,
+    equivocation_tx: &Sender<Equivocation>,
     vote: PrevoteVote,
 ) -> Result<(), xc_storage::StorageError> {
     if db.get_finality_record(vote.height)?.is_some() {
@@ -1212,19 +1272,32 @@ fn tally_prevote(
         return Ok(());
     }
 
+    // Same check, same placement and same reasoning as `tally_vote`'s:
+    // the vote is a verified signature from a validator of this height, so
+    // a second one for another block at this round is a provable fault.
     let round_tally = tallies.entry((vote.height, vote.round)).or_default();
-    if round_tally
-        .iter()
-        .any(|(hash, signers)| *hash != vote.block_hash && signers.contains_key(&vote.voter))
-    {
-        // ponytail: counted and logged, not yet turned into slashing
-        // evidence. Safety doesn't depend on punishing it (at most `f`
-        // equivocators can't build a second lock); accountability would.
+    let prior = round_tally.iter().find_map(|(hash, signers)| {
+        (*hash != vote.block_hash)
+            .then(|| signers.get(&vote.voter))
+            .flatten()
+            .map(|sig| (*hash, sig.clone()))
+    });
+    if let Some((prior_hash, prior_signature)) = prior {
         warn!(
-            "finality: {} prevoted two blocks at height {} round {}",
+            "finality: {} prevoted two blocks at height {} round {}, reporting equivocation",
             vote.voter, vote.height, vote.round
         );
         metrics::counter!("arxium_prevote_equivocations_detected_total").increment(1);
+        let _ = equivocation_tx.send(Equivocation::Prevote(PrevoteEquivocation {
+            votes: [
+                PrevoteVote {
+                    block_hash: prior_hash,
+                    signature: prior_signature,
+                    ..vote.clone()
+                },
+                vote.clone(),
+            ],
+        }));
     }
     let signers = round_tally.entry(vote.block_hash).or_default();
     signers.insert(vote.voter, vote.signature);
@@ -1281,7 +1354,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
     chain_lock: &Mutex<()>,
     tallies: &mut VoteTallies,
     my_votes: &mut HashMap<(u64, u32), PrecommitVote>,
-    equivocation_tx: &Sender<PrecommitEquivocation>,
+    equivocation_tx: &Sender<Equivocation>,
     vote: PrecommitVote,
 ) -> Result<(), xc_storage::StorageError> {
     if db.get_finality_record(vote.height)?.is_some() {
@@ -1357,7 +1430,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
             vote.voter, vote.height, vote.round
         );
         metrics::counter!("arxium_precommit_equivocations_detected_total").increment(1);
-        let _ = equivocation_tx.send(PrecommitEquivocation {
+        let _ = equivocation_tx.send(Equivocation::Precommit(PrecommitEquivocation {
             votes: [
                 PrecommitVote {
                     height: vote.height,
@@ -1371,7 +1444,7 @@ fn tally_vote<P: Serialize + DeserializeOwned>(
                 },
                 vote.clone(),
             ],
-        });
+        }));
     }
 
     let vote_record = PrecommitVoteRecord {
@@ -1739,7 +1812,7 @@ mod tests {
     /// For the tallying tests that aren't about equivocation: the receiver
     /// is dropped immediately, and `tally_vote` already ignores send
     /// failures (a node with nobody listening still has to keep tallying).
-    fn equivocation_tx_for_test() -> Sender<PrecommitEquivocation> {
+    fn equivocation_tx_for_test() -> Sender<Equivocation> {
         std::sync::mpsc::channel().0
     }
 
@@ -1961,9 +2034,9 @@ mod tests {
         );
         // Round 1 again, different hash: that *is* equivocation.
         tally_vote::<()>(&db, &lock, &mut tallies, &mut my_votes, &tx, vote(1, C)).unwrap();
-        let reported = rx
-            .try_recv()
-            .expect("same-round double vote is equivocation");
+        let Ok(Equivocation::Precommit(reported)) = rx.try_recv() else {
+            panic!("same-round double vote is equivocation");
+        };
         assert_eq!(reported.votes[0].round, 1);
         assert_eq!(reported.votes[1].round, 1);
         let _ = std::fs::remove_dir_all(dir);
@@ -2043,7 +2116,9 @@ mod tests {
         tally(vote(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         ));
-        let reported = rx.try_recv().expect("expected a reported equivocation");
+        let Ok(Equivocation::Precommit(reported)) = rx.try_recv() else {
+            panic!("expected a reported precommit equivocation");
+        };
         assert_eq!(
             reported.votes[0].block_hash,
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -2063,6 +2138,77 @@ mod tests {
         assert_eq!(tallies[&(5, 0)].len(), 2);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `tally_prevote`'s twin of the test above: a second prevote for
+    /// another block at one round is reported, a same-round rebroadcast and
+    /// a later-round prevote are not, and the vote is still tallied.
+    #[test]
+    fn a_validator_prevoting_twice_at_one_round_is_reported_and_still_tallied() {
+        let (db, dir) = open_test_db();
+        let ed_key = SigningKey::from_bytes(&[1u8; 32]);
+        let addr = Address::from_pubkey_bytes(ed_key.verifying_key().as_bytes()).unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[50u8; 32]).unwrap();
+        db.write_batches(&[&xc_storage::BlsKeyRegistration {
+            address: addr.clone(),
+            pubkey: pk,
+            effective_height: 0,
+            previous_pubkey: None,
+        }])
+        .unwrap();
+        let mut validators = vec![addr.clone()];
+        for i in 2u8..5 {
+            let key = SigningKey::from_bytes(&[i; 32]);
+            validators.push(Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap());
+        }
+        db.write_batches(&[&xc_storage::ValidatorSetSnapshot::equal_power(
+            0,
+            &validators,
+        )])
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut tallies = HashMap::new();
+        let a = Hash32::from_bytes([0xaa; 32]);
+        let b = Hash32::from_bytes([0xbb; 32]);
+        let key = (addr.clone(), sk);
+        let mut tally = |round: u32, hash: Hash32| {
+            tally_prevote(&db, &mut tallies, &tx, prevote_by(&key, 5, round, hash)).unwrap()
+        };
+
+        tally(0, a);
+        tally(0, a);
+        tally(1, b);
+        assert!(
+            rx.try_recv().is_err(),
+            "a rebroadcast or a new round is no fault"
+        );
+
+        tally(0, b);
+        let Ok(Equivocation::Prevote(reported)) = rx.try_recv() else {
+            panic!("expected a reported prevote equivocation");
+        };
+        assert_eq!(
+            reported.votes.each_ref().map(|v| (v.round, v.block_hash)),
+            [(0, a), (0, b)]
+        );
+        // The prior vote's signature is the one that voter actually sent.
+        assert_eq!(
+            reported.votes[0].signature.0,
+            prevote_by(&key, 5, 0, a).signature.0
+        );
+        assert_eq!(tallies[&(5, 0)].len(), 2);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Twin of `frozen_prevote_signing_bytes_vector` in `core/artifact`.
+    #[test]
+    fn frozen_prevote_signing_bytes_vector() {
+        assert_eq!(
+            hex::encode(prevote_signing_bytes(&[0xa1; 32], 5, 2, "0xblockhash")),
+            "110000000000000061727869756d2f707265766f74652f76312000000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1080000000000000005000000000000000400000000000000020000000b000000000000003078626c6f636b68617368",
+        );
     }
 
     /// Equal stakes: 3 of 4 (7,500) reach `QUORUM_POWER`, 2 of 4 (5,000)

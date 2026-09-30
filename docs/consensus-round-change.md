@@ -160,7 +160,9 @@ In both cases the height finalizes and the watermark follows.
   `Block`. That means a schema bump and a devnet reset.
 - **Accountability.** Prevote equivocation needs its own evidence variant and
   slash (`Fault::PrevoteEquivocation`), mirroring `PrecommitEquivocation`.
-  Safety doesn't depend on slashing it, but accountability does.
+  Safety doesn't depend on slashing it, but accountability does. *Done in
+  D-26: detected in `tally_prevote`, verified by `xc_artifact::verify`, and
+  slashed like a double precommit.*
 - **Code.** Mostly `arxd/finality` (event loop, tallies, timeouts),
   `core/executor::accept_block` (POL verification), the producer (propose
   the valid block), `arxd/network` (topic), `core/artifact` (new fault).

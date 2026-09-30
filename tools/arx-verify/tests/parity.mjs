@@ -11,7 +11,7 @@ const moduleText = await readFile(resolve(dir, 'arx_verify.js'), 'utf8');
 const wasm = await import(`data:text/javascript;base64,${Buffer.from(moduleText).toString('base64')}`);
 wasm.initSync({ module: await readFile(resolve(dir, 'arx_verify_bg.wasm')) });
 
-for (const name of ['equivocation', 'disagreement']) {
+for (const name of ['equivocation', 'prevote-equivocation', 'disagreement']) {
   const file = resolve(import.meta.dirname, '../examples', `${name}.json`);
   const json = await readFile(file, 'utf8');
   const result = JSON.parse(wasm.verify_evidence(json));

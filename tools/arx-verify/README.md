@@ -13,6 +13,11 @@ fault:
   same height. `arx-verify` checks both block signatures and that they're
   from the same proposer at the same height, and reports the pubkey that's
   provably guilty.
+- **Prevote / precommit equivocation** — a validator BLS-signed two
+  different prevotes (or precommits) at the same height and round.
+  `arx-verify` checks both signatures against the named BLS key and reports
+  it as guilty. Votes at different rounds are rejected: re-voting after a
+  round change is the protocol, not a fault.
 - **Execution disagreement** — a validator's local execution disagreed
   with a proposed block's state root and it signed a dissent saying so.
   `arx-verify` checks the proposer's block signature and the voter's BLS

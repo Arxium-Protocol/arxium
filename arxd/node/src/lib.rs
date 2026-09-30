@@ -26,13 +26,15 @@ use xc_circuit::KeySpec as _;
 use xc_runtime_api::ChainRuntime;
 
 use arxd_finality::{
-    Dissent, DissentReason, FinalityEvent, PEER_EVENT_BACKLOG_CAP, PrecommitEquivocation,
-    PrecommitVote, PrevoteVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
+    Dissent, DissentReason, Equivocation, FinalityEvent, PEER_EVENT_BACKLOG_CAP, PrecommitVote,
+    PrevoteVote, RoundTimeoutVote, dissent_signing_bytes, spawn_finality,
 };
 use arxd_network::{P2pConfig, spawn_p2p_node};
 use cli::{Cli, Command};
 use commands::*;
-use xc_artifact::{DissentAttestation, EvidenceArtifact, Fault, PrecommitAttestation};
+use xc_artifact::{
+    DissentAttestation, EvidenceArtifact, Fault, PrecommitAttestation, PrevoteAttestation,
+};
 use xc_evidence::{EquivocationEvidence, EvidenceEvent, spawn_evidence_watcher};
 use xc_executor::{AcceptBlockError, accept_block};
 use xc_mempool::Mempool;
@@ -151,6 +153,15 @@ mod dissent_cross_crate_tests {
     /// worthless if `xc-artifact` hashes a different message than the voter
     /// signed.
     #[test]
+    fn prevote_signing_bytes_match_across_crates() {
+        let genesis = [1u8; 32];
+        assert_eq!(
+            arxd_finality::prevote_signing_bytes(&genesis, 5, 2, "0xblock"),
+            xc_artifact::prevote_signing_bytes(&genesis, 5, 2, "0xblock"),
+        );
+    }
+
+    #[test]
     fn precommit_signing_bytes_match_across_crates() {
         let genesis = [1u8; 32];
         let ep = [7u8; 32];
@@ -266,7 +277,7 @@ mod dissent_evidence_bridge_tests {
             }
             EvidenceEvent::BlockObserved(_)
             | EvidenceEvent::BlockDivergence { .. }
-            | EvidenceEvent::PrecommitEquivocation { .. } => {
+            | EvidenceEvent::VoteEquivocation { .. } => {
                 panic!("expected ExecutionDisagreement")
             }
         }
@@ -425,7 +436,7 @@ fn next_own_nonce<P: serde::Serialize>(
 /// Nonce-stamps and signs a `SubmitExecutionFault` action for
 /// `artifact_json`. Shared by the two fault kinds that reach the chain
 /// through that action — a block divergence (after local re-adjudication)
-/// and a precommit equivocation (which needs none).
+/// and a vote equivocation (which needs none).
 fn sign_fault_action<R: ChainRuntime>(
     db: &ArxiumDb,
     mempool: &Mutex<Mempool<R::Payload>>,
@@ -830,13 +841,16 @@ fn spawn_evidence<R: ChainRuntime>(
         let mempool = mempool.clone();
         Some(move |artifact: EvidenceArtifact| -> Option<Action<R::Payload>> {
             let artifact_json = serde_json::to_string(&artifact).expect("artifact always encodes");
-            // A precommit equivocation is proved by its two signatures
+            // A vote equivocation is proved by its two signatures
             // alone, so there is no local re-adjudication to run and no
             // party to mistake for the culprit — the culpable key is the
             // one that signed both votes. It also needs no self-check: the
             // only way this node reports itself is if it genuinely
             // double-signed, which is exactly the fault being reported.
-            if matches!(artifact.fault, Fault::PrecommitEquivocation { .. }) {
+            if matches!(
+                artifact.fault,
+                Fault::PrevoteEquivocation { .. } | Fault::PrecommitEquivocation { .. }
+            ) {
                 return sign_fault_action::<R>(&db, &mempool, &address, &key, artifact_json);
             }
             // The node writing this artifact is, by construction, the
@@ -915,7 +929,7 @@ struct FinalityBridges<P> {
 }
 
 /// Spawns the finality thread plus the four threads bridging its output:
-/// dissents and precommit equivocations into evidence, signed precommit and
+/// dissents and vote equivocations into evidence, signed precommit and
 /// round-timeout votes onto the network's tokio channels.
 fn spawn_finality_bridges<R: ChainRuntime>(
     db: &ArxiumDb,
@@ -938,11 +952,11 @@ fn spawn_finality_bridges<R: ChainRuntime>(
     // `dissent_evidence_bridge` below). Closes the gap where only the
     // local-rejection path used to produce one.
     let (dissent_recorded_tx, dissent_recorded_rx) = std_mpsc::channel::<DissentRecord>();
-    // Precommit equivocations `spawn_finality` detects while tallying, on
+    // Prevote and precommit equivocations `spawn_finality` detects while tallying, on
     // their way to the evidence watcher — same seam as `dissent_recorded_tx`
     // above, and for the same reason: `arxd/finality` owns the votes and
     // their signing, this crate owns the artifact shape.
-    let (equivocation_tx, equivocation_rx) = std_mpsc::channel::<PrecommitEquivocation>();
+    let (equivocation_tx, equivocation_rx) = std_mpsc::channel::<Equivocation>();
 
     // Peer-sourced finality events are admitted through this counter — see
     // `PEER_EVENT_BACKLOG_CAP` for why the channel itself stays unbounded.
@@ -988,37 +1002,55 @@ fn spawn_finality_bridges<R: ChainRuntime>(
         })
     });
 
-    // Turns a detected double-signed precommit into the evidence event that
-    // writes the artifact and reports it on-chain. The BLS key is read back
-    // height-scoped (`get_bls_pubkey_at`), not current: the artifact must
-    // carry the key the votes actually verify against, which a rotation
-    // since would otherwise silently invalidate.
-    spawn_supervised("precommit_equivocation_bridge", {
+    // Turns a detected double-signed prevote or precommit into the evidence
+    // event that writes the artifact and reports it on-chain. The BLS key is
+    // read back height-scoped (`get_bls_pubkey_at`), not current: the
+    // artifact must carry the key the votes actually verify against, which a
+    // rotation since would otherwise silently invalidate.
+    spawn_supervised("vote_equivocation_bridge", {
         let db = db.clone();
         let evidence_tx = evidence_tx.clone();
         thread::spawn(move || {
             for equivocation in equivocation_rx {
-                let [a, b] = equivocation.votes;
-                let Ok(Some(pubkey)) = db.get_bls_pubkey_at(&a.voter, a.height) else {
+                let (voter, height) = match &equivocation {
+                    Equivocation::Prevote(e) => (e.votes[0].voter.clone(), e.votes[0].height),
+                    Equivocation::Precommit(e) => (e.votes[0].voter.clone(), e.votes[0].height),
+                };
+                let Ok(Some(pubkey)) = db.get_bls_pubkey_at(&voter, height) else {
                     warn!(
-                        "precommit equivocation by {} at height {} has no registered BLS key at that \
-                         height, skipping evidence artifact",
-                        a.voter, a.height
+                        "vote equivocation by {voter} at height {height} has no registered BLS key \
+                         at that height, skipping evidence artifact"
                     );
                     continue;
                 };
-                let attest = |vote: &PrecommitVote| PrecommitAttestation {
-                    height: vote.height,
-                    round: vote.round,
-                    block_hash: vote.block_hash.to_string(),
-                    ep: format!("0x{}", hex::encode(vote.ep)),
-                    signature: format!("0x{}", hex::encode(vote.signature.0)),
+                let voter_pubkey = format!("0x{}", hex::encode(pubkey.0));
+                let fault = match equivocation {
+                    Equivocation::Prevote(e) => Fault::PrevoteEquivocation {
+                        voter_pubkey,
+                        height,
+                        prevotes: e.votes.map(|vote| PrevoteAttestation {
+                            height: vote.height,
+                            round: vote.round,
+                            block_hash: vote.block_hash.to_string(),
+                            signature: format!("0x{}", hex::encode(vote.signature.0)),
+                        }),
+                    },
+                    Equivocation::Precommit(e) => Fault::PrecommitEquivocation {
+                        voter_pubkey,
+                        height,
+                        precommits: e.votes.map(|vote| PrecommitAttestation {
+                            height: vote.height,
+                            round: vote.round,
+                            block_hash: vote.block_hash.to_string(),
+                            ep: format!("0x{}", hex::encode(vote.ep)),
+                            signature: format!("0x{}", hex::encode(vote.signature.0)),
+                        }),
+                    },
                 };
-                let _ = evidence_tx.send(EvidenceEvent::<R::Payload>::PrecommitEquivocation {
-                    voter: a.voter.clone(),
-                    voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
-                    height: a.height,
-                    precommits: [attest(&a), attest(&b)],
+                let _ = evidence_tx.send(EvidenceEvent::<R::Payload>::VoteEquivocation {
+                    voter,
+                    height,
+                    fault,
                 });
             }
         })
