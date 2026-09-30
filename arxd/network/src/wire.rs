@@ -37,8 +37,9 @@ pub fn sync_protocol(chain_id: &str) -> String {
 /// apart within one `SYNC_PROTOCOL` generation.
 ///
 /// 1 = `Status` + `Blocks`. 2 = adds `NodeInfo` and `Hashes`. 3 = adds
-/// `Certificate`. 4 = adds `SnapshotManifest` and `SnapshotChunk`.
-pub const WIRE_VERSION: u32 = 4;
+/// `Certificate`. 4 = adds `SnapshotManifest` and `SnapshotChunk`. 5 = adds
+/// `Certificates`.
+pub const WIRE_VERSION: u32 = 5;
 
 /// `Blocks` returns at most the responder's page size (see
 /// [`NodeInfo::max_page_size`]) starting at `from`, capped at its local tip —
@@ -84,6 +85,15 @@ pub enum SyncRequest {
     SnapshotChunk {
         height: u64,
         index: u32,
+    },
+    /// Up to a page of the responder's finality certificates, contiguous from
+    /// `from` and stopping at its first uncertified height.
+    ///
+    /// Exists for watermark backfill (Trello 137): synced blocks arrive
+    /// without certificates, and fetching them one `Certificate` per round
+    /// trip left a fresh node's watermark thousands of heights behind.
+    Certificates {
+        from: u64,
     },
 }
 
@@ -144,6 +154,13 @@ pub enum SyncResponse<B> {
         height: u64,
         index: u32,
         entries: Option<Vec<SnapshotEntry>>,
+    },
+    /// Answer to [`SyncRequest::Certificates`]: bincode-encoded records for
+    /// `from`, `from + 1`, … in order, opaque and unverified as `Certificate`'s.
+    /// Empty when the responder has none at `from`.
+    Certificates {
+        from: u64,
+        records: Vec<Vec<u8>>,
     },
 }
 

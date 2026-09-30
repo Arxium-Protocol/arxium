@@ -539,9 +539,9 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     if !recovering.contains_key(&peer) && !halted_below_watermark {
                         let watermark = db.get_final_watermark().unwrap_or(0);
                         if watermark < local_tip_height(&db) {
-                            recovering.insert(peer, RecoveryStep::BackfillingCertificate(watermark + 1));
-                            send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate {
-                                height: watermark + 1,
+                            recovering.insert(peer, RecoveryStep::BackfillingCertificates(watermark + 1));
+                            send_sync_request(&mut swarm, &peer, &SyncRequest::Certificates {
+                                from: watermark + 1,
                             });
                         }
                     }
@@ -880,6 +880,13 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                     // MAX_CONSECUTIVE_SYNC_FAILURES the tick skips this peer
                     // entirely until it reconnects or a request succeeds.
                     counter!("arxium_sync_outbound_failures_total").increment(1);
+                    // A lost page would otherwise hold this peer's backfill
+                    // open forever (the tick only starts one when none is).
+                    // An old peer that can't decode `Certificates` lands here
+                    // too, and just retries each tick.
+                    if matches!(recovering.get(&peer), Some(RecoveryStep::BackfillingCertificates(_))) {
+                        recovering.remove(&peer);
+                    }
                     let failures = sync_failures.entry(peer).or_insert(0);
                     if matches!(error, request_response::OutboundFailure::UnsupportedProtocols) {
                         // A peer capability, not a transient fault (e.g. the
@@ -964,6 +971,7 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                             SyncResponse::Certificate { .. } => "certificate",
                             SyncResponse::SnapshotManifest(_) => "snapshot_manifest",
                             SyncResponse::SnapshotChunk { .. } => "snapshot_chunk",
+                            SyncResponse::Certificates { .. } => "certificates",
                         };
                         counter!("arxium_sync_responses_total", "kind" => kind).increment(1);
                         // While a snapshot is being fetched, every step of it
@@ -1021,6 +1029,62 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                         "peer {peer} serves blocks this node rejects but agrees with it everywhere from the watermark to the tip — not a fork this node can roll back to; giving up on {peer}"
                                     ),
                                 }
+                            }
+                            // Watermark backfill, a page per round trip. Only
+                            // certificates that verify *and* name the block
+                            // this node holds are kept here; anything else
+                            // goes to the single-height path below, which owns
+                            // conflict and divergence handling.
+                            SyncResponse::Certificates { from, records } => {
+                                if recovering.get(&peer) != Some(&RecoveryStep::BackfillingCertificates(from)) {
+                                    warn!("unsolicited certificates page from {peer}, ignoring");
+                                    continue;
+                                }
+                                recovering.remove(&peer);
+                                let tip = local_tip_height(&db);
+                                let mut verified = Vec::new();
+                                let mut handoff = None;
+                                for (height, bytes) in (from..=tip).zip(&records) {
+                                    let Some(record) = decode_wire::<FinalityRecord>(bytes)
+                                        .ok()
+                                        .filter(|record| record.height == height && verify_finality_record(&db, record))
+                                    else {
+                                        warn!("certificate from {peer} at {height} does not verify against this node's validator set; keeping the page before it");
+                                        break;
+                                    };
+                                    let local_hash = db.get_block::<P>(height).ok().flatten().map(|block| block.hash());
+                                    let stored = db.get_finality_record(height).ok().flatten();
+                                    if local_hash != Some(record.block_hash)
+                                        || stored.is_some_and(|stored| stored.block_hash != record.block_hash)
+                                    {
+                                        handoff = Some(height);
+                                        break;
+                                    }
+                                    verified.push(record);
+                                }
+                                // One atomic, fsync'd batch per page, not per
+                                // height; the watermark advances inside it.
+                                let batch: Vec<&dyn xc_storage::BatchWritable> =
+                                    verified.iter().map(|record| record as &dyn xc_storage::BatchWritable).collect();
+                                if !batch.is_empty()
+                                    && let Err(err) = db.write_batches(&batch)
+                                {
+                                    warn!("failed to persist {} verified certificate(s) from {from}: {err}", batch.len());
+                                    continue;
+                                }
+                                if let Some(height) = handoff {
+                                    recovering.insert(peer, RecoveryStep::BackfillingCertificate(height));
+                                    send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate { height });
+                                } else if !verified.is_empty() {
+                                    let watermark = db.get_final_watermark().unwrap_or(0);
+                                    if watermark < tip {
+                                        recovering.insert(peer, RecoveryStep::BackfillingCertificates(watermark + 1));
+                                        send_sync_request(&mut swarm, &peer, &SyncRequest::Certificates {
+                                            from: watermark + 1,
+                                        });
+                                    }
+                                }
+                                continue;
                             }
                             // Step two: the only input in this whole path that
                             // is allowed to move local state, and only after
@@ -1095,9 +1159,9 @@ async fn run_swarm<P: Payload>(params: SwarmParams<'_, P>, ready_tx: std_mpsc::S
                                     // than one height per status tick.
                                     let watermark = db.get_final_watermark().unwrap_or(0);
                                     if watermark < local_tip_height(&db) {
-                                        recovering.insert(peer, RecoveryStep::BackfillingCertificate(watermark + 1));
-                                        send_sync_request(&mut swarm, &peer, &SyncRequest::Certificate {
-                                            height: watermark + 1,
+                                        recovering.insert(peer, RecoveryStep::BackfillingCertificates(watermark + 1));
+                                        send_sync_request(&mut swarm, &peer, &SyncRequest::Certificates {
+                                            from: watermark + 1,
                                         });
                                     }
                                     continue;

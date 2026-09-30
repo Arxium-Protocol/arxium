@@ -63,6 +63,10 @@ pub(crate) enum RecoveryStep {
     /// below the gap forever. Same request, same verification, same persist
     /// path as a divergence; only the reason for asking differs.
     BackfillingCertificate(u64),
+    /// The same backfill a page at a time (`SyncRequest::Certificates`): the
+    /// normal path. The single-height step above is left for a height whose
+    /// certificate names a block this node doesn't hold.
+    BackfillingCertificates(u64),
 }
 
 impl RecoveryStep {
@@ -71,7 +75,7 @@ impl RecoveryStep {
         match self {
             RecoveryStep::AwaitingCertificate(height)
             | RecoveryStep::BackfillingCertificate(height) => Some(height),
-            RecoveryStep::AwaitingHashes => None,
+            RecoveryStep::AwaitingHashes | RecoveryStep::BackfillingCertificates(_) => None,
         }
     }
 }
