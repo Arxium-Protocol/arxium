@@ -299,6 +299,16 @@ impl BatchWritable for EvidenceMarker {
                 .encode(),
                 vec![1u8],
             ));
+            // Unresolved until governance's `ResolveDispute` deletes it;
+            // pauses settlement meanwhile (`ArxiumDb::get_settled_height`).
+            entries.push((
+                DisputeOpenKey {
+                    height: self.height,
+                    header,
+                }
+                .encode(),
+                vec![1u8],
+            ));
         }
         Ok(entries)
     }

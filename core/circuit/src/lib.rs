@@ -322,6 +322,31 @@ impl KeySpec for DisputedBlockKey {
     }
 }
 
+/// An upheld dispute against `header` at `height` that governance has not
+/// resolved yet. Written with `DisputedBlockKey`; deleted by an executed
+/// `GovernanceAction::ResolveDispute`. While any exists, settlement is
+/// capped below the lowest such height (`ArxiumDb::get_settled_height`).
+pub struct DisputeOpenKey {
+    pub height: u64,
+    pub header: [u8; 32],
+}
+impl DisputeOpenKey {
+    pub const PREFIX: &'static str = "evidence:dispute_open:";
+}
+impl KeySpec for DisputeOpenKey {
+    const CF: &'static str = CF_EVIDENCE;
+    type Value = ();
+    fn encode(&self) -> Vec<u8> {
+        format!(
+            "{}{:020}:{}",
+            Self::PREFIX,
+            self.height,
+            hex::encode(self.header)
+        )
+        .into_bytes()
+    }
+}
+
 /// This chain's genesis hash — block 0's state root — seeded once at genesis
 /// so `dispatch` can check a submitted fault artifact's `genesis_hash`
 /// against the chain it is actually running on.

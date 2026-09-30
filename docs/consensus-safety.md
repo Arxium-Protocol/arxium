@@ -179,7 +179,7 @@ height, because the culprit's block is often one the chain dropped (its
 round timed out and another block was certified at that height), and that
 other block must still settle. The chain does not unwind a certified
 block on its own; what to do with the state after a disputed block is an
-operator and governance decision.
+operator and governance decision (recovery, below).
 
 Whoever submitted an upheld fault (this action or
 `SubmitEquivocationEvidence`) gets `challenger_reward_bps` of what was
@@ -197,3 +197,63 @@ W = 48h follows CometBFT's default evidence age. Optimistic rollups use ~7
 days because a challenger has to get through a possibly censored L1; here
 the evidence lands on this chain, where any one honest proposer includes
 it, and dissenting validators submit within seconds.
+
+### Recovery after an upheld dispute
+
+**Rule: an upheld dispute pauses settlement, not the chain.** Blocks keep
+being produced and users keep transacting. The dispute also writes
+`DisputeOpenKey { height, header }`, and while any such key exists
+`get_settled_height` is `min(watermark - window, lowest_open_dispute - 1)`,
+so nothing from the bad block onward becomes `final` (the RPC `settlement`
+field follows it). Those blocks read `attested`, which is exactly what the
+challenge window already tells users. The chain never halts or rolls back
+by itself.
+
+**Detect.** The node logs `execution dispute upheld` at `error!` level, and
+`/status` carries `open_dispute_height` (null when none). Alert on it being
+non-null. There is no metrics endpoint in `arxd` yet; the log line and this
+field are the hooks.
+
+**Decide, by this criterion, fixed before an incident:**
+
+- **A. Accept and correct (default).** Use it when the supply invariant and
+  the validator-set invariant still hold after the disputed block.
+  Validators propose `ResolveDispute { height, header, resolution: Accept,
+  corrections }` (`corrections` = balances to set, empty if the difference is
+  harmless) and vote it through like any proposal. Executing it deletes the
+  open marker, applies the corrections, and settlement resumes. No history
+  is rewritten.
+- **B. Fork, rebasing instead of rolling back.** Use it only when an
+  invariant is broken or the difference is too large to reason about.
+  1. Operators halt the chain.
+  2. Export the state at the disputed block's `parent_state_root`
+     (`ArxiumDb::state_at(height - 1)`; undo records are kept for the whole
+     challenge window plus 5,000 blocks, so this works for any dispute the
+     chain can still uphold) and apply the disputed block correctly with the
+     fixed binary.
+  3. Replay the transactions from later blocks, in order, on the corrected
+     state. Drop any that now fail and publish that list.
+  4. Restart from the result as a new genesis that keeps the height. The
+     old chain's open marker goes away with it, so no `ResolveDispute` is
+     needed there; `Forked` exists to record it if the old chain stays up,
+     and takes no corrections.
+
+  This keeps most of up to 48h of user activity instead of discarding it.
+
+**Who and when.** The validator set decides, through the ordinary proposal
+and vote (`voting_period_blocks`). Settlement stays paused for as long as it
+takes; nobody is promised finality for those blocks meanwhile.
+
+**Dissenting nodes.** A node that re-executed and disagreed sits on
+`local tip stuck` / `HaltBelowWatermark`. It probably still holds the correct
+parent state, but do not depend on it: export from a node that has the undo
+records, keep the dissenter's data directory for forensics, and re-sync it
+from the resolved chain (path A) or the new genesis (path B).
+
+**Storage cost.** Retaining undo records for the window is ~86k records,
+each holding only the keys that block touched. `state_at` materialises the
+whole state in memory, which is fine for a one-time recovery export.
+
+Not built: automatic halting, automatic rollback, a rebase tool. Path B is
+to be rehearsed once on devnet (force a bad root, uphold the dispute, export,
+rebase, restart) and the tool written from what that needs.

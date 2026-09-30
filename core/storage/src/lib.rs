@@ -16,8 +16,8 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
     AccountAssetsKey, AccountKey, AdminKey, AdminRole, AssetBalanceKey, AssetHolderStateKey,
     AssetHoldersKey, AssetIndexKey, AssetKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey,
-    ChainParamsKey, DisputedBlockKey, EvidenceMarkerKey, GenesisHashKey, KeySpec, KvRead,
-    OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorCandidatesKey,
+    ChainParamsKey, DisputeOpenKey, DisputedBlockKey, EvidenceMarkerKey, GenesisHashKey, KeySpec,
+    KvRead, OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorCandidatesKey,
     ValidatorSetKey, ValidatorStatusKey,
 };
 use xc_circuit::{
@@ -378,7 +378,11 @@ const COLUMN_FAMILIES: [&str; 9] = [
 ///
 /// Bumped 22 -> 23: `ChainParams` gained `token_create_fee` (the token
 /// circuit) — positional bincode on the `chain_params` row. Devnet reset.
-pub const SCHEMA_VERSION: u32 = 23;
+///
+/// Bumped 23 -> 24: an upheld dispute also writes `evidence:dispute_open:`
+/// rows, and `GovernanceAction` gained `ResolveDispute` (Trello 183).
+/// Merkleized keys and positional bincode — devnet reset.
+pub const SCHEMA_VERSION: u32 = 24;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -1379,13 +1383,25 @@ impl ArxiumDb {
         Ok(())
     }
 
+    /// How many blocks of undo records to keep below the watermark: the whole
+    /// challenge window plus `UNDO_RETAIN` of margin, so `state_at(parent)` of
+    /// a block disputed at the last moment can still be exported (the parent
+    /// state is what a rebase starts from). Read from chain params because
+    /// `SetChainParams` can change the window.
+    fn undo_retain(&self) -> Result<u64, StorageError> {
+        Ok(self
+            .chain_params()?
+            .challenge_window_blocks
+            .saturating_add(UNDO_RETAIN))
+    }
+
     /// Advances `FINAL_WATERMARK_KEY` as far as contiguity allows, given the
     /// certificates already on disk plus `incoming` (the heights certified by
     /// the batch being staged, which aren't readable yet). Out-of-order
     /// certificates simply don't move it; they get absorbed later when the gap
     /// they left ahead of the watermark fills in.
     ///
-    /// Undo records more than `UNDO_RETAIN` below the new watermark are
+    /// Undo records more than `undo_retain` below the new watermark are
     /// dropped in the same batch — the watermark is the revert floor, so
     /// those can never be needed for a revert; the window above that floor
     /// is kept so `state_at` can still serve a snapshot at a recent height.
@@ -1426,8 +1442,11 @@ impl ArxiumDb {
             FINAL_WATERMARK_KEY,
             watermark.to_be_bytes(),
         );
-        let was_pruned_to = start.saturating_sub(UNDO_RETAIN);
-        for height in was_pruned_to + 1..=watermark.saturating_sub(UNDO_RETAIN) {
+        // ponytail: a window shortened by `SetChainParams` leaves the records
+        // between the old and new retention undeleted; harmless, they're small.
+        let retain = self.undo_retain()?;
+        let was_pruned_to = start.saturating_sub(retain);
+        for height in was_pruned_to + 1..=watermark.saturating_sub(retain) {
             batch.delete_cf(self.cf(CF_META), undo_key(height));
         }
         Ok(())
@@ -2079,9 +2098,38 @@ impl ArxiumDb {
     /// by `h + challenge_window_blocks`, so once the final watermark is
     /// there nothing can still be recorded against `h`. Blocks at or below
     /// this that `is_block_disputed` are the exception — they never settle.
+    ///
+    /// An upheld dispute that governance hasn't resolved pauses settlement
+    /// below it: capped at `lowest_open_dispute - 1`, so nothing built on the
+    /// bad block becomes final while a rollback is still possible.
     pub fn get_settled_height(&self) -> Result<u64, StorageError> {
         let window = self.chain_params()?.challenge_window_blocks;
-        Ok(self.get_final_watermark()?.saturating_sub(window))
+        let settled = self.get_final_watermark()?.saturating_sub(window);
+        Ok(match self.lowest_open_dispute()? {
+            Some(height) => settled.min(height.saturating_sub(1)),
+            None => settled,
+        })
+    }
+
+    /// Lowest height with an unresolved upheld dispute (`DisputeOpenKey`).
+    /// Keys are zero-padded, so the first one under the prefix is the lowest.
+    pub fn lowest_open_dispute(&self) -> Result<Option<u64>, StorageError> {
+        let prefix = DisputeOpenKey::PREFIX.as_bytes();
+        let mut iter = self.db.iterator_cf(
+            self.cf(CF_EVIDENCE),
+            IteratorMode::From(prefix, Direction::Forward),
+        );
+        if let Some(item) = iter.next() {
+            let (key, _) = item?;
+            if let Some(rest) = key.strip_prefix(prefix) {
+                let height = rest.get(..20).and_then(|d| std::str::from_utf8(d).ok());
+                return height
+                    .and_then(|d| d.parse().ok())
+                    .map(Some)
+                    .ok_or(StorageError::CorruptedMeta);
+            }
+        }
+        Ok(None)
     }
 
     /// Whether the block at `height` whose header signing bytes hash to
@@ -3918,6 +3966,12 @@ mod divergence_recovery_tests {
     #[test]
     fn undo_records_are_pruned_once_the_watermark_passes_them() {
         let db = ArxiumDb::open(&temp_path()).unwrap();
+        // Retention is the challenge window plus `UNDO_RETAIN`.
+        db.write_batch(&ChainParamsRow(ChainParams {
+            challenge_window_blocks: 10,
+            ..Default::default()
+        }))
+        .unwrap();
         for height in 0..=5 {
             commit(&db, height, 1, height as u128);
         }
@@ -3932,19 +3986,20 @@ mod divergence_recovery_tests {
             );
         }
         // Fake a watermark far past the window and advance once more: only
-        // heights more than `UNDO_RETAIN` below it go.
+        // heights more than the retention below it go.
+        let retain = UNDO_RETAIN + 10;
         let mut batch = WriteBatch::default();
         batch.put_cf(
             db.cf(CF_META),
             FINAL_WATERMARK_KEY,
-            (UNDO_RETAIN + 2).to_be_bytes(),
+            (retain + 2).to_be_bytes(),
         );
         db.db.write(batch).unwrap();
-        for height in 6..=UNDO_RETAIN + 3 {
+        for height in 6..=retain + 3 {
             commit(&db, height, 1, height as u128);
         }
-        certify(&db, UNDO_RETAIN + 3);
-        assert_eq!(db.get_final_watermark().unwrap(), UNDO_RETAIN + 3);
+        certify(&db, retain + 3);
+        assert_eq!(db.get_final_watermark().unwrap(), retain + 3);
         assert!(
             db.get(&undo_key(3)).unwrap().is_none(),
             "undo 3 is past the window"
@@ -3953,6 +4008,51 @@ mod divergence_recovery_tests {
             db.get(&undo_key(4)).unwrap().is_some(),
             "undo 4 is exactly UNDO_RETAIN below"
         );
+    }
+
+    /// Retention follows the challenge window: with the default 86_400-block
+    /// window nothing inside it is pruned, so `state_at(parent)` still works
+    /// for a dispute upheld at the very end of the window.
+    #[test]
+    fn undo_retention_covers_the_whole_challenge_window() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        assert!(db.undo_retain().unwrap() > db.chain_params().unwrap().challenge_window_blocks);
+    }
+
+    /// An upheld dispute pauses settlement below it until it is deleted.
+    #[test]
+    fn an_open_dispute_caps_the_settled_height() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        db.write_batch(&ChainParamsRow(ChainParams {
+            challenge_window_blocks: 2,
+            ..Default::default()
+        }))
+        .unwrap();
+        for height in 0..=10 {
+            commit(&db, height, 1, height as u128);
+        }
+        for height in 1..=10 {
+            certify(&db, height);
+        }
+        assert_eq!(db.get_settled_height().unwrap(), 8);
+        assert_eq!(db.lowest_open_dispute().unwrap(), None);
+
+        db.write_batch(&EvidenceMarker {
+            height: 6,
+            proposer: addr(1),
+            disputed: Some([7u8; 32]),
+        })
+        .unwrap();
+        assert_eq!(db.lowest_open_dispute().unwrap(), Some(6));
+        assert_eq!(db.get_settled_height().unwrap(), 5);
+
+        let mut resolved = GovernanceUpdates::default();
+        resolved.delete(&DisputeOpenKey {
+            height: 6,
+            header: [7u8; 32],
+        });
+        db.write_batch(&resolved).unwrap();
+        assert_eq!(db.get_settled_height().unwrap(), 8);
     }
 
     /// The case that makes the watermark a floor on *this node's* history

@@ -654,7 +654,15 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
         0
     });
 
+    // Non-null means an upheld dispute is unresolved and settlement is
+    // paused below it: the field an operator's alert rule watches.
+    let open_dispute_height = state.db.lowest_open_dispute().unwrap_or_else(|err| {
+        warn!("failed to read open disputes for /status: {err}");
+        None
+    });
+
     Ok(Json(serde_json::json!({
+        "open_dispute_height": open_dispute_height,
         "chain_name": chain_name,
         // This crate's version — bumped whenever the JSON shape of a block
         // changes, so an HTTP reader (Retracer) can refuse a node whose
