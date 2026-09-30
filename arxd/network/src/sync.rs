@@ -184,6 +184,21 @@ pub(crate) fn build_sync_response<P: Payload>(
             index,
             entries: crate::snapshot_sync::chunk(db, height, index),
         },
+        // Inclusive range so `from` near `u64::MAX` can't overflow.
+        SyncRequest::Certificates { from } => SyncResponse::<Block<P>>::Certificates {
+            from,
+            records: (from..=from.saturating_add(xc_storage::MAX_PAGE_SIZE as u64 - 1))
+                .map_while(|height| {
+                    let record = db.get_finality_record(height).unwrap_or_else(|err| {
+                        warn!("failed to read finality record at {height} for {peer}: {err}");
+                        None
+                    })?;
+                    bincode::serde::encode_to_vec(&record, xc_primitives::wire_config())
+                        .map_err(|err| warn!("failed to encode finality record at {height}: {err}"))
+                        .ok()
+                })
+                .collect(),
+        },
     }
 }
 
@@ -238,6 +253,7 @@ pub(crate) fn send_sync_request(
         SyncRequest::Certificate { .. } => "certificate",
         SyncRequest::SnapshotManifest { .. } => "snapshot_manifest",
         SyncRequest::SnapshotChunk { .. } => "snapshot_chunk",
+        SyncRequest::Certificates { .. } => "certificates",
     };
     match bincode::serde::encode_to_vec(request, bincode::config::standard()) {
         Ok(bytes) => {
@@ -502,6 +518,38 @@ pub(crate) mod tests {
             panic!("expected Certificate response");
         };
         assert_eq!(record, None);
+    }
+
+    #[test]
+    fn certificates_page_is_contiguous_and_stops_at_the_first_gap() {
+        let db = temp_db();
+        for h in 0..=5 {
+            db.write_batch(&block(h)).unwrap();
+        }
+        for h in [1, 2, 3, 5] {
+            certify(&db, h);
+        }
+        let heights = |from| {
+            let SyncResponse::Certificates { records, .. } = build_sync_response::<()>(
+                &db,
+                PeerId::random(),
+                SyncRequest::Certificates { from },
+            ) else {
+                panic!("expected Certificates response");
+            };
+            records
+                .iter()
+                .map(|bytes| {
+                    crate::decode_wire::<xc_storage::FinalityRecord>(bytes)
+                        .unwrap()
+                        .height
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(heights(1), vec![1, 2, 3]);
+        assert_eq!(heights(4), Vec::<u64>::new());
+        assert_eq!(heights(5), vec![5]);
+        assert_eq!(heights(u64::MAX), Vec::<u64>::new());
     }
 
     #[test]
