@@ -228,7 +228,7 @@ pub enum ActionPayload {
         attestor: Address,
         reason: String,
     },
-    /// Submits a `Fault::BlockDivergence` (or `Fault::PrecommitEquivocation`)
+    /// Submits a `Fault::BlockDivergence` (or a prevote/precommit equivocation)
     /// evidence artifact (JSON-serialized `xc_artifact::EvidenceArtifact`)
     /// for on-chain adjudication and slashing — the counterpart to
     /// `SubmitEquivocationEvidence` for a fault that needs chain-specific

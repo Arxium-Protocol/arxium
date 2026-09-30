@@ -116,7 +116,8 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
     Ok(updates)
 }
 
-/// Submits a `Fault::BlockDivergence` (or `Fault::PrecommitEquivocation`)
+/// Submits a `Fault::BlockDivergence` (or a `Fault::PrevoteEquivocation` /
+/// `Fault::PrecommitEquivocation`)
 /// evidence artifact for adjudication and slashing — the counterpart to
 /// `submit_equivocation_evidence` for a fault that can't name a culprit
 /// from signatures alone and needs chain-specific replay
@@ -163,7 +164,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     // The challenge window: an execution dispute over block `height` must
     // land within `challenge_window_blocks` of it, after which that block is
     // FINAL (once certified) and no longer open to one. Checked before the
-    // replay so a stale artifact costs nothing to refuse. A precommit
+    // replay so a stale artifact costs nothing to refuse. A vote
     // equivocation is a double-sign, not a dispute over the block, so it is
     // bounded by unbonding like `SubmitEquivocationEvidence` instead.
     if let xc_artifact::Fault::BlockDivergence { height, .. } = &artifact.fault {
@@ -178,7 +179,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     }
 
     // `reason` rides along with the culprit because not every fault that
-    // arrives here is an execution fault: a precommit equivocation is a
+    // arrives here is an execution fault: a vote equivocation is a
     // double-sign (whitepaper §9.3), and the slash record must say so.
     let (outcome, height, proposer_pubkey, voter_pubkey, reason) = match &artifact.fault {
         xc_artifact::Fault::BlockDivergence {
@@ -198,25 +199,33 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
             )
         }
         // No replay, no second party: two BLS signatures over two different
-        // precommit messages at one height are the whole proof, so
+        // prevote or precommit messages at one (height, round) are the whole
+        // proof, so
         // `xc_artifact::verify` names the culprit outright — the same shape
         // `Fault::Equivocation` has, which is why this one can ride this
         // action instead of needing its own. `proposer_pubkey` is empty
         // because the fault has no proposer; the culpability match below
         // compares against it first and an empty string can never equal a
         // hex-encoded key.
-        xc_artifact::Fault::PrecommitEquivocation {
+        // Both phases slash the same: a double prevote is as attributable
+        // as a double precommit, and one tombstone covers either.
+        xc_artifact::Fault::PrevoteEquivocation {
+            voter_pubkey,
+            height,
+            ..
+        }
+        | xc_artifact::Fault::PrecommitEquivocation {
             voter_pubkey,
             height,
             ..
         } => {
             let verdict = xc_artifact::verify(&artifact)
-                .map_err(|err| anyhow::anyhow!("invalid precommit equivocation artifact: {err}"))?;
+                .map_err(|err| anyhow::anyhow!("invalid vote equivocation artifact: {err}"))?;
             let xc_artifact::Verdict::Culpable {
                 culpable_pubkey, ..
             } = verdict
             else {
-                anyhow::bail!("precommit equivocation did not name a culprit");
+                anyhow::bail!("vote equivocation did not name a culprit");
             };
             (
                 crate::adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey },
@@ -690,6 +699,113 @@ mod tests {
         let marker = updates.evidence.expect("must write an evidence marker");
         assert_eq!(marker.height, 5);
         assert_eq!(marker.proposer, voter);
+    }
+
+    /// D-26: a double prevote slashes exactly like a double precommit, and
+    /// the (height, culprit) evidence marker stops the same pair from being
+    /// submitted again.
+    #[test]
+    fn prevote_equivocation_artifact_slashes_the_double_signer_once() {
+        let voter = Address::from_pubkey_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[4u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let (sk, pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
+        let prevote = |block_hash: &str| xc_artifact::PrevoteAttestation {
+            height: 5,
+            round: 0,
+            block_hash: block_hash.to_string(),
+            signature: format!(
+                "0x{}",
+                hex::encode(
+                    xc_bls::sign(
+                        &sk,
+                        &xc_artifact::prevote_signing_bytes(&[0xa1; 32], 5, 0, block_hash)
+                    )
+                    .0
+                )
+            ),
+        };
+        let artifact = xc_artifact::EvidenceArtifact {
+            artifact_version: xc_artifact::ARTIFACT_VERSION,
+            genesis_hash: format!("0x{}", hex::encode([0xa1u8; 32])),
+            fault: xc_artifact::Fault::PrevoteEquivocation {
+                voter_pubkey: format!("0x{}", hex::encode(pk.0)),
+                height: 5,
+                prevotes: [prevote("0xaaa"), prevote("0xbbb")],
+            },
+            human_readable: serde_json::json!({}),
+        };
+        let reporter = Address::from_pubkey_bytes(
+            ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        )
+        .unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (circuit_staking::stake_subaccount(&voter), funded(10_000)),
+                (reporter.clone(), funded(FEE_BUDGET)),
+            ]),
+            HashMap::from([(
+                (voter.clone(), voter.clone()),
+                self_allocation(&voter, 10_000),
+            )]),
+        );
+        view.put(&StakeByValidatorKey(&voter), &vec![voter.clone()])
+            .unwrap();
+        view.put(&GenesisHashKey, &hex::encode([0xa1u8; 32]))
+            .unwrap();
+        let voter_for_lookup = voter.clone();
+        let bls_owner = move |_: &BlsPublicKey| Ok(Some(voter_for_lookup.clone()));
+        let action = Action {
+            sender: reporter.clone(),
+            nonce: 0,
+            signature: None,
+            payload: ActionPayload::SubmitExecutionFault {
+                artifact_json: serde_json::to_string(&artifact).unwrap(),
+            },
+        };
+        let dispatch = |view: &_| {
+            crate::dispatch(
+                &action,
+                view,
+                &operator_lookup,
+                &operator_validators_lookup,
+                &[],
+                10,
+                &bls_owner,
+                0,
+            )
+        };
+
+        let updates = dispatch(&view).unwrap();
+        assert!(
+            updates
+                .stakes
+                .allocations
+                .get(&(voter.clone(), voter.clone()))
+                .unwrap()
+                .is_none(),
+            "same full-stake slash as a double precommit"
+        );
+        let marker = updates.evidence.expect("must write an evidence marker");
+        assert_eq!((marker.height, &marker.proposer), (5, &voter));
+
+        view.put(
+            &EvidenceMarkerKey {
+                height: 5,
+                proposer: &voter,
+            },
+            &(),
+        )
+        .unwrap();
+        let err = dispatch(&view).unwrap_err();
+        assert!(err.to_string().contains("already processed"), "{err}");
     }
 
     #[test]

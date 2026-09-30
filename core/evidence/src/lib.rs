@@ -13,7 +13,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 use xc_artifact::{
     ARTIFACT_VERSION, BlockAttestation, BlockDissentClaim, CanonicalHeader, DissentAttestation,
-    EvidenceArtifact, Fault, PrecommitAttestation,
+    EvidenceArtifact, Fault,
 };
 use xc_mempool::Mempool;
 use xc_primitives::{Action, Address, Block, SignatureError};
@@ -116,19 +116,19 @@ pub enum EvidenceEvent<P> {
         voter_pubkey: String,
         dissent_claim: BlockDissentClaim,
     },
-    /// A validator signed two conflicting precommits at one height,
-    /// detected by `arxd/finality`'s tally. Carries the already-hex-encoded
-    /// attestations for the same reason `ExecutionDisagreement` carries a
-    /// `DissentAttestation`: the signing and detection live in
-    /// `arxd/finality`, and this crate only needs enough to write the
-    /// artifact and report it.
-    PrecommitEquivocation {
+    /// A validator signed two conflicting prevotes or precommits at one
+    /// (height, round), detected by `arxd/finality`'s tally. `fault` is the
+    /// already-built `Fault::PrevoteEquivocation` or
+    /// `Fault::PrecommitEquivocation`, for the same reason
+    /// `ExecutionDisagreement` carries a ready `DissentAttestation`: the
+    /// signing and detection live in `arxd/finality`, and this crate only
+    /// needs enough to write the artifact and report it.
+    VoteEquivocation {
         /// Bech32 address of the culpable voter — artifact filename and
         /// dedup key, same role `voter` plays for `BlockDivergence`.
         voter: Address,
-        voter_pubkey: String,
         height: u64,
-        precommits: [PrecommitAttestation; 2],
+        fault: Fault,
     },
 }
 
@@ -280,35 +280,40 @@ fn write_disagreement_artifact<P: Serialize>(
     }
 }
 
-/// Builds a `PrecommitEquivocation` artifact and writes it to
-/// `<evidence_dir>/<height>-precommit-equivocation-<voter>.json`. Returns
-/// the artifact whether or not the write succeeded — unlike the fraud-proof
-/// path, nothing here is derived from what lands on disk, so a full disk
-/// must not be what stops a provable double-sign from being reported.
-fn write_precommit_equivocation_artifact(
+/// Builds a vote-equivocation artifact and writes it to
+/// `<evidence_dir>/<height>-{prevote,precommit}-equivocation-<voter>.json`.
+/// Returns the artifact whether or not the write succeeded — unlike the
+/// fraud-proof path, nothing here is derived from what lands on disk, so a
+/// full disk must not be what stops a provable double-sign from being
+/// reported.
+fn write_vote_equivocation_artifact(
     evidence_dir: &Path,
     genesis_hash: [u8; 32],
     voter: &Address,
-    voter_pubkey: &str,
     height: u64,
-    precommits: [PrecommitAttestation; 2],
+    fault: Fault,
 ) -> EvidenceArtifact {
+    let (kind, block_hashes) = match &fault {
+        Fault::PrevoteEquivocation {
+            prevotes: [a, b], ..
+        } => ("prevote", [&a.block_hash, &b.block_hash]),
+        Fault::PrecommitEquivocation {
+            precommits: [a, b], ..
+        } => ("precommit", [&a.block_hash, &b.block_hash]),
+        _ => unreachable!("VoteEquivocation only ever carries a vote fault"),
+    };
     let artifact = EvidenceArtifact {
         artifact_version: ARTIFACT_VERSION,
         genesis_hash: format!("0x{}", hex::encode(genesis_hash)),
         human_readable: serde_json::json!({
             "voter": voter.to_string(),
-            "block_hash_a": precommits[0].block_hash,
-            "block_hash_b": precommits[1].block_hash,
+            "block_hash_a": block_hashes[0],
+            "block_hash_b": block_hashes[1],
         }),
-        fault: Fault::PrecommitEquivocation {
-            voter_pubkey: voter_pubkey.to_string(),
-            height,
-            precommits,
-        },
+        fault,
     };
 
-    let path = evidence_dir.join(format!("{height}-precommit-equivocation-{voter}.json"));
+    let path = evidence_dir.join(format!("{height}-{kind}-equivocation-{voter}.json"));
     match std::fs::create_dir_all(evidence_dir).and_then(|()| {
         let bytes = serde_json::to_vec_pretty(&artifact).expect("artifact always encodes");
         std::fs::write(&path, bytes)
@@ -550,19 +555,17 @@ where
                     }
                     continue;
                 }
-                EvidenceEvent::PrecommitEquivocation {
+                EvidenceEvent::VoteEquivocation {
                     voter,
-                    voter_pubkey,
                     height,
-                    precommits,
+                    fault,
                 } => {
-                    let artifact = write_precommit_equivocation_artifact(
+                    let artifact = write_vote_equivocation_artifact(
                         &evidence_dir,
                         genesis_hash,
                         &voter,
-                        &voter_pubkey,
                         height,
-                        precommits,
+                        fault,
                     );
                     // Same one-attempt-per-(height, culprit) rule the
                     // divergence path uses, and for the same reason: every
@@ -570,7 +573,9 @@ where
                     // fault, and all those submissions would race for one
                     // (sender, nonce) mempool slot. `EvidenceMarkerKey` is
                     // keyed the same way on-chain, so this is never
-                    // stricter than the chain.
+                    // stricter than the chain — a prevote and a precommit
+                    // double-sign at one height share that one slot, and
+                    // either one tombstones.
                     if !fault_attempted.insert((height, voter.clone()))
                         || build_execution_fault_action.is_none()
                     {
@@ -585,12 +590,10 @@ where
                     let mut guard = mempool.lock().unwrap_or_else(|e| e.into_inner());
                     match guard.push(action) {
                         Ok(()) => {
-                            info!("evidence: submitted precommit equivocation against {voter}")
+                            info!("evidence: submitted vote equivocation against {voter}")
                         }
                         Err(err) => {
-                            warn!(
-                                "evidence: failed to submit precommit equivocation for {voter}: {err}"
-                            )
+                            warn!("evidence: failed to submit vote equivocation for {voter}: {err}")
                         }
                     }
                     continue;

@@ -261,6 +261,39 @@ pub fn precommit_signing_bytes(
     buf
 }
 
+const DOMAIN_PREVOTE: &[u8] = b"arxium/prevote/v1";
+
+/// One BLS-signed prevote, the first-phase counterpart to
+/// `PrecommitAttestation`: same fields minus `ep`, which a prevote doesn't
+/// carry. Must match `arxd_finality::prevote_signing_bytes` byte-for-byte —
+/// pinned by `frozen_prevote_signing_bytes_vector` here, its twin in
+/// `arxd/finality/src/lib.rs`, and `prevote_signing_bytes_match_across_crates`
+/// in `arxd/node/src/lib.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrevoteAttestation {
+    pub height: u64,
+    pub round: u32,
+    pub block_hash: String,
+    /// Hex-encoded (`0x...`) BLS signature (96 bytes) over `prevote_signing_bytes`.
+    pub signature: String,
+}
+
+/// The exact bytes a validator signs for a prevote.
+pub fn prevote_signing_bytes(
+    genesis: &[u8; 32],
+    height: u64,
+    round: u32,
+    block_hash: &str,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    push_field(&mut buf, DOMAIN_PREVOTE);
+    push_field(&mut buf, genesis);
+    push_field(&mut buf, &height.to_le_bytes());
+    push_field(&mut buf, &round.to_le_bytes());
+    push_field(&mut buf, block_hash.as_bytes());
+    buf
+}
+
 const DOMAIN_BLOCK_DIVERGENCE: &[u8] = b"arxium/block_divergence/v2";
 
 /// The exact bytes a dissenter signs to stake a claim on a whole block's
@@ -507,6 +540,16 @@ pub enum Fault {
         height: u64,
         precommits: [PrecommitAttestation; 2],
     },
+    /// A validator BLS-signed prevotes for two different blocks at one
+    /// (height, round). Same shape and same verdict as
+    /// `PrecommitEquivocation`, one voting phase earlier.
+    PrevoteEquivocation {
+        /// Hex-encoded (`0x...`) raw BLS12-381 public key (48 bytes) of the
+        /// culpable voter.
+        voter_pubkey: String,
+        height: u64,
+        prevotes: [PrevoteAttestation; 2],
+    },
 }
 
 /// A complete, standalone evidence artifact.
@@ -608,10 +651,14 @@ pub enum VerifyError {
         "dissent_claim's computed_state_root is identical to the proposer's signed state_root — not a divergence"
     )]
     BlockDivergenceNoDisagreement,
-    #[error("precommit {0} does not verify against voter_pubkey")]
-    PrecommitSignatureInvalid(usize),
-    #[error("the two cited precommits sign identical bytes, not distinct evidence")]
-    SamePrecommit,
+    #[error("vote {0} does not verify against voter_pubkey")]
+    VoteSignatureInvalid(usize),
+    #[error("the two cited votes sign identical bytes, not distinct evidence")]
+    SameVote,
+    #[error(
+        "the two cited votes are for different rounds ({0} vs {1}) of one height, not equivocation"
+    )]
+    VoteRoundMismatch(u32, u32),
 }
 
 /// What a verified artifact proves, once `verify()` accepts it. Two shapes:
@@ -830,6 +877,23 @@ pub fn verify(artifact: &EvidenceArtifact) -> Result<Verdict, VerifyError> {
             height,
             precommits,
         } => verify_precommit_equivocation(&genesis, voter_pubkey, *height, precommits),
+        Fault::PrevoteEquivocation {
+            voter_pubkey,
+            height,
+            prevotes,
+        } => verify_vote_equivocation(
+            "prevote_equivocation",
+            voter_pubkey,
+            *height,
+            prevotes.each_ref().map(|v| {
+                (
+                    v.height,
+                    v.round,
+                    prevote_signing_bytes(&genesis, v.height, v.round, &v.block_hash),
+                    v.signature.as_str(),
+                )
+            }),
+        ),
         Fault::ActionDivergence {
             proposer_pubkey,
             voter_pubkey,
@@ -1011,6 +1075,42 @@ fn verify_precommit_equivocation(
     height: u64,
     precommits: &[PrecommitAttestation; 2],
 ) -> Result<Verdict, VerifyError> {
+    let mut signed = Vec::with_capacity(2);
+    for precommit in precommits {
+        let ep_bytes = decode_hex("ep", &precommit.ep)?;
+        let ep_bytes: [u8; 32] = ep_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
+        signed.push((
+            precommit.height,
+            precommit.round,
+            precommit_signing_bytes(
+                genesis,
+                precommit.height,
+                precommit.round,
+                &precommit.block_hash,
+                &ep_bytes,
+            ),
+            precommit.signature.as_str(),
+        ));
+    }
+    let [a, b] = <[_; 2]>::try_from(signed).expect("two precommits");
+    verify_vote_equivocation("precommit_equivocation", voter_pubkey, height, [a, b])
+}
+
+/// Shared by both vote-equivocation faults. Each vote is `(height, round,
+/// signing bytes, hex signature)`, the bytes already recomputed by the
+/// caller from the vote's own fields. A fault iff one key signed two
+/// different messages at one (height, round): a vote at another round is the
+/// legitimate re-vote after a round change (`docs/consensus-safety.md` §2),
+/// so it must never read as a double-sign.
+fn verify_vote_equivocation(
+    fault: &'static str,
+    voter_pubkey: &str,
+    height: u64,
+    votes: [(u64, u32, Vec<u8>, &str); 2],
+) -> Result<Verdict, VerifyError> {
     let pubkey_bytes = decode_hex("voter_pubkey", voter_pubkey)?;
     let pubkey_bytes: [u8; 48] = pubkey_bytes
         .as_slice()
@@ -1018,54 +1118,43 @@ fn verify_precommit_equivocation(
         .map_err(|_| VerifyError::BadBlsPubkeyLength(pubkey_bytes.len()))?;
     let voter = BlsPublicKey(pubkey_bytes);
 
-    if precommits[0].height != precommits[1].height {
-        return Err(VerifyError::HeightMismatch(
-            precommits[0].height,
-            precommits[1].height,
-        ));
+    let [
+        (height_a, round_a, bytes_a, _),
+        (height_b, round_b, bytes_b, _),
+    ] = &votes;
+    if height_a != height_b {
+        return Err(VerifyError::HeightMismatch(*height_a, *height_b));
     }
-    if precommits[0].height != height {
+    if *height_a != height {
         return Err(VerifyError::FaultHeightMismatch {
             claimed: height,
-            actual: precommits[0].height,
+            actual: *height_a,
         });
     }
+    if round_a != round_b {
+        return Err(VerifyError::VoteRoundMismatch(*round_a, *round_b));
+    }
 
-    let mut signed = Vec::with_capacity(2);
-    for (i, precommit) in precommits.iter().enumerate() {
-        let ep_bytes = decode_hex("ep", &precommit.ep)?;
-        let ep_bytes: [u8; 32] = ep_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| VerifyError::BadEpLength(ep_bytes.len()))?;
-        let sig_bytes = decode_hex("signature", &precommit.signature)?;
+    for (i, (_, _, bytes, signature)) in votes.iter().enumerate() {
+        let sig_bytes = decode_hex("signature", signature)?;
         let sig_bytes: [u8; 96] = sig_bytes
             .as_slice()
             .try_into()
             .map_err(|_| VerifyError::BadBlsSignatureLength(sig_bytes.len()))?;
-
-        let bytes = precommit_signing_bytes(
-            genesis,
-            precommit.height,
-            precommit.round,
-            &precommit.block_hash,
-            &ep_bytes,
-        );
-        xc_bls::verify(&bytes, &voter, &BlsSignature(sig_bytes))
-            .map_err(|_| VerifyError::PrecommitSignatureInvalid(i))?;
-        signed.push(bytes);
+        xc_bls::verify(bytes, &voter, &BlsSignature(sig_bytes))
+            .map_err(|_| VerifyError::VoteSignatureInvalid(i))?;
     }
 
     // Signed bytes, not the raw signatures: BLS signing is deterministic
     // here, so equal messages give equal signatures — but the property that
     // actually makes this a fault is two *distinct messages* under one key,
     // and that is what gets compared.
-    if signed[0] == signed[1] {
-        return Err(VerifyError::SamePrecommit);
+    if bytes_a == bytes_b {
+        return Err(VerifyError::SameVote);
     }
 
     Ok(Verdict::Culpable {
-        fault: "precommit_equivocation",
+        fault,
         culpable_pubkey: voter_pubkey.to_string(),
     })
 }
@@ -1347,7 +1436,7 @@ mod tests {
             5,
             [precommit(&sk, 5, "0xaaa", 1), precommit(&sk, 5, "0xaaa", 1)],
         );
-        assert!(matches!(verify(&artifact), Err(VerifyError::SamePrecommit)));
+        assert!(matches!(verify(&artifact), Err(VerifyError::SameVote)));
     }
 
     #[test]
@@ -1380,7 +1469,7 @@ mod tests {
         );
         assert!(matches!(
             verify(&artifact),
-            Err(VerifyError::PrecommitSignatureInvalid(1))
+            Err(VerifyError::VoteSignatureInvalid(1))
         ));
     }
 
@@ -1532,6 +1621,134 @@ mod tests {
         );
     }
 
+    /// Same role as `frozen_dissent_signing_bytes_vector`, for prevotes;
+    /// twinned in `arxd/finality/src/lib.rs`.
+    #[test]
+    fn frozen_prevote_signing_bytes_vector() {
+        assert_eq!(
+            hex::encode(prevote_signing_bytes(&[0xa1; 32], 5, 2, "0xblockhash")),
+            "110000000000000061727869756d2f707265766f74652f76312000000000000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1080000000000000005000000000000000400000000000000020000000b000000000000003078626c6f636b68617368",
+        );
+    }
+
+    fn prevote(
+        sk: &xc_bls::BlsSecretKey,
+        height: u64,
+        round: u32,
+        block_hash: &str,
+    ) -> PrevoteAttestation {
+        let signature = xc_bls::sign(
+            sk,
+            &prevote_signing_bytes(&GENESIS, height, round, block_hash),
+        );
+        PrevoteAttestation {
+            height,
+            round,
+            block_hash: block_hash.to_string(),
+            signature: format!("0x{}", hex::encode(signature.0)),
+        }
+    }
+
+    fn prevote_artifact(
+        pubkey: &BlsPublicKey,
+        prevotes: [PrevoteAttestation; 2],
+    ) -> EvidenceArtifact {
+        EvidenceArtifact {
+            artifact_version: ARTIFACT_VERSION,
+            genesis_hash: genesis_hex(),
+            fault: Fault::PrevoteEquivocation {
+                voter_pubkey: format!("0x{}", hex::encode(pubkey.0)),
+                height: prevotes[0].height,
+                prevotes,
+            },
+            human_readable: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn prevote_equivocation_names_the_double_signer() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let artifact = prevote_artifact(
+            &pk,
+            [prevote(&sk, 5, 1, "0xaaa"), prevote(&sk, 5, 1, "0xbbb")],
+        );
+        assert_eq!(
+            verify(&artifact).unwrap(),
+            Verdict::Culpable {
+                fault: "prevote_equivocation",
+                culpable_pubkey: format!("0x{}", hex::encode(pk.0)),
+            }
+        );
+    }
+
+    /// Prevoting a new block after a round change is the protocol working,
+    /// not a double-sign; an honest validator does it every stalled height.
+    #[test]
+    fn prevotes_at_different_rounds_are_not_equivocation() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let artifact = prevote_artifact(
+            &pk,
+            [prevote(&sk, 5, 0, "0xaaa"), prevote(&sk, 5, 1, "0xbbb")],
+        );
+        assert!(matches!(
+            verify(&artifact),
+            Err(VerifyError::VoteRoundMismatch(0, 1))
+        ));
+    }
+
+    #[test]
+    fn prevote_equivocation_rejects_the_same_vote_twice_and_a_foreign_key() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let (other_sk, _) = xc_bls::keygen_from_seed(&[4u8; 32]).unwrap();
+        let same = prevote_artifact(
+            &pk,
+            [prevote(&sk, 5, 0, "0xaaa"), prevote(&sk, 5, 0, "0xaaa")],
+        );
+        assert!(matches!(verify(&same), Err(VerifyError::SameVote)));
+        let framed = prevote_artifact(
+            &pk,
+            [
+                prevote(&sk, 5, 0, "0xaaa"),
+                prevote(&other_sk, 5, 0, "0xbbb"),
+            ],
+        );
+        assert!(matches!(
+            verify(&framed),
+            Err(VerifyError::VoteSignatureInvalid(1))
+        ));
+    }
+
+    /// Same rule for precommits: an honest validator re-precommits at a
+    /// later round once a newer quorum unlocks it. Before the shared
+    /// verifier checked rounds, two such gossiped precommits were enough to
+    /// slash it.
+    #[test]
+    fn precommits_at_different_rounds_are_not_equivocation() {
+        let (sk, pk) = xc_bls::keygen_from_seed(&[3u8; 32]).unwrap();
+        let ep = [1u8; 32];
+        let at_round = |round: u32, block_hash: &str| PrecommitAttestation {
+            height: 5,
+            round,
+            block_hash: block_hash.to_string(),
+            ep: format!("0x{}", hex::encode(ep)),
+            signature: format!(
+                "0x{}",
+                hex::encode(
+                    xc_bls::sign(
+                        &sk,
+                        &precommit_signing_bytes(&GENESIS, 5, round, block_hash, &ep)
+                    )
+                    .0
+                )
+            ),
+        };
+        let artifact = precommit_artifact(&pk, 5, [at_round(0, "0xaaa"), at_round(1, "0xbbb")]);
+        assert!(matches!(
+            verify(&artifact),
+            Err(VerifyError::VoteRoundMismatch(0, 1))
+        ));
+    }
+
     #[test]
     fn unsupported_version_is_rejected() {
         let key = SigningKey::from_bytes(&[7u8; 32]);
@@ -1636,7 +1853,7 @@ mod tests {
         let art = precommit_artifact(&pk, 5, [on_a, on_b]);
         assert!(matches!(
             verify(&art),
-            Err(VerifyError::PrecommitSignatureInvalid(1))
+            Err(VerifyError::VoteSignatureInvalid(1))
         ));
 
         // And the label itself is now load-bearing: relabel a genuine
@@ -1650,7 +1867,7 @@ mod tests {
         relabeled.genesis_hash = format!("0x{}", hex::encode(other_genesis));
         assert!(matches!(
             verify(&relabeled),
-            Err(VerifyError::PrecommitSignatureInvalid(0))
+            Err(VerifyError::VoteSignatureInvalid(0))
         ));
     }
 

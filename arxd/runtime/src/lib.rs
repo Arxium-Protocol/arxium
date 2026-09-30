@@ -144,6 +144,7 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
             // `consensus::submit_execution_fault`).
             xc_artifact::Fault::Equivocation { .. }
             | xc_artifact::Fault::PrecommitEquivocation { .. }
+            | xc_artifact::Fault::PrevoteEquivocation { .. }
             | xc_artifact::Fault::ActionDivergence { .. }
             | xc_artifact::Fault::ExecutionDisagreement { .. } => return None,
         };

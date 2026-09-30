@@ -219,6 +219,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_prevote_equivocation_example_names_its_signer() {
+        let json = include_str!("../examples/prevote-equivocation.json");
+        assert!(matches!(
+            verify_evidence(json),
+            EvidenceResult::Valid { fault, .. } if fault == "prevote_equivocation"
+        ));
+        // Moving one vote to another round is an honest re-vote, not a fault.
+        let next_round = json.replacen("\"round\": 0", "\"round\": 1", 1);
+        assert!(matches!(
+            verify_evidence(&next_round),
+            EvidenceResult::Invalid { error, .. } if error.contains("different rounds")
+        ));
+    }
+
+    #[test]
     fn a_certificate_binds_the_root_through_the_ep() {
         let empty_root = xc_poe::state_trie::default_hashes()[256];
         let state_root = format!("0x{}", hex::encode(empty_root));

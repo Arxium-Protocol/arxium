@@ -41,6 +41,13 @@
 # reorg/rollback is required. Default here is 4 (quorum 3, faulty node
 # outvoted) so a stall demonstrates an actual missing-machinery gap instead.
 #
+# FAULT_KIND=prevote (D-26) swaps the fault: node 0 stays an honest proposer
+# but, at FAULT_HEIGHT, gossips a second prevote for a made-up block next to
+# its real one (ARXD_DOUBLE_PREVOTE_AT_HEIGHT). The honest nodes' tallies
+# must catch it and a Fault::PrevoteEquivocation artifact must slash and
+# tombstone node 0. Nothing diverges in that mode, so the settlement and
+# rollback checks (block-divergence only) are skipped.
+#
 # What this does NOT prove: the loop working against an ordinary
 # hundred-action block. This chain never carries other traffic, so
 # artifact_json stays tiny regardless of the compression work already
@@ -52,6 +59,12 @@ cd "$REPO_ROOT"
 
 NUM_VALIDATORS="${NUM_VALIDATORS:-4}"
 FAULT_HEIGHT="${FAULT_HEIGHT:-5}"
+FAULT_KIND="${FAULT_KIND:-divergence}"
+case "$FAULT_KIND" in
+    divergence) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT" ;;
+    prevote) FAULT_ENV="ARXD_DOUBLE_PREVOTE_AT_HEIGHT" ;;
+    *) echo "FAULT_KIND must be divergence or prevote" >&2; exit 1 ;;
+esac
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
 STARTUP_TIMEOUT=30
@@ -162,13 +175,13 @@ jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
     boot_nodes: []
 }' > "$ROOT/genesis.json"
 
-echo "starting node 0 (fault-injected at height $FAULT_HEIGHT) as ${ADDRS[0]} ..."
+echo "starting node 0 ($FAULT_KIND fault at height $FAULT_HEIGHT) as ${ADDRS[0]} ..."
 # RUST_LOG explicitly, not from the caller's environment: arxd's tracing
 # subscriber emits nothing at all with it unset, so the log greps below
 # ("reverted from height", "HALT:") read an empty file and the run's verdict
 # silently depends on whoever's shell started it. Found while building
 # scripts/partition-heal-harness.sh.
-RUST_LOG="${RUST_LOG:-info}" ARXD_INJECT_FAULT_AT_HEIGHT="$FAULT_HEIGHT" \
+env RUST_LOG="${RUST_LOG:-info}" "$FAULT_ENV=$FAULT_HEIGHT" \
 "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[0]}" --validator \
     --port "${RPC_PORTS[0]}" --p2p-port "${P2P_PORTS[0]}" --rpc-bind 127.0.0.1 \
     >"$ROOT/node-0.log" 2>&1 &
@@ -267,6 +280,7 @@ done
 
 # The dispute names node 0's header, not the height: the block the chain kept
 # at FAULT_HEIGHT is the honest one and must still settle normally.
+if [ "$FAULT_KIND" = divergence ]; then
 echo "checking the kept block at height $FAULT_HEIGHT is not marked disputed..."
 settlement="$(rpc "blocks/$FAULT_HEIGHT" | jq -r '.settlement // "missing"')"
 if [ "$settlement" != "disputed" ] && [ "$settlement" != "missing" ]; then
@@ -274,6 +288,7 @@ if [ "$settlement" != "disputed" ] && [ "$settlement" != "missing" ]; then
 else
     echo "  FAIL: height $FAULT_HEIGHT settlement is $settlement"
     pass=false
+fi
 fi
 
 # Genesis sets no ChainParams, so the window is the default 86,400 blocks —
@@ -296,6 +311,9 @@ fi
 
 echo "checking an honest node submitted fault evidence..."
 evidence_honest="$(curl -sf "http://127.0.0.1:$RPC_HONEST/evidence")"
+if [ "$FAULT_KIND" = prevote ]; then
+    evidence_honest="$(echo "$evidence_honest" | jq '[.[] | select(contains("-prevote-equivocation-"))]')"
+fi
 if [ "$(echo "$evidence_honest" | jq 'length')" -gt 0 ]; then
     echo "  ok: honest node's evidence dir has $(echo "$evidence_honest" | jq 'length') artifact(s)"
 else
@@ -325,6 +343,18 @@ for h in $(seq 1 "$tip"); do
 done
 if [ "$self_incrimination" = 0 ]; then
     echo "  ok: node 0 never submitted a fault action"
+fi
+
+if [ "$FAULT_KIND" = prevote ]; then
+    if [ "$pass" = true ]; then
+        echo; echo "PASS — double-prevoting node 0 slashed and tombstoned, honest validators untouched."
+        echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"
+        echo "logs and RPC captures kept in $ROOT"
+        exit 0
+    fi
+    echo; echo "FAIL $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"
+    echo "FAIL — see $ROOT for logs and RPC captures."
+    exit 1
 fi
 
 # --- Divergence recovery -----------------------------------------------------

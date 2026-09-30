@@ -136,10 +136,6 @@ any protocol; mainnet needs at least 4 roughly equal validators.
 - `ep` disagreement (honest execution divergence) splits a round's votes and
   cannot be resolved by rounds — a determinism bug, surfaced as dissent and
   evidence, not something consensus should paper over.
-- Prevote equivocation is detected and counted
-  (`arxium_prevote_equivocations_detected_total`) but not yet turned into a
-  slashing artifact. Safety doesn't depend on it (the argument above holds
-  for at most `f` equivocators); accountability for it is a follow-up.
 - A chain whose registered BLS keys can't reach quorum finalizes nothing;
   there N1 does not wait for finality, so the chain keeps producing
   provisional blocks instead of halting before it can register keys.

@@ -64,6 +64,13 @@ const ENV_KNOBS: &[(&str, Validate, &str)] = &[
         arxd_finality::withheld_height_error,
         "WITHHOLDING PROPOSER ARMED — this node will not gossip or vote on its block at this height.",
     ),
+    // Makes the node a double-prevoting validator (arxd/finality's
+    // `DOUBLE_PREVOTE_AT_HEIGHT`) — outside a harness, a slashable offence.
+    (
+        "ARXD_DOUBLE_PREVOTE_AT_HEIGHT",
+        arxd_finality::double_prevote_height_error,
+        "DOUBLE PREVOTE ARMED — this node will sign two conflicting prevotes at this height.",
+    ),
 ];
 
 /// Arms `--inject-fault-at-height` and checks every set env knob. Call once
