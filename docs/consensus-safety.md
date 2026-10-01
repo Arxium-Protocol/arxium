@@ -151,7 +151,7 @@ A certified block can still be wrong if enough of the set signed a bad
 state root. Any validator that re-executes it and disagrees signs a
 `BlockDivergence` artifact, and anyone can submit it
 (`SubmitExecutionFault`) up to `challenge_window_blocks` after the block
-(`ChainParams`, default 86,400 blocks = 48h at 2s; must stay below
+(`ChainParams`, default 21,600 blocks = 12h at 2s; must stay below
 `unbonding_blocks`, checked at `SetChainParams`). After that the block is
 FINAL and no longer open to one.
 
@@ -193,7 +193,7 @@ has no on-chain path. No node signs the per-action claims it needs, and
 `BlockDivergence` covers the whole block from the pre-state the proposer
 signed. `arx-verify` still checks it offline.
 
-W = 48h follows CometBFT's default evidence age. Optimistic rollups use ~7
+W = 12h. Optimistic rollups use ~7
 days because a challenger has to get through a possibly censored L1; here
 the evidence lands on this chain, where any one honest proposer includes
 it, and dissenting validators submit within seconds.
@@ -238,7 +238,7 @@ field are the hooks.
      needed there; `Forked` exists to record it if the old chain stays up,
      and takes no corrections.
 
-  This keeps most of up to 48h of user activity instead of discarding it.
+  This keeps most of up to 12h of user activity instead of discarding it.
 
 **Who and when.** The validator set decides, through the ordinary proposal
 and vote (`voting_period_blocks`). Settlement stays paused for as long as it

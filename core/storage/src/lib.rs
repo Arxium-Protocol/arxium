@@ -4010,7 +4010,7 @@ mod divergence_recovery_tests {
         );
     }
 
-    /// Retention follows the challenge window: with the default 86_400-block
+    /// Retention follows the challenge window: with the default 21_600-block
     /// window nothing inside it is pruned, so `state_at(parent)` still works
     /// for a dispute upheld at the very end of the window.
     #[test]
