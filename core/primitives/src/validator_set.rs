@@ -427,7 +427,26 @@ pub enum GovernanceAction {
         header: [u8; 32],
         resolution: DisputeResolution,
         corrections: Vec<(Address, u128)>,
+        /// What governance found (Trello 202). `Attack` slashes and
+        /// tombstones the proposer, paying the challenger from the slash;
+        /// it takes no corrections and no bounty. `Bug` slashes no one and
+        /// pays the challenger `bounty` from the treasury.
+        cause: DisputeCause,
+        bounty: u128,
     },
+    /// Lift a tombstone: deletes the validator's `Tombstoned` status row so
+    /// it may `JoinValidator` again with fresh stake. For an upheld dispute
+    /// later shown to be a determinism bug (Trello 202). Rejected if the
+    /// validator is not tombstoned. Slashed stake is not returned.
+    ReinstateValidator { validator: Address },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisputeCause {
+    /// A determinism bug or version mismatch: nobody is punished.
+    Bug,
+    /// A knowingly bad root: the proposer is slashed and tombstoned.
+    Attack,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

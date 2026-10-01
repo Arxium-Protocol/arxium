@@ -336,6 +336,7 @@ mod tests {
                     height: 1,
                     proposer: proposer.clone(),
                     disputed: Some(commitment(block)),
+                    challenger: None,
                 })
                 .unwrap();
         };

@@ -171,8 +171,12 @@ Adjudication is a deterministic replay of `accept_block` from proofs alone
   reject, names the proposer. A replay that needs state the proofs don't
   cover is a `Disagreement`: nobody is slashed on a guess.
 
-An upheld dispute that names the proposer slashes and tombstones it and
-writes `DisputedBlockKey { height, header }`, where `header` is the sha256
+An upheld dispute that names the proposer slashes no one at once: a
+certified wrong root means at least 2/3 of the set signed it, which is
+likelier a shared determinism bug than an attack. It writes
+`DisputedBlockKey { height, header }` and an open-dispute row naming the
+proposer and the challenger (who submitted the proof), and governance
+classifies it later (Recovery, below). `DisputedBlockKey { height, header }`, where `header` is the sha256
 of the disputed header's signing bytes: that block reports `settlement:
 "disputed"` and never becomes FINAL. The key names the block, not the
 height, because the culprit's block is often one the chain dropped (its
@@ -181,10 +185,11 @@ other block must still settle. The chain does not unwind a certified
 block on its own; what to do with the state after a disputed block is an
 operator and governance decision (recovery, below).
 
-Whoever submitted an upheld fault (this action or
-`SubmitEquivocationEvidence`) gets `challenger_reward_bps` of what was
-slashed (default 5%, capped at 10% by `SetChainParams`), so an outside
-Guard has a reason to submit and not only the dissenting validator. The
+Whoever submitted an upheld fault gets paid: for equivocation, and for a
+dispute resolved as an attack, `challenger_reward_bps` of what was slashed
+(default 5%, capped at 10% by `SetChainParams`); for a dispute resolved as
+a bug, a `bounty` the resolution names, paid from the treasury. So an
+outside Guard has a reason to submit and not only the dissenting validator. The
 rest goes to the reward pool like any slash. Nothing is burned. An artifact
 against an already-tombstoned validator slashes nothing and pays nothing.
 
@@ -239,6 +244,22 @@ field are the hooks.
      and takes no corrections.
 
   This keeps most of up to 12h of user activity instead of discarding it.
+
+**Undoing a tombstone.** If the dispute turns out to be a determinism bug,
+the proposer should not stay banned. A `ReinstateValidator { validator }`
+proposal deletes its `Tombstoned` status row, so it can `JoinValidator`
+again with fresh stake (slashed stake is not returned). It rejects if the
+validator is not tombstoned. Who is slashed in the first place is still open
+(Trello 202).
+
+**Classify the cause.** `ResolveDispute` carries `cause` and `bounty`.
+Re-execute the disputed block with the canonical binary first.
+`Bug` (version mismatch, determinism fault): nobody is slashed and the
+challenger gets `bounty` from the treasury. `Attack` (a root no bug
+explains): the proposer is slashed and tombstoned as an equivocator is and
+the challenger gets the percentage reward; an attack verdict carries no
+corrections and no bounty. Signers of the bad root are not penalised yet;
+their precommits stay in the finality certificate as evidence.
 
 **Who and when.** The validator set decides, through the ordinary proposal
 and vote (`voting_period_blocks`). Settlement stays paused for as long as it

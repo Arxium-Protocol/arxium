@@ -112,6 +112,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
         height: block_a.height,
         proposer: equivocator,
         disputed: None,
+        challenger: None,
     });
     Ok(updates)
 }
@@ -328,11 +329,20 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
             "execution dispute upheld: block marked disputed, settlement paused"
         );
     }
-    let mut updates = fault_slash(view, &culprit, reason, current_height, challenger)?;
+    // An upheld dispute slashes no one yet: a certified wrong root means
+    // 2/3 of the set signed it, which is likelier a shared determinism bug
+    // than an attack. Governance classifies it in `ResolveDispute`, which
+    // slashes only on `Attack` (Trello 202).
+    let mut updates = if disputed.is_some() {
+        BlockUpdates::default()
+    } else {
+        fault_slash(view, &culprit, reason, current_height, challenger)?
+    };
     updates.evidence = Some(EvidenceMarker {
         height,
         proposer: culprit,
         disputed,
+        challenger: disputed.map(|_| challenger.clone()),
     });
     Ok(updates)
 }
@@ -347,7 +357,7 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
 /// address-scoped, no re-entry with any stake. No slash, no reward — an
 /// artifact against an already-tombstoned validator pays nothing, so old
 /// faults can't be farmed.
-fn fault_slash<V: KvRead<Error = StorageError>>(
+pub(crate) fn fault_slash<V: KvRead<Error = StorageError>>(
     view: &V,
     culprit: &Address,
     reason: circuit_staking::SlashReason,

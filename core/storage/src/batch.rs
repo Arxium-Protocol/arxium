@@ -280,6 +280,9 @@ pub struct EvidenceMarker {
     pub height: u64,
     pub proposer: Address,
     pub disputed: Option<[u8; 32]>,
+    /// Who submitted the proof, kept in the open-dispute row so governance
+    /// can pay them when it resolves the dispute. Only read when `disputed`.
+    pub challenger: Option<Address>,
 }
 
 impl BatchWritable for EvidenceMarker {
@@ -307,7 +310,16 @@ impl BatchWritable for EvidenceMarker {
                     header,
                 }
                 .encode(),
-                vec![1u8],
+                bincode::serde::encode_to_vec(
+                    &xc_circuit::OpenDispute {
+                        culprit: self.proposer.clone(),
+                        challenger: self
+                            .challenger
+                            .clone()
+                            .unwrap_or_else(|| self.proposer.clone()),
+                    },
+                    bincode::config::standard(),
+                )?,
             ));
         }
         Ok(entries)
@@ -1023,6 +1035,7 @@ mod effects_tests {
                 height: 3,
                 proposer: a.clone(),
                 disputed: Some([4u8; 32]),
+                challenger: None,
             }],
             &[BlsKeyRegistration {
                 address: a.clone(),

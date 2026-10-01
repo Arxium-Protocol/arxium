@@ -333,9 +333,18 @@ pub struct DisputeOpenKey {
 impl DisputeOpenKey {
     pub const PREFIX: &'static str = "evidence:dispute_open:";
 }
+/// Who a resolved dispute may penalise or pay: the proposer whose block was
+/// shown wrong, and whoever submitted the proof. Stored as the
+/// `DisputeOpenKey` value (Trello 202).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OpenDispute {
+    pub culprit: xc_primitives::Address,
+    pub challenger: xc_primitives::Address,
+}
+
 impl KeySpec for DisputeOpenKey {
     const CF: &'static str = CF_EVIDENCE;
-    type Value = ();
+    type Value = OpenDispute;
     fn encode(&self) -> Vec<u8> {
         format!(
             "{}{:020}:{}",

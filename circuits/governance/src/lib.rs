@@ -20,11 +20,12 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use xc_circuit::{
     AccountKey, AdminKey, AdminRole, ChainParamsKey, DisputeOpenKey, KvRead, NextProposalIdKey,
-    ProposalKey, ValidatorSetKey, VoteKey,
+    OpenDispute, ProposalKey, ValidatorSetKey, ValidatorStatusKey, VoteKey,
 };
 use xc_primitives::{
-    Address, ChainParams, DisputeResolution, GovernanceAction, Proposal, ProposalStatus,
-    TOTAL_VOTING_POWER, treasury_account, validator_set_effective_height,
+    Address, ChainParams, DisputeCause, DisputeResolution, GovernanceAction, Proposal,
+    ProposalStatus, TOTAL_VOTING_POWER, ValidatorStatus, treasury_account,
+    validator_set_effective_height,
 };
 use xc_storage::{AccountUpdates, GovernanceUpdates, StorageError};
 
@@ -54,6 +55,8 @@ pub enum GovernanceError {
     InvalidAddress(Address),
     #[error("a forked resolution carries no corrections")]
     ForkedWithCorrections,
+    #[error("an attack verdict carries no corrections and no bounty")]
+    AttackWithPayouts,
     #[error("chain params rejected: {0}")]
     InvalidParams(&'static str),
 }
@@ -185,13 +188,25 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
             to.pubkey_bytes()
                 .map_err(|_| GovernanceError::InvalidAddress(to.clone()))?;
         }
+        GovernanceAction::ReinstateValidator { validator } => {
+            validator
+                .pubkey_bytes()
+                .map_err(|_| GovernanceError::InvalidAddress(validator.clone()))?;
+        }
         GovernanceAction::ResolveDispute {
             resolution,
             corrections,
+            cause,
+            bounty,
             ..
         } => {
             if *resolution == DisputeResolution::Forked && !corrections.is_empty() {
                 return Err(GovernanceError::ForkedWithCorrections);
+            }
+            // The slash is computed from the same view as these writes, so
+            // the two must not touch the same account rows.
+            if *cause == DisputeCause::Attack && (!corrections.is_empty() || *bounty > 0) {
+                return Err(GovernanceError::AttackWithPayouts);
             }
             for (who, _) in corrections {
                 who.pubkey_bytes()
@@ -289,7 +304,7 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
     view: &V,
     id: u64,
     current_height: u64,
-) -> Result<(GovernanceUpdates, AccountUpdates), GovernanceError> {
+) -> Result<(GovernanceUpdates, AccountUpdates, Option<OpenDispute>), GovernanceError> {
     let mut proposal = proposal(view, id)?;
     if proposal.status != ProposalStatus::Open {
         return Err(GovernanceError::NotOpen(id));
@@ -305,6 +320,9 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
 
     let mut updates = GovernanceUpdates::default();
     let mut accounts = AccountUpdates(BTreeMap::new());
+    // An executed `Attack` verdict: the caller slashes (the circuit has no
+    // staking logic) and must do so in the same block.
+    let mut slash = None;
     proposal.status = ProposalStatus::Rejected;
     if passed {
         match &proposal.action {
@@ -344,6 +362,8 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                 height,
                 header,
                 corrections,
+                cause,
+                bounty,
                 ..
             } => {
                 let key = DisputeOpenKey {
@@ -351,20 +371,59 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                     header: *header,
                 };
                 // Nothing open (already resolved) falls through as Rejected.
-                if view.get(&key)?.is_some() {
-                    for (who, balance) in corrections {
-                        let mut entry = view.get(&AccountKey(who))?.unwrap_or_default();
-                        entry.balance = *balance;
-                        accounts.0.insert(who.clone(), entry);
+                if let Some(open) = view.get(&key)? {
+                    let treasury = treasury_account();
+                    let mut paid = true;
+                    if *bounty > 0 {
+                        let mut from = view.get(&AccountKey(&treasury))?.unwrap_or_default();
+                        // Short treasury (or a bounty to the treasury itself)
+                        // rejects, like `TreasurySpend`.
+                        if let (Some(rest), true) = (
+                            from.balance.checked_sub(*bounty),
+                            open.challenger != treasury,
+                        ) {
+                            from.balance = rest;
+                            let mut dest =
+                                view.get(&AccountKey(&open.challenger))?.unwrap_or_default();
+                            dest.balance = dest.balance.saturating_add(*bounty);
+                            accounts.0.insert(treasury.clone(), from);
+                            accounts.0.insert(open.challenger.clone(), dest);
+                        } else {
+                            paid = false;
+                        }
                     }
-                    updates.delete(&key);
+                    if paid {
+                        for (who, balance) in corrections {
+                            // A correction wins over the bounty on the same row.
+                            let mut entry = match accounts.0.get(who) {
+                                Some(entry) => entry.clone(),
+                                None => view.get(&AccountKey(who))?.unwrap_or_default(),
+                            };
+                            entry.balance = *balance;
+                            accounts.0.insert(who.clone(), entry);
+                        }
+                        updates.delete(&key);
+                        if *cause == DisputeCause::Attack {
+                            slash = Some(open);
+                        }
+                        proposal.status = ProposalStatus::Executed;
+                    } else {
+                        accounts.0.clear();
+                    }
+                }
+            }
+            GovernanceAction::ReinstateValidator { validator } => {
+                // Not tombstoned (never was, or already reinstated) falls
+                // through as Rejected.
+                if view.get(&ValidatorStatusKey(validator))? == Some(ValidatorStatus::Tombstoned) {
+                    updates.delete(&ValidatorStatusKey(validator));
                     proposal.status = ProposalStatus::Executed;
                 }
             }
         }
     }
     updates.put(&ProposalKey(id), &proposal)?;
-    Ok((updates, accounts))
+    Ok((updates, accounts, slash))
 }
 
 #[cfg(test)]
@@ -448,7 +507,7 @@ mod tests {
             )
             .unwrap();
         db.write_batch(&stored).unwrap();
-        let (up, accounts) = apply_execute(&db, 0, 15).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 0, 15).unwrap();
         db.write_batch(&up).unwrap();
         db.write_batch(&accounts).unwrap();
         assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 100);
@@ -499,7 +558,7 @@ mod tests {
             GovernanceError::VotingClosed { .. }
         ));
 
-        let (up, accounts) = apply_execute(&db, 0, 15).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 0, 15).unwrap();
         db.write_batch(&up).unwrap();
         db.write_batch(&accounts).unwrap();
         assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 40);
@@ -520,7 +579,7 @@ mod tests {
         assert_eq!(id, 1);
         db.write_batch(&apply_vote(&db, &addr(1), 1, true, 21).unwrap())
             .unwrap();
-        let (up, accounts) = apply_execute(&db, 1, 30).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 1, 30).unwrap();
         assert!(accounts.0.is_empty());
         db.write_batch(&up).unwrap();
         let p: Proposal = KvRead::get(&db, &ProposalKey(1)).unwrap().unwrap();
@@ -541,7 +600,7 @@ mod tests {
             .unwrap();
         db.write_batch(&apply_vote(&db, &addr(3), id, true, 1).unwrap())
             .unwrap();
-        let (up, _) = apply_execute(&db, id, 10).unwrap();
+        let (up, _, _) = apply_execute(&db, id, 10).unwrap();
         db.write_batch(&up).unwrap();
         let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
         assert_eq!(p.status, ProposalStatus::Rejected);
@@ -558,7 +617,7 @@ mod tests {
             db.write_batch(&apply_vote(&db, &addr(who), id, yes, 11).unwrap())
                 .unwrap();
         }
-        let (up, _) = apply_execute(&db, id, 20).unwrap();
+        let (up, _, _) = apply_execute(&db, id, 20).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(
             KvRead::get(&db, &AdminKey(AdminRole::Freeze)).unwrap(),
@@ -626,7 +685,7 @@ mod tests {
         db.write_batch(&up).unwrap();
         db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
             .unwrap();
-        let (up, _) = apply_execute(&db, id, 10).unwrap();
+        let (up, _, _) = apply_execute(&db, id, 10).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(chain_params(&db).unwrap(), new_params);
     }
@@ -670,7 +729,7 @@ mod tests {
             )
             .unwrap();
         db.write_batch(&stored).unwrap();
-        let (up, _) = apply_execute(&db, 0, 10).unwrap();
+        let (up, _, _) = apply_execute(&db, 0, 10).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(proposal(&db, 0).unwrap().status, ProposalStatus::Rejected);
         assert_eq!(chain_params(&db).unwrap(), before);
@@ -686,6 +745,7 @@ mod tests {
             height: 3,
             proposer: addr(3),
             disputed: Some(header),
+            challenger: Some(addr(2)),
         })
         .unwrap();
         assert_eq!(db.lowest_open_dispute().unwrap(), Some(3));
@@ -695,6 +755,8 @@ mod tests {
             header,
             resolution,
             corrections,
+            cause: DisputeCause::Bug,
+            bounty: 0,
         };
         assert!(matches!(
             apply_submit(
@@ -721,7 +783,7 @@ mod tests {
             db.write_batch(&up).unwrap();
             db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
                 .unwrap();
-            let (up, accounts) = apply_execute(&db, id, 10).unwrap();
+            let (up, accounts, _) = apply_execute(&db, id, 10).unwrap();
             db.write_batch(&up).unwrap();
             db.write_batch(&accounts).unwrap();
             let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
@@ -732,5 +794,137 @@ mod tests {
         assert_eq!(db.get_account(&addr(2)).unwrap().unwrap().balance, 42);
         // Nothing left to resolve: the second proposal rejects.
         assert_eq!(run(1), ProposalStatus::Rejected);
+    }
+
+    /// A passed `ReinstateValidator` lifts a tombstone (the row is gone, so
+    /// admission no longer refuses it) and rejects when there is none.
+    #[test]
+    fn reinstating_lifts_a_tombstone_once() {
+        let db = db();
+        db.write_batch(&xc_storage::ValidatorStatusUpdates(
+            [(addr(3), Some(ValidatorStatus::Tombstoned))].into(),
+        ))
+        .unwrap();
+        let run = |id: u64| {
+            let (got, up) = apply_submit(
+                &db,
+                &addr(1),
+                GovernanceAction::ReinstateValidator { validator: addr(3) },
+                "",
+                0,
+            )
+            .unwrap();
+            assert_eq!(got, id);
+            db.write_batch(&up).unwrap();
+            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+                .unwrap();
+            let (up, _, _) = apply_execute(&db, id, 10).unwrap();
+            db.write_batch(&up).unwrap();
+            let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
+            p.status
+        };
+        assert_eq!(run(0), ProposalStatus::Executed);
+        assert_eq!(
+            KvRead::get(&db, &ValidatorStatusKey(&addr(3))).unwrap(),
+            None
+        );
+        assert_eq!(run(1), ProposalStatus::Rejected);
+    }
+
+    /// Verdicts: a bug pays the challenger from the treasury (and rejects on a
+    /// short treasury, leaving the dispute open); an attack asks the caller to
+    /// slash the culprit and carries no payouts.
+    #[test]
+    fn verdicts_pay_a_bounty_or_request_a_slash() {
+        let db = db();
+        let header = [7u8; 32];
+        let (culprit, challenger) = (addr(3), addr(2));
+        db.write_batch(&xc_storage::EvidenceMarker {
+            height: 3,
+            proposer: culprit.clone(),
+            disputed: Some(header),
+            challenger: Some(challenger.clone()),
+        })
+        .unwrap();
+        db.write_batch(&AccountUpdates(
+            [(
+                treasury_account(),
+                xc_primitives::AccountEntry {
+                    balance: 100,
+                    ..Default::default()
+                },
+            )]
+            .into(),
+        ))
+        .unwrap();
+        let resolve = |cause, bounty, corrections| GovernanceAction::ResolveDispute {
+            height: 3,
+            header,
+            resolution: DisputeResolution::Accept,
+            corrections,
+            cause,
+            bounty,
+        };
+        let execute = |id: u64, action| {
+            let (got, up) = apply_submit(&db, &addr(1), action, "", 0).unwrap();
+            assert_eq!(got, id);
+            db.write_batch(&up).unwrap();
+            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+                .unwrap();
+            let (up, accounts, slash) = apply_execute(&db, id, 10).unwrap();
+            db.write_batch(&up).unwrap();
+            db.write_batch(&accounts).unwrap();
+            let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
+            ((accounts.0.len(), slash), p.status)
+        };
+
+        assert!(matches!(
+            apply_submit(
+                &db,
+                &addr(1),
+                resolve(DisputeCause::Attack, 5, vec![]),
+                "",
+                0
+            )
+            .unwrap_err(),
+            GovernanceError::AttackWithPayouts
+        ));
+        // Treasury holds 100: a bounty of 500 rejects and the dispute stays open.
+        let ((written, slash), status) = execute(0, resolve(DisputeCause::Bug, 500, vec![]));
+        assert_eq!(
+            (status, slash, written),
+            (ProposalStatus::Rejected, None, 0)
+        );
+        assert_eq!(db.lowest_open_dispute().unwrap(), Some(3));
+        // Affordable bounty: challenger paid, no slash, dispute closed.
+        let ((_, slash), status) = execute(1, resolve(DisputeCause::Bug, 60, vec![]));
+        assert_eq!((status, slash), (ProposalStatus::Executed, None));
+        assert_eq!(db.get_account(&challenger).unwrap().unwrap().balance, 60);
+        assert_eq!(
+            db.get_account(&treasury_account())
+                .unwrap()
+                .unwrap()
+                .balance,
+            40
+        );
+        assert_eq!(db.lowest_open_dispute().unwrap(), None);
+
+        // Attack: reopen and expect the culprit and challenger back.
+        db.write_batch(&xc_storage::EvidenceMarker {
+            height: 3,
+            proposer: culprit.clone(),
+            disputed: Some(header),
+            challenger: Some(challenger.clone()),
+        })
+        .unwrap();
+        let ((_, slash), status) = execute(2, resolve(DisputeCause::Attack, 0, vec![]));
+        assert_eq!(status, ProposalStatus::Executed);
+        assert_eq!(
+            slash,
+            Some(OpenDispute {
+                culprit,
+                challenger
+            })
+        );
     }
 }

@@ -382,7 +382,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// Bumped 23 -> 24: an upheld dispute also writes `evidence:dispute_open:`
 /// rows, and `GovernanceAction` gained `ResolveDispute` (Trello 183).
 /// Merkleized keys and positional bincode — devnet reset.
-pub const SCHEMA_VERSION: u32 = 24;
+///
+/// Bumped 24 -> 25: `GovernanceAction` gained `ReinstateValidator`
+/// (Trello 202), and `ResolveDispute` gained `cause`/`bounty` — positional
+/// bincode in stored proposals; `EvidenceMarker` gained `challenger` and the
+/// `evidence:dispute_open:` value became an `OpenDispute`.
+pub const SCHEMA_VERSION: u32 = 25;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -4041,6 +4046,7 @@ mod divergence_recovery_tests {
             height: 6,
             proposer: addr(1),
             disputed: Some([7u8; 32]),
+            challenger: None,
         })
         .unwrap();
         assert_eq!(db.lowest_open_dispute().unwrap(), Some(6));
