@@ -57,12 +57,35 @@ pub(crate) fn execute<V: KvRead<Error = StorageError>>(
     proposal: u64,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    let (governance, accounts) = circuit_governance::apply_execute(view, proposal, current_height)?;
-    Ok(BlockUpdates {
+    let (governance, accounts, slash) =
+        circuit_governance::apply_execute(view, proposal, current_height)?;
+    let mut updates = BlockUpdates {
         governance,
         accounts,
         ..Default::default()
-    })
+    };
+    // An `Attack` verdict: slash and tombstone the proposer, paying the
+    // challenger from the slash. The circuit forbids corrections and
+    // bounties on this path, so the two account sets are disjoint.
+    if let Some(open) = slash {
+        match crate::consensus::fault_slash(
+            view,
+            &open.culprit,
+            circuit_staking::SlashReason::ExecutionFault,
+            current_height,
+            &open.challenger,
+        ) {
+            Ok(slashed) => {
+                updates.accounts = slashed.accounts;
+                updates.stakes = slashed.stakes;
+                updates.validator_statuses = slashed.validator_statuses;
+            }
+            // The culprit has no stake left to take (fully unbonded since the
+            // dispute): execute anyway, or the proposal could never close.
+            Err(err) => tracing::warn!(culprit = %open.culprit, %err, "attack verdict slashed nothing"),
+        }
+    }
+    Ok(updates)
 }
 
 #[cfg(test)]
@@ -333,5 +356,104 @@ mod tests {
         run(&mut view, act(3, next), 3).unwrap();
         assert_eq!(b1 - balance(&view), new_fee);
         assert!(new_fee > old_fee);
+    }
+
+    /// An executed `Attack` verdict slashes and tombstones the culprit and
+    /// pays the challenger from the slash; nothing happened at dispute time.
+    #[test]
+    fn an_attack_verdict_slashes_and_tombstones_the_culprit() {
+        let alice = Address::from_pubkey_bytes(&[1u8; 32]).unwrap();
+        let bob = Address::from_pubkey_bytes(&[2u8; 32]).unwrap();
+        let db = temp_db();
+        let mut view = seeded_view(
+            &db,
+            HashMap::from([
+                (alice.clone(), funded(FEE_BUDGET * 4)),
+                (bob.clone(), funded(FEE_BUDGET)),
+                (circuit_staking::stake_subaccount(&alice), funded(10_000)),
+            ]),
+            HashMap::from([(
+                (alice.clone(), alice.clone()),
+                self_allocation(&alice, 10_000),
+            )]),
+        );
+        view.put(&xc_circuit::StakeByValidatorKey(&alice), &vec![alice.clone()])
+            .unwrap();
+        view.put(
+            &ValidatorSetKey(0),
+            &std::collections::BTreeMap::from([(alice.clone(), VotingPower(10_000))]),
+        )
+        .unwrap();
+        view.put(
+            &ChainParamsKey,
+            &ChainParams {
+                voting_period_blocks: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let header = [9u8; 32];
+        view.put(
+            &xc_circuit::DisputeOpenKey { height: 1, header },
+            &xc_circuit::OpenDispute {
+                culprit: alice.clone(),
+                challenger: bob.clone(),
+            },
+        )
+        .unwrap();
+        let act = |nonce, payload| Action {
+            sender: alice.clone(),
+            nonce,
+            signature: None,
+            payload,
+        };
+        run(
+            &mut view,
+            act(
+                0,
+                ActionPayload::SubmitProposal {
+                    action: GovernanceAction::ResolveDispute {
+                        height: 1,
+                        header,
+                        resolution: xc_primitives::DisputeResolution::Accept,
+                        corrections: vec![],
+                        cause: xc_primitives::DisputeCause::Attack,
+                        bounty: 0,
+                    },
+                    description: "attack".into(),
+                },
+            ),
+            1,
+        )
+        .unwrap();
+        run(
+            &mut view,
+            act(
+                1,
+                ActionPayload::VoteProposal {
+                    proposal: 0,
+                    approve: true,
+                },
+            ),
+            2,
+        )
+        .unwrap();
+        let updates = crate::dispatch(
+            &act(2, ActionPayload::ExecuteProposal { proposal: 0 }),
+            &view,
+            &operator_lookup,
+            &operator_validators_lookup,
+            &[],
+            8,
+            &no_bls_owner,
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            updates.validator_statuses.0[&alice],
+            Some(xc_primitives::ValidatorStatus::Tombstoned)
+        );
+        // 5% of the 10,000 slashed goes to the challenger.
+        assert_eq!(updates.accounts.0[&bob].balance, FEE_BUDGET + 500);
     }
 }

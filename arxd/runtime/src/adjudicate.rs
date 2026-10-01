@@ -2163,24 +2163,14 @@ mod tests {
             "the proposer was wrong, so block 1 is"
         );
 
-        // The reporter gets `challenger_reward_bps` of the 10,000 slashed,
-        // net of its fee; the pool keeps the rest. Nothing is minted.
+        // Nothing is slashed yet: governance classifies the dispute in
+        // `ResolveDispute` (bug: no one pays, bounty; attack: slash then).
+        // The reporter only pays its fee, and the culprit is untouched.
         let fee = crate::metering::action_fee_for(&params, crate::metering::action_weight(&action));
-        let reward = 10_000 * u128::from(params.challenger_reward_bps) / 10_000;
-        assert_eq!(reward, 500);
-        assert_eq!(
-            updates.accounts.0[&action.sender].balance,
-            FEE_BUDGET + reward - fee
-        );
-        let pool = xc_primitives::reward_pool_account();
-        let pool_before = view
-            .get(&xc_circuit::AccountKey(&pool))
-            .unwrap()
-            .map_or(0, |e| e.balance);
-        assert_eq!(
-            updates.accounts.0[&pool].balance - pool_before,
-            10_000 - reward
-        );
+        assert_eq!(updates.accounts.0[&action.sender].balance, FEE_BUDGET - fee);
+        assert!(!updates.accounts.0.contains_key(&xc_primitives::reward_pool_account()));
+        assert!(updates.validator_statuses.0.is_empty());
+        assert_eq!(marker.challenger, Some(action.sender.clone()));
 
         let err = at(last + 1).unwrap_err().to_string();
         assert!(err.contains("challenge window"), "{err}");
