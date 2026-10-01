@@ -5,9 +5,10 @@
 # synthetic series through a rule and asserts what fires and what stays
 # silent.
 #
-# Rules using increase() are deliberately absent: its extrapolation yields
-# values like 10.000000000000002, so asserting a templated "{{ $value }}"
-# summary against them is brittle rather than useful.
+# Rules using increase() are tested with a single step of 1 inside an
+# otherwise flat counter: the series covers the whole window, so increase()
+# is exactly 1 and the templated "{{ $value }}" summary is stable. Larger or
+# ramping inputs extrapolate to values like 10.000000000000002.
 rule_files:
   - alerts.yml
 
@@ -326,3 +327,147 @@ tests:
             exp_annotations:
               summary: "Host metrics are unavailable"
               description: "Prometheus has been unable to scrape node_exporter for five minutes, so the disk alerts below cannot fire. Check systemctl status arxium-node-exporter.\n"
+
+  # --- arxium node: liveness and finality -----------------------------------
+
+  # The tip timestamp stops at 0 while wall-clock time runs on: stale after
+  # 120 s, firing one minute later. An advancing tip stays silent.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_tip_timestamp_seconds'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: ArxiumChainStalled
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: ArxiumChainStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Node tip is stale (5m 0s old)"
+              description: "The tip block timestamp has been more than 120 seconds behind wall-clock time for one minute. Process supervision alone does not detect this application-liveness failure.\n"
+  - interval: 1m
+    input_series:
+      - series: 'arxium_tip_timestamp_seconds'
+        values: '0+60x10'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: ArxiumChainStalled
+        exp_alerts: []
+
+  # D-25: a height below finalized_height without a certificate. A gap that
+  # closes within five minutes is certificates landing out of order and stays
+  # silent; one that lasts five minutes fires.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finalized_height'
+        values: '110x10'
+      - series: 'arxium_final_watermark'
+        values: '100x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumFinalityGap
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: ArxiumFinalityGap
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "final_watermark is 10 height(s) behind finalized_height"
+              description: "A height below finalized_height has no finality certificate, so final_watermark and settled_height have stopped. See Trello D-25 and docs/consensus-round-change.md.\n"
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finalized_height'
+        values: '110 111 112 113 114 115 116 117 118 119 120'
+      - series: 'arxium_final_watermark'
+        values: '100 101 102 113 114 115 116 117 118 119 120'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: ArxiumFinalityGap
+        exp_alerts: []
+
+  # --- arxium node: event counters (one increment inside the window) --------
+  # A single step of 1 inside a flat series gives increase() exactly 1, so
+  # the templated summaries are stable. Quiet cases use flat counters.
+
+  - interval: 1m
+    input_series:
+      - series: 'arxium_blocks_rejected_total'
+        values: '0x20 1x10'
+      - series: 'arxium_block_production_errors_total'
+        values: '0x20 1x10'
+      - series: 'arxium_network_outbound_dropped_total{channel="blocks"}'
+        values: '0x20 1x10'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ArxiumBlocksRejected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "1 block(s) rejected in the last 10 minutes"
+      - eval_time: 25m
+        alertname: ArxiumProductionErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "1 block production error(s) in the last 10 minutes"
+      - eval_time: 25m
+        alertname: ArxiumOutboundDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              channel: blocks
+            exp_annotations:
+              summary: "1 outbound blocks message(s) dropped in the last 10 minutes"
+      # Ten minutes after the last step the window no longer holds it.
+      - eval_time: 32m
+        alertname: ArxiumBlocksRejected
+        exp_alerts: []
+
+  # Signed-vote protection. `floor` refusals are routine catch-up after a
+  # restart and must not page; `conflict` and `write_failed` must.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finality_votes_refused_total{reason="floor"}'
+        values: '0x10 5x10'
+      - series: 'arxium_finality_votes_refused_total{reason="conflict"}'
+        values: '0x20'
+      - series: 'arxium_finality_votes_refused_total{reason="write_failed"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ArxiumVoteConflictRefused
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: ArxiumVoteRecordWriteFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finality_votes_refused_total{reason="conflict"}'
+        values: '0x10 1x10'
+      - series: 'arxium_finality_votes_refused_total{reason="write_failed"}'
+        values: '0x10 1x10'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: ArxiumVoteConflictRefused
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: conflict
+            exp_annotations:
+              summary: "signed_votes refused a conflicting vote"
+              description: "The validator was about to sign a vote that conflicts with one it already signed. The signed_votes file prevented a slash, which means a restore or rollback happened. Find out why.\n"
+      - eval_time: 15m
+        alertname: ArxiumVoteRecordWriteFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: write_failed
+            exp_annotations:
+              summary: "Votes skipped: signed_votes could not be written"
+              description: "The validator is not voting because it cannot persist its signed-vote record. Check the disk space and permissions of the base path.\n"
