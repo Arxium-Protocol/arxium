@@ -84,7 +84,8 @@ groups:
             final_watermark and settled_height have stopped. See Trello D-25
             and docs/consensus-round-change.md.
 
-      # `floor` refusals are routine catch-up and not alerted on.
+      # `floor` (catch-up) and `round_left` (D-25 round change) refusals are
+      # routine and not alerted on.
       - alert: ArxiumVoteConflictRefused
         expr: increase(arxium_finality_votes_refused_total{reason="conflict"}[10m]) > 0
         labels:

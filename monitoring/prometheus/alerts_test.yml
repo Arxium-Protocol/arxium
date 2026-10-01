@@ -191,6 +191,35 @@ tests:
             exp_annotations:
               summary: "1500 actions have been pending for at least 5 minutes"
 
+  # D-29: a precommit refused after a round timeout is the V2 guard working,
+  # not a restore. Only reason="conflict" may page.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finality_votes_refused_total{reason="round_left"}'
+        values: '0 0 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: ArxiumVoteConflictRefused
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'arxium_finality_votes_refused_total{reason="conflict"}'
+        values: '0 0 2 2 2 2'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: ArxiumVoteConflictRefused
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: conflict
+            exp_annotations:
+              summary: "signed_votes refused a conflicting vote"
+              description: >
+                The validator was about to sign a vote that conflicts with one it
+                already signed. The signed_votes file prevented a slash, which
+                means a restore or rollback happened. Find out why.
+
   # Retracer DB growing 72 MB/h from 1 GB: projected ~13.6 GB in a week,
   # over the 12 GB budget (and under the old 20 GB placeholder, which is
   # exactly the case the placeholder missed).
