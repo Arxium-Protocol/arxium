@@ -355,13 +355,13 @@ fn default_fee_proposer_bps() -> u32 {
 fn default_fee_treasury_bps() -> u32 {
     2_000
 }
-/// 48h at 2s slots — CometBFT's default evidence age. Optimistic rollups
-/// run ~7 days because a challenger has to get through a possibly censored
-/// L1; here evidence lands on this chain, where any one honest proposer
-/// includes it, and dissenting validators auto-submit within seconds. 48h
-/// covers a human Guard noticing, and leaves 12 of the 14 unbonding days
-/// for the slash to find stake.
-pub const DEFAULT_CHALLENGE_WINDOW_BLOCKS: u64 = 48 * 60 * 60 / 2;
+/// 12h at 2s slots. Optimistic rollups run ~7 days because a challenger
+/// has to get through a possibly censored L1; here evidence lands on this
+/// chain, where any one honest proposer includes it, and dissenting
+/// validators auto-submit within seconds. 12h covers a human Guard
+/// noticing, and leaves 13.5 of the 14 unbonding days for the slash to
+/// find stake.
+pub const DEFAULT_CHALLENGE_WINDOW_BLOCKS: u64 = 12 * 60 * 60 / 2;
 fn default_challenge_window_blocks() -> u64 {
     DEFAULT_CHALLENGE_WINDOW_BLOCKS
 }
