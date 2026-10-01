@@ -2168,7 +2168,12 @@ mod tests {
         // The reporter only pays its fee, and the culprit is untouched.
         let fee = crate::metering::action_fee_for(&params, crate::metering::action_weight(&action));
         assert_eq!(updates.accounts.0[&action.sender].balance, FEE_BUDGET - fee);
-        assert!(!updates.accounts.0.contains_key(&xc_primitives::reward_pool_account()));
+        assert!(
+            !updates
+                .accounts
+                .0
+                .contains_key(&xc_primitives::reward_pool_account())
+        );
         assert!(updates.validator_statuses.0.is_empty());
         assert_eq!(marker.challenger, Some(action.sender.clone()));
 

@@ -82,7 +82,9 @@ pub(crate) fn execute<V: KvRead<Error = StorageError>>(
             }
             // The culprit has no stake left to take (fully unbonded since the
             // dispute): execute anyway, or the proposal could never close.
-            Err(err) => tracing::warn!(culprit = %open.culprit, %err, "attack verdict slashed nothing"),
+            Err(err) => {
+                tracing::warn!(culprit = %open.culprit, %err, "attack verdict slashed nothing")
+            }
         }
     }
     Ok(updates)
@@ -377,8 +379,11 @@ mod tests {
                 self_allocation(&alice, 10_000),
             )]),
         );
-        view.put(&xc_circuit::StakeByValidatorKey(&alice), &vec![alice.clone()])
-            .unwrap();
+        view.put(
+            &xc_circuit::StakeByValidatorKey(&alice),
+            &vec![alice.clone()],
+        )
+        .unwrap();
         view.put(
             &ValidatorSetKey(0),
             &std::collections::BTreeMap::from([(alice.clone(), VotingPower(10_000))]),

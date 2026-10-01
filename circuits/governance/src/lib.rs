@@ -23,8 +23,9 @@ use xc_circuit::{
     OpenDispute, ProposalKey, ValidatorSetKey, ValidatorStatusKey, VoteKey,
 };
 use xc_primitives::{
-    Address, ChainParams, DisputeCause, DisputeResolution, GovernanceAction, Proposal, ProposalStatus,
-    TOTAL_VOTING_POWER, ValidatorStatus, treasury_account, validator_set_effective_height,
+    Address, ChainParams, DisputeCause, DisputeResolution, GovernanceAction, Proposal,
+    ProposalStatus, TOTAL_VOTING_POWER, ValidatorStatus, treasury_account,
+    validator_set_effective_height,
 };
 use xc_storage::{AccountUpdates, GovernanceUpdates, StorageError};
 
@@ -377,9 +378,10 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                         let mut from = view.get(&AccountKey(&treasury))?.unwrap_or_default();
                         // Short treasury (or a bounty to the treasury itself)
                         // rejects, like `TreasurySpend`.
-                        if let (Some(rest), true) =
-                            (from.balance.checked_sub(*bounty), open.challenger != treasury)
-                        {
+                        if let (Some(rest), true) = (
+                            from.balance.checked_sub(*bounty),
+                            open.challenger != treasury,
+                        ) {
                             from.balance = rest;
                             let mut dest =
                                 view.get(&AccountKey(&open.challenger))?.unwrap_or_default();
@@ -822,7 +824,10 @@ mod tests {
             p.status
         };
         assert_eq!(run(0), ProposalStatus::Executed);
-        assert_eq!(KvRead::get(&db, &ValidatorStatusKey(&addr(3))).unwrap(), None);
+        assert_eq!(
+            KvRead::get(&db, &ValidatorStatusKey(&addr(3))).unwrap(),
+            None
+        );
         assert_eq!(run(1), ProposalStatus::Rejected);
     }
 
@@ -842,7 +847,14 @@ mod tests {
         })
         .unwrap();
         db.write_batch(&AccountUpdates(
-            [(treasury_account(), xc_primitives::AccountEntry { balance: 100, ..Default::default() })].into(),
+            [(
+                treasury_account(),
+                xc_primitives::AccountEntry {
+                    balance: 100,
+                    ..Default::default()
+                },
+            )]
+            .into(),
         ))
         .unwrap();
         let resolve = |cause, bounty, corrections| GovernanceAction::ResolveDispute {
@@ -857,7 +869,8 @@ mod tests {
             let (got, up) = apply_submit(&db, &addr(1), action, "", 0).unwrap();
             assert_eq!(got, id);
             db.write_batch(&up).unwrap();
-            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap()).unwrap();
+            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+                .unwrap();
             let (up, accounts, slash) = apply_execute(&db, id, 10).unwrap();
             db.write_batch(&up).unwrap();
             db.write_batch(&accounts).unwrap();
@@ -866,18 +879,34 @@ mod tests {
         };
 
         assert!(matches!(
-            apply_submit(&db, &addr(1), resolve(DisputeCause::Attack, 5, vec![]), "", 0).unwrap_err(),
+            apply_submit(
+                &db,
+                &addr(1),
+                resolve(DisputeCause::Attack, 5, vec![]),
+                "",
+                0
+            )
+            .unwrap_err(),
             GovernanceError::AttackWithPayouts
         ));
         // Treasury holds 100: a bounty of 500 rejects and the dispute stays open.
         let ((written, slash), status) = execute(0, resolve(DisputeCause::Bug, 500, vec![]));
-        assert_eq!((status, slash, written), (ProposalStatus::Rejected, None, 0));
+        assert_eq!(
+            (status, slash, written),
+            (ProposalStatus::Rejected, None, 0)
+        );
         assert_eq!(db.lowest_open_dispute().unwrap(), Some(3));
         // Affordable bounty: challenger paid, no slash, dispute closed.
         let ((_, slash), status) = execute(1, resolve(DisputeCause::Bug, 60, vec![]));
         assert_eq!((status, slash), (ProposalStatus::Executed, None));
         assert_eq!(db.get_account(&challenger).unwrap().unwrap().balance, 60);
-        assert_eq!(db.get_account(&treasury_account()).unwrap().unwrap().balance, 40);
+        assert_eq!(
+            db.get_account(&treasury_account())
+                .unwrap()
+                .unwrap()
+                .balance,
+            40
+        );
         assert_eq!(db.lowest_open_dispute().unwrap(), None);
 
         // Attack: reopen and expect the culprit and challenger back.
@@ -890,6 +919,12 @@ mod tests {
         .unwrap();
         let ((_, slash), status) = execute(2, resolve(DisputeCause::Attack, 0, vec![]));
         assert_eq!(status, ProposalStatus::Executed);
-        assert_eq!(slash, Some(OpenDispute { culprit, challenger }));
+        assert_eq!(
+            slash,
+            Some(OpenDispute {
+                culprit,
+                challenger
+            })
+        );
     }
 }
