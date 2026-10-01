@@ -173,7 +173,8 @@ impl SignedVotes {
     }
 
     /// Every refusal is counted in `arxium_finality_votes_refused_total{reason}`:
-    /// `floor` is routine catch-up, `conflict` means the file just saved this
+    /// `floor` is routine catch-up, `round_left` is the V2 guard after a normal
+    /// round change (D-25), `conflict` means the file just saved this
     /// validator from a slash (a restore or rollback happened), and
     /// `write_failed` means the vote was skipped because the record couldn't
     /// be made durable (disk full, permissions).
@@ -214,7 +215,7 @@ impl SignedVotes {
                     && (e.round > round || (e.round == round && e.kind == Kind::Timeout))
             })
         {
-            refused("conflict");
+            refused("round_left");
             return Err(format!(
                 "already left round {round} at height {height} ({:?} vote at round {})",
                 e.kind, e.round
