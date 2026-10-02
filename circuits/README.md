@@ -68,7 +68,7 @@ back up.
 If you're asked to implement handling for a new payload variant: add a
 new crate here (`circuits/<name>`, package name `circuit-<name>`) taking
 plain arguments (not `Action<P>`), wire its dispatch into the calling
-chain's own `dispatch` fn (e.g. `arxd/node/src/payload.rs` for CoreChain,
+chain's own `dispatch` fn (e.g. `arxd/runtime/src/payload.rs` for CoreChain,
 `examples/toy-chain/src/main.rs` for the RWA chain) — not into
 `core/executor`, which has no knowledge of payload types — and keep the
 circuit itself free of role checks, networking, and direct DB writes —

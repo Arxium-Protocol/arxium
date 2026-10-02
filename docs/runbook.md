@@ -1,8 +1,9 @@
 # Arxium node operator runbook
 
-Everything here is grounded in what's actually implemented as of 2026-08-20 — no
-aspirational tooling. Where something an operator would want doesn't exist yet
-(alerting, automated failover, a `reset` subcommand), it's called out explicitly
+Everything here is grounded in what's actually implemented — no aspirational
+tooling. Staking, slashing, installer paths and monitoring were last reconciled
+with the code on 2026-10-02; other sections reflect 2026-08-20. Where something an operator would want doesn't exist yet
+(automated failover, a `reset` subcommand), it's called out explicitly
 rather than assumed.
 
 ## Topology
@@ -10,7 +11,7 @@ rather than assumed.
 One `arxd` process = one node. A node is a **validator** if started with
 `--validator` (it produces blocks on its round-robin turn) or a plain peer
 otherwise (accepts/relays blocks only). RPC (`30333`, HTTP) and P2P (`30334`,
-TCP+QUIC) are separate listeners — see `core/cli`'s `RunArgs` for every flag.
+TCP+QUIC) are separate listeners — see `RunArgs` in `arxd/node/src/cli.rs` for every flag.
 
 Production topology (`docker-compose.prod.yml`): `nginx-proxy` terminates TLS
 (with `acme-companion` renewing the certificate) and forwards to the `gateway`
@@ -49,8 +50,9 @@ bash install.sh            # add --dry-run first to see every step, touching not
 What it does: resolves the latest GitHub release (`--version vX.Y.Z` to pin
 one), downloads the binary **and `SHA256SUMS`, verifying the archive before
 unpacking it** (it refuses to install if either the checksum file or a
-matching digest is missing), lays out `<base_path>/{bin,config,data}`,
-writes `config/arxd.env`, prints this node's validator address, and
+matching digest is missing), lays out `<base_path>/{bin,configs}` (each
+chain's data directory is created by `arxd` on first run),
+writes `configs/arxd.env`, prints this node's validator address, and
 generates + installs a systemd unit. Flags: `--base-path`, `--yes`
 (non-interactive, all defaults), `--dry-run`.
 
@@ -61,7 +63,7 @@ foreground command.
 
 ### Configuration lives in an env file, not a TOML file
 
-`<base_path>/config/arxd.env` is read by systemd (`EnvironmentFile=`) and by
+`<base_path>/configs/arxd.env` is read by systemd (`EnvironmentFile=`) and by
 `arxd` itself (clap `env` on every `RunArgs` field). There is no config
 parser in `arxd` and no precedence rules to learn beyond one: **a
 command-line flag beats the env file**, so a one-off run can override the
@@ -70,7 +72,7 @@ installed config without editing it.
 ```sh
 sudo systemctl stop arxd
 sudo -u <node-user> ~/.arxium/bin/arxd --rpc-bind 0.0.0.0    # try it
-$EDITOR ~/.arxium/config/arxd.env                            # then make it stick
+$EDITOR ~/.arxium/configs/arxd.env                            # then make it stick
 sudo systemctl restart arxd
 ```
 
@@ -205,15 +207,16 @@ is a fatal error, not a silent divergence.
 - `GET /metrics` → Prometheus text format. Key series (see `arxd/node/src/lib.rs`
   and `produce.rs`): `arxium_tip_timestamp_seconds` (gauge — **the one to
   alert on**, see below), `arxium_tip_height` (gauge — should climb roughly
-  every `BLOCK_INTERVAL`, 2s), `arxium_is_expected_proposer` (0/1),
+  every block interval, `block_interval_secs`, 2s), `arxium_is_expected_proposer` (0/1),
   `arxium_consensus_round`, `arxium_production_skipped_not_eligible_total`,
   `arxium_blocks_produced_total` /
   `arxium_blocks_accepted_total` / `arxium_blocks_rejected_total` (counters),
   `arxium_mempool_pending_actions` (gauge), `arxium_block_production_errors_total`,
   `arxium_rpc_requests_total` (per-endpoint, `core/rpc/src/lib.rs`).
-  **No dashboard or alerting is wired up yet** — this is `curl`-and-read
-  territory until one exists; don't assume a Grafana board is already
-  deployed.
+  Alert rules (`monitoring/prometheus/alerts.yml`) and a provisioned Grafana
+  dashboard ship in `monitoring/`; `install.sh --with-monitoring` installs
+  them. They only exist on a node where that was run, so on any other node
+  this is `curl`-and-read.
 - Tip not advancing is the #1 symptom to watch. Cross-check against the
   validator-identity gotcha above before assuming it's a deeper bug —
   that's the single most likely cause on a freshly (re)provisioned box.
@@ -926,7 +929,7 @@ for the next boundary:
 | You do / it happens | Status written | In the set from |
 |---|---|---|
 | `JoinValidator` (stake ≥ 100,000 ARX self-stake, BLS key + PoP) | `Pending` | the first block of the next epoch — not before. **A join landing in the last block of an epoch waits one epoch more**: the boundary reads candidates from committed state, and that block's writes aren't committed yet |
-| `LeaveValidator` | `Leaving` | you keep proposing and voting until the boundary, then drop; the stake unbonds for 21 epochs and stays slashable throughout |
+| `LeaveValidator` | `Leaving` | you keep proposing and voting until the boundary, then drop; the stake unbonds for `unbonding_blocks` (14 days on mainnet, 1 hour on devnet) and stays slashable throughout |
 | Missed proposer slot (downtime) | `Jailed { until_epoch: current + 2 }` | out at the next boundary, eligible again two epochs on — no action needed |
 | Double-sign or execution fault (evidence submitted) | `Tombstoned` | never again, with any stake, from that address. Slashed once — further evidence at other heights records nothing more |
 | Stake drops below the floor, or outside the top 100 by stake | `Pending` | back in at a later boundary once it qualifies again |
@@ -942,7 +945,7 @@ quorum is never written. A BLS key registered mid-epoch (`RegisterBlsKey`,
 or the one carried by `JoinValidator`) also takes effect at the boundary, so
 keys and membership always activate together.
 
-All slashed stake is burned; nothing is credited to the treasury.
+Slashed stake is not burned: it is credited to the reward pool (less any challenger reward), and nothing goes to the treasury.
 
 `GET /validators` returns the sorted member list at the tip (or `?height=`),
 `GET /validators/power` the same set as `{address: voting_power}`. A validator's own status has no RPC yet — read it from the

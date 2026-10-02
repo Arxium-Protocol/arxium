@@ -70,13 +70,15 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         | LockIssuance { .. }
         | TransferIssuer { .. }
         | SetAssetMetadataUri { .. } => 100,
-        // ponytail: flat, though the real cost is one move per snapshot
-        // holder. Weight must be a pure function of the action, so a
-        // per-holder term would need the count carried in the payload.
-        SnapshotHolders { .. }
-        | DistributeToHolders { .. }
-        | RedeemHolders { .. }
-        | SplitAsset { .. } => 1_000,
+        // Measured at the `MAX_ASSET_HOLDERS` ceiling (1,000 holders, release
+        // build, `bench_corporate_actions_at_the_holder_ceiling`): snapshot
+        // ~0.6ms, distribute ~7ms, split ~4.5ms, redeem ~3.2ms, all before the
+        // commit's balance and index writes. Flat at about 2x measured rather
+        // than per-holder, because weight is a pure function of the action
+        // and the ceiling bounds the worst case.
+        SnapshotHolders { .. } => 2_000,
+        DistributeToHolders { .. } => 15_000,
+        RedeemHolders { .. } | SplitAsset { .. } => 10_000,
         // A validator-set read plus one or two governance rows.
         SubmitProposal { .. } | VoteProposal { .. } | ExecuteProposal { .. } => 150,
         // Two block-signature verifies plus the slash.
