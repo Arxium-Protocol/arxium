@@ -357,6 +357,11 @@ pub fn apply_record_claim_proof<V: KvRead<Error = StorageError>>(
 /// prospectus limits. The issuer's own balance is exempt from both — it's
 /// the treasury, not an investor. Returns the recipient's current balance so
 /// the caller doesn't read it twice.
+/// Hard ceiling on non-issuer holders per asset, whatever `max_holders` says.
+// ponytail: flat constant; make it a `ChainParams` field if governance needs
+// to retune it (that is a state-format bump).
+pub const MAX_ASSET_HOLDERS: u32 = 1_000;
+
 fn check_recipient<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &Asset,
@@ -374,11 +379,13 @@ fn check_recipient<V: KvRead<Error = StorageError>>(
     if to == &asset.issuer {
         return Ok(balance);
     }
-    if let Some(cap) = asset.max_holders
-        && balance == 0
-        && amount > 0
-        && asset.holder_count >= cap
-    {
+    // The protocol ceiling applies even when the issuer set no cap: corporate
+    // actions iterate the whole cap table at a flat weight, and the table
+    // rides on the asset record that snapshot sync must carry.
+    let cap = asset
+        .max_holders
+        .map_or(MAX_ASSET_HOLDERS, |c| c.min(MAX_ASSET_HOLDERS));
+    if balance == 0 && amount > 0 && asset.holder_count >= cap {
         return Err(RwaError::HolderCapReached {
             asset: asset.asset_ref.clone(),
             address: to.clone(),
@@ -2318,6 +2325,79 @@ mod tests {
         let (_, assets) =
             apply_compliant_transfer(&db, &mut asset, &issuer, 1, &recipient, 10, 0).unwrap();
         assert_eq!(assets.0[&(asset.asset_ref.clone(), recipient)], 10);
+    }
+
+    /// Cost of each corporate action at the holder ceiling, in microseconds,
+    /// to compare with `metering` weight (nominal µs) and `max_block_weight`.
+    /// `cargo test -p circuit-rwa-asset --release -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_corporate_actions_at_the_holder_ceiling() {
+        use std::time::Instant;
+        let db = temp_db();
+        let issuer = addr(1);
+        let who = |i: u32| {
+            let mut b = [7u8; 32];
+            b[..4].copy_from_slice(&i.to_be_bytes());
+            Address::from_pubkey_bytes(&b).unwrap()
+        };
+        let mut bond = Asset::new("bond", issuer.clone(), true);
+        let usd_issuer = addr(9);
+        let mut usd = Asset::new("usd", usd_issuer.clone(), true);
+        attest(&db, &issuer, &[], None);
+        attest(&db, &usd_issuer, &[], None);
+        let (a, b) = apply_issue(&db, &mut bond, &issuer, 0, 10_000_000).unwrap();
+        db.write_batch(&a).unwrap();
+        db.write_batch(&b).unwrap();
+        let (a, b) = apply_issue(&db, &mut usd, &usd_issuer, 0, 1_000_000_000).unwrap();
+        db.write_batch(&a).unwrap();
+        db.write_batch(&b).unwrap();
+        let mut balances = AssetBalanceUpdates(BTreeMap::new());
+        for i in 0..MAX_ASSET_HOLDERS {
+            let h = who(i);
+            attest(&db, &h, &[], None);
+            balances.0.extend(
+                apply_forced_transfer(&db, &mut bond, &issuer, &h, 100)
+                    .unwrap()
+                    .0,
+            );
+        }
+        commit(&db, &balances);
+        assert_eq!(bond.holder_count, MAX_ASSET_HOLDERS);
+
+        let t = Instant::now();
+        apply_snapshot(&db, &mut bond, 1).unwrap();
+        eprintln!("snapshot     {:>8} µs", t.elapsed().as_micros());
+        let table = bond.snapshot.clone().unwrap();
+        eprintln!(
+            "snapshot bytes {}",
+            bincode::serde::encode_to_vec(&table, bincode::config::standard())
+                .unwrap()
+                .len()
+        );
+        let t = Instant::now();
+        apply_distribution(&db, &mut usd, &usd_issuer, &table, 100_000_000, 1).unwrap();
+        eprintln!("distribute   {:>8} µs", t.elapsed().as_micros());
+        let t = Instant::now();
+        apply_split(&db, &mut bond.clone(), &table, 2, 1, 1).unwrap();
+        eprintln!("split 2:1    {:>8} µs", t.elapsed().as_micros());
+        let t = Instant::now();
+        apply_redemption(&db, &mut bond, &table, 1).unwrap();
+        eprintln!("redeem       {:>8} µs", t.elapsed().as_micros());
+    }
+
+    /// No issuer cap still means a cap: the protocol ceiling stops the
+    /// holder that would exceed `MAX_ASSET_HOLDERS`.
+    #[test]
+    fn protocol_holder_ceiling_applies_without_an_issuer_cap() {
+        let db = temp_db();
+        let issuer = addr(1);
+        let mut asset = seeded_open_asset(&db, &issuer, 100);
+        assert_eq!(asset.max_holders, None);
+        asset.holder_count = MAX_ASSET_HOLDERS;
+        let err =
+            apply_compliant_transfer(&db, &mut asset, &issuer, 1, &addr(2), 10, 0).unwrap_err();
+        assert!(matches!(err, RwaError::HolderCapReached { .. }), "{err}");
     }
 
     /// Investor cap: the third distinct holder is refused, the issuer's own
