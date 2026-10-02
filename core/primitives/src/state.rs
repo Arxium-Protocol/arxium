@@ -57,6 +57,9 @@ pub struct AccountEntry {
     /// `zk_identity_verified`), which an age-limited asset treats as expired.
     #[serde(default)]
     pub attested_at: Option<u64>,
+    /// Stateful authorization, counters and cancellable recovery. State v26.
+    #[serde(default)]
+    pub programmable: Option<crate::ProgrammableAccount>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -528,6 +531,22 @@ impl Snapshot {
                     pop.len()
                 ),
                 _ => {}
+            }
+        }
+        for (address, entry) in &self.accounts {
+            if let Some(account) = &entry.programmable {
+                crate::policy::validate_account_address(address)?;
+                account.policy.validate()?;
+                if !account.counters.is_empty() || account.pending_recovery.is_some() {
+                    anyhow::bail!(
+                        "genesis programmable accounts must have empty counters and recovery queues"
+                    );
+                }
+                if !self.params.account_extensions_enabled
+                    && (!account.policy.sessions.is_empty() || account.policy.recovery.is_some())
+                {
+                    anyhow::bail!("session keys and recovery are disabled in chain parameters");
+                }
             }
         }
         Ok(())

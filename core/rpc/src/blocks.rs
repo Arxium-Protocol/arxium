@@ -19,7 +19,10 @@ pub(super) async fn get_action_status<P: Payload>(
     State(state): State<AppState<P>>,
     Path(signature): Path<String>,
 ) -> Result<Response, ApiError> {
-    {
+    // A previously rejected action may subsequently land (locally or from a
+    // peer). Committed history takes precedence over the local rejection ring.
+    let committed_height = state.db.get_action_block_height(&signature)?;
+    if committed_height.is_none() {
         let mempool = state.mempool.lock().unwrap_or_else(|e| e.into_inner());
         if mempool.contains_signature(&signature) {
             return Ok(Json(serde_json::json!({ "status": "pending" })).into_response());
@@ -31,10 +34,7 @@ pub(super) async fn get_action_status<P: Payload>(
         }
     }
 
-    let height = state
-        .db
-        .get_action_block_height(&signature)?
-        .ok_or(ApiError::NotFound)?;
+    let height = committed_height.ok_or(ApiError::NotFound)?;
     let block = state.db.get_block::<P>(height)?.ok_or_else(|| {
         ApiError::internal(anyhow::anyhow!(
             "action index points at missing block {height} for {signature}"

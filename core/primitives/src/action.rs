@@ -141,6 +141,60 @@ impl<P: Serialize> Action<P> {
         }
         verify_one(&sender_bytes, &sig_bytes, &self.signing_bytes())
     }
+
+    /// Verify against the current state, never an old address policy. Runtime
+    /// checks the returned capability's scope and height before execution.
+    pub fn verify_account_signature(
+        &self,
+        account: Option<&crate::ProgrammableAccount>,
+    ) -> Result<crate::PolicyAuthorization, SignatureError> {
+        use crate::PolicyAuthorization;
+        let Some(account) = account else {
+            self.verify_signature()?;
+            return Ok(PolicyAuthorization::Owner);
+        };
+        account.policy.validate()?;
+        crate::policy::validate_account_address(&self.sender)?;
+        let bytes = hex::decode(self.signature.as_deref().ok_or(SignatureError::Missing)?)
+            .map_err(|_| SignatureError::InvalidHex)?;
+        let [0xa7, mode, witness @ ..] = bytes.as_slice() else {
+            return Err(SignatureError::Invalid);
+        };
+        let message = self.signing_bytes();
+        let threshold = |policy: &crate::ThresholdPolicy| {
+            let address = multisig_address(policy.threshold, &policy.members)?;
+            verify_multisig(&address.pubkey_bytes()?[1..], witness, &message)
+        };
+        match mode {
+            0 => {
+                threshold(&account.policy.owners)?;
+                Ok(PolicyAuthorization::Owner)
+            }
+            1 => {
+                if witness.len() != 96 {
+                    return Err(SignatureError::Invalid);
+                }
+                let i = account
+                    .policy
+                    .sessions
+                    .iter()
+                    .position(|s| s.public_key == witness[..32])
+                    .ok_or(SignatureError::Invalid)?;
+                verify_one(&witness[..32], &witness[32..], &message)?;
+                Ok(PolicyAuthorization::Session(i))
+            }
+            2 => {
+                let recovery = account
+                    .policy
+                    .recovery
+                    .as_ref()
+                    .ok_or(SignatureError::Invalid)?;
+                threshold(&recovery.guardians)?;
+                Ok(PolicyAuthorization::Guardian)
+            }
+            _ => Err(SignatureError::Invalid),
+        }
+    }
 }
 
 fn verify_one(pubkey: &[u8], sig: &[u8], message: &[u8]) -> Result<(), SignatureError> {

@@ -1,6 +1,7 @@
 import { signAction, signingBytes, submitBody, verifyMultisig, type SignedAction } from "./actions.js";
 import { decodeAddress, isMultisigAddress } from "./bech32.js";
 import { asBuffer, fromHex } from "./bincode.js";
+import { verifyPolicySignature, type AccountPolicy } from "./policy.js";
 
 export type RpcOptions = { rpc: string; token?: string; fetch?: typeof globalThis.fetch };
 export type ActionStatus = { status: "pending" } | { status: "confirmed"; height: number; block_hash: string; sender: string; nonce: number } | { status: "dropped"; reason: string } | { status: "unknown" };
@@ -30,4 +31,12 @@ export class ArxiumRpc {
   actionFee<T = unknown>(): Promise<T> { return this.request("/action-fee"); }
   async sendAction(options: SendActionOptions): Promise<{ action: SignedAction; status: ActionStatus }> { const account = await this.account<{ nonce: number }>(options.sender).catch((error) => { if (error instanceof RpcError && error.status === 404) return { nonce: 0 }; throw error; }); const signature = await signAction(options.privateKey, options.sender, account.nonce, options.payload); const action = submitBody(options.sender, account.nonce, signature, options.payload); await this.submit(action); const deadline = Date.now() + (options.timeoutMs ?? 120_000); while (Date.now() < deadline) { const status = await this.action(signature); if (status.status === "dropped") throw new Error(`action dropped: ${status.reason}`); if (status.status === "confirmed") { if (!options.finalized) return { action, status }; const block = await this.block<{ finalized?: boolean }>(status.height); if (block.finalized) return { action, status }; } await new Promise((resolve) => setTimeout(resolve, options.pollIntervalMs ?? 1_000)); } throw new Error("timed out waiting for action"); }
 }
-export async function verifySignedAction(action: SignedAction): Promise<boolean> { try { if (isMultisigAddress(action.sender)) return await verifyMultisig(action.sender, action.signature, signingBytes(action.sender, action.nonce, Uint8Array.from(action.payload))); const key = await crypto.subtle.importKey("raw", asBuffer(decodeAddress(action.sender)), "Ed25519", false, ["verify"]); return crypto.subtle.verify("Ed25519", key, asBuffer(fromHex(action.signature)), asBuffer(signingBytes(action.sender, action.nonce, Uint8Array.from(action.payload)))); } catch { return false; } }
+/** Stateful witnesses require the policy at the action's pre-state, not today's
+ * policy. This checks cryptography; circuit execution proves limits and scope. */
+export async function verifySignedAction(action: SignedAction, preStatePolicy?: AccountPolicy): Promise<boolean> { try {
+  const message = signingBytes(action.sender, action.nonce, Uint8Array.from(action.payload));
+  if (action.signature.length > 128 && /^a7(00|01|02)/.test(action.signature)) return !!preStatePolicy && await verifyPolicySignature(preStatePolicy, action.signature, message) !== null;
+  if (isMultisigAddress(action.sender)) return await verifyMultisig(action.sender, action.signature, message);
+  const key = await crypto.subtle.importKey("raw", asBuffer(decodeAddress(action.sender)), "Ed25519", false, ["verify"]);
+  return crypto.subtle.verify("Ed25519", key, asBuffer(fromHex(action.signature)), asBuffer(message));
+} catch { return false; } }

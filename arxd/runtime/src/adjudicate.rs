@@ -338,7 +338,15 @@ fn replay_block_divergence(
                     .to_string(),
             );
         }
-        if action.verify_signature().is_err() {
+        let account = match view.get(&xc_circuit::AccountKey(&action.sender)) {
+            Ok(account) => account,
+            Err(StorageError::UnprovenRead) => return disagreement(not_proven("account policy")),
+            Err(err) => return Err(AdjudicateError::Replay(err.to_string())),
+        };
+        if action
+            .verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))
+            .is_err()
+        {
             return proposer_culpable();
         }
         let weight = crate::metering::action_weight(action);
@@ -1809,6 +1817,124 @@ mod tests {
                 culpable_pubkey: voter_pubkey
             }
         );
+    }
+
+    #[test]
+    fn programmable_rotation_and_spending_replay_from_account_proofs() {
+        use xc_primitives::{
+            AccountPolicy, AccountPolicyAction, ProgrammableAccount, SpendAsset, SpendingLimit,
+            ThresholdPolicy,
+        };
+        let old = [1u8, 2, 3].map(|seed| SigningKey::from_bytes(&[seed; 32]));
+        let new = [4u8, 5, 6].map(|seed| SigningKey::from_bytes(&[seed; 32]));
+        let threshold = |keys: &[SigningKey]| {
+            let mut members = keys
+                .iter()
+                .map(|k| k.verifying_key().to_bytes())
+                .collect::<Vec<_>>();
+            members.sort();
+            ThresholdPolicy {
+                threshold: 2,
+                members,
+            }
+        };
+        // Enroll a personal-key address: ownership changes, its ID does not.
+        let sender = key_address(&old[0]);
+        let recipient = key_address(&new[0]);
+        let policy = AccountPolicy {
+            owners: threshold(&old),
+            limits: vec![SpendingLimit {
+                asset: SpendAsset::Native,
+                amount: 10_000_000_000,
+                period_blocks: 10,
+            }],
+            recipients: Some(vec![recipient.clone()]),
+            sessions: vec![],
+            recovery: None,
+        };
+        let chain = chain(&[&sender], Default::default(), |db| {
+            let mut account = db.get_account(&sender).unwrap().unwrap();
+            account.programmable = Some(ProgrammableAccount {
+                policy,
+                counters: vec![],
+                pending_recovery: None,
+            });
+            db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
+                sender.clone(),
+                account,
+            )])))
+            .unwrap();
+        });
+        let sign = |keys: &[SigningKey], nonce, payload| {
+            let mut action = xc_primitives::Action {
+                sender: sender.clone(),
+                nonce,
+                signature: None,
+                payload,
+            };
+            let owners = threshold(keys);
+            let sigs = keys
+                .iter()
+                .take(2)
+                .map(|k| {
+                    (
+                        k.verifying_key().to_bytes(),
+                        k.sign(&action.signing_bytes()).to_bytes(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            action.signature = Some(
+                xc_primitives::policy_signature(
+                    0,
+                    &xc_primitives::multisig_signature(2, &owners.members, &sigs).unwrap(),
+                )
+                .unwrap(),
+            );
+            action
+        };
+        let actions = vec![
+            sign(
+                &old,
+                0,
+                crate::ActionPayload::Transfer {
+                    to: recipient.clone(),
+                    amount: 40,
+                },
+            ),
+            sign(
+                &old,
+                1,
+                crate::ActionPayload::AccountPolicy(AccountPolicyAction::RotateMembers {
+                    owners: threshold(&new),
+                }),
+            ),
+            sign(
+                &new,
+                2,
+                crate::ActionPayload::Transfer {
+                    to: recipient,
+                    amount: 50,
+                },
+            ),
+        ];
+        let (block, touched) = run_block(&chain, actions, 1000);
+        assert_ne!(block.state_root, chain.genesis.state_root);
+        let (artifact, _, voter) = divergence(&chain, &block, touched.clone(), &bogus_root(0xcc));
+        assert_eq!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Culpable {
+                culpable_pubkey: voter
+            }
+        );
+        let incomplete = touched
+            .into_iter()
+            .filter(|key| key != &AccountKey(&sender).encode())
+            .collect();
+        let (artifact, _, _) = divergence(&chain, &block, incomplete, &bogus_root(0xcc));
+        assert!(matches!(
+            adjudicate_block_divergence(&artifact).unwrap(),
+            AdjudicationOutcome::Disagreement { .. }
+        ));
     }
 
     #[test]

@@ -1142,7 +1142,16 @@ where
     let mut signatures = verify_signatures(&actions).into_iter();
     let mut actions = actions.into_iter();
     while let Some(action) = actions.next() {
-        if let Err(err) = signatures.next().expect("one result per action") {
+        // Stateless results stand for legacy accounts. A programmable account
+        // must be checked against this block's overlay, so a rotation earlier
+        // in the block takes effect for the next action.
+        let presigned = signatures.next().expect("one result per action");
+        let account = KvRead::get(&view, &xc_circuit::AccountKey(&action.sender))?;
+        let verified = match account.as_ref().and_then(|e| e.programmable.as_ref()) {
+            Some(policy) => action.verify_account_signature(Some(policy)).map(|_| ()),
+            None => presigned,
+        };
+        if let Err(err) = verified {
             warn!("dropping action from {}: {err}", action.sender);
             dropped.push(DroppedAction {
                 signature: action.signature.clone().unwrap_or_default(),

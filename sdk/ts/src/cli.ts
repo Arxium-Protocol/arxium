@@ -8,6 +8,8 @@ import {
   encodeRegisterBlsKey, encodeRevokeAttestation, encodeRevokeOperator, encodeStake, encodeTransfer,
   encodeUnstake, generateKey, isKeyFile, signAction, submitBody, unlockKey, verifyKeyFile,
   verifySignedAction, wrapPkcs8, encodeAddress, toHex, toKeyFile, PKCS8_ED25519_PREFIX, type ClaimTopic, type KeyFile,
+  assemblePolicySignature, decodePayload, encodePayload, fromHex, multisigAddress, multisigSignature, signingBytes, asBuffer,
+  type AccountPolicy,
 } from "./index.js";
 
 type Globals = { rpc: string; token?: string; key?: string; json: boolean; nonce?: number };
@@ -25,9 +27,59 @@ function payload(action: string, args: string[]): Uint8Array { const amount = (i
 function hexArg(value: string | undefined): Uint8Array { if (!value || !/^[0-9a-f]*$/i.test(value) || value.length % 2) throwUsage("expected even-length hex"); return Uint8Array.from(value.match(/../g)?.map((byte) => Number.parseInt(byte, 16)) ?? []); }
 async function main(): Promise<void> { const { globals, args } = parseGlobals(process.argv.slice(2)); const [command, ...rest] = args; if (!command) throwUsage("use: arx keys|sign|submit|send|query|verify"); if (command === "keys") { const [operation, ...keyArgs] = rest; if (operation === "new") { const pass = await passphrase(true), generated = await generateKey(pass), file = toKeyFile(generated), destination = keyArgs[0] ?? `arxium-devnet-key-${generated.address.slice(4, 12)}.json`; await writeFile(destination, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 }); output({ path: destination, address: file.address, publicKey: file.publicKey, network: file.network }, globals.json); return; } if (operation === "import" && keyArgs[0] === "--file") { const source = keyArgs[1] ?? throwUsage("keys import --file needs a path"), parsed = await readKeyFile(source); const destination = keyArgs[2] ?? basename(source); await writeFile(destination, `${JSON.stringify(parsed, null, 2)}\n`, { mode: 0o600 }); output({ path: destination, address: parsed.address }, globals.json); return; } if (operation === "import") { if (input.isTTY) throwUsage("pipe a 32-byte hex seed to `arx keys import`; seeds are never command arguments"); const seed = (await readStdin()).trim(); if (!/^[0-9a-f]{64}$/i.test(seed)) throwUsage("seed must be 32 bytes of hex"); const pkcs8 = Buffer.from(PKCS8_ED25519_PREFIX + seed, "hex"), publicJwk = createPublicKey(createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" })).export({ format: "jwk" }); if (!publicJwk.x) throw new Error("could not derive public key from seed"); const publicKey = Buffer.from(publicJwk.x, "base64url"), address = encodeAddress(publicKey), file = toKeyFile({ address, publicKey: toHex(publicKey), blob: await wrapPkcs8(pkcs8, await passphrase(true)) }), destination = keyArgs[0] ?? `arxium-devnet-key-${address.slice(4, 12)}.json`; await writeFile(destination, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 }); output({ path: destination, address }, globals.json); return; } if (operation === "show") { const file = await readKeyFile(globals.key); output({ address: file.address, publicKey: file.publicKey, network: file.network }, globals.json); return; } throwUsage("use: arx keys new|import [destination]|import --file <file>|show"); }
   const rpc = new ArxiumRpc(globals);
+  if (command === "multisig") {
+    const [operation, source, ...extra] = rest;
+    if (operation === "address") { output(await multisigAddress(Number(source), extra.map(fromHex)), globals.json); return; }
+    if (!source) throwUsage("multisig build|sign|combine|link needs a JSON file");
+    const value = JSON.parse(await readFile(source, "utf8"));
+    if (operation === "build") {
+      const members = (value.members as string[]).map(m => m.toLowerCase()).sort();
+      const derived = await multisigAddress(value.threshold, members.map(fromHex));
+      const sender = value.sender ?? derived;
+      if (!value.mode && sender !== derived) throwUsage("legacy policy does not derive sender");
+      if (value.mode && !["owner", "guardian"].includes(value.mode)) throwUsage("invalid policy mode");
+      const nonce = globals.nonce ?? value.nonce ?? await rpc.account<{ nonce: number }>(sender).then(a => a.nonce);
+      if (!Number.isSafeInteger(nonce) || nonce < 0) throwUsage("nonce must be a safe non-negative integer");
+      output({ sender, nonce, threshold: value.threshold, members, payload: toHex(encodePayload(value.payload)), sigs: [], ...(value.mode ? { mode: value.mode } : {}) }, true); return;
+    }
+    const r = value as { sender: string; nonce: number; threshold: number; members: string[]; payload: string; sigs: [string, string][]; mode?: "owner" | "guardian" };
+    if (!Number.isSafeInteger(r.nonce) || r.nonce < 0 || (r.mode !== undefined && !["owner", "guardian"].includes(r.mode))) throwUsage("invalid co-sign request");
+    const encoded = fromHex(r.payload), decoded = decodePayload(encoded), derived = await multisigAddress(r.threshold, r.members.map(fromHex));
+    if (r.mode) {
+      const current = await rpc.account<{ programmable?: { policy: { owners: { threshold: number; members: number[][] }; recovery?: { guardians: { threshold: number; members: number[][] } } } } }>(r.sender);
+      const p = r.mode === "owner" ? current.programmable?.policy.owners : current.programmable?.policy.recovery?.guardians;
+      if (!p || await multisigAddress(p.threshold, p.members.map(m => Uint8Array.from(m))) !== derived) throwUsage("request is not authorized by the current account policy");
+    } else if (r.sender !== derived) throwUsage("policy does not derive sender");
+    const message = signingBytes(r.sender, r.nonce, encoded);
+    const seen = new Set<string>();
+    for (const [member, sig] of r.sigs) {
+      if (!r.members.includes(member) || seen.has(member)) throwUsage("duplicate or non-member signature"); seen.add(member);
+      const key = await crypto.subtle.importKey("raw", asBuffer(fromHex(member)), "Ed25519", false, ["verify"]);
+      if (!await crypto.subtle.verify("Ed25519", key, asBuffer(fromHex(sig)), asBuffer(message))) throwUsage("invalid member signature");
+    }
+    if (operation === "sign") {
+      const { file, privateKey } = await loadKey(globals.key);
+      if (!r.members.includes(file.publicKey) || seen.has(file.publicKey)) throwUsage("key is not an unsigned member");
+      stderr.write(`Signing ${JSON.stringify(decoded)} for ${r.sender} at nonce ${r.nonce}\n`);
+      output({ ...r, sigs: [...r.sigs, [file.publicKey, await signAction(privateKey, r.sender, r.nonce, encoded)]] }, true); return;
+    }
+    if (operation === "combine") {
+      if (r.sigs.length !== r.threshold) throwUsage("need exactly threshold signatures");
+      const sig = r.mode ? assemblePolicySignature(r.mode, { threshold: r.threshold, members: r.members }, r.sigs) : multisigSignature(r.threshold, r.members.map(fromHex), r.sigs.map(([m, s]) => [fromHex(m), s]));
+      output(submitBody(r.sender, r.nonce, sig, encoded), true); return;
+    }
+    if (operation === "link") { output(`${extra[0] ?? throwUsage("link needs the Console co-sign page URL")}#${Buffer.from(JSON.stringify(r)).toString("base64url")}`, globals.json); return; }
+    throwUsage("use: arx multisig address|build|sign|combine|link");
+  }
   if (command === "sign" || command === "send") { const action = rest[0] ?? throwUsage(`${command} needs an action`), { file, privateKey } = await loadKey(globals.key), encoded = payload(action, rest.slice(1)); if (command === "sign") { const nonce = globals.nonce ?? await rpc.account<{ nonce: number }>(file.address).then((account) => account.nonce, (error: unknown) => { if (error instanceof RpcError && error.status === 404) return 0; throw error; }); output(submitBody(file.address, nonce, await signAction(privateKey, file.address, nonce, encoded), encoded), true); return; } output(await rpc.sendAction({ privateKey, sender: file.address, payload: encoded, finalized: true }), globals.json); return; }
   if (command === "submit") { const source = rest[0] ?? throwUsage("submit needs <file|->"), body = JSON.parse(source === "-" ? await readStdin() : await readFile(source, "utf8")); output(await rpc.submit(body) ?? { submitted: body.signature }, globals.json); return; }
-  if (command === "verify") { const signature = rest[0] ?? throwUsage("verify needs <signature>"), status = await rpc.action(signature); if (status.status !== "confirmed") throw new Error(`action is ${status.status}`); const block = await rpc.block<{ finalized?: boolean; actions?: Array<{ sender: string; nonce: number; signature: string; payload: number[] }> }>(status.height); const action = block.actions?.find((item) => item.signature === signature); if (!block.finalized || !action || !await verifySignedAction(action)) throw new Error("action is not finalized with a valid signature"); output({ signature, finalized: true, signatureValid: true, height: status.height }, globals.json); return; }
+  if (command === "verify") { const signature = rest[0] ?? throwUsage("verify needs <signature>"), status = await rpc.action(signature); if (status.status !== "confirmed") throw new Error(`action is ${status.status}`); const block = await rpc.block<{ finalized?: boolean; actions?: Array<{ sender: string; nonce: number; signature: string; payload: number[] }> }>(status.height); const action = block.actions?.find((item) => item.signature === signature);
+    let preStatePolicy: AccountPolicy | undefined;
+    if (signature.length > 128 && /^a7(00|01|02)/.test(signature)) {
+      if (rest[1] !== "--policy" || !rest[2]) throwUsage("stateful verification needs --policy <JSON file> containing the proven pre-action policy");
+      preStatePolicy = JSON.parse(await readFile(rest[2], "utf8")) as AccountPolicy;
+    }
+    if (!block.finalized || !action || !await verifySignedAction(action, preStatePolicy)) throw new Error("action is not finalized with a valid signature"); output({ signature, finalized: true, signatureValid: true, height: status.height }, globals.json); return; }
   if (command === "query") { const [operation, value] = rest; const result = operation === "status" ? await rpc.status() : operation === "account" ? await rpc.account(value ?? throwUsage("account needs an address")) : operation === "block" ? (/^\d+$/.test(value ?? "") ? await rpc.block(Number(value)) : await rpc.blockByHash(value ?? throwUsage("block needs a height or hash"))) : operation === "action" ? await rpc.action(value ?? throwUsage("action needs a signature")) : operation === "validators" ? await rpc.validators() : operation === "finality" ? await rpc.finality() : operation === "search" ? await rpc.search(value ?? throwUsage("search needs a query")) : throwUsage("use: arx query status|account|block|action|validators|finality|search"); output(result, globals.json); return; }
   throwUsage(`unknown command: ${command}`); }
 main().catch((error: unknown) => { const usage = error instanceof UsageError; stderr.write(`${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = usage ? 2 : 1; });

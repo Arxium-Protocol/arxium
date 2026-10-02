@@ -4,3 +4,4 @@ export * from "./bech32.js";
 export * from "./bincode.js";
 export * from "./keys.js";
 export * from "./rpc.js";
+export * from "./policy.js";

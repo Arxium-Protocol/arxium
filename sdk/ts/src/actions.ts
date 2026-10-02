@@ -1,5 +1,6 @@
 import { MULTISIG_TAG, decodeAddress, encodeAddress } from "./bech32.js";
 import { Reader, Writer, asBuffer, fromHex, toHex } from "./bincode.js";
+import { ACCOUNT_POLICY_ACTION, POLICY_VARIANT, encodeAccountPolicy, readAccountPolicy } from "./policy.js";
 
 /** These indices are ActionPayload's positional bincode discriminants. Never derive them. */
 export const ACTION_VARIANT = {
@@ -55,10 +56,11 @@ export function encodeRenounceMint(tokenRef: string): Uint8Array { return token(
 export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
 
 /** `{ name, input }` names and shapes match `fixtures/signed-actions.json`: amounts are decimal strings, byte fields are number arrays. */
-export type ActionName = keyof typeof ACTION_VARIANT | keyof typeof TOKEN_VARIANT;
+export type ActionName = keyof typeof ACTION_VARIANT | keyof typeof TOKEN_VARIANT | keyof typeof POLICY_VARIANT;
 export type DecodedPayload = { name: ActionName; input: Record<string, any> };
 const nullableBig = (value: unknown): bigint | null => value == null ? null : BigInt(value as string);
 export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
+  if (name in POLICY_VARIANT) return encodeAccountPolicy(name as keyof typeof POLICY_VARIANT, input);
   switch (name) {
     case "transfer": return encodeTransfer(input.to, BigInt(input.amount));
     case "joinValidator": return encodeJoinValidator(input.validator, BigInt(input.stake), Uint8Array.from(input.blsPubkey), Uint8Array.from(input.blsPop));
@@ -88,6 +90,7 @@ export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
     case "transferToken": return encodeTransferToken(input.token, input.to, BigInt(input.amount));
     case "burnToken": return encodeBurnToken(input.token, BigInt(input.amount));
     case "renounceMint": return encodeRenounceMint(input.token);
+    default: throw new Error(`unsupported action: ${name}`);
   }
 }
 const invert = <K extends string>(table: Record<K, number>): Record<number, K> => Object.fromEntries(Object.entries(table).map(([key, value]) => [value, key])) as Record<number, K>;
@@ -99,9 +102,14 @@ const known = <T>(value: T | undefined, what: string): T => { if (value === unde
  */
 export function decodePayload(payload: Uint8Array): DecodedPayload {
   const r = new Reader(payload), outer = Number(r.varint());
+  if (outer === ACCOUNT_POLICY_ACTION) {
+    const decoded = readAccountPolicy(r); r.done();
+    if (toHex(encodePayload(decoded)) !== toHex(payload)) throw new Error("payload is not in canonical form");
+    return decoded;
+  }
   const name: ActionName = outer === TOKEN_ACTION ? known(TOKEN_NAME[Number(r.varint())], "token action") : known(VARIANT_NAME[outer], "action variant");
   const str = () => r.string(), amount = () => r.varint().toString(), bytes = () => r.vec((rr) => rr.u8()), topics = () => r.vec((rr) => known(TOPIC_NAME[Number(rr.varint())], "claim topic"));
-  const read: Record<DecodedPayload["name"], () => Record<string, unknown>> = {
+  const read: Record<keyof typeof ACTION_VARIANT | keyof typeof TOKEN_VARIANT, () => Record<string, unknown>> = {
     transfer: () => ({ to: str(), amount: amount() }),
     joinValidator: () => ({ validator: str(), stake: amount(), blsPubkey: bytes(), blsPop: bytes() }),
     leaveValidator: () => ({ validator: str() }),
@@ -133,7 +141,7 @@ export function decodePayload(payload: Uint8Array): DecodedPayload {
     burnToken: () => ({ token: str(), amount: amount() }),
     renounceMint: () => ({ token: str() }),
   };
-  const decoded = { name, input: read[name]() };
+  const decoded = { name, input: read[name as keyof typeof read]() };
   r.done();
   if (toHex(encodePayload(decoded)) !== toHex(payload)) throw new Error("payload is not in canonical form");
   return decoded;

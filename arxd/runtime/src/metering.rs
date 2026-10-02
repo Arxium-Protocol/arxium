@@ -28,6 +28,10 @@ use crate::{ActionPayload, ChainAction, payload::TokenAction};
 /// its variant is cheap. It also prices a multisig sender: each extra member
 /// signature is ~130 hex bytes of witness, above one ed25519 verify.
 const WEIGHT_PER_BYTE: u64 = 1;
+// Stateful witnesses validate the bounded stored menu, including up to 16
+// sessions with 64 recipients each. Its read/validation cost is not visible in
+// the action's encoded size, so it needs a static allowance like ZK verification.
+const POLICY_AUTHORIZATION_WEIGHT: u64 = 5_000;
 
 /// Fixed cost per variant, excluding the per-byte term. Every action already
 /// pays for one ed25519 verify and a nonce/balance read-modify-write, which
@@ -86,6 +90,7 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         // writes the registry row and two native accounts for the fee.
         Token(TokenAction::Create { .. }) => 150,
         Token(_) => 100,
+        AccountPolicy(_) => 1_000,
     }
 }
 
@@ -94,7 +99,21 @@ pub fn action_weight(action: &ChainAction) -> u64 {
     let bytes = bincode::serde::encode_to_vec(action, bincode::config::standard())
         .map(|b| b.len() as u64)
         .unwrap_or(u64::MAX / WEIGHT_PER_BYTE.max(1));
-    base_weight(&action.payload).saturating_add(bytes.saturating_mul(WEIGHT_PER_BYTE))
+    let policy_weight = action
+        .signature
+        .as_deref()
+        .filter(|signature| {
+            signature.len() > 128
+                && signature.get(..4).is_some_and(|head| {
+                    ["a700", "a701", "a702"]
+                        .iter()
+                        .any(|prefix| head.eq_ignore_ascii_case(prefix))
+                })
+        })
+        .map_or(0, |_| POLICY_AUTHORIZATION_WEIGHT);
+    base_weight(&action.payload)
+        .saturating_add(policy_weight)
+        .saturating_add(bytes.saturating_mul(WEIGHT_PER_BYTE))
 }
 
 /// `ChainRuntime::action_fee_for` for CoreChain:

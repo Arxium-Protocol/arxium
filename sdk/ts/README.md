@@ -96,3 +96,13 @@ arx verify signature
 ```
 
 Supported signed actions are `transfer`, `stake`, `unstake`, `join-validator`, `leave-validator`, `register-bls-key`, `authorize-operator`, `revoke-operator`, `grant-attestation`, and `revoke-attestation`. Amount arguments are raw IUM integers.
+# Programmable-account tooling (0.1.5)
+
+The SDK exports bounded account-policy codecs and stateful owner/session/guardian
+witness helpers. `arx multisig build|sign|combine|link` provides an individual
+member signing workflow for both immutable and stateful account addresses.
+Historical `verifySignedAction` calls require the proven pre-action policy for
+stateful witnesses; `arx verify SIGNATURE --policy FILE` accepts that policy.
+
+See [the programmable-account guide](../../docs/Programmable_Accounts.md) for
+configuration shapes, fees, block-height windows, recovery and reset requirements.
