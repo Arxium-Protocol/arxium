@@ -8,7 +8,7 @@ use xc_primitives::{Limits, NodeConfig};
 /// Flags accepted with no subcommand — runs the node, same as always
 /// (`arxd --validator ...`). `arxd node-key` is the only other subcommand.
 #[derive(Parser, Clone, Debug)]
-#[command(about = "Arxium chain node")]
+#[command(about = "Arxium chain node", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -333,6 +333,10 @@ pub struct LimitArgs {
     /// be admitted to the mempool.
     #[arg(long, env = "ARXD_MEMPOOL_MAX_NONCE_GAP", default_value_t = Limits::default().mempool_max_nonce_gap)]
     pub mempool_max_nonce_gap: u64,
+    /// Most actions packed into a block this node proposes (the block is
+    /// still bounded by `max_block_weight` and the wire size).
+    #[arg(long, env = "ARXD_BLOCK_MAX_ACTIONS", default_value_t = Limits::default().block_max_actions)]
+    pub block_max_actions: usize,
 
     /// Concurrent inbound P2P connections.
     #[arg(long, env = "ARXD_MAX_PEERS_INCOMING", default_value_t = Limits::default().max_peers_incoming)]
@@ -351,6 +355,7 @@ impl From<LimitArgs> for Limits {
             mempool_max_bytes: args.mempool_max_bytes,
             mempool_max_per_sender: args.mempool_max_per_sender,
             mempool_max_nonce_gap: args.mempool_max_nonce_gap,
+            block_max_actions: args.block_max_actions,
             max_peers_incoming: args.max_peers_incoming,
         }
     }

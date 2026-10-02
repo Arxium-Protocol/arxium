@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "arxd"
-version = "0.1.1"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "arxd-node",
@@ -480,13 +480,14 @@ dependencies = [
 
 [[package]]
 name = "arxd-node"
-version = "0.1.0"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "arxd-finality",
  "arxd-genesis",
  "arxd-network",
  "arxd-runtime",
+ "bincode",
  "clap",
  "dirs",
  "ed25519-dalek",
