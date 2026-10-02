@@ -75,12 +75,9 @@ pub fn validate_action<P: Serialize>(
     action: &Action<P>,
     max_nonce_gap: u64,
 ) -> Result<(), AdmissionError> {
-    action.verify_signature()?;
-
-    let current_nonce = db
-        .get_account(&action.sender)?
-        .map(|entry| entry.nonce)
-        .unwrap_or(0);
+    let account = db.get_account(&action.sender)?;
+    action.verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))?;
+    let current_nonce = account.map(|entry| entry.nonce).unwrap_or(0);
     if action.nonce < current_nonce {
         return Err(AdmissionError::StaleNonce {
             sender: action.sender.clone(),
@@ -221,6 +218,9 @@ impl<P: Serialize> Mempool<P> {
 
         if let Some(signature) = &action.signature {
             self.signatures.insert(signature.clone());
+            // A period/allowlist change can make the exact same signed action
+            // executable later. Its earlier rejection is no longer current.
+            self.dropped.retain(|(sig, _)| sig != signature);
         }
         self.total_bytes += size;
         *self.per_sender.entry(action.sender.clone()).or_insert(0) += 1;
@@ -388,6 +388,18 @@ mod tests {
             signature: Some(format!("sig-{nonce}")),
             payload: (),
         }
+    }
+
+    #[test]
+    fn retrying_a_dropped_signature_removes_the_stale_rejection() {
+        let mut mempool = Mempool::new();
+        let retry = action(addr(1), 5);
+        mempool.note_dropped([("sig-5".into(), "period spending limit exceeded".into())]);
+        mempool.push(retry).unwrap();
+        assert!(mempool.contains_signature("sig-5"));
+        assert_eq!(mempool.dropped_reason("sig-5"), None);
+        mempool.drain_pending(1);
+        assert_eq!(mempool.dropped_reason("sig-5"), None);
     }
 
     #[test]

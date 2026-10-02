@@ -1117,7 +1117,10 @@ where
 
     let mut actions = actions.into_iter();
     while let Some(action) = actions.next() {
-        if let Err(err) = action.verify_signature() {
+        let account = KvRead::get(&view, &xc_circuit::AccountKey(&action.sender))?;
+        if let Err(err) =
+            action.verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))
+        {
             warn!("dropping action from {}: {err}", action.sender);
             dropped.push(DroppedAction {
                 signature: action.signature.clone().unwrap_or_default(),

@@ -7,6 +7,7 @@ use thiserror::Error;
 use xc_circuit::{AccountKey, KvRead};
 use xc_primitives::{AccountEntry, Address};
 use xc_storage::{AccountUpdates, StorageError};
+pub mod policy;
 
 #[derive(Error, Debug)]
 pub enum AccountError {

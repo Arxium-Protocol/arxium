@@ -12,6 +12,7 @@
 //! chain's runtime.
 
 mod account;
+mod account_policy;
 pub mod adjudicate;
 mod asset;
 mod consensus;
@@ -361,6 +362,14 @@ impl<V: KvRead<Error = StorageError>> KvRead for SealOverlay<'_, V> {
 /// same-block race between two actions) is still caught, just later, by
 /// `dispatch` itself, which remains the authoritative check.
 pub fn admission_precheck(action: &ChainAction, db: &ArxiumDb) -> anyhow::Result<()> {
+    account_policy::precheck(
+        action,
+        db,
+        db.get_tip_height()?
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("block height overflow"))?,
+    )?;
     let balance = db
         .get_account(&action.sender)?
         .map(|e| e.balance)
@@ -450,6 +459,7 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
     bls_pubkey_owner_lookup: &dyn Fn(&BlsPublicKey) -> Result<Option<Address>, StorageError>,
     block_timestamp: u64,
 ) -> anyhow::Result<BlockUpdates> {
+    let authorization = account_policy::authorization(action, view, current_height)?;
     let mut updates = dispatch_inner(
         action,
         view,
@@ -462,6 +472,7 @@ pub fn dispatch<V: KvRead<Error = StorageError>>(
     )?;
     consume_nonce(action, view, &mut updates)?;
     charge_action_fee(action, view, &mut updates)?;
+    account_policy::enforce(action, view, current_height, authorization, &mut updates)?;
     Ok(updates)
 }
 
@@ -538,6 +549,9 @@ fn dispatch_inner<V: KvRead<Error = StorageError>>(
     block_timestamp: u64,
 ) -> anyhow::Result<BlockUpdates> {
     match &action.payload {
+        ActionPayload::AccountPolicy(policy_action) => {
+            account_policy::apply(action, view, policy_action, current_height)
+        }
         ActionPayload::Transfer { to, amount } => account::transfer(view, action, to, *amount),
         ActionPayload::JoinValidator {
             validator,

@@ -282,6 +282,10 @@ pub struct ChainParams {
     /// the spam floor; governable like every other fee.
     #[serde(default = "default_token_create_fee")]
     pub token_create_fee: u128,
+    /// Post-mainnet capabilities. Disabled at launch; activation requires a
+    /// voted SetChainParams after the session/recovery audit.
+    #[serde(default)]
+    pub account_extensions_enabled: bool,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -399,6 +403,7 @@ impl Default for ChainParams {
             challenge_window_blocks: default_challenge_window_blocks(),
             challenger_reward_bps: default_challenger_reward_bps(),
             token_create_fee: default_token_create_fee(),
+            account_extensions_enabled: false,
         }
     }
 }

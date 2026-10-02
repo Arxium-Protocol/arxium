@@ -1,6 +1,6 @@
 {
   "name": "@arxium-protocol/sdk",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Arxium TypeScript SDK and arx CLI",
   "type": "module",
   "private": false,
@@ -9,6 +9,6 @@
   "bin": { "arx": "./dist/cli.js" },
   "files": ["dist", "!dist/*.test.*", "README.md"],
   "engines": { "node": ">=20" },
-  "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node dist/codec.test.js" },
+  "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node dist/codec.test.js && node dist/policy.test.js && node dist/cli.test.js" },
   "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.0.0" }
 }

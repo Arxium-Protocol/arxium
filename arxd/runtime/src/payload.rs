@@ -454,6 +454,8 @@ pub enum ActionPayload {
     /// first family nested under one variant: new token actions extend
     /// `TokenAction` without moving anything in this enum.
     Token(TokenAction),
+    /// Programmable accounts. Variant 43; nested variants are append-only.
+    AccountPolicy(xc_primitives::AccountPolicyAction),
 }
 
 /// `ActionPayload::Token`'s actions. Same rule as the outer enum: variant
@@ -604,7 +606,7 @@ mod tests {
     /// every later index and fails here instead of on a phone.
     #[test]
     fn variant_discriminants_are_pinned() {
-        const EXPECTED: [&str; 43] = [
+        const EXPECTED: [&str; 44] = [
             "Transfer",
             "JoinValidator",
             "LeaveValidator",
@@ -648,6 +650,7 @@ mod tests {
             "VerifyClaimProof",
             "SetPrivateClaims",
             "Token",
+            "AccountPolicy",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

@@ -10,6 +10,7 @@ mod block;
 mod consensus;
 mod hash32;
 pub mod keyfile;
+mod policy;
 mod state;
 mod validator_set;
 
@@ -24,6 +25,7 @@ pub use consensus::{
     round_timeout_signing_bytes,
 };
 pub use hash32::{Hash32, Hash32Error};
+pub use policy::*;
 pub use state::{
     AccountEntry, Asset, AssetClass, AssetMetadata, AttestorRecord, CapTable, ClaimTopic,
     CountryCode, HolderState, Snapshot, StakeAllocation, Unbonding, ValidatorEntry,

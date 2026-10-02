@@ -886,6 +886,34 @@ mod tests {
         action
     }
 
+    #[test]
+    fn confirmed_action_overrides_an_earlier_local_rejection() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = test_state();
+            let action = signed_action(&SigningKey::from_bytes(&[7; 32]), 0);
+            let signature = action.signature.clone().unwrap();
+            state
+                .mempool
+                .lock()
+                .unwrap()
+                .note_dropped([(signature.clone(), "period spending limit exceeded".into())]);
+            let mut block: Block<TestPayload> = Block::genesis(0);
+            block.height = 1;
+            block.actions = vec![action];
+            state.db.write_batch(&block).unwrap();
+            let response = get_action_status(State(state), Path(signature))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status["status"], "confirmed");
+            assert_eq!(status["height"], 1);
+        });
+    }
+
     /// Two requests for two different addresses must produce *one* label set,
     /// naming the route template. Keying on the request path instead grows the
     /// metrics registry once per distinct address anyone asks about, and

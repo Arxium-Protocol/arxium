@@ -387,7 +387,9 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// (Trello 202), and `ResolveDispute` gained `cause`/`bounty` — positional
 /// bincode in stored proposals; `EvidenceMarker` gained `challenger` and the
 /// `evidence:dispute_open:` value became an `OpenDispute`.
-pub const SCHEMA_VERSION: u32 = 25;
+/// Bumped 25 -> 26: AccountEntry gained programmable policies/counters/recovery,
+/// and ChainParams gained account_extensions_enabled. Devnet reset required.
+pub const SCHEMA_VERSION: u32 = 26;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
