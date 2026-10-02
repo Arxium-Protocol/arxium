@@ -1,6 +1,6 @@
 [package]
 name = "arxd-node"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2024"
 license.workspace = true
 
@@ -44,6 +44,7 @@ xc-artifact = { workspace = true }
 # what let a toy-chain node inherit a `pair` subcommand it couldn't
 # decode) — tests still exercise the concrete CoreChainRuntime.
 arxd-runtime = { workspace = true }
+bincode = { workspace = true }
 
 [features]
 fault-injection = [

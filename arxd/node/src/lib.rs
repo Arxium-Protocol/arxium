@@ -1620,6 +1620,7 @@ fn run_node<R: ChainRuntime>(cli: Cli) -> Result<()> {
         &chain_lock,
         &finality_event_tx,
         &block_tx,
+        config.limits.block_max_actions,
     )
     .inspect_err(latch_shutdown)
 }
