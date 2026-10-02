@@ -472,7 +472,28 @@ fn decode_root(root: &str) -> Result<[u8; 32], StorageError> {
 
 /// Nodes rebuilt from shortcut records during one descent: hash to (the
 /// node's own shortcut record, its two children).
-type Expanded = HashMap<[u8; 32], (Vec<u8>, ([u8; 32], [u8; 32]))>;
+/// Hasher for maps keyed by a trie node hash. Those keys are SHA-256 outputs,
+/// already uniformly random, so SipHash over all 32 bytes (the default) is
+/// pure overhead on the hottest loop of the state root: ~25% of producing a
+/// 3,000-action block. Eight bytes of the key are as good a bucket index.
+/// ponytail: not HashDoS-safe for attacker-chosen keys, but nobody can pick
+/// a SHA-256 output.
+#[derive(Default, Clone, Copy)]
+struct NodeHasher(u64);
+
+impl std::hash::Hasher for NodeHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(head) = bytes.first_chunk::<8>() {
+            self.0 ^= u64::from_le_bytes(*head);
+        }
+    }
+}
+
+type NodeMap<V> = HashMap<[u8; 32], V, std::hash::BuildHasherDefault<NodeHasher>>;
+type Expanded = NodeMap<(Vec<u8>, ([u8; 32], [u8; 32]))>;
 
 /// One sibling hash per trie level, index 0 nearest the root.
 type Siblings = [[u8; 32]; 256];
@@ -520,6 +541,39 @@ fn lone_chain(key_hash: &[u8; 32], leaf: &[u8; 32], level: usize) -> [[u8; 32]; 
         };
     }
     chain
+}
+
+/// `lone_chain` from the leaf up for every changed key that has a value,
+/// computed across the available cores. While a key's subtree holds only that
+/// key, the climb in `trie_root_after` produces exactly `chain[level]` at each
+/// level (the sibling is the default, so nothing else feeds the hash), so the
+/// ~240 SHA-256 calls per key, the bulk of a full block's state-root time, can
+/// be done up front in parallel and merely looked up in the serial climb.
+/// Changed keys whose hash chains are held in memory at once.
+const CHAIN_SLICE: usize = 512;
+
+fn lone_chains(entries: &[(&[u8; 32], &Option<Vec<u8>>)]) -> Vec<Option<Box<[[u8; 32]; 257]>>> {
+    let chain = |(key_hash, value): &(&[u8; 32], &Option<Vec<u8>>)| {
+        value
+            .as_deref()
+            .map(|value| Box::new(lone_chain(key_hash, &leaf_hash(key_hash, value), 0)))
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Below this a thread costs more than the chain it computes.
+    if threads == 1 || entries.len() < 16 {
+        return entries.iter().map(chain).collect();
+    }
+    let per_thread = entries.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = entries
+            .chunks(per_thread)
+            .map(|part| scope.spawn(move || part.iter().map(chain).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("trie hash worker panicked"))
+            .collect()
+    })
 }
 
 fn leaf_of(value: &Option<Vec<u8>>, key_hash: &[u8; 32]) -> [u8; 32] {
@@ -1757,7 +1811,7 @@ impl ArxiumDb {
     fn node_children(
         &self,
         hash: &[u8; 32],
-        overrides: &HashMap<[u8; 32], Vec<u8>>,
+        overrides: &NodeMap<Vec<u8>>,
         expanded: &mut Expanded,
     ) -> Result<([u8; 32], [u8; 32]), StorageError> {
         if let Some((_, children)) = expanded.get(hash) {
@@ -1809,9 +1863,9 @@ impl ArxiumDb {
         &self,
         root: [u8; 32],
         key_hash: &[u8; 32],
-        overrides: &HashMap<[u8; 32], Vec<u8>>,
+        overrides: &NodeMap<Vec<u8>>,
     ) -> Result<(Siblings, [u8; 32], Expanded), StorageError> {
-        let mut expanded = HashMap::new();
+        let mut expanded = Expanded::default();
         let (siblings, leaf) = descend(root, key_hash, |hash| {
             self.node_children(hash, overrides, &mut expanded)
         })?;
@@ -1830,7 +1884,7 @@ impl ArxiumDb {
     pub fn prove(&self, key: &[u8], root: &str) -> Result<InclusionProof, StorageError> {
         let root_bytes = decode_root(root)?;
         let key_hash = hash_key(key);
-        let (siblings, leaf_node, _) = self.descend(root_bytes, &key_hash, &HashMap::new())?;
+        let (siblings, leaf_node, _) = self.descend(root_bytes, &key_hash, &NodeMap::default())?;
         let value = if leaf_node == default_hashes()[0] {
             None
         } else {
@@ -1866,84 +1920,92 @@ impl ArxiumDb {
     ) -> Result<[u8; 32], StorageError> {
         let defaults = default_hashes();
         let mut root = self.merkle_root()?;
-        let mut overrides: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut overrides: NodeMap<Vec<u8>> = NodeMap::default();
 
-        for (key_hash, new_value) in changes {
-            // `defaults[depth]` short-circuits an entirely-empty subtree
-            // without ever touching storage during descent, which is what
-            // keeps an update to one key cheap regardless of how much of the
-            // trie is still empty.
-            let (siblings, _leaf_node, expanded) = self.descend(root, key_hash, &overrides)?;
+        let entries: Vec<_> = changes.iter().collect();
+        // Chains are 8KB per key, so they are computed a slice at a time to
+        // keep a huge block from holding hundreds of MB.
+        for slice in entries.chunks(CHAIN_SLICE) {
+            let chains = lone_chains(slice);
+            for ((key_hash, new_value), chain) in slice.iter().copied().zip(&chains) {
+                // `defaults[depth]` short-circuits an entirely-empty subtree
+                // without ever touching storage during descent, which is what
+                // keeps an update to one key cheap regardless of how much of the
+                // trie is still empty.
+                let (siblings, _leaf_node, expanded) = self.descend(root, key_hash, &overrides)?;
 
-            // A sibling rebuilt from a shortcut record is about to get a stored
-            // parent, so it needs a record of its own to stay reachable.
-            for sibling in &siblings {
-                if let Some((content, _)) = expanded.get(sibling) {
-                    if let Some(batch) = batch.as_deref_mut() {
-                        batch.put_cf(self.cf(CF_MERKLE), sibling, content);
+                // A sibling rebuilt from a shortcut record is about to get a stored
+                // parent, so it needs a record of its own to stay reachable.
+                for sibling in &siblings {
+                    if let Some((content, _)) = expanded.get(sibling) {
+                        if let Some(batch) = batch.as_deref_mut() {
+                            batch.put_cf(self.cf(CF_MERKLE), sibling, content);
+                        }
+                        overrides.insert(*sibling, content.clone());
                     }
-                    overrides.insert(*sibling, content.clone());
                 }
-            }
 
-            // Climb back up, recomputing every node on the path with the new
-            // leaf in place of the old one. Hashes are unchanged, but while the
-            // subtree below holds only this key, its single-child nodes are not
-            // stored: one shortcut record at the top of that chain stands in
-            // for all of them (~250 nodes, i.e. ~24 KB, per changed key).
-            let mut lone = new_value.is_some();
-            let mut current = match new_value {
-                Some(value) => {
-                    let leaf = leaf_hash(key_hash, value);
-                    let content = [key_hash.as_slice(), value.as_slice()].concat();
-                    if let Some(batch) = batch.as_deref_mut() {
-                        batch.put_cf(self.cf(CF_MERKLE), leaf, &content);
+                // Climb back up, recomputing every node on the path with the new
+                // leaf in place of the old one. Hashes are unchanged, but while the
+                // subtree below holds only this key, its single-child nodes are not
+                // stored: one shortcut record at the top of that chain stands in
+                // for all of them (~250 nodes, i.e. ~24 KB, per changed key).
+                let mut lone = new_value.is_some();
+                let mut current = match new_value {
+                    Some(value) => {
+                        let leaf = leaf_hash(key_hash, value);
+                        let content = [key_hash.as_slice(), value.as_slice()].concat();
+                        if let Some(batch) = batch.as_deref_mut() {
+                            batch.put_cf(self.cf(CF_MERKLE), leaf, &content);
+                        }
+                        overrides.insert(leaf, content);
+                        leaf
                     }
-                    overrides.insert(leaf, content);
-                    leaf
-                }
-                None => defaults[0],
-            };
-            for level in (0..256).rev() {
-                let sibling = siblings[level];
-                let (left, right) = if bit_at(key_hash, level) == 0 {
-                    (current, sibling)
-                } else {
-                    (sibling, current)
+                    None => defaults[0],
                 };
-                let parent = internal_hash(&left, &right);
-                if lone && sibling == defaults[255 - level] {
+                for level in (0..256).rev() {
+                    let sibling = siblings[level];
+                    if lone && sibling == defaults[255 - level] {
+                        // Same value `internal_hash` would give here; see `lone_chains`.
+                        current = chain.as_ref().expect("a lone key has a value")[level];
+                        continue;
+                    }
+                    let (left, right) = if bit_at(key_hash, level) == 0 {
+                        (current, sibling)
+                    } else {
+                        (sibling, current)
+                    };
+                    let parent = internal_hash(&left, &right);
+                    if lone {
+                        lone = false;
+                        if level + 1 < 256 {
+                            let content =
+                                shortcut(key_hash, &leaf_of(new_value, key_hash), level + 1);
+                            if let Some(batch) = batch.as_deref_mut() {
+                                batch.put_cf(self.cf(CF_MERKLE), current, &content);
+                            }
+                            overrides.insert(current, content);
+                        }
+                    }
+                    // An all-empty subtree resolves from `defaults`, never storage.
+                    if parent != defaults[256 - level] {
+                        let content = [left.as_slice(), right.as_slice()].concat();
+                        if let Some(batch) = batch.as_deref_mut() {
+                            batch.put_cf(self.cf(CF_MERKLE), parent, &content);
+                        }
+                        overrides.insert(parent, content);
+                    }
                     current = parent;
-                    continue;
                 }
                 if lone {
-                    lone = false;
-                    if level + 1 < 256 {
-                        let content = shortcut(key_hash, &leaf_of(new_value, key_hash), level + 1);
-                        if let Some(batch) = batch.as_deref_mut() {
-                            batch.put_cf(self.cf(CF_MERKLE), current, &content);
-                        }
-                        overrides.insert(current, content);
-                    }
-                }
-                // An all-empty subtree resolves from `defaults`, never storage.
-                if parent != defaults[256 - level] {
-                    let content = [left.as_slice(), right.as_slice()].concat();
+                    let content = shortcut(key_hash, &leaf_of(new_value, key_hash), 0);
                     if let Some(batch) = batch.as_deref_mut() {
-                        batch.put_cf(self.cf(CF_MERKLE), parent, &content);
+                        batch.put_cf(self.cf(CF_MERKLE), current, &content);
                     }
-                    overrides.insert(parent, content);
+                    overrides.insert(current, content);
                 }
-                current = parent;
+                root = current;
             }
-            if lone {
-                let content = shortcut(key_hash, &leaf_of(new_value, key_hash), 0);
-                if let Some(batch) = batch.as_deref_mut() {
-                    batch.put_cf(self.cf(CF_MERKLE), current, &content);
-                }
-                overrides.insert(current, content);
-            }
-            root = current;
         }
 
         if let Some(batch) = batch
@@ -3365,7 +3427,7 @@ mod merkle_state_root_tests {
             );
 
             for key in &keys {
-                let (siblings, _, _) = db.descend(root, key, &HashMap::new()).unwrap();
+                let (siblings, _, _) = db.descend(root, key, &NodeMap::default()).unwrap();
                 let proof = InclusionProof {
                     key_hash: *key,
                     value: reference.get(key).cloned(),
@@ -3391,6 +3453,45 @@ mod merkle_state_root_tests {
         db.db.write(batch).unwrap();
         let written = count(&db) - before;
         assert!(written <= 12, "one changed key stored {written} nodes");
+    }
+
+    /// A block-sized batch (the parallel-chain path, which a handful of keys
+    /// never reaches) must give the same root as the in-memory full trie,
+    /// across inserts, updates and deletes, and across slice boundaries.
+    #[test]
+    fn a_large_batch_matches_the_full_trie() {
+        let db = ArxiumDb::open(&temp_path()).unwrap();
+        let mut reference: BTreeMap<[u8; 32], Vec<u8>> = BTreeMap::new();
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let keys: Vec<[u8; 32]> = (0..1500u32).map(|i| hash_key(&i.to_le_bytes())).collect();
+        for round in 0..4 {
+            let mut changes = BTreeMap::new();
+            for _ in 0..700 {
+                let key = keys[(next() % keys.len() as u64) as usize];
+                let value = (next() % 4 != 0).then(|| next().to_le_bytes().to_vec());
+                changes.insert(key, value);
+            }
+            for (key, value) in &changes {
+                match value {
+                    Some(v) => reference.insert(*key, v.clone()),
+                    None => reference.remove(key),
+                };
+            }
+            let mut batch = WriteBatch::default();
+            let root = db.trie_root_after(&changes, Some(&mut batch)).unwrap();
+            db.db.write(batch).unwrap();
+            assert_eq!(
+                root,
+                xc_poe::state_trie::root_of(&reference),
+                "round {round}"
+            );
+        }
     }
 
     /// `prove` (Part 3 Stage 1) must produce a proof `xc_poe::state_trie::verify_proof`

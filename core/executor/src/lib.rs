@@ -515,7 +515,7 @@ pub fn accept_block<P>(
     ) -> anyhow::Result<BlockUpdates>,
 ) -> Result<Block<P>, AcceptBlockError>
 where
-    P: Serialize + DeserializeOwned + Clone,
+    P: Serialize + DeserializeOwned + Clone + Sync,
 {
     // Against this chain's genesis hash: a block the same proposer key
     // signed for another chain must not pass as one of ours.
@@ -1040,6 +1040,30 @@ pub fn max_block_weight(db: &ArxiumDb) -> Result<u64, StorageError> {
 /// producing the exact same overlay contents as the original execution: the
 /// `BTreeMap` discipline already in place for every overlay below is what
 /// makes that replay deterministic.
+/// `verify_signature` for every action, spread over the available cores.
+/// The results are deterministic, so checking them up front instead of one at
+/// a time inside the execution loop changes nothing but wall time; an action
+/// that ends up deferred past the block's weight limit was checked early and
+/// is simply checked again in the next block.
+fn verify_signatures<P: serde::Serialize + Sync>(actions: &[Action<P>]) -> Vec<Result<(), SignatureError>> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Below this a thread costs more than the ~100us verify it saves.
+    if threads == 1 || actions.len() < 64 {
+        return actions.iter().map(Action::verify_signature).collect();
+    }
+    let chunk = actions.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = actions
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(Action::verify_signature).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("signature worker panicked"))
+            .collect()
+    })
+}
+
 pub fn execute_actions<P>(
     db: &ArxiumDb,
     actions: Vec<Action<P>>,
@@ -1066,7 +1090,7 @@ pub fn execute_actions<P>(
     record_touched_keys: bool,
 ) -> Result<ExecutionOutcome<P>, ExecutorError>
 where
-    P: serde::Serialize,
+    P: serde::Serialize + Sync,
 {
     let mut applied = Vec::with_capacity(actions.len());
     let mut dropped = Vec::new();
@@ -1115,12 +1139,19 @@ where
     }
     view.apply_governance(&governance);
 
+    let mut signatures = verify_signatures(&actions).into_iter();
     let mut actions = actions.into_iter();
     while let Some(action) = actions.next() {
+        // Stateless results stand for legacy accounts. A programmable account
+        // must be checked against this block's overlay, so a rotation earlier
+        // in the block takes effect for the next action.
+        let presigned = signatures.next().expect("one result per action");
         let account = KvRead::get(&view, &xc_circuit::AccountKey(&action.sender))?;
-        if let Err(err) =
-            action.verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))
-        {
+        let verified = match account.as_ref().and_then(|e| e.programmable.as_ref()) {
+            Some(policy) => action.verify_account_signature(Some(policy)).map(|_| ()),
+            None => presigned,
+        };
+        if let Err(err) = verified {
             warn!("dropping action from {}: {err}", action.sender);
             dropped.push(DroppedAction {
                 signature: action.signature.clone().unwrap_or_default(),

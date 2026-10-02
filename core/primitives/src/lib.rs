@@ -127,6 +127,10 @@ pub struct Limits {
     /// filled, so without a bound a sender can queue actions that are
     /// permanently unexecutable and never purged as stale.
     pub mempool_max_nonce_gap: u64,
+    /// Most actions this node packs into a block it proposes. Producer
+    /// policy only: validators bound a block by `max_block_weight` and the
+    /// wire size, never by action count, so nodes may differ.
+    pub block_max_actions: usize,
     /// Concurrent inbound P2P connections this node will hold.
     pub max_peers_incoming: u32,
 }
@@ -143,6 +147,7 @@ impl Default for Limits {
             mempool_max_bytes: 10_000_000,
             mempool_max_per_sender: 64,
             mempool_max_nonce_gap: 64,
+            block_max_actions: 1_000,
             max_peers_incoming: 200,
         }
     }
