@@ -437,7 +437,7 @@ pub fn apply_slash<V: KvRead<Error = StorageError>>(
 /// proof. No-ops (rather than erroring) if the primary has nothing staked
 /// left to slash — a missed slot from an already-exiting validator isn't a
 /// block-production failure.
-/// Whitepaper §7.3: `downtime_slash_bps` of total stake burned per missed
+/// Whitepaper §7.3: `downtime_slash_bps` of total stake slashed (to the reward pool) per missed
 /// block, applied automatically rather than via submitted evidence — every
 /// node deterministically agrees on who missed a slot from the same stored
 /// block, so there's nothing to prove.

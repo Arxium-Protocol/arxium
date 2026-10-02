@@ -23,8 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/Arxium-Protocol/arxium/main/scripts
 ```
 
 Downloads the latest release and verifies it against the release's
-`SHA256SUMS` before unpacking, lays out `~/.arxium/{bin,config,data}`, writes a
-configuration file, prints this node's validator address, and generates a
+`SHA256SUMS` before unpacking, lays out `~/.arxium/{bin,configs}` (each chain's data directory is created by
+`arxd` on first run), writes `configs/arxd.env`, prints this node's validator address, and generates a
 systemd unit. `--dry-run` shows every step without touching the disk.
 
 Add `--with-monitoring` to install release-matched native Prometheus and
@@ -188,7 +188,7 @@ an indexer reading the chain, not to the node's hot path.
 | Action | Effect |
 | --- | --- |
 | `Transfer` | Move balance between accounts |
-| `Stake` / `Unstake` | Delegate to a validator; unstaking unbonds over 100 blocks |
+| `Stake` / `Unstake` | Delegate to a validator; unstaking unbonds over `unbonding_blocks` (14 days on mainnet; see below) |
 | `JoinValidator` / `LeaveValidator` | Enter or leave the validator set; joining carries the BLS finality key |
 | `RegisterBlsKey` | Register a BLS key so precommits count toward finality |
 | `SubmitEquivocationEvidence` | Report a validator that signed two blocks at one height |
@@ -200,14 +200,14 @@ an indexer reading the chain, not to the node's hot path.
 | Parameter | Value |
 | --- | --- |
 | Denomination | 1 ARX = 1,000,000,000 IUM |
-| Block interval | 2s |
-| Slot duration | 4s |
-| Action fee | 0.001 ARX |
-| Minimum validator stake | 100,000 ARX |
+| Block interval | 2s (`block_interval_secs`, a chain param) |
+| Round timeout | 8s for round 0 of a height, longer in later rounds |
+| Action fee | 0.001 ARX base (`action_fee`) plus weight × `weight_fee` (0.00001 ARX per weight unit) |
+| Minimum validator stake | 100,000 ARX (`min_validator_stake`) |
 | Unbonding period | 14 days (`unbonding_blocks` in the chain spec's `params`, 604,800 at 2s; devnet uses 1,800 = 1h) |
 | Finality | BLS aggregate precommits, 2/3+1 of the validator set |
 | Block reward | 4.3 ARX/block (`reward_per_block` in the chain spec's `params`) |
-| Fee split | 30% proposer, 20% treasury, 50% burned |
+| Fee split | 30% proposer, 20% treasury, 50% burned (`fee_proposer_bps`, `fee_treasury_bps`) |
 
 A validator's BLS finality key is bound to its registration: `JoinValidator`
 carries it and registers it atomically, and genesis validators declare one via
@@ -216,9 +216,11 @@ not it can vote, so one without a key would raise the threshold while
 contributing nothing to meeting it. `GET /finality` reports how much of the
 current set can actually vote, and whether that clears quorum.
 
-These are compile-time constants, except `reward_per_block` and
-`unbonding_blocks`, which are read from the chain spec. Changing a constant is a coordinated release, not a runtime
-setting.
+The economics and timing values above are chain params: defaults in
+`core/primitives/src/validator_set.rs`, overridable in the chain spec's `params`,
+and retunable by a governance vote (`SetChainParams`). The denomination, the
+round timeout and the metering weights are compile-time constants, so changing
+one is a coordinated release.
 
 Block rewards are never minted. Each block pays the proposer
 `min(reward_per_block, pool balance)` out of the reward pool account
@@ -246,15 +248,20 @@ Three layers, with a dependency rule enforced between them: `arxd` depends on
 | `core/mempool` | Capacity-bounded pending pool, deduplicated by `(sender, nonce)` |
 | `core/rpc` | HTTP ingest and reads, generic over the payload type |
 | `core/bls` | BLS12-381 signing, verification, aggregation |
-| `core/cli`, `core/genesis`, `core/wire` | Node configuration, genesis bootstrap, wire types |
+| `core/chain-spec` | Chain-spec parsing and presets |
+| `core/evidence` | Equivocation detection |
+| `core/artifact`, `core/poe` | Evidence artifact format; Proof-of-Execution primitives |
+| `core/circuit`, `core/runtime-api` | Typed storage keys the circuits touch; the `ChainRuntime` trait the node is generic over |
 | `circuits/account` | Balance and nonce transitions |
 | `circuits/staking` | Staking, unbonding, slashing, block rewards |
+| `circuits/identity`, `circuits/token`, `circuits/governance` | Attestations and the attestor registry; permissionless tokens; on-chain governance |
 | `circuits/rwa-asset` | Asset issuance and compliance-gated transfer |
 | `circuits/identity-zk` | Groth16 credential proofs |
-| `arxd/node` | Block production, role selection, this chain's action type and dispatch |
+| `arxd/node` | Block production, role selection, the CLI and subsystem wiring |
+| `arxd/runtime` | CoreChain's action type, dispatch, metering and state transitions |
+| `arxd/genesis` | BLS validator registration and the chain spec a node boots from |
 | `arxd/network` | libp2p — gossip, discovery, block and state sync |
 | `arxd/finality` | Precommit signing and aggregation to a finality record |
-| `arxd/evidence` | Equivocation detection and slashing |
 
 The boundary rule is a question, answered twice. **Does this need to know what
 role the node is playing?** If yes it belongs under `arxd/`; if no it belongs
