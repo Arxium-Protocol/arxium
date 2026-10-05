@@ -95,7 +95,15 @@ arx query search arx1address
 arx verify signature
 ```
 
-Supported signed actions are `transfer`, `stake`, `unstake`, `join-validator`, `leave-validator`, `register-bls-key`, `authorize-operator`, `revoke-operator`, `grant-attestation`, and `revoke-attestation`. Amount arguments are raw IUM integers.
+Supported signed actions are `transfer`, `stake`, `unstake`, `join-validator`, `leave-validator`, `register-bls-key`, `authorize-operator`, `revoke-operator`, `grant-attestation`, `revoke-attestation`, `register-asset`, `issue-asset`, and `transfer-asset`. Amount arguments are raw base-unit integers (IUM for ARX, the asset's smallest unit for an asset).
+
+```sh
+arx send register-asset fund-a FUNDA "Fund A" 0 kyc CH,LI   # <asset-id> <symbol> <name> <decimals> [topics] [jurisdictions]
+arx send issue-asset arxasset1... 1000
+arx send transfer-asset arxasset1... arx1recipient 100
+```
+
+Builder docs (devnet quickstart, RWA walkthrough, arx-verify): https://arxium.network/docs
 # Programmable-account tooling (0.1.5)
 
 The SDK exports bounded account-policy codecs and stateful owner/session/guardian

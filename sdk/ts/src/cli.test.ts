@@ -6,7 +6,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
 import { createPrivateKey, createPublicKey } from "node:crypto";
-import { encodeAddress, fromHex, toHex, toKeyFile, wrapPkcs8 } from "./index.js";
+import { decodePayload, encodeAddress, fromHex, toHex, toKeyFile, wrapPkcs8 } from "./index.js";
 
 const vectors = JSON.parse(await readFile(new URL("../fixtures/account-policies.json", import.meta.url), "utf8"));
 const dir = await mkdtemp(join(tmpdir(), "arx-policy-cli-"));
@@ -43,6 +43,13 @@ try {
   assert.equal(action.sender, vectors.sender);
   assert.equal(action.nonce, vectors.nonce);
   console.log("CLI build → member sign → member sign → assemble passed");
+  const key = ["--key", join(dir, "member-0.json"), "--nonce", "0", "sign"];
+  const decoded = async (...args: string[]) => decodePayload(Uint8Array.from((await cli(...key, ...args)).payload));
+  assert.deepEqual(await decoded("register-asset", "fund-a", "FUNDA", "Fund A", "0", "kyc", "CH,LI"), { name: "registerAsset", input: { assetId: "fund-a", complianceRequired: false,
+    metadata: { asset_class: "other", decimals: 0, required_claims: ["kyc"], allowed_jurisdictions: ["CH", "LI"], max_supply: null, metadata_uri: null, symbol: "FUNDA", name: "Fund A" } } });
+  assert.deepEqual(await decoded("issue-asset", "arxasset1x", "1000"), { name: "issueAsset", input: { asset: "arxasset1x", amount: "1000" } });
+  assert.deepEqual(await decoded("transfer-asset", "arxasset1x", vectors.sender, "5"), { name: "transferAsset", input: { asset: "arxasset1x", to: vectors.sender, amount: "5" } });
+  console.log("CLI register-asset / issue-asset / transfer-asset payloads passed");
 } finally {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await rm(dir, { recursive: true, force: true });
