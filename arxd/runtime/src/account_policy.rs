@@ -407,6 +407,107 @@ mod tests {
         assert!(bad.verify_signature().is_err());
     }
 
+    /// "Offer both" (Trello #221): an institution that co-signs a holder's
+    /// account makes regulated transfers stricter than the asset's own gate.
+    /// Two recipients pass the asset's KYC rule, yet the account's allowlist
+    /// refuses one; the holder's key alone can neither move units nor drop
+    /// the allowlist; and the asset gate still refuses an allowlisted but
+    /// un-attested recipient, so the chain's minimum holds underneath.
+    #[test]
+    fn institution_cosigned_account_is_stricter_than_the_asset_gate() {
+        let db = temp_db();
+        let keys = [key(1), key(2)]; // holder, institution
+        let holder = multisig_address(2, &owners(&keys, 2).members).unwrap();
+        let mut view = funded_view(&db, &holder);
+        let addr =
+            |seed| Address::from_pubkey_bytes(&key(seed).verifying_key().to_bytes()).unwrap();
+        let (approved, other, unattested) = (addr(3), addr(4), addr(5));
+        let kyc = |balance| AccountEntry {
+            identity_hash: Some("kyc".into()),
+            ..funded(balance)
+        };
+        view.put(&AccountKey(&holder), &kyc(100 * FEE_BUDGET))
+            .unwrap();
+        view.put(&AccountKey(&approved), &kyc(0)).unwrap();
+        view.put(&AccountKey(&other), &kyc(0)).unwrap();
+        let bond = Asset::new("bond", addr(9), true);
+        let asset = bond.asset_ref.clone();
+        view.put(&xc_circuit::AssetKey(&asset), &bond).unwrap();
+        view.put(
+            &AssetBalanceKey {
+                asset: &asset,
+                owner: &holder,
+            },
+            &100u128,
+        )
+        .unwrap();
+
+        let mut p = policy(&keys);
+        p.recipients = Some(vec![approved.clone(), unattested.clone()]);
+        let enroll = ActionPayload::AccountPolicy(AccountPolicyAction::SetPolicy { policy: p });
+        run(&mut view, &signed(&holder, 0, enroll, &keys, None), 1).unwrap();
+
+        let send = |to: &Address| ActionPayload::TransferAsset {
+            asset: asset.clone(),
+            to: to.clone(),
+            amount: 10,
+        };
+        let err = run(
+            &mut view,
+            &signed(&holder, 1, send(&other), &keys, Some(0)),
+            2,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("recipient"), "got: {err}");
+
+        // The holder alone: one of two signatures, for a transfer or for
+        // replacing the policy with one that has no allowlist.
+        for payload in [
+            send(&approved),
+            ActionPayload::AccountPolicy(AccountPolicyAction::SetPolicy {
+                policy: policy(&keys),
+            }),
+        ] {
+            let mut alone = signed(&holder, 1, payload, &keys, Some(0));
+            let witness = multisig_signature(
+                2,
+                &owners(&keys, 2).members,
+                &[(
+                    keys[0].verifying_key().to_bytes(),
+                    keys[0].sign(&alone.signing_bytes()).to_bytes(),
+                )],
+            )
+            .unwrap();
+            alone.signature = Some(policy_signature(0, &witness).unwrap());
+            let err = run(&mut view, &alone, 2).unwrap_err();
+            assert!(err.to_string().contains("multisig witness"), "got: {err}");
+        }
+
+        let err = run(
+            &mut view,
+            &signed(&holder, 1, send(&unattested), &keys, Some(0)),
+            2,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not KYC'd"), "got: {err}");
+
+        run(
+            &mut view,
+            &signed(&holder, 1, send(&approved), &keys, Some(0)),
+            2,
+        )
+        .unwrap();
+        let balance = |owner| {
+            view.get(&AssetBalanceKey {
+                asset: &asset,
+                owner,
+            })
+            .unwrap()
+        };
+        assert_eq!(balance(&holder), Some(90));
+        assert_eq!(balance(&approved), Some(10));
+    }
+
     #[test]
     fn rotation_retains_address_and_invalidates_old_keys_in_same_block() {
         let db = temp_db();
