@@ -55,7 +55,6 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         IssueAsset { .. }
         | IssueAssetTo { .. }
         | TransferAsset { .. }
-        | ForcedTransfer { .. }
         | IssuerForcedTransfer { .. }
         | BurnAsset { .. }
         | RecoverHolder { .. } => 150,

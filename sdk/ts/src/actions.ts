@@ -7,12 +7,12 @@ export const ACTION_VARIANT = {
   transfer: 0, joinValidator: 1, leaveValidator: 2, stake: 3, unstake: 4, registerBlsKey: 6,
   authorizeOperator: 8, revokeOperator: 9, grantAttestation: 10, revokeAttestation: 11,
   registerAsset: 12, issueAsset: 13, transferAsset: 14, freezeAsset: 18, unfreezeAsset: 19,
-  burnAsset: 21, setHolderFrozen: 22, lockHolderAmount: 23, unlockHolderAmount: 24,
-  issuerForcedTransfer: 25, recoverHolder: 26, issueAssetTo: 27,
-  setAssetLimits: 31, verifyClaimProof: 40, setPrivateClaims: 41,
+  burnAsset: 20, setHolderFrozen: 21, lockHolderAmount: 22, unlockHolderAmount: 23,
+  issuerForcedTransfer: 24, recoverHolder: 25, issueAssetTo: 26,
+  setAssetLimits: 30, verifyClaimProof: 39, setPrivateClaims: 40,
 } as const;
-/** `ActionPayload::Token(TokenAction)` is variant 42; these are `TokenAction`'s own discriminants, written after it. */
-export const TOKEN_ACTION = 42;
+/** `ActionPayload::Token(TokenAction)` is variant 41; these are `TokenAction`'s own discriminants, written after it. */
+export const TOKEN_ACTION = 41;
 export const TOKEN_VARIANT = { createToken: 0, mintToken: 1, transferToken: 2, burnToken: 3, renounceMint: 4 } as const;
 const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5, token: 6 } as const;
 const TOPIC = { kyc: 0, aml: 1, accredited: 2, jurisdiction: 3 } as const;

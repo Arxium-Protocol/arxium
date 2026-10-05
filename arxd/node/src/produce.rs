@@ -843,8 +843,6 @@ mod tests {
             boot_nodes: Vec::new(),
             attestor: None,
             attestor_admin: None,
-            freeze_admin: None,
-            recovery_admin: None,
         })
         .unwrap();
 
@@ -975,8 +973,6 @@ mod tests {
             boot_nodes: Vec::new(),
             attestor: None,
             attestor_admin: None,
-            freeze_admin: None,
-            recovery_admin: None,
         })
         .unwrap();
 

@@ -233,7 +233,7 @@ pub struct Asset {
     /// `None` means uncapped. Enforced in `circuit_rwa_asset::apply_issue`.
     pub max_supply: Option<u128>,
     /// Cumulative issued supply, maintained by `apply_issue`/`apply_issue_to`
-    /// and reduced by `apply_burn` (`BurnAsset`, variant 21).
+    /// and reduced by `apply_burn` (`BurnAsset`, variant 20).
     pub total_supply: u128,
     /// Blocks every transfer of this asset while set. Issuance is
     /// deliberately still allowed; freezing is about circulation.
@@ -274,7 +274,7 @@ pub struct Asset {
     /// `circuit-rwa-asset` wherever a balance crosses zero. The issuer's own
     /// treasury balance is not a holder for cap purposes.
     pub holder_count: u32,
-    /// The record-date cap table (`SnapshotHolders`, variant 36) that the
+    /// The record-date cap table (`SnapshotHolders`, variant 35) that the
     /// corporate actions (`DistributeToHolders`/`RedeemHolders`/`SplitAsset`)
     /// pay or scale against. One live snapshot per asset; taking another
     /// replaces it, and the actions that move the balances it describes
@@ -284,9 +284,9 @@ pub struct Asset {
     // give it its own merkleized key if snapshots of thousands of holders
     // start showing up in transfer cost.
     pub snapshot: Option<CapTable>,
-    /// Issuer opt-in (`SetPrivateClaims`, variant 41): a holder may clear
+    /// Issuer opt-in (`SetPrivateClaims`, variant 40): a holder may clear
     /// `required_claims`/`allowed_jurisdictions` with a zk claim proof
-    /// (`VerifyClaimProof`, variant 40) instead of clear-text account
+    /// (`VerifyClaimProof`, variant 39) instead of clear-text account
     /// fields. Off by default, so existing assets keep today's gating.
     pub private_claims: bool,
 }
@@ -460,16 +460,6 @@ pub struct Snapshot {
     /// `Option`/`#[serde(default)]` for the same reason as `attestor`.
     #[serde(default)]
     pub attestor_admin: Option<Address>,
-    /// Address allowed to `FreezeAsset`/`UnfreezeAsset` any asset (an
-    /// asset's issuer can always freeze its own).
-    #[serde(default)]
-    pub freeze_admin: Option<Address>,
-    /// Address allowed to `ForcedTransfer`. The three admin fields may be
-    /// the same address (soft rollout); the protocol checks each on its own.
-    /// Each is one address, which may be a multisig one
-    /// (`multisig_address`): the M-of-N is then checked on chain.
-    #[serde(default)]
-    pub recovery_admin: Option<Address>,
     /// Epoch length, attestation gate, minimum set — see `ChainParams`.
     /// Defaults so specs written before it existed still parse.
     #[serde(default)]

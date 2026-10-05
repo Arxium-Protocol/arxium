@@ -415,8 +415,8 @@ pub enum GovernanceAction {
     /// so the proposal text is exactly the state that results — a supervisor
     /// reads one record, not a diff against something that may have moved.
     SetChainParams(ChainParams),
-    /// Rotate one of the genesis-seeded admin roles (`AdminKey`). `role` is
-    /// the `AdminRole` name (`"attestor"`, `"freeze"`, `"recovery"`) — a
+    /// Rotate a genesis-seeded admin role (`AdminKey`). `role` is the
+    /// `AdminRole` name (`"attestor"`) — a
     /// string so this crate needn't depend on `xc-circuit`, which defines
     /// the enum and depends on this crate.
     SetAdmin { role: String, address: Address },

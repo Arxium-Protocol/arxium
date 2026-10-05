@@ -962,14 +962,14 @@ pub fn apply_recover<V: KvRead<Error = StorageError>>(
 ///
 /// This is deliberately the unchecked mover, and it is both the tail of
 /// `apply_compliant_transfer` (which runs every gate before calling it) and
-/// the whole of `ForcedTransfer`. `ForcedTransfer` exists for the cases
-/// compliance cannot express — a court order, a sanctioned holder, a lost
-/// key — where the holder cannot or must not sign, and where the recipient's
+/// the whole of `IssuerForcedTransfer`. `IssuerForcedTransfer` exists for the
+/// cases compliance cannot express — a court order, a sanctioned holder —
+/// where the holder cannot or must not sign, and where the recipient's
 /// claims may well be the reason the transfer is being forced. Freeze is
-/// likewise not a gate here: freezing an instrument is exactly when a
-/// regulator most needs to be able to move it. Authorization is the caller's
-/// job (the runtime restricts `ForcedTransfer` to the recovery admin); this
-/// function assumes it has already been established.
+/// likewise not a gate here: freezing an instrument is exactly when the
+/// issuer most needs to be able to move it. Authorization is the caller's
+/// job (the runtime restricts `IssuerForcedTransfer` to the asset's issuer);
+/// this function assumes it has already been established.
 pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     view: &V,
     asset: &mut Asset,
@@ -1018,7 +1018,7 @@ pub fn apply_forced_transfer<V: KvRead<Error = StorageError>>(
     ])))
 }
 
-/// `ForcedTransfer` itself: `apply_forced_transfer`, plus `from`'s lock
+/// `IssuerForcedTransfer` itself: `apply_forced_transfer`, plus `from`'s lock
 /// clamped to what it has left.
 pub fn apply_forced_transfer_with_lock<V: KvRead<Error = StorageError>>(
     view: &V,
@@ -2184,7 +2184,7 @@ mod tests {
         assert_eq!(moved.0[&(asset.asset_ref.clone(), seized_from.clone())], 0);
         assert_eq!(moved.0[&(asset.asset_ref.clone(), receiver.clone())], 60);
 
-        // The balance check is the floor a governor cannot go under: forcing
+        // The balance check is the floor an issuer cannot go under: forcing
         // more than the holder has would be minting by another name.
         let err = apply_forced_transfer(&db, &mut asset, &seized_from, &receiver, 61).unwrap_err();
         assert!(

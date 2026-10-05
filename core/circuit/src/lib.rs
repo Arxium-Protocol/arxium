@@ -434,19 +434,14 @@ impl KeySpec for NextProposalIdKey {
     }
 }
 
-/// The three privileged roles that used to be one `governor` address —
-/// split so the party that decides who may act as a KYC provider, the
-/// party that can halt an instrument, and the party that can move a
-/// balance without its owner's signature are independently checkable
-/// keys. See `Snapshot::attestor_admin`/`freeze_admin`/`recovery_admin`.
+/// The chain's privileged roles. Only one: the party that decides who may
+/// act as a KYC provider. Every control over an asset (freeze, forced
+/// transfer, recovery) belongs to that asset's issuer alone. See
+/// `Snapshot::attestor_admin`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdminRole {
     /// `RegisterAttestor`/`DeregisterAttestor`.
     Attestor,
-    /// `FreezeAsset`/`UnfreezeAsset` (alongside the asset's own issuer).
-    Freeze,
-    /// `ForcedTransfer`.
-    Recovery,
 }
 
 impl AdminRole {
@@ -454,8 +449,6 @@ impl AdminRole {
     pub fn parse(role: &str) -> Option<Self> {
         match role {
             "attestor" => Some(AdminRole::Attestor),
-            "freeze" => Some(AdminRole::Freeze),
-            "recovery" => Some(AdminRole::Recovery),
             _ => None,
         }
     }
@@ -463,8 +456,6 @@ impl AdminRole {
     pub fn name(self) -> &'static str {
         match self {
             AdminRole::Attestor => "attestor admin",
-            AdminRole::Freeze => "freeze admin",
-            AdminRole::Recovery => "recovery admin",
         }
     }
 }
@@ -479,8 +470,6 @@ impl KeySpec for AdminKey {
     fn encode(&self) -> Vec<u8> {
         match self.0 {
             AdminRole::Attestor => b"admin:attestor".to_vec(),
-            AdminRole::Freeze => b"admin:freeze".to_vec(),
-            AdminRole::Recovery => b"admin:recovery".to_vec(),
         }
     }
 }
