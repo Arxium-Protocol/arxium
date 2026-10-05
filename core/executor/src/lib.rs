@@ -1045,7 +1045,9 @@ pub fn max_block_weight(db: &ArxiumDb) -> Result<u64, StorageError> {
 /// a time inside the execution loop changes nothing but wall time; an action
 /// that ends up deferred past the block's weight limit was checked early and
 /// is simply checked again in the next block.
-fn verify_signatures<P: serde::Serialize + Sync>(actions: &[Action<P>]) -> Vec<Result<(), SignatureError>> {
+fn verify_signatures<P: serde::Serialize + Sync>(
+    actions: &[Action<P>],
+) -> Vec<Result<(), SignatureError>> {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // Below this a thread costs more than the ~100us verify it saves.
     if threads == 1 || actions.len() < 64 {
@@ -1055,7 +1057,13 @@ fn verify_signatures<P: serde::Serialize + Sync>(actions: &[Action<P>]) -> Vec<R
     std::thread::scope(|scope| {
         let handles: Vec<_> = actions
             .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().map(Action::verify_signature).collect::<Vec<_>>()))
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(Action::verify_signature)
+                        .collect::<Vec<_>>()
+                })
+            })
             .collect();
         handles
             .into_iter()
