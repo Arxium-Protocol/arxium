@@ -32,5 +32,5 @@ const signature = assembleSessionSignature(vectors.policy.sessions[0].publicKey,
 assert.equal(await verifyPolicySignature(vectors.policy, signature, signingBytes(vectors.sender, 0, payload)), "session");
 assert.equal(await verifyPolicySignature({ ...vectors.policy, sessions: [] }, signature, signingBytes(vectors.sender, 0, payload)), null);
 assert.throws(() => encodePayload({ name: "setAccountPolicy", input: { policy: { ...vectors.policy, owners: { ...vectors.members, members: [...vectors.members.members].reverse() } } } }), /sorted/);
-assert.equal(toHex(encodePayload({ name: "cancelAccountRecovery", input: {} })), "2b05");
+assert.equal(toHex(encodePayload({ name: "cancelAccountRecovery", input: {} })), "2a05");
 console.log("programmable account Rust/TypeScript vectors passed");

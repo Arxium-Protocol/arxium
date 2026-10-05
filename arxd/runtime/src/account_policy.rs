@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn threshold_issuer_and_all_admin_roles_execute_in_the_real_executor() {
+    fn threshold_issuer_and_attestor_admin_execute_in_the_real_executor() {
         let db = temp_db();
         let keys = [key(7), key(8), key(9)];
         let issuer = multisig_address(2, &owners(&keys, 2).members).unwrap();
@@ -295,19 +295,15 @@ mod tests {
         )]))])
         .unwrap();
         let mut admins = xc_storage::GovernanceUpdates::default();
-        for role in [
-            xc_circuit::AdminRole::Attestor,
-            xc_circuit::AdminRole::Freeze,
-            xc_circuit::AdminRole::Recovery,
-        ] {
-            admins.put(&xc_circuit::AdminKey(role), &issuer).unwrap();
-        }
+        admins
+            .put(
+                &xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor),
+                &issuer,
+            )
+            .unwrap();
         db.write_batches(&[&admins]).unwrap();
         let asset = AssetRef::derive(&issuer, "gold").unwrap();
         let receiver = Address::from_pubkey_bytes(&key(10).verifying_key().to_bytes()).unwrap();
-        let external = Asset::new("external", receiver.clone(), false);
-        let external_ref = external.asset_ref.clone();
-        db.write_batches(&[&external]).unwrap();
         let actions = vec![
             signed(
                 &issuer,
@@ -348,7 +344,7 @@ mod tests {
             signed(
                 &issuer,
                 3,
-                ActionPayload::ForcedTransfer {
+                ActionPayload::IssuerForcedTransfer {
                     asset: asset.clone(),
                     from: issuer.clone(),
                     to: receiver.clone(),
@@ -358,12 +354,11 @@ mod tests {
                 &keys,
                 None,
             ),
-            // Different issuer: succeeds only through the Freeze admin role.
             signed(
                 &issuer,
                 4,
                 ActionPayload::FreezeAsset {
-                    asset: external_ref,
+                    asset: asset.clone(),
                     reason: "halt".into(),
                 },
                 &keys,

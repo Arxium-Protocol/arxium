@@ -52,9 +52,8 @@ async function waitHeight(height, base = rpc) {
   throw new Error(`height ${height} did not arrive`);
 }
 function encode(name, input) {
-  // These two admin variants are not in the SDK's user-facing codec menu.
+  // The attestor-admin variant is not in the SDK's user-facing codec menu.
   if (name === "registerAttestor") return new Writer().varint(15).string(input.attestor).string(input.name).string(input.reason).bytes();
-  if (name === "forcedTransfer") return new Writer().varint(20).string(input.asset).string(input.from).string(input.to).varint(BigInt(input.amount)).string(input.reason).bytes();
   return encodePayload({ name, input });
 }
 async function build(profile, sender, name, input, options = {}) {
@@ -130,7 +129,6 @@ async function prepare() {
   profile.testAccount = await multisigAddress(2, threshold(profile, "original").members.map(fromHex));
   profile.uiAccount = await multisigAddress(2, threshold(profile, "ui").members.map(fromHex));
   profile.asset = await deriveAssetRef(profile.testAccount, "manual_demo");
-  profile.externalAsset = await deriveAssetRef(profile.uiAccount, "external_demo");
   for (const [name, enabled] of [["extensions", true], ["launch", false]]) {
     const basePath = join(home, name);
     await mkdir(basePath, { recursive: true, mode: 0o700 });
@@ -138,7 +136,7 @@ async function prepare() {
     const accounts = Object.fromEntries(Object.values(profile.keys).map(k => [k.address, { balance: 100000000000, nonce: 0, identity_hash: null }]));
     for (const address of [profile.testAccount, profile.uiAccount]) accounts[address] = { balance: 1000000000000, nonce: 0, identity_hash: null };
     await jsonFile(`${name}.json`, { genesis_format: "plain", height: 0, chain_name: `account-demo-${name}`, accounts, validators, boot_nodes: [],
-      attestor_admin: profile.testAccount, freeze_admin: profile.testAccount, recovery_admin: profile.testAccount,
+      attestor_admin: profile.testAccount,
       params: { block_interval_secs: 1, epoch_length: 100, min_validator_set: 1, max_validator_set: 16, validator_attestation_required: false,
         reward_per_block: 0, weight_fee: 1000, challenge_window_blocks: 2, account_extensions_enabled: enabled } });
   }
@@ -162,14 +160,13 @@ async function test(profile) {
   await act("registerAsset", { assetId: "manual_demo", complianceRequired: false, metadata });
   await act("issueAsset", { asset: profile.asset, amount: "1000" });
   await act("registerAttestor", { attestor: profile.keys.allowed.address, name: "Local test provider", reason: "manual demo" });
-  await act("registerAsset", { assetId: "external_demo", complianceRequired: false, metadata: { ...metadata, symbol: "EXTERNAL" } }, { sender: profile.uiAccount });
-  await act("freezeAsset", { asset: profile.externalAsset, frozen: true, reason: "admin role test" });
-  await act("forcedTransfer", { asset: profile.asset, from: sender, to: profile.keys.allowed.address, amount: "100", reason: "recovery admin role test" });
+  await act("freezeAsset", { asset: profile.asset, frozen: true, reason: "issuer freeze test" });
+  await act("issuerForcedTransfer", { asset: profile.asset, from: sender, to: profile.keys.allowed.address, amount: "100", reason: "issuer forced transfer test" });
   await act("setAccountPolicy", { policy: policyFor(profile) });
   await act("rotateAccountMembers", { owners: threshold(profile, "next") });
   await act("transfer", { to: profile.keys.allowed.address, amount: "1" }, { group: "original", reject: true });
   await act("issueAsset", { asset: profile.asset, amount: "1" });
-  await act("unfreezeAsset", { asset: profile.externalAsset, frozen: false, reason: "rotated admin test" });
+  await act("unfreezeAsset", { asset: profile.asset, frozen: false, reason: "rotated issuer test" });
   assert.equal((await get(`/assets/${profile.asset}`)).issuer, sender);
   let policy = fromNodePolicy((await get(`/accounts/${sender}`)).programmable.policy);
   policy.limits = [{ asset: "native", periodBlocks: "100000", amount: "80000000" }, { asset: { asset: profile.asset }, periodBlocks: "100000", amount: "100" }];

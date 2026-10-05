@@ -260,7 +260,7 @@ fn proof_json(mut input: Request) -> Result<serde_json::Value, String> {
     Ok(serde_json::json!({ "sub": encode_field(&sub), "proof": hex::encode(bytes) }))
 }
 
-/// `VerifyClaimProof` (payload variant 40) for a private-mode asset: proves
+/// `VerifyClaimProof` (payload variant 39) for a private-mode asset: proves
 /// the imported credential meets the asset's gate without revealing it.
 /// Pass the account's on-chain `identity_hash` as `opening.leaf`, so a
 /// credential that isn't the attested one fails here, not on chain.

@@ -3,9 +3,9 @@
 ## Milestone coverage and release status
 
 - **M1:** immutable threshold issuer/admin roles run through the real executor.
-  `account_policy::tests::threshold_issuer_and_all_admin_roles_execute_in_the_real_executor`
-  registers and issues an asset, registers an attestor, performs an authorized
-  forced transfer, and freezes another issuer's asset. Threshold signatures are
+  `account_policy::tests::threshold_issuer_and_attestor_admin_execute_in_the_real_executor`
+  registers and issues an asset, registers an attestor, performs an issuer
+  forced transfer, and freezes the asset. Threshold signatures are
   verified before role dispatch. The SDK/CLI, Console, API assembler and mobile
   codecs provide building, individual signing and assembly.
 - **M2:** `AccountEntry.programmable` commits the current policy, spending
@@ -70,7 +70,7 @@ to another holder is subject to the recipient allowlist, but is not a debit of
 the issuer's existing balance and does not count as spending that balance.
 Supply/issuance and regulatory forced-transfer authorization keep their separate
 business rules; this policy governs the **action sender**, not the forced-from
-party's permission to be moved by an authorized issuer/admin.
+party's permission to be moved by the asset's issuer.
 
 Native fees for ordinary actions count toward native limits even if the action also credits the sender;
 the native debit counter has the metered fee as its floor. All external balance credits produced by

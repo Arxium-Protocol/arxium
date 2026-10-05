@@ -27,15 +27,16 @@ is right and this file is stale — fix the file.
   `required_claims`, `allowed_jurisdictions`, `max_attestation_age`,
   `max_holders`, `max_balance_per_holder`, `max_supply`, plus the
   `frozen` / `issuance_locked` switches.
-- **Roles.** Three chain-wide admin addresses seeded at genesis — attestor
-  admin, freeze admin, recovery admin — one address per role. Per asset: the
-  issuer. Any of these may be a multisig address (up to 16 ed25519 members,
+- **Roles.** One chain-wide admin address seeded at genesis: the attestor
+  admin, which decides who may act as a KYC provider. Every control over an
+  asset — freeze, forced transfer, recovery — belongs to that asset's issuer
+  and no one else. Either may be a multisig address (up to 16 ed25519 members,
   threshold 1..=N; `xc_primitives::multisig_address`, SDK `multisigAddress`),
   in which case every action from it must carry exactly `threshold` member
   signatures — checked on chain in `Action::verify_signature`.
   Attestors are a registry, many at once. `arxd/runtime/src/identity.rs`
   (`require_admin`), `asset.rs` (`require_issuer`).
-- **Reasons.** Every admin-gated action (forced transfers, freeze/unfreeze,
+- **Reasons.** Every privileged action (forced transfers, freeze/unfreeze,
   attestor register/deregister) carries a free-text `reason`, non-blank and
   ≤ 512 bytes. It is not written to state; the block carrying the action is
   the audit record. `asset::check_reason`.
@@ -50,8 +51,7 @@ is right and this file is stale — fix the file.
 | `RegisterAsset` | anyone (becomes issuer) | `runtime::asset::register_asset` |
 | `IssueAsset`, `IssueAssetTo`, `BurnAsset`, `LockIssuance`, `TransferIssuer`, `SetAssetMetadataUri`, `SetAssetLimits` | issuer | `runtime::asset::require_issuer` |
 | `SetHolderFrozen`, `LockHolderAmount(Until)`, `IssuerForcedTransfer`, `RecoverHolder` | issuer | `require_issuer` |
-| `SetAssetFrozen` | issuer **or** freeze admin | `runtime::asset::set_frozen` |
-| `ForcedTransfer` | recovery admin | `runtime::asset::forced_transfer` |
+| `FreezeAsset` / `UnfreezeAsset` | issuer | `runtime::asset::set_frozen` |
 | `TransferAsset` | any holder — subject to §3 | `circuit_rwa_asset::apply_compliant_transfer` |
 | `JoinValidator` | attested account, if `ChainParams.validator_attestation_required` | `runtime::staking` |
 
@@ -62,8 +62,6 @@ Authorization errors (all `arxd/runtime`):
 | `{sender} is not the {role}` | sender is not the seeded admin for that role |
 | `chain has no {role} configured` | genesis seeded no address for the role; the action can never succeed on this chain |
 | `only the issuer ({issuer}) of {asset} may do this, got {sender}` | issuer-only action from someone else |
-| `{sender} is neither the issuer of {asset} nor the freeze admin` | `SetAssetFrozen` |
-| `only the recovery admin may force a transfer` | `ForcedTransfer` |
 | `{addr} is not a registered attestor` | grant/revoke from an unregistered address, or deregistering one |
 | `{addr} is already a registered attestor` | deregister first to change its name |
 | `{what} needs a non-empty reason` / `reason is N bytes, over the 512-byte limit` | missing/oversized audit reason |
@@ -154,12 +152,11 @@ both.
 
 | Action | Sender | Gates skipped | Kept |
 |---|---|---|---|
-| `ForcedTransfer` | recovery admin | attestation, claims, jurisdiction, age, holder limits, asset freeze, holder freeze | `from` must hold the balance (`insufficient {asset} balance for {from}…`); cannot mint; reason required |
-| `IssuerForcedTransfer` | issuer | same | same |
+| `IssuerForcedTransfer` | issuer | attestation, claims, jurisdiction, age, holder limits, asset freeze, holder freeze | `from` must hold the balance (`insufficient {asset} balance for {from}…`); cannot mint; reason required |
 
-This is by design: court orders, sanctions and lost keys are exactly the
-cases ordinary compliance refuses, and freezing an instrument is exactly when
-a regulator most needs to move it. The `reason` on the action and the block
+This is by design: court orders and sanctions are exactly the cases ordinary
+compliance refuses, and freezing an instrument is exactly when the issuer
+most needs to move it. The `reason` on the action and the block
 it lands in are the audit trail.
 
 ## 7. Registration validity (`RegisterAsset`, `GrantAttestation`)

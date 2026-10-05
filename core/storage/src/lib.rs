@@ -290,7 +290,7 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// 8 -> 9 migration goes with it — any pre-10 database needs the reset.
 ///
 /// Bumped 10 -> 11: `Asset` gained `issuance_locked` (`LockIssuance`,
-/// variant 28). Positional bincode again, and `asset_record:` is
+/// variant 27). Positional bincode again, and `asset_record:` is
 /// merkleized, so no in-place migration — devnet reset.
 ///
 /// Bumped 11 -> 12 (closing the external review's gaps, see
@@ -322,11 +322,11 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// devnet reset, which also seeds the new reward pool from the spec.
 ///
 /// Bumped 14 -> 15: `Asset` gained `max_holders`, `max_balance_per_holder`,
-/// `max_attestation_age` and `holder_count` (`SetAssetLimits`, variant 31);
+/// `max_attestation_age` and `holder_count` (`SetAssetLimits`, variant 30);
 /// `HolderState` gained `lock_expires_at` (`LockHolderAmountUntil`, variant
 /// 32); `AccountEntry` gained `attested_at`; `ChainParams` gained
 /// `voting_period_blocks` and `proposal_quorum_bps` (`circuit-governance`,
-/// variants 33–35, `proposal*:` rows in `CF_GOVERNANCE`) and then the
+/// variants 32–34, `proposal*:` rows in `CF_GOVERNANCE`) and then the
 /// formerly compile-time economics — `action_fee`, `weight_fee`,
 /// `min_validator_stake`, `equivocation_slash_bps`, `downtime_slash_bps`,
 /// `fee_proposer_bps`, `fee_treasury_bps` — so a vote can retune them. All
@@ -347,12 +347,12 @@ const COLUMN_FAMILIES: [&str; 9] = [
 ///
 /// Bumped 16 -> 17: `Asset` gained `snapshot` (the record-date cap table
 /// behind `SnapshotHolders`/`DistributeToHolders`/`RedeemHolders`/
-/// `SplitAsset`, variants 36–39). Positional bincode on a merkleized
+/// `SplitAsset`, variants 35–38). Positional bincode on a merkleized
 /// `asset_record:` row — devnet reset.
 ///
 /// Bumped 17 -> 18: `Asset` gained `private_claims` and `HolderState`
 /// gained `claim_verified_at` (zk claim proofs, `VerifyClaimProof` /
-/// `SetPrivateClaims`, variants 40–41). Positional bincode on merkleized
+/// `SetPrivateClaims`, variants 39–40). Positional bincode on merkleized
 /// `CF_ASSETS` rows — devnet reset.
 ///
 /// Bumped 18 -> 19: `CF_MERKLE` can hold 65-byte shortcut records in place
@@ -389,7 +389,11 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `evidence:dispute_open:` value became an `OpenDispute`.
 /// Bumped 25 -> 26: AccountEntry gained programmable policies/counters/recovery,
 /// and ChainParams gained account_extensions_enabled. Devnet reset required.
-pub const SCHEMA_VERSION: u32 = 26;
+/// Bumped 26 -> 27: the chain-wide freeze and recovery admins are gone —
+/// `ActionPayload` lost `ForcedTransfer`, so every later variant moved down
+/// one (positional bincode in stored blocks), and `admin:freeze`/
+/// `admin:recovery` rows are no longer seeded. Devnet reset required.
+pub const SCHEMA_VERSION: u32 = 27;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -2681,8 +2685,6 @@ mod explorer_index_tests {
             boot_nodes: vec![],
             attestor: None,
             attestor_admin: None,
-            freeze_admin: None,
-            recovery_admin: None,
         })
         .unwrap();
 
@@ -2737,8 +2739,6 @@ mod explorer_index_tests {
             boot_nodes: vec![],
             attestor: None,
             attestor_admin: None,
-            freeze_admin: None,
-            recovery_admin: None,
         })
         .unwrap();
 
@@ -2776,8 +2776,6 @@ mod explorer_index_tests {
             boot_nodes: vec![],
             attestor: None,
             attestor_admin: None,
-            freeze_admin: None,
-            recovery_admin: None,
         })
         .unwrap();
 

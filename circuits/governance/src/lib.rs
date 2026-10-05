@@ -590,7 +590,7 @@ mod tests {
     fn quorum_and_majority_are_both_required() {
         let db = db();
         let action = GovernanceAction::SetAdmin {
-            role: "freeze".into(),
+            role: "attestor".into(),
             address: addr(9),
         };
         // 30% + 10% yes is a majority of votes cast but under the 50% quorum.
@@ -605,7 +605,7 @@ mod tests {
         let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
         assert_eq!(p.status, ProposalStatus::Rejected);
         assert!(
-            KvRead::get(&db, &AdminKey(AdminRole::Freeze))
+            KvRead::get(&db, &AdminKey(AdminRole::Attestor))
                 .unwrap()
                 .is_none()
         );
@@ -620,7 +620,7 @@ mod tests {
         let (up, _, _) = apply_execute(&db, id, 20).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(
-            KvRead::get(&db, &AdminKey(AdminRole::Freeze)).unwrap(),
+            KvRead::get(&db, &AdminKey(AdminRole::Attestor)).unwrap(),
             Some(addr(9))
         );
     }

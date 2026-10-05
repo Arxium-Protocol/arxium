@@ -1,14 +1,36 @@
 {
   "name": "@arxium-protocol/sdk",
-  "version": "0.1.6",
+  "version": "0.2.0",
   "description": "Arxium TypeScript SDK and arx CLI",
   "type": "module",
   "private": false,
-  "publishConfig": { "registry": "https://npm.pkg.github.com", "access": "restricted" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "bin": { "arx": "./dist/cli.js" },
-  "files": ["dist", "!dist/*.test.*", "README.md"],
-  "engines": { "node": ">=20" },
-  "scripts": { "build": "tsc -p tsconfig.json", "test": "npm run build && node dist/codec.test.js && node dist/policy.test.js && node dist/cli.test.js" },
-  "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.0.0" }
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "arx": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "!dist/*.test.*",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node dist/codec.test.js && node dist/policy.test.js && node dist/cli.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
 }
