@@ -158,9 +158,9 @@ fn pct(v: &[Duration], p: usize) -> Duration {
 /// Tip height plus, for a height range, (actions, weight_used) per block and
 /// first/last timestamps — the committed side of the measurement.
 fn tip(node: &str, token: &str) -> Result<u64> {
-    Ok(get_json(node, token, "/status")?["tip_height"]
+    get_json(node, token, "/status")?["tip_height"]
         .as_u64()
-        .context("tip_height")?)
+        .context("tip_height")
 }
 
 fn chain_stats(node: &str, token: &str, from: u64, to: u64) -> Result<(u64, u64, u64, u64)> {
