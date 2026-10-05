@@ -911,48 +911,105 @@ mod tests {
     #[ignore]
     fn bench_full_block() {
         use std::time::Instant;
-        let n: usize = std::env::var("BENCH_ACTIONS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let n: usize = std::env::var("BENCH_ACTIONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
         let dir = std::env::temp_dir().join(format!("arxium-bench-block-{}", std::process::id()));
         let db = ArxiumDb::open(&dir).expect("open test db");
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
-        let ExecutionOutcome { accounts: genesis_updates, .. } = execute_actions(
-            &db, genesis.actions.clone(), &[], BlockUpdates::default(),
-            |a, v, o, ov, vs| dispatch(a, v, o, ov, vs, 0, &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None), 0),
-            &meter::<CoreChainRuntime>(Default::default()), None, false,
-        ).unwrap();
+        let ExecutionOutcome {
+            accounts: genesis_updates,
+            ..
+        } = execute_actions(
+            &db,
+            genesis.actions.clone(),
+            &[],
+            BlockUpdates::default(),
+            |a, v, o, ov, vs| {
+                dispatch(
+                    a,
+                    v,
+                    o,
+                    ov,
+                    vs,
+                    0,
+                    &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
+                    0,
+                )
+            },
+            &meter::<CoreChainRuntime>(Default::default()),
+            None,
+            false,
+        )
+        .unwrap();
         db.write_batches(&[&genesis_updates, &genesis]).unwrap();
 
         let keys: Vec<SigningKey> = (0..n)
-            .map(|i| { let mut s = [0u8; 32]; s[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes()); SigningKey::from_bytes(&s) })
+            .map(|i| {
+                let mut s = [0u8; 32];
+                s[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+                SigningKey::from_bytes(&s)
+            })
             .collect();
-        let addrs: Vec<Address> = keys.iter().map(|k| Address::from_pubkey_bytes(k.verifying_key().as_bytes()).unwrap()).collect();
+        let addrs: Vec<Address> = keys
+            .iter()
+            .map(|k| Address::from_pubkey_bytes(k.verifying_key().as_bytes()).unwrap())
+            .collect();
         let mut accounts = BTreeMap::new();
         for a in &addrs {
-            accounts.insert(a.clone(), AccountEntry { balance: 1_000_000_000_000, ..Default::default() });
+            accounts.insert(
+                a.clone(),
+                AccountEntry {
+                    balance: 1_000_000_000_000,
+                    ..Default::default()
+                },
+            );
         }
         db.write_batch(&Snapshot {
-            height: 0, params: Default::default(), chain_name: "bench".into(), accounts,
-            validators: BTreeMap::new(), boot_nodes: Vec::new(), attestor: None,
-            attestor_admin: None, freeze_admin: None, recovery_admin: None,
-        }).unwrap();
+            height: 0,
+            params: Default::default(),
+            chain_name: "bench".into(),
+            accounts,
+            validators: BTreeMap::new(),
+            boot_nodes: Vec::new(),
+            attestor: None,
+            attestor_admin: None,
+            freeze_admin: None,
+            recovery_admin: None,
+        })
+        .unwrap();
 
-        let rounds: u64 = std::env::var("BENCH_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let rounds: u64 = std::env::var("BENCH_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
         let (mut verify, mut produce) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let mut block = None;
         for round in 0..rounds {
-            let actions: Vec<_> = (0..n).map(|i| {
-                let mut a = Action {
-                    sender: addrs[i].clone(), nonce: round, signature: None,
-                    payload: ActionPayload::Transfer { to: addrs[(i + 1) % n].clone(), amount: 1 },
-                };
-                a.signature = Some(hex::encode(keys[i].sign(&a.signing_bytes()).to_bytes()));
-                a
-            }).collect();
+            let actions: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut a = Action {
+                        sender: addrs[i].clone(),
+                        nonce: round,
+                        signature: None,
+                        payload: ActionPayload::Transfer {
+                            to: addrs[(i + 1) % n].clone(),
+                            amount: 1,
+                        },
+                    };
+                    a.signature = Some(hex::encode(keys[i].sign(&a.signing_bytes()).to_bytes()));
+                    a
+                })
+                .collect();
             let t = Instant::now();
-            for a in &actions { a.verify_signature().unwrap(); }
+            for a in &actions {
+                a.verify_signature().unwrap();
+            }
             verify += t.elapsed();
             let t = Instant::now();
-            let (b, _, _) = produce_block_reporting::<CoreChainRuntime>(&db, actions, round + 1, None).unwrap();
+            let (b, _, _) =
+                produce_block_reporting::<CoreChainRuntime>(&db, actions, round + 1, None).unwrap();
             produce += t.elapsed();
             block = Some(b);
         }
@@ -967,11 +1024,16 @@ mod tests {
         let _ = block.hash();
         let hash = t.elapsed();
         let wire = xc_primitives::wire_config();
-        let bin = bincode::serde::encode_to_vec(&block, wire).map(|v| v.len()).unwrap_or(0);
+        let bin = bincode::serde::encode_to_vec(&block, wire)
+            .map(|v| v.len())
+            .unwrap_or(0);
         println!("actions={} applied={}", n, block.actions.len());
         println!("sig verify (serial, all) : {verify:?}");
         println!("produce_block (exec+root+commit): {produce:?}");
-        println!("tx_root: {tx_root:?}  block.hash: {hash:?}  root={:?}", &root[..2]);
+        println!(
+            "tx_root: {tx_root:?}  block.hash: {hash:?}  root={:?}",
+            &root[..2]
+        );
         println!("actions json {json} B ({enc:?}), block bincode {bin} B");
         std::fs::remove_dir_all(&dir).ok();
     }

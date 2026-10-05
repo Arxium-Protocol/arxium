@@ -206,7 +206,11 @@ fn main() -> Result<()> {
 
     // Fund phase: skip senders already funded (re-runs), 60 per wave so the
     // funder stays under the per-sender mempool cap.
-    let bal = accounts(node0, token, &senders.iter().map(|k| &k.addr).collect::<Vec<_>>())?;
+    let bal = accounts(
+        node0,
+        token,
+        &senders.iter().map(|k| &k.addr).collect::<Vec<_>>(),
+    )?;
     let todo: Vec<&Key> = senders
         .iter()
         .zip(&bal)
@@ -234,10 +238,14 @@ fn main() -> Result<()> {
     }
 
     // Hand each worker a disjoint slice with chain-synced nonces.
-    let nonces: Vec<u64> = accounts(node0, token, &senders.iter().map(|k| &k.addr).collect::<Vec<_>>())?
-        .into_iter()
-        .map(|a| a.1)
-        .collect();
+    let nonces: Vec<u64> = accounts(
+        node0,
+        token,
+        &senders.iter().map(|k| &k.addr).collect::<Vec<_>>(),
+    )?
+    .into_iter()
+    .map(|a| a.1)
+    .collect();
     let senders = Arc::new(senders);
     let nonces = Arc::new(Mutex::new(nonces));
     let addrs: Arc<Vec<Address>> = Arc::new(senders.iter().map(|k| k.addr.clone()).collect());
