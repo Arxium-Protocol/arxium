@@ -237,6 +237,8 @@ pub enum AcceptBlockError {
     },
     #[error("parent hash mismatch: local tip is {local}, block expects {expected}")]
     ParentMismatch { local: Hash32, expected: String },
+    #[error("block {height} build_id is {len} bytes, over the limit")]
+    BuildIdTooLong { height: u64, len: usize },
     #[error("block {height} claims parent state root {claimed}, its parent's is {local}")]
     ParentStateRootMismatch {
         height: u64,
@@ -615,6 +617,13 @@ where
             height: block.height,
             local: parent.state_root.clone(),
             claimed: block.parent_state_root.clone(),
+        });
+    }
+
+    if block.build_id.len() > xc_primitives::MAX_BUILD_ID_LEN {
+        return Err(AcceptBlockError::BuildIdTooLong {
+            height: block.height,
+            len: block.build_id.len(),
         });
     }
 
@@ -1593,6 +1602,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -1615,6 +1625,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         accept_block_computing_root(&db, block2, &alice, &alice_key).unwrap();
         let mut expected = vec![alice, bob];
@@ -2005,6 +2016,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -2097,6 +2109,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
 
         let accepted = accept_block_computing_root(&db, block1, &alice, &alice_key).unwrap();
@@ -2163,6 +2176,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block1.sign(&GENESIS, addr.clone(), &key);
         let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
@@ -2207,6 +2221,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block.sign(&GENESIS, addr.clone(), key);
         block
@@ -2399,6 +2414,7 @@ mod tests {
             state_root: db.compute_state_root(&[&reward_updates]).unwrap(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block1.sign(&GENESIS, addr1, &key1);
         let block1 = accept_block(&db, block1, false, &flat, dispatch, seal).unwrap();
@@ -2476,6 +2492,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block2.sign(&GENESIS, addr, &key);
         let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
@@ -2506,6 +2523,7 @@ mod tests {
                 state_root: String::new(),
                 round: 0,
                 round_certificate: None,
+                build_id: String::new(),
             };
             block2.sign(&GENESIS, addr.clone(), &key);
             let err = accept_block(&db, block2, false, &flat, dispatch, seal).unwrap_err();
@@ -2551,6 +2569,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block2.sign(&GENESIS, addr.clone(), &key);
 
@@ -2611,6 +2630,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block2.sign(&GENESIS, addr.clone(), &key);
         db.write_batch(&RoundCertificate {
@@ -2667,6 +2687,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block2.sign(&GENESIS, addr.clone(), &key);
         let pol = |block_hash| xc_storage::PolRecord {
@@ -2751,6 +2772,7 @@ mod tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block1.sign(&GENESIS, alice, &alice_key);
 

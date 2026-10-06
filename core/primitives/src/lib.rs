@@ -24,7 +24,7 @@ pub use attestor::{
     MAX_ATTESTOR_NAME_LEN, MIN_ATTESTOR_NAME_LEN, MIN_ATTESTOR_THRESHOLD, attestor_name_skeleton,
     validate_attestor_multisig, validate_attestor_name,
 };
-pub use block::{Block, RawBlock};
+pub use block::{Block, MAX_BUILD_ID_LEN, RawBlock};
 pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer,
     round_timeout_signing_bytes,

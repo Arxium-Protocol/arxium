@@ -58,7 +58,16 @@ pub struct Block<P> {
     /// with different locally-held certificates always agree on the same
     /// verdict. See `Arxium_OpenItems.md` §7 (B1c).
     pub round_certificate: Option<RoundCertificate>,
+    /// Release that produced this block (`arxd` crate version), signed with
+    /// the header. An upheld execution dispute is classified from it: a
+    /// listed older build is a bug, the current or an unlisted build an
+    /// attack (`ChainParams::canonical_builds`, docs/consensus-safety.md §5).
+    /// At most [`MAX_BUILD_ID_LEN`] bytes; empty for genesis.
+    pub build_id: String,
 }
+
+/// Longest `Block::build_id` `accept_block` takes.
+pub const MAX_BUILD_ID_LEN: usize = 64;
 
 /// Same wire shape [`Block<P>`] always serializes as, but `actions` is
 /// captured as [`RawAction`] instead of `Action<P>` — decodes any chain's
@@ -80,6 +89,7 @@ pub struct RawBlock {
     pub state_root: String,
     pub round: u32,
     pub round_certificate: Option<RoundCertificate>,
+    pub build_id: String,
 }
 
 impl RawBlock {
@@ -127,6 +137,7 @@ struct BlockSigningPayload<'a> {
     parent_state_root: &'a str,
     state_root: &'a str,
     round: u32,
+    build_id: &'a str,
 }
 
 impl<P: Serialize> Block<P> {
@@ -148,6 +159,7 @@ impl<P: Serialize> Block<P> {
                 .to_string(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         }
     }
 
@@ -173,6 +185,7 @@ impl<P: Serialize> Block<P> {
             parent_state_root: &self.parent_state_root,
             state_root: &self.state_root,
             round: self.round,
+            build_id: &self.build_id,
         };
         bincode::serde::encode_to_vec(&payload, crate::wire_config())
             .expect("signing payload encoding should never fail")
@@ -189,7 +202,7 @@ impl<P: Serialize> Block<P> {
 
     /// Verifies `signature` was produced by the private key behind `proposer`,
     /// over this block's (genesis_hash, height, parent_hash, timestamp,
-    /// tx_root, proposer, parent_state_root, state_root, round) — so only for the chain whose
+    /// tx_root, proposer, parent_state_root, state_root, round, build_id) — so only for the chain whose
     /// genesis hash the caller passes. Proves nothing about `actions` on its own — a caller
     /// that trusts `actions` off a validly-signed block without separately
     /// checking `tx_root` against them is trusting an unverified field; see
@@ -308,6 +321,7 @@ mod tests {
             state_root: header.state_root,
             round: header.round,
             round_certificate: None,
+            build_id: header.build_id,
         };
         (block, proposer)
     }
@@ -333,7 +347,7 @@ mod tests {
         let (block, proposer) = block_matching_frozen_artifact_header();
         assert_eq!(
             hex::encode(block.signing_bytes(&xc_artifact::FROZEN_TEST_GENESIS, &proposer)),
-            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790c3078706172656e74526f6f740f30787374617465726f6f744861736803",
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790c3078706172656e74526f6f740f30787374617465726f6f74486173680305302e342e30",
         );
     }
 }

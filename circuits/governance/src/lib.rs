@@ -126,6 +126,9 @@ fn changes_epoch_length<V: KvRead<Error = StorageError>>(
     Ok(proposed.epoch_length != chain_params(view)?.epoch_length)
 }
 
+/// Most release ids `ChainParams::canonical_builds` holds.
+const MAX_CANONICAL_BUILDS: usize = 32;
+
 /// The cheap sanity checks on a proposed action, run at submission so a
 /// proposal that could never execute isn't voted on for a week. State-
 /// dependent checks (treasury balance) wait for execution.
@@ -145,6 +148,15 @@ fn validate_action(action: &GovernanceAction) -> Result<(), GovernanceError> {
             if p.min_validator_set == 0 || p.min_validator_set > p.max_validator_set {
                 return Err(GovernanceError::InvalidParams(
                     "need 0 < min_validator_set <= max_validator_set",
+                ));
+            }
+            if p.canonical_builds.len() > MAX_CANONICAL_BUILDS
+                || p.canonical_builds
+                    .iter()
+                    .any(|b| b.is_empty() || b.len() > xc_primitives::MAX_BUILD_ID_LEN)
+            {
+                return Err(GovernanceError::InvalidParams(
+                    "canonical_builds: at most 32 non-empty ids of at most 64 bytes",
                 ));
             }
             if p.max_block_weight == 0 {
@@ -583,7 +595,11 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                     header: *header,
                 };
                 // Nothing open (already resolved) falls through as Rejected.
-                if let Some(open) = view.get(&key)? {
+                // Raising the chain's `Bug` to `Attack` also falls through as
+                // Rejected: a slash needs the provenance evidence behind it.
+                if let Some(open) = view.get(&key)?
+                    && !(open.cause == DisputeCause::Bug && *cause == DisputeCause::Attack)
+                {
                     let treasury = treasury_account();
                     let mut paid = true;
                     if *bounty > 0 {
@@ -1292,6 +1308,7 @@ mod tests {
             height: 3,
             proposer: addr(3),
             disputed: Some(header),
+            cause: None,
             challenger: Some(addr(2)),
         })
         .unwrap();
@@ -1390,6 +1407,7 @@ mod tests {
             height: 3,
             proposer: culprit.clone(),
             disputed: Some(header),
+            cause: Some(DisputeCause::Attack),
             challenger: Some(challenger.clone()),
         })
         .unwrap();
@@ -1461,6 +1479,7 @@ mod tests {
             height: 3,
             proposer: culprit.clone(),
             disputed: Some(header),
+            cause: Some(DisputeCause::Attack),
             challenger: Some(challenger.clone()),
         })
         .unwrap();
@@ -1470,8 +1489,62 @@ mod tests {
             slash,
             Some(OpenDispute {
                 culprit,
-                challenger
+                challenger,
+                cause: DisputeCause::Attack,
             })
         );
+    }
+
+    /// The chain's classification caps governance: a dispute it called a bug
+    /// can't be voted into an attack (no slash without provenance), and an
+    /// attack can be voted down to a bug.
+    #[test]
+    fn governance_can_lower_the_chains_classification_but_not_raise_it() {
+        let db = db();
+        let (culprit, challenger) = (addr(3), addr(4));
+        let header = [9u8; 32];
+        let open = |cause| {
+            db.write_batch(&xc_storage::EvidenceMarker {
+                height: 3,
+                proposer: culprit.clone(),
+                disputed: Some(header),
+                cause: Some(cause),
+                challenger: Some(challenger.clone()),
+            })
+            .unwrap();
+        };
+        let resolve = |cause| GovernanceAction::ResolveDispute {
+            height: 3,
+            header,
+            resolution: DisputeResolution::Accept,
+            corrections: vec![],
+            cause,
+            bounty: 0,
+        };
+        let mut next = 0u64;
+        let mut execute = |action| {
+            let id = next;
+            next += 1;
+            let (got, up) = apply_submit(&db, &addr(1), action, "", 0).unwrap();
+            assert_eq!(got, id);
+            db.write_batch(&up).unwrap();
+            db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+                .unwrap();
+            let (up, accounts, slash, _) = apply_execute(&db, id, 10).unwrap();
+            db.write_batch(&up).unwrap();
+            db.write_batch(&accounts).unwrap();
+            let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
+            (slash, p.status)
+        };
+
+        open(DisputeCause::Bug);
+        let (slash, status) = execute(resolve(DisputeCause::Attack));
+        assert_eq!((slash, status), (None, ProposalStatus::Rejected));
+        assert_eq!(db.lowest_open_dispute().unwrap(), Some(3));
+
+        open(DisputeCause::Attack);
+        let (slash, status) = execute(resolve(DisputeCause::Bug));
+        assert_eq!((slash, status), (None, ProposalStatus::Executed));
+        assert_eq!(db.lowest_open_dispute().unwrap(), None);
     }
 }

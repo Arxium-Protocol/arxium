@@ -404,6 +404,7 @@ mod tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(height, &[&updates, &block], true)
             .unwrap();

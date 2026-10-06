@@ -156,6 +156,7 @@ fn write_equivocation_artifact<P: Serialize>(
             parent_state_root: block.parent_state_root.clone(),
             state_root: block.state_root.clone(),
             round: block.round,
+            build_id: String::new(),
         },
         signature: format!("0x{}", block.signature.clone().unwrap_or_default()),
     };
@@ -235,6 +236,7 @@ fn write_disagreement_artifact<P: Serialize>(
             parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
+            build_id: String::new(),
         },
         signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
     };
@@ -361,6 +363,7 @@ fn write_block_divergence_artifact<P: Serialize>(
             parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
+            build_id: String::new(),
         },
         signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
     };

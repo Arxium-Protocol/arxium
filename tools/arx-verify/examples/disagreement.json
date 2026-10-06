@@ -1,34 +1,35 @@
 {
-  "artifact_version": 5,
-  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
-  "fault": "execution_disagreement",
-  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
-  "height": 5,
-  "proposed": {
-    "header": {
-      "height": 5,
-      "parent_hash": "0xparent",
-      "timestamp": 1234,
-      "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
-      "proposer": "arx1proposer",
-      "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "state_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "round": 0
-    },
-    "signature": "0x93b709cc36447848dfcef5b1589da1a7660ebbe4eeb641297b87cc2393e8d86747c83084717131e4d885944eb570b90aa7f06d199a9c2c233f9409ed71e73b06"
-  },
+  "artifact_version": 6,
   "dissent": {
-    "height": 5,
     "block_hash": "0xblockhash",
-    "state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "header_commitment": "0x99b73bc9e4a3eda156d78f63ec7c59b8845427a0064e1170cd66838d02e86b52",
     "ep": "0x0303030303030303030303030303030303030303030303030303030303030303",
+    "header_commitment": "0x7ce4a461e4ef4cbdf2ef334c3692fa9b7ec21399897e8218d926f4395b80ca51",
+    "height": 5,
     "reason": "state_root_mismatch",
+    "signature": "0xb3bceba3f4fc7fc3549950e9241227c031120ac3951d5025c10de063cc0d6907cf15814d9d07494b73ccbad016ad112c12d6cf6b566ca871a5be1db5caf60a2002adceea7db8ff3a2d42daf48edb42c31091887e9040fbc33d6d864271e082c3",
+    "state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "voter": "arx1voter",
-    "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b",
-    "signature": "0xb55df606b2b8c5c69c62b8a804b3d5a54890dee13d9326c17f011c312256cd95a514ccc92cc1930f4e7c3c3a787445ad0dda9f544faa88744c4f143f21c39c1728369743d6d08202b78129f251de55e9e9b41b2a18ca9a1c1e30c020d19e6462"
+    "voter_pubkey": "0x957467ef01661798515186269581fd323fc8fd8fb05215d6944b2f2e742400c92778fe84fd1347b97f4159be4451966b"
   },
+  "fault": "execution_disagreement",
+  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
+  "height": 5,
   "human_readable": {
     "note": "devnet soak run, height 5"
-  }
+  },
+  "proposed": {
+    "header": {
+      "build_id": "",
+      "height": 5,
+      "parent_hash": "0xparent",
+      "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "proposer": "arx1proposer",
+      "round": 0,
+      "state_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1234,
+      "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101"
+    },
+    "signature": "0xd95e81308b34adcdb0efa07af76a8ea209a5d60692a034b57e6f7a93b77a33bdb46bc67d3279c2712ca2680ffe9f6e1c836b7ca8acc412aadb6f3a749f69fe06"
+  },
+  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
 }

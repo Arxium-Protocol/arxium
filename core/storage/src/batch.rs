@@ -276,6 +276,10 @@ pub struct EvidenceMarker {
     /// Who submitted the proof, kept in the open-dispute row so governance
     /// can pay them when it resolves the dispute. Only read when `disputed`.
     pub challenger: Option<Address>,
+    /// What the chain made of the dispute from the disputed header's
+    /// `build_id` (`ChainParams::classify_build`). Governance may only
+    /// downgrade it. Only read when `disputed`.
+    pub cause: Option<xc_primitives::DisputeCause>,
 }
 
 impl BatchWritable for EvidenceMarker {
@@ -310,6 +314,7 @@ impl BatchWritable for EvidenceMarker {
                             .challenger
                             .clone()
                             .unwrap_or_else(|| self.proposer.clone()),
+                        cause: self.cause.unwrap_or(xc_primitives::DisputeCause::Bug),
                     },
                     bincode::config::standard(),
                 )?,
@@ -1028,6 +1033,7 @@ mod effects_tests {
                 height: 3,
                 proposer: a.clone(),
                 disputed: Some([4u8; 32]),
+                cause: None,
                 challenger: None,
             }],
             &[BlsKeyRegistration {

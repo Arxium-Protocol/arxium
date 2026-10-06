@@ -273,6 +273,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         state_root,
         round,
         round_certificate,
+        build_id: env!("CARGO_PKG_VERSION").to_string(),
     };
     if let Some((address, key)) = proposer {
         // Bound to this chain's genesis hash, so the signature can't be

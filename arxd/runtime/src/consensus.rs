@@ -112,6 +112,7 @@ pub(crate) fn submit_equivocation_evidence<V: KvRead<Error = StorageError>>(
         height: block_a.height,
         proposer: equivocator,
         disputed: None,
+        cause: None,
         challenger: None,
     });
     Ok(updates)
@@ -316,7 +317,11 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
             let genesis = Hash32::parse(&chain_genesis)?.into_bytes();
             let bytes = xc_artifact::signing_bytes_for(&genesis, &block_attestation.header)
                 .map_err(|err| anyhow::anyhow!("disputed header: {err}"))?;
-            Some(<sha2::Sha256 as sha2::Digest>::digest(bytes).into())
+            let params = view.get(&ChainParamsKey)?.unwrap_or_default();
+            Some((
+                <sha2::Sha256 as sha2::Digest>::digest(bytes).into(),
+                params.classify_build(&block_attestation.header.build_id),
+            ))
         }
         _ => None,
     };
@@ -326,13 +331,15 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
         // governance resolves it (docs/consensus-safety.md §5).
         tracing::error!(
             %culprit, height,
+            cause = ?disputed.map(|(_, cause)| cause),
             "execution dispute upheld: block marked disputed, settlement paused"
         );
     }
     // An upheld dispute slashes no one yet: a certified wrong root means
     // 2/3 of the set signed it, which is likelier a shared determinism bug
-    // than an attack. Governance classifies it in `ResolveDispute`, which
-    // slashes only on `Attack` (Trello 202).
+    // than an attack. The chain classifies it from the disputed header's
+    // `build_id` (above); governance's `ResolveDispute` may only lower that
+    // to `Bug`, and slashes only on `Attack` (Trello 202).
     let mut updates = if disputed.is_some() {
         BlockUpdates::default()
     } else {
@@ -341,7 +348,8 @@ pub(crate) fn submit_execution_fault<V: KvRead<Error = StorageError>>(
     updates.evidence = Some(EvidenceMarker {
         height,
         proposer: culprit,
-        disputed,
+        disputed: disputed.map(|(header, _)| header),
+        cause: disputed.map(|(_, cause)| cause),
         challenger: disputed.map(|_| challenger.clone()),
     });
     Ok(updates)
@@ -1171,6 +1179,7 @@ mod tests {
                 "parent_state_root": "",
                 "state_root": "",
                 "round": 0,
+                "build_id": "",
             },
             "signature": "0x00",
         })

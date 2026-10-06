@@ -1014,6 +1014,7 @@ mod tests {
                 state_root: String::new(),
                 round: 0,
                 round_certificate: None,
+                build_id: String::new(),
             })
             .unwrap();
         let app = Router::new()
@@ -1108,6 +1109,7 @@ mod tests {
                     state_root: String::new(),
                     round: 0,
                     round_certificate: None,
+                    build_id: String::new(),
                 },
                 &xc_storage::BlsKeyRegistration {
                     address: validator.clone(),

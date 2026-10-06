@@ -435,6 +435,7 @@ mod tests {
             &xc_circuit::OpenDispute {
                 culprit: alice.clone(),
                 challenger: bob.clone(),
+                cause: xc_primitives::DisputeCause::Attack,
             },
         )
         .unwrap();

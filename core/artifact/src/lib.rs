@@ -48,7 +48,9 @@ use xc_bls::{BlsPublicKey, BlsSignature};
 /// `Fault::BlockDivergence` takes its pre-state from there instead of a
 /// field of its own — the dissenter no longer picks what the proposer is
 /// judged against.
-pub const ARTIFACT_VERSION: u32 = 5;
+/// v6: the header gained `build_id` (signed), which classifies an upheld
+/// execution dispute as a bug or an attack.
+pub const ARTIFACT_VERSION: u32 = 6;
 
 /// The fields a proposer's signature actually covers (mirrors
 /// `xc_primitives::block::BlockSigningPayload` byte-for-byte, so
@@ -71,6 +73,9 @@ pub struct CanonicalHeader {
     pub state_root: String,
     /// Mirrors `xc_primitives::block::Block::round`.
     pub round: u32,
+    /// Mirrors `xc_primitives::block::Block::build_id`: the release that
+    /// produced the block, signed with the header.
+    pub build_id: String,
 }
 
 /// What `BlockSigningPayload` actually encodes, reimplemented here so the
@@ -87,6 +92,7 @@ struct SigningPayload<'a> {
     parent_state_root: &'a str,
     state_root: &'a str,
     round: u32,
+    build_id: &'a str,
 }
 
 /// Recomputes the exact bytes a proposer signs for `header` — byte-for-byte
@@ -120,6 +126,7 @@ pub fn signing_bytes_for(
         parent_state_root: &header.parent_state_root,
         state_root: &header.state_root,
         round: header.round,
+        build_id: &header.build_id,
     };
     let config = bincode::config::standard();
     // Every field is a primitive or `&str`/`&[u8; 32]` — no user `Serialize`
@@ -705,6 +712,7 @@ pub fn frozen_test_header() -> CanonicalHeader {
         parent_state_root: "0xparentRoot".to_string(),
         state_root: "0xstaterootHash".to_string(),
         round: 3,
+        build_id: "0.4.0".to_string(),
     }
 }
 
@@ -1335,6 +1343,7 @@ mod tests {
             state_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 .to_string(),
             round: 0,
+            build_id: String::new(),
         }
     }
 
@@ -1498,6 +1507,7 @@ mod tests {
             &key,
             CanonicalHeader {
                 round: 2,
+                build_id: String::new(),
                 ..header(5, 2, "arx1proposer")
             },
         );
@@ -1591,7 +1601,7 @@ mod tests {
         let bytes = signing_bytes_for(&FROZEN_TEST_GENESIS, &header).unwrap();
         assert_eq!(
             hex::encode(&bytes),
-            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790c3078706172656e74526f6f740f30787374617465726f6f744861736803",
+            "6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e2a0a30786465616462656566fc00ca9a3babababababababababababababababababababababababababababababababab3e6172783134323432343234323432343234323432343234323432343234323432343234323432343234323432343234323432343234323471357038766c790c3078706172656e74526f6f740f30787374617465726f6f74486173680305302e342e30",
         );
     }
 
@@ -2507,6 +2517,7 @@ mod tests {
                 parent_state_root: format!("0x{}", hex::encode(empty_trie_root())),
                 state_root: state_root.to_string(),
                 round: 0,
+                build_id: String::new(),
             }
         }
 

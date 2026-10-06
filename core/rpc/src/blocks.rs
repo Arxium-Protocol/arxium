@@ -336,6 +336,7 @@ mod tests {
                     height: 1,
                     proposer: proposer.clone(),
                     disputed: Some(commitment(block)),
+                    cause: None,
                     challenger: None,
                 })
                 .unwrap();
@@ -394,6 +395,7 @@ mod tests {
                 height: 1,
                 proposer: Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap(),
                 disputed: Some([9u8; 32]),
+                cause: None,
                 challenger: None,
             })
             .unwrap();

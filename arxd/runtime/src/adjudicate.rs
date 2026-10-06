@@ -1654,6 +1654,7 @@ mod tests {
             state_root: format!("0x{}", "00".repeat(32)),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         block.sign(
             &GENESIS,
@@ -1742,6 +1743,7 @@ mod tests {
             parent_state_root: block.parent_state_root.clone(),
             state_root: block.state_root.clone(),
             round: block.round,
+            build_id: String::new(),
         };
         let header_bytes = xc_artifact::signing_bytes_for(&GENESIS, &header).unwrap();
         let header_commitment: [u8; 32] = sha2::Sha256::digest(&header_bytes).into();
@@ -2275,23 +2277,27 @@ mod tests {
                 artifact_json: serde_json::to_string(&artifact).unwrap(),
             },
         };
-        let at = |height| {
-            crate::dispatch(
-                &action,
-                &view,
-                &operator_lookup,
-                &operator_validators_lookup,
-                &[],
-                height,
-                &no_bls_owner,
-                0,
-                &crate::TEST_GENESIS,
-            )
-        };
+        // A macro, not a closure: the test rewrites `view`'s chain params
+        // between dispatches, and a closure would hold it borrowed.
+        macro_rules! at {
+            ($height:expr) => {
+                crate::dispatch(
+                    &action,
+                    &view,
+                    &operator_lookup,
+                    &operator_validators_lookup,
+                    &[],
+                    $height,
+                    &no_bls_owner,
+                    0,
+                    &crate::TEST_GENESIS,
+                )
+            };
+        }
         let params = xc_primitives::ChainParams::default();
         let last = 1 + params.challenge_window_blocks;
 
-        let updates = at(last).unwrap();
+        let updates = at!(last).unwrap();
         let marker = updates.evidence.expect("slash writes a marker");
         assert_eq!(marker.proposer, proposer);
         // Named by the same commitment `/blocks` recomputes from the block
@@ -2318,8 +2324,36 @@ mod tests {
         );
         assert!(updates.validator_statuses.0.is_empty());
         assert_eq!(marker.challenger, Some(action.sender.clone()));
+        // No builds listed: not configured, so a bug and never a slash.
+        assert_eq!(marker.cause, Some(xc_primitives::DisputeCause::Bug));
+        // Builds listed, and this block's `build_id` (empty) is not one of
+        // them: code nobody accepted, so the chain classifies an attack.
+        // Listing it as an older build makes it a bug again.
+        macro_rules! listed {
+            ($builds:expr) => {
+                view.put(
+                    &xc_circuit::ChainParamsKey,
+                    &xc_primitives::ChainParams {
+                        canonical_builds: $builds.iter().map(|b: &&str| b.to_string()).collect(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            };
+        }
+        listed!(["0.4.0"]);
+        assert_eq!(
+            at!(last).unwrap().evidence.unwrap().cause,
+            Some(xc_primitives::DisputeCause::Attack)
+        );
+        listed!(["", "0.4.0"]);
+        assert_eq!(
+            at!(last).unwrap().evidence.unwrap().cause,
+            Some(xc_primitives::DisputeCause::Bug)
+        );
+        listed!([] as [&str; 0]);
 
-        let err = at(last + 1).unwrap_err().to_string();
+        let err = at!(last + 1).unwrap_err().to_string();
         assert!(err.contains("challenge window"), "{err}");
     }
 
@@ -2440,6 +2474,7 @@ mod tests {
             state_root: parent_root.clone(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         let action_bytes: Vec<String> = block
             .actions
@@ -2471,6 +2506,7 @@ mod tests {
                         parent_state_root: parent_root.clone(),
                         state_root: block.state_root.clone(),
                         round: block.round,
+                        build_id: String::new(),
                     },
                     signature: format!("0x{}", block.signature.clone().unwrap()),
                 },

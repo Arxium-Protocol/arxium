@@ -352,6 +352,9 @@ impl DisputeOpenKey {
 pub struct OpenDispute {
     pub culprit: xc_primitives::Address,
     pub challenger: xc_primitives::Address,
+    /// The chain's own classification, from the disputed header's
+    /// `build_id`. `ResolveDispute` may lower it to `Bug`, never raise it.
+    pub cause: xc_primitives::DisputeCause,
 }
 
 impl KeySpec for DisputeOpenKey {

@@ -265,15 +265,14 @@ path B (fork), where the new genesis can leave the signers out of the set;
 their precommits stay in the finality certificate as the public evidence for
 that. A bug is answered by `Bug` (no slash).
 
-**Planned: chain-enforced classification (design, not built).** Today `cause`
-is whatever the vote says, and "re-execute with the canonical binary first"
-is procedure. The chain can't judge intent, but it can judge provenance. An
+**Chain-enforced classification (arxd 0.4.0, schema 29).** `cause` is not
+whatever the vote says. The chain can't judge intent, but it can judge provenance. An
 upheld dispute means the chain's own replay (the canonical build) disagrees
 with a root that at least 2/3 signed, so the signers ran different code, or
 signed a root they never computed. Provenance tells those apart:
 
-- Each header carries `build_id` (hash of the release that produced it,
-  signed with the header). `ChainParams.canonical_builds` lists the release
+- Each header carries `build_id` (the `arxd` release version that produced
+  it, at most 64 bytes, signed with the header). `ChainParams.canonical_builds` lists the release
   ids governance has accepted, updated at each release (the signed-release
   receipts of A-35 already name them).
 - The chain computes `cause` when it upholds the dispute and stores it in

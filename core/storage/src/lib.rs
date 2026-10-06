@@ -404,7 +404,10 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// parameters, `Proposal` gained `bond` (refunded to an applicant whose vote passes),
 /// and `Snapshot.attestors` replaces `attestor`/`attestor_admin`.
 /// Devnet reset required.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Bumped 28 -> 29: `Block`/`RawBlock` gained a signed `build_id` (positional
+/// bincode in stored blocks), `ChainParams` gained `canonical_builds`, and the
+/// `evidence:dispute_open:` `OpenDispute` gained `cause`. Devnet reset required.
+pub const SCHEMA_VERSION: u32 = 29;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -2537,6 +2540,7 @@ mod explorer_index_tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         }
     }
 
@@ -3792,6 +3796,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(height, &[&updates, &block], true)
             .unwrap();
@@ -3881,6 +3886,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(1, &[&updates, &block], true)
             .unwrap();
@@ -4051,6 +4057,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(1, &[&gold, &balances, &index, &block], true)
             .unwrap();
@@ -4155,6 +4162,7 @@ mod divergence_recovery_tests {
             height: 6,
             proposer: addr(1),
             disputed: Some([7u8; 32]),
+            cause: None,
             challenger: None,
         })
         .unwrap();

@@ -1,38 +1,40 @@
 {
-  "artifact_version": 5,
-  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
-  "fault": "equivocation",
-  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c",
-  "height": 5,
+  "artifact_version": 6,
   "blocks": [
     {
       "header": {
+        "build_id": "",
         "height": 5,
         "parent_hash": "0xparent",
-        "timestamp": 1234,
-        "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
-        "proposer": "arx1proposer",
         "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "proposer": "arx1proposer",
+        "round": 0,
         "state_root": "0xstate",
-        "round": 0
+        "timestamp": 1234,
+        "tx_root": "0x0101010101010101010101010101010101010101010101010101010101010101"
       },
-      "signature": "0x07857de23eabc2bc47a61849a2f63a9bbcc85733a7fbb6560c14da7296ff109a1b7a769c3f75bc166f143176652b5694533eec2dfaf2ed397a2ed3987739e30c"
+      "signature": "0x543a53180d49fa274a153777ff10c736dacfa7123e08acdd3d117b6f86de21325ac2a8623946378e141f5d88bb5be91439451e72aa5c1d1398843bcdb938be00"
     },
     {
       "header": {
+        "build_id": "",
         "height": 5,
         "parent_hash": "0xparent",
-        "timestamp": 1234,
-        "tx_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
-        "proposer": "arx1proposer",
         "parent_state_root": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "proposer": "arx1proposer",
+        "round": 0,
         "state_root": "0xstate",
-        "round": 0
+        "timestamp": 1234,
+        "tx_root": "0x0202020202020202020202020202020202020202020202020202020202020202"
       },
-      "signature": "0xc2e04037a23d1be4c2e0bd856a1b063651f3f0f335fb18f3b4d48904cbf7753009dc5a87b32142834bc80e5aa693e425d4cfa983957febe8276f589661419c05"
+      "signature": "0xf454a2c4d80f8d2514e20d8f200e53309f239beae70b2e57f2f4a5e619f66d56d2c234fa721a37f8e82f5db23f82aa945185e997307e7058efaf85852b284705"
     }
   ],
+  "fault": "equivocation",
+  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
+  "height": 5,
   "human_readable": {
     "note": "devnet soak run, height 5"
-  }
+  },
+  "proposer_pubkey": "0xea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
 }
