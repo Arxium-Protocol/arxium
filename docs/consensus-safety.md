@@ -265,6 +265,37 @@ path B (fork), where the new genesis can leave the signers out of the set;
 their precommits stay in the finality certificate as the public evidence for
 that. A bug is answered by `Bug` (no slash).
 
+**Planned: chain-enforced classification (design, not built).** Today `cause`
+is whatever the vote says, and "re-execute with the canonical binary first"
+is procedure. The chain can't judge intent, but it can judge provenance. An
+upheld dispute means the chain's own replay (the canonical build) disagrees
+with a root that at least 2/3 signed, so the signers ran different code, or
+signed a root they never computed. Provenance tells those apart:
+
+- Each header carries `build_id` (hash of the release that produced it,
+  signed with the header). `ChainParams.canonical_builds` lists the release
+  ids governance has accepted, updated at each release (the signed-release
+  receipts of A-35 already name them).
+- The chain computes `cause` when it upholds the dispute and stores it in
+  `OpenDispute`:
+  - `build_id` is a listed build other than the current one: **Bug**. A
+    release that was canonical produced the root and a later one fixed it.
+  - `build_id` is the current build: **Attack**. The same code replays
+    differently under two independent replays (the dissenter's and the
+    chain's), so the proposer misreported its work.
+  - `build_id` is not listed: **Attack**. The operator ran code nobody
+    accepted.
+- `ResolveDispute` may only downgrade Attack to Bug (an honest operator on an
+  unlisted hotfix), never raise Bug to Attack. Wrong calls fail toward no slash.
+- Known gap: a proposer that runs modified code and puts a listed `build_id`
+  in the header is classed Bug and escapes the slash. Closing it needs
+  attested builds (TEE or reproducible-build checks), out of scope.
+
+Cost: a header field (wire change, schema bump, devnet reset), one chain
+param, a governance action to update the list, and a release step that
+registers each new build. Do it in the first schema bump after the public
+devnet opens, and before mainnet; until then classification stays by vote.
+
 **Who and when.** The validator set decides, through the ordinary proposal
 and vote (`voting_period_blocks`). Settlement stays paused for as long as it
 takes; nobody is promised finality for those blocks meanwhile.
