@@ -480,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "arxd-node"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arxd-finality",
@@ -5423,7 +5423,7 @@ dependencies = [
 
 [[package]]
 name = "xc-rpc"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "ark-bls12-381",

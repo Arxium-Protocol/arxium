@@ -347,4 +347,56 @@ mod tests {
         mark(&kept);
         assert_eq!(settlement(), "disputed");
     }
+
+    /// An unresolved upheld dispute pauses settlement below it: a later,
+    /// undisputed block that would otherwise be FINAL stays merely attested.
+    #[test]
+    fn an_open_dispute_stops_later_blocks_settling() {
+        let state = test_state();
+        let genesis: Block<TestPayload> = Block::genesis(0);
+        state.db.write_batch(&genesis).unwrap();
+        state
+            .db
+            .write_batch(&xc_storage::GenesisHash(genesis.state_root.clone()))
+            .unwrap();
+        state
+            .db
+            .write_batch(&xc_storage::ChainParamsRow(xc_primitives::ChainParams {
+                challenge_window_blocks: 0,
+                ..Default::default()
+            }))
+            .unwrap();
+        // The watermark only moves over certified blocks this node holds.
+        let mut block: Block<TestPayload> = Block::genesis(0);
+        for height in 1..=3 {
+            block = Block::genesis(0);
+            block.height = height;
+            state.db.write_batch(&block).unwrap();
+            state
+                .db
+                .write_batch(&xc_storage::FinalityRecord {
+                    height,
+                    round: 0,
+                    block_hash: block.hash(),
+                    signers: Vec::new(),
+                    aggregate_signature: xc_bls::BlsSignature([0u8; 96]),
+                    ep: [0u8; 32],
+                })
+                .unwrap();
+        }
+        let settlement = || block_with_finality(&state.db, &block).unwrap()["settlement"].clone();
+        assert_eq!(settlement(), "final");
+
+        let key = SigningKey::from_bytes(&[4u8; 32]);
+        state
+            .db
+            .write_batch(&xc_storage::EvidenceMarker {
+                height: 1,
+                proposer: Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap(),
+                disputed: Some([9u8; 32]),
+                challenger: None,
+            })
+            .unwrap();
+        assert_eq!(settlement(), "attested");
+    }
 }

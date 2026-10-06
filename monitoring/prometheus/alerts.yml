@@ -84,6 +84,20 @@ groups:
             final_watermark and settled_height have stopped. See Trello D-25
             and docs/consensus-round-change.md.
 
+      # An upheld execution dispute governance has not resolved: settlement
+      # is paused below it until a ResolveDispute passes. Page immediately;
+      # procedure in docs/consensus-safety.md §5.
+      - alert: ArxiumDisputeOpen
+        expr: arxium_open_dispute_height > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Execution dispute upheld at height {{ $value }}, unresolved"
+          description: >
+            An execution dispute was upheld and settlement is paused below it.
+            Governance must pass ResolveDispute (Accept or Forked). The node
+            logged "execution dispute upheld"; /status shows open_dispute_height.
+
       # `floor` (catch-up) and `round_left` (D-25 round change) refusals are
       # routine and not alerted on.
       - alert: ArxiumVoteConflictRefused

@@ -418,6 +418,27 @@ tests:
         alertname: ArxiumFinalityGap
         exp_alerts: []
 
+  # An upheld dispute fires at once and clears when governance resolves it.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_open_dispute_height'
+        values: '0 0 42 42 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ArxiumDisputeOpen
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: ArxiumDisputeOpen
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Execution dispute upheld at height 42, unresolved"
+              description: "An execution dispute was upheld and settlement is paused below it. Governance must pass ResolveDispute (Accept or Forked). The node logged \"execution dispute upheld\"; /status shows open_dispute_height.\n"
+      - eval_time: 4m
+        alertname: ArxiumDisputeOpen
+        exp_alerts: []
+
   # --- arxium node: event counters (one increment inside the window) --------
   # A single step of 1 inside a flat series gives increase() exactly 1, so
   # the templated summaries are stable. Quiet cases use flat counters.
