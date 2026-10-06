@@ -113,7 +113,8 @@ accepted action wins a race at the execution height.
 ## Witness format
 
 The action wire envelope remains `{sender, nonce, signature, payload}`. Everyone
-signs the same canonical bytes: sender + nonce + encoded payload. Stateful
+signs the same canonical bytes: genesis hash (32 bytes, so a signature is
+valid on one chain only) + sender + nonce + encoded payload. Stateful
 witnesses are hex:
 
 - owner: `a7 00 || canonical_multisig_witness`
@@ -177,7 +178,9 @@ with `public_key` and `signature`. `payload` is a JSON array of bytes. `sender`
 may be omitted for legacy derivation. Modes are `legacy`, `owner`, `guardian`.
 Owner/guardian assembly reads the current account policy before verifying each
 contribution. It returns a node-ready action; submit it through `POST /actions`.
-No private keys are submitted to the API. The assembler does not replace node
+The API reads the chain's genesis hash from the node and binds it when verifying
+contributions, so contributions must be signed for that chain. No private keys
+are submitted to the API. The assembler does not replace node
 execution/prechecks, and policy/nonce changes can invalidate an assembled action.
 
 Swift `ArxProgrammableAccount` and Kotlin `ProgrammableAccount` encode the fixed

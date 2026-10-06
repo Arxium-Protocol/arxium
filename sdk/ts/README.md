@@ -31,14 +31,19 @@ const payload = encodeTransfer("arx1...", arxToIum("1.5"));
 
 All token amounts are `bigint`: `1 ARX = 1_000_000_000 IUM`.
 
+### Chain binding
+
+Every action signature covers the chain's 32-byte genesis hash (`GET /genesis-hash`, `rpc.genesisHash()`) ahead of sender, nonce and payload, so an action signed for one chain is rejected on any other (devnet vs. mainnet, or after a reset). `signingBytes`, `signAction` and `verifySignedAction` take it as an argument; `rpc.sendAction` fetches it for you.
+
 ### Multisig senders
 
 An M-of-N address (up to 16 members) is derived from its policy. Each member signs the action exactly as a single-key sender would. You then combine exactly `threshold` of those signatures:
 
 ```ts
 const sender = await multisigAddress(2, [pkA, pkB, pkC]);          // member order doesn't matter
-const sigA = await signAction(keyA, sender, nonce, payload);       // on A's machine
-const sigC = await signAction(keyC, sender, nonce, payload);       // on C's machine
+const genesis = await rpc.genesisHash();                           // every signature binds the chain's genesis hash
+const sigA = await signAction(keyA, genesis, sender, nonce, payload); // on A's machine
+const sigC = await signAction(keyC, genesis, sender, nonce, payload); // on C's machine
 const signature = multisigSignature(2, [pkA, pkB, pkC], [[pkA, sigA], [pkC, sigC]]);
 await rpc.submit(submitBody(sender, nonce, signature, payload));
 ```
