@@ -931,7 +931,7 @@ for the next boundary:
 | `JoinValidator` (stake ≥ 100,000 ARX self-stake, BLS key + PoP) | `Pending` | the first block of the next epoch — not before. **A join landing in the last block of an epoch waits one epoch more**: the boundary reads candidates from committed state, and that block's writes aren't committed yet |
 | `LeaveValidator` | `Leaving` | you keep proposing and voting until the boundary, then drop; the stake unbonds for `unbonding_blocks` (14 days on mainnet, 1 hour on devnet) and stays slashable throughout |
 | Missed proposer slot (downtime) | `Jailed { until_epoch: current + 2 }` | out at the next boundary, eligible again two epochs on — no action needed |
-| Double-sign or execution fault (evidence submitted) | `Tombstoned` | never again, with any stake, from that address. Slashed once — further evidence at other heights records nothing more |
+| Double-sign (evidence submitted), or an execution dispute governance resolves as `Attack` | `Tombstoned` | not again from that address unless governance passes `ReinstateValidator` (meant for a wrongly classified dispute); a fresh `JoinValidator` with new stake follows. Slashed once — further evidence at other heights records nothing more. An execution dispute resolved as `Bug` slashes no one |
 | Stake drops below the floor, or outside the top 100 by stake | `Pending` | back in at a later boundary once it qualifies again |
 
 At the boundary the eligible validators (not tombstoned, not jailed, above the
