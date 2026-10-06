@@ -104,6 +104,7 @@ pub(super) async fn get_finality<P: Payload>(
         None => None,
     };
     let final_watermark = state.db.get_final_watermark()?;
+    let open_dispute_height = state.db.lowest_open_dispute()?;
 
     Ok(Json(serde_json::json!({
         // null rather than absent: a client must be able to tell "nothing has
@@ -119,6 +120,9 @@ pub(super) async fn get_finality<P: Payload>(
         // certificate: everything at or below this is contiguously certified
         // and no node will roll it back.
         "final_watermark": final_watermark,
+        // Non-null: an upheld dispute is unresolved and settlement is paused
+        // below it. What a client banner keys on (`/status` carries it too).
+        "open_dispute_height": open_dispute_height,
         "validators": validators.len(),
         "validators_with_bls_key": voters,
         "total_voting_power": TOTAL_VOTING_POWER,

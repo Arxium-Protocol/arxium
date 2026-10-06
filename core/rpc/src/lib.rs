@@ -296,6 +296,12 @@ async fn get_metrics<P: Payload>(State(state): State<AppState<P>>) -> Response {
     if let Ok(watermark) = state.db.get_final_watermark() {
         metrics::gauge!("arxium_final_watermark").set(watermark as f64);
     }
+    // 0 = none (no dispute can sit at genesis). Alerted on as
+    // `arxium_open_dispute_height > 0`: an upheld dispute governance has not
+    // resolved, with settlement paused below it.
+    if let Ok(open) = state.db.lowest_open_dispute() {
+        metrics::gauge!("arxium_open_dispute_height").set(open.unwrap_or(0) as f64);
+    }
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         state.metrics_handle.render(),
@@ -2077,6 +2083,7 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(json["validators_with_bls_key"], 1);
             assert_eq!(json["quorum_reachable"], true);
+            assert!(json["open_dispute_height"].is_null());
         });
     }
 
