@@ -290,7 +290,19 @@ fn main() -> Result<()> {
         signature: None,
         payload: action_payload,
     };
-    let signature = signer.sign(&action.signing_bytes());
+    let (status, body) = http("GET", &args.node, "/genesis-hash", None, args.token.as_deref())?;
+    if status != 200 {
+        bail!("GET /genesis-hash -> {status}: {body}");
+    }
+    let genesis: [u8; 32] = hex::decode(
+        serde_json::from_str::<Value>(&body)?["genesis_hash"]
+            .as_str()
+            .context("genesis-hash response missing genesis_hash")?
+            .trim_start_matches("0x"),
+    )?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("genesis_hash is not 32 bytes"))?;
+    let signature = signer.sign(&action.signing_bytes(&genesis));
     action.signature = Some(hex::encode(signature.to_bytes()));
 
     let payload = serde_json::to_string(&action)?;

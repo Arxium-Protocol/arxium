@@ -147,8 +147,9 @@ pub fn adjudicate_action_divergence(
         ));
     }
 
-    let proposed_result = replay(&action, proposed_claim, *height)?;
-    let dissent_result = replay(&action, dissent_claim, *height)?;
+    let genesis = decode_root(&artifact.genesis_hash)?;
+    let proposed_result = replay(&action, proposed_claim, *height, &genesis)?;
+    let dissent_result = replay(&action, dissent_claim, *height, &genesis)?;
 
     match (proposed_result, dissent_result) {
         (ReplayResult::Unprovable(reason), _) | (_, ReplayResult::Unprovable(reason)) => {
@@ -291,6 +292,7 @@ fn replay_block_divergence(
     // Everything from here mirrors `xc_executor::accept_block`, on one trie
     // built from proofs against the parent root the proposer signed:
     // matured unbonding, then each action, then the seal.
+    let genesis = decode_root(&artifact.genesis_hash)?;
     let proofs = decode_proofs(&dissent_claim.proofs)?;
     let Ok(trie) = ProofBackedTrie::from_proofs(decode_root(&header.parent_state_root)?, &proofs)
     else {
@@ -344,7 +346,10 @@ fn replay_block_divergence(
             Err(err) => return Err(AdjudicateError::Replay(err.to_string())),
         };
         if action
-            .verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))
+            .verify_account_signature(
+                account.as_ref().and_then(|e| e.programmable.as_ref()),
+                &genesis,
+            )
             .is_err()
         {
             return proposer_culpable();
@@ -375,6 +380,7 @@ fn replay_block_divergence(
             // Signed by the proposer as part of the header — the same value
             // `accept_block` handed `dispatch`.
             header.timestamp,
+            &genesis,
         ) {
             Ok(updates) => updates,
             Err(err) if unprovable(&err) => return disagreement(not_proven("actions")),
@@ -527,6 +533,7 @@ fn replay(
     action: &crate::ChainAction,
     claim: &ActionClaim,
     height: u64,
+    genesis: &[u8; 32],
 ) -> Result<ReplayResult, AdjudicateError> {
     if is_unreplayable_fault_submission(&action.payload) {
         return Ok(ReplayResult::Unprovable(
@@ -589,6 +596,7 @@ fn replay(
         &bls_pubkey_owner_lookup,
         // Only `VerifyClaimProof` reads it, and that is refused above.
         0,
+        genesis,
     );
 
     let updates = match updates {
@@ -876,7 +884,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -910,7 +918,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1200,7 +1208,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -1240,7 +1248,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1349,7 +1357,7 @@ mod tests {
             &validators,
             height,
             &bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         // Writes are logged the way `execute_actions` logs them: by folding
@@ -1615,7 +1623,7 @@ mod tests {
             signature: None,
             payload,
         };
-        action.signature = Some(hex::encode(key.sign(&action.signing_bytes()).to_bytes()));
+        action.signature = Some(hex::encode(key.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes()));
         action
     }
 
@@ -1666,7 +1674,7 @@ mod tests {
                     validators,
                     1,
                     &no_bls_owner,
-                    timestamp,
+                    timestamp, &crate::TEST_GENESIS,
                 )
             },
             <crate::CoreChainRuntime as xc_runtime_api::ChainRuntime>::on_block_sealed,
@@ -1879,7 +1887,7 @@ mod tests {
                 .map(|k| {
                     (
                         k.verifying_key().to_bytes(),
-                        k.sign(&action.signing_bytes()).to_bytes(),
+                        k.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2269,7 +2277,7 @@ mod tests {
                 &[],
                 height,
                 &no_bls_owner,
-                0,
+                0, &crate::TEST_GENESIS,
             )
         };
         let params = xc_primitives::ChainParams::default();
@@ -2399,7 +2407,7 @@ mod tests {
                 &[],
                 0,
                 &no_bls_owner,
-                0,
+                0, &crate::TEST_GENESIS,
             )
             .unwrap();
             actions.push(action);

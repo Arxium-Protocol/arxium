@@ -1047,11 +1047,12 @@ pub fn max_block_weight(db: &ArxiumDb) -> Result<u64, StorageError> {
 /// is simply checked again in the next block.
 fn verify_signatures<P: serde::Serialize + Sync>(
     actions: &[Action<P>],
+    genesis: &[u8; 32],
 ) -> Vec<Result<(), SignatureError>> {
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // Below this a thread costs more than the ~100us verify it saves.
     if threads == 1 || actions.len() < 64 {
-        return actions.iter().map(Action::verify_signature).collect();
+        return actions.iter().map(|a| a.verify_signature(genesis)).collect();
     }
     let chunk = actions.len().div_ceil(threads);
     std::thread::scope(|scope| {
@@ -1060,7 +1061,7 @@ fn verify_signatures<P: serde::Serialize + Sync>(
             .map(|part| {
                 scope.spawn(move || {
                     part.iter()
-                        .map(Action::verify_signature)
+                        .map(|a| a.verify_signature(genesis))
                         .collect::<Vec<_>>()
                 })
             })
@@ -1106,6 +1107,7 @@ where
     let mut weight_used = 0u64;
     let mut fees_collected = 0u128;
     let max_weight = max_block_weight(db)?;
+    let genesis = db.genesis_hash_bytes()?;
     // Seeded from e.g. matured-unbonding resolution, run by the caller
     // before this loop — so a same-block `Stake` action sees a just-cleared
     // `unbonding` slot instead of hitting "already unbonding".
@@ -1147,7 +1149,7 @@ where
     }
     view.apply_governance(&governance);
 
-    let mut signatures = verify_signatures(&actions).into_iter();
+    let mut signatures = verify_signatures(&actions, &genesis).into_iter();
     let mut actions = actions.into_iter();
     while let Some(action) = actions.next() {
         // Stateless results stand for legacy accounts. A programmable account
@@ -1156,7 +1158,7 @@ where
         let presigned = signatures.next().expect("one result per action");
         let account = KvRead::get(&view, &xc_circuit::AccountKey(&action.sender))?;
         let verified = match account.as_ref().and_then(|e| e.programmable.as_ref()) {
-            Some(policy) => action.verify_account_signature(Some(policy)).map(|_| ()),
+            Some(policy) => action.verify_account_signature(Some(policy), &genesis).map(|_| ()),
             None => presigned,
         };
         if let Err(err) = verified {
@@ -1518,7 +1520,7 @@ mod tests {
                 amount,
             },
         };
-        let signature = key.sign(&action.signing_bytes());
+        let signature = key.sign(&action.signing_bytes(&GENESIS));
         action.signature = Some(hex::encode(signature.to_bytes()));
         action
     }
@@ -1552,7 +1554,7 @@ mod tests {
             signature: None,
             payload: TestPayload::Join,
         };
-        let signature = key.sign(&action.signing_bytes());
+        let signature = key.sign(&action.signing_bytes(&GENESIS));
         action.signature = Some(hex::encode(signature.to_bytes()));
         action
     }
@@ -1688,7 +1690,7 @@ mod tests {
             signature: None,
             payload,
         };
-        let signature = key.sign(&action.signing_bytes());
+        let signature = key.sign(&action.signing_bytes(&GENESIS));
         action.signature = Some(hex::encode(signature.to_bytes()));
         action
     }
@@ -1738,6 +1740,36 @@ mod tests {
             2,
             "IssueAsset must see the same-block registration"
         );
+    }
+
+    /// D-30: an action signed for another chain's genesis hash must be dropped
+    /// here (same key, same nonce, same payload) while the one signed for this
+    /// chain applies — otherwise a seed reused on devnet and mainnet could have
+    /// its actions replayed across them.
+    #[test]
+    fn an_action_signed_for_another_chain_is_dropped() {
+        let db = temp_db();
+        let key = SigningKey::from_bytes(&[1u8; 32]);
+        let sender = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
+        let to = Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
+        let mut foreign = signed_transfer(&key, &sender, 0, &to, 1);
+        foreign.signature = Some(hex::encode(
+            key.sign(&foreign.signing_bytes(&[0xb2u8; 32])).to_bytes(),
+        ));
+        let outcome = execute_actions(
+            &db,
+            vec![foreign.clone(), signed_transfer(&key, &sender, 0, &to, 1)],
+            &[],
+            BlockUpdates::default(),
+            |_, _, _, _, _| Ok(BlockUpdates::default()),
+            &flat,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.dropped.len(), 1, "foreign-chain signature must not verify");
+        assert_eq!(outcome.dropped[0].signature, foreign.signature.unwrap());
+        assert_eq!(outcome.applied.len(), 1);
     }
 
     /// Stage 1A: two `RegisterAsset` for the same slug in one block used to
@@ -1922,7 +1954,7 @@ mod tests {
                 amount,
             },
         };
-        let signature = key.sign(&action.signing_bytes());
+        let signature = key.sign(&action.signing_bytes(&GENESIS));
         action.signature = Some(hex::encode(signature.to_bytes()));
         action
     }

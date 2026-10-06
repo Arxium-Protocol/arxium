@@ -24,6 +24,7 @@ pub(crate) fn authorization<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     view: &V,
     height: u64,
+    genesis: &[u8; 32],
 ) -> anyhow::Result<PolicyAuthorization> {
     let extensions = view
         .get(&xc_circuit::ChainParamsKey)?
@@ -55,7 +56,7 @@ pub(crate) fn authorization<V: KvRead<Error = StorageError>>(
     let Some(state) = account.programmable.as_ref() else {
         return Ok(PolicyAuthorization::Owner);
     };
-    let auth = action.verify_account_signature(Some(state))?;
+    let auth = action.verify_account_signature(Some(state), genesis)?;
     if !extensions && auth != PolicyAuthorization::Owner {
         anyhow::bail!("session keys and recovery are not activated");
     }
@@ -92,8 +93,9 @@ pub(crate) fn precheck<V: KvRead<Error = StorageError>>(
     action: &ChainAction,
     view: &V,
     height: u64,
+    genesis: &[u8; 32],
 ) -> anyhow::Result<()> {
-    authorization(action, view, height)?;
+    authorization(action, view, height, genesis)?;
     if let ActionPayload::AccountPolicy(AccountPolicyAction::SetPolicy { policy }) = &action.payload
     {
         policy.validate()?;
@@ -106,12 +108,13 @@ pub(crate) fn apply<V: KvRead<Error = StorageError>>(
     view: &V,
     policy_action: &AccountPolicyAction,
     height: u64,
+    genesis: &[u8; 32],
 ) -> anyhow::Result<BlockUpdates> {
-    let auth = authorization(action, view, height)?;
+    let auth = authorization(action, view, height, genesis)?;
     let mut entry = view.get(&AccountKey(&action.sender))?.unwrap_or_default();
     // Initial enrollment must be authorized by the existing key/immutable multisig.
     if entry.programmable.is_none() {
-        action.verify_signature()?;
+        action.verify_signature(genesis)?;
     }
     circuit_account::policy::apply_policy_action(&mut entry, policy_action, auth, height)?;
     let mut updates = BlockUpdates::default();
@@ -242,7 +245,7 @@ mod tests {
             .map(|k| {
                 (
                     k.verifying_key().to_bytes(),
-                    k.sign(&action.signing_bytes()).to_bytes(),
+                    k.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
                 )
             })
             .collect::<Vec<_>>();
@@ -259,7 +262,10 @@ mod tests {
         height: u64,
     ) -> anyhow::Result<BlockUpdates> {
         let account = view.get(&AccountKey(&action.sender))?;
-        action.verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))?;
+        action.verify_account_signature(
+            account.as_ref().and_then(|e| e.programmable.as_ref()),
+            &crate::TEST_GENESIS,
+        )?;
         let updates = crate::dispatch(
             action,
             view,
@@ -268,7 +274,7 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )?;
         view.apply_accounts(&updates.accounts)?;
         view.apply_asset_balances(&updates.assets)?;
@@ -287,6 +293,7 @@ mod tests {
     #[test]
     fn threshold_issuer_and_attestor_admin_execute_in_the_real_executor() {
         let db = temp_db();
+        db.write_batch(&xc_storage::GenesisHash(hex::encode(crate::TEST_GENESIS))).unwrap();
         let keys = [key(7), key(8), key(9)];
         let issuer = multisig_address(2, &owners(&keys, 2).members).unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
@@ -371,7 +378,7 @@ mod tests {
             &[],
             BlockUpdates::default(),
             |a, v, op, ops, validators| {
-                crate::dispatch(a, v, op, ops, validators, 1, &no_bls_owner, 0)
+                crate::dispatch(a, v, op, ops, validators, 1, &no_bls_owner, 0, &crate::TEST_GENESIS)
             },
             &|a| (crate::metering::action_weight(a), fee_of(a)),
             None,
@@ -399,12 +406,12 @@ mod tests {
             &owners(&keys, 2).members,
             &[(
                 keys[0].verifying_key().to_bytes(),
-                keys[0].sign(&bad.signing_bytes()).to_bytes(),
+                keys[0].sign(&bad.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
             )],
         )
         .unwrap();
         bad.signature = Some(witness);
-        assert!(bad.verify_signature().is_err());
+        assert!(bad.verify_signature(&crate::TEST_GENESIS).is_err());
     }
 
     /// "Offer both" (Trello #221): an institution that co-signs a holder's
@@ -474,7 +481,7 @@ mod tests {
                 &owners(&keys, 2).members,
                 &[(
                     keys[0].verifying_key().to_bytes(),
-                    keys[0].sign(&alone.signing_bytes()).to_bytes(),
+                    keys[0].sign(&alone.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
                 )],
             )
             .unwrap();
@@ -713,7 +720,7 @@ mod tests {
             payload: ActionPayload::Transfer { to, amount: 10 },
         };
         let mut witness = session_key.verifying_key().to_bytes().to_vec();
-        witness.extend_from_slice(&session_key.sign(&tx.signing_bytes()).to_bytes());
+        witness.extend_from_slice(&session_key.sign(&tx.signing_bytes(&crate::TEST_GENESIS)).to_bytes());
         tx.signature = Some(policy_signature(1, &hex::encode(witness)).unwrap());
         run(&mut view, &tx, 2).unwrap();
         assert_eq!(
@@ -735,7 +742,7 @@ mod tests {
                 payload,
             };
             let mut witness = session_key.verifying_key().to_bytes().to_vec();
-            witness.extend_from_slice(&session_key.sign(&action.signing_bytes()).to_bytes());
+            witness.extend_from_slice(&session_key.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes());
             action.signature = Some(policy_signature(1, &hex::encode(witness)).unwrap());
             action
         };
@@ -976,11 +983,11 @@ mod tests {
         let fixtures = variants.into_iter().map(|(name, input, payload)| {
             let mode = if matches!(payload, AccountPolicyAction::StartRecovery { .. } | AccountPolicyAction::ExecuteRecovery) { 2 } else { 0 };
             let action = signed(&sender, 251, ActionPayload::AccountPolicy(payload), &keys, Some(mode));
-            action.verify_account_signature(Some(&ProgrammableAccount { policy: p.clone(), counters: vec![], pending_recovery: None })).unwrap();
+            action.verify_account_signature(Some(&ProgrammableAccount { policy: p.clone(), counters: vec![], pending_recovery: None }), &crate::TEST_GENESIS).unwrap();
             json!({"name": name, "input": input, "payload": hex::encode(bincode::serde::encode_to_vec(&action.payload, wire_config()).unwrap()),
-                "signing_bytes": hex::encode(action.signing_bytes()), "signature": action.signature, "mode": if mode == 2 { "guardian" } else { "owner" }})
+                "signing_bytes": hex::encode(action.signing_bytes(&crate::TEST_GENESIS)), "signature": action.signature, "mode": if mode == 2 { "guardian" } else { "owner" }})
         }).collect::<Vec<_>>();
-        let document = json!({"sender": sender, "nonce": 251, "policy": policy_json, "members": threshold,
+        let document = json!({"genesis_hash": hex::encode(crate::TEST_GENESIS), "sender": sender, "nonce": 251, "policy": policy_json, "members": threshold,
             "seeds": keys.iter().map(|k| hex::encode(k.to_bytes())).collect::<Vec<_>>(), "fixtures": fixtures});
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../sdk/ts/fixtures/account-policies.json");

@@ -76,7 +76,10 @@ pub fn validate_action<P: Serialize>(
     max_nonce_gap: u64,
 ) -> Result<(), AdmissionError> {
     let account = db.get_account(&action.sender)?;
-    action.verify_account_signature(account.as_ref().and_then(|e| e.programmable.as_ref()))?;
+    action.verify_account_signature(
+        account.as_ref().and_then(|e| e.programmable.as_ref()),
+        &db.genesis_hash_bytes()?,
+    )?;
     let current_nonce = account.map(|entry| entry.nonce).unwrap_or(0);
     if action.nonce < current_nonce {
         return Err(AdmissionError::StaleNonce {

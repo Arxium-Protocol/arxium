@@ -839,6 +839,8 @@ mod tests {
         Transfer { to: Address, amount: u128 },
     }
 
+    const TEST_GENESIS: [u8; 32] = [0xa1; 32];
+
     pub(super) fn test_state() -> AppState<TestPayload> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -850,9 +852,13 @@ mod tests {
                 .as_nanos(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        let db = ArxiumDb::open(&dir).unwrap();
+        // Actions admitted through the mempool are verified against this.
+        db.write_batch(&xc_storage::GenesisHash(hex::encode(TEST_GENESIS)))
+            .unwrap();
         AppState {
             mempool: Arc::new(Mutex::new(Mempool::new())),
-            db: ArxiumDb::open(&dir).unwrap(),
+            db,
             rpc_token: None,
             admin_token: None,
             rate_limiter: Arc::new(RateLimiter::new(&Limits::default())),
@@ -881,7 +887,7 @@ mod tests {
             signature: None,
             payload: TestPayload::Transfer { to, amount: 1 },
         };
-        let sig = key.sign(&action.signing_bytes());
+        let sig = key.sign(&action.signing_bytes(&TEST_GENESIS));
         action.signature = Some(hex::encode(sig.to_bytes()));
         action
     }

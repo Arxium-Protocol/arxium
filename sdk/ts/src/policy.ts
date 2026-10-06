@@ -56,7 +56,7 @@ export function readAccountPolicy(r: Reader): { name: keyof typeof POLICY_VARIAN
   return { name, input };
 }
 /** Sign the stable account's envelope, not the signer's personal address. */
-export async function signPolicyMember(privateKey: CryptoKey, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return signAction(privateKey, sender, nonce, payload); }
+export async function signPolicyMember(privateKey: CryptoKey, genesis: Uint8Array, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return signAction(privateKey, genesis, sender, nonce, payload); }
 export function assemblePolicySignature(mode: Exclude<PolicyMode, "session">, policy: ThresholdPolicy, signatures: [string, string][]): string {
   if (signatures.length !== policy.threshold || new Set(signatures.map(([m]) => m)).size !== signatures.length || signatures.some(([, s]) => fromHex(s).length !== 64)) throw new Error("need exactly threshold distinct member signatures");
   return `a7${MODE[mode].toString(16).padStart(2, "0")}${multisigSignature(policy.threshold, policy.members.map(key), signatures.map(([m, s]) => [key(m), s]))}`;

@@ -84,10 +84,14 @@ pub struct RawAction {
     pub payload: Vec<u8>,
 }
 
-/// What actually gets signed: sender + nonce + payload, deterministically
-/// encoded. The signature field itself is excluded (it can't sign itself).
+/// What actually gets signed: genesis hash + sender + nonce + payload,
+/// deterministically encoded. The genesis hash binds the signature to one
+/// chain, so an action signed for chain A can't be replayed on chain B (same
+/// pattern as the block/precommit signatures). The signature field itself is
+/// excluded (it can't sign itself).
 #[derive(Serialize)]
 struct SigningPayload<'a, P> {
+    genesis: &'a [u8; 32],
     sender: &'a Address,
     nonce: u64,
     payload: &'a P,
@@ -111,8 +115,9 @@ pub enum SignatureError {
 
 impl<P: Serialize> Action<P> {
     /// Deterministic bytes that a valid signature must cover.
-    pub fn signing_bytes(&self) -> Vec<u8> {
+    pub fn signing_bytes(&self, genesis: &[u8; 32]) -> Vec<u8> {
         let payload = SigningPayload {
+            genesis,
             sender: &self.sender,
             nonce: self.nonce,
             payload: &self.payload,
@@ -122,7 +127,7 @@ impl<P: Serialize> Action<P> {
     }
 
     /// Verifies `signature` was produced by the private key behind `sender`,
-    /// over this action's (sender, nonce, payload). `verify_strict`, not
+    /// over this action's (genesis, sender, nonce, payload). `verify_strict`, not
     /// `verify`: addresses are raw pubkeys, and the small-order points
     /// (`arx1qqq…` among them) pass cofactored verification for any
     /// message — a funded one would be everyone's to spend.
@@ -132,14 +137,14 @@ impl<P: Serialize> Action<P> {
     /// field, so the wire shape (and `tx_root`, `RawAction`, indexers) is
     /// unchanged. Every `require_admin`/`require_issuer` style check compares
     /// `sender` only, so it gets M-of-N for free once this passes.
-    pub fn verify_signature(&self) -> Result<(), SignatureError> {
+    pub fn verify_signature(&self, genesis: &[u8; 32]) -> Result<(), SignatureError> {
         let sig_hex = self.signature.as_deref().ok_or(SignatureError::Missing)?;
         let sig_bytes = hex::decode(sig_hex).map_err(|_| SignatureError::InvalidHex)?;
         let sender_bytes = self.sender.pubkey_bytes()?;
         if sender_bytes.len() == 33 && sender_bytes[0] == MULTISIG_TAG {
-            return verify_multisig(&sender_bytes[1..], &sig_bytes, &self.signing_bytes());
+            return verify_multisig(&sender_bytes[1..], &sig_bytes, &self.signing_bytes(genesis));
         }
-        verify_one(&sender_bytes, &sig_bytes, &self.signing_bytes())
+        verify_one(&sender_bytes, &sig_bytes, &self.signing_bytes(genesis))
     }
 
     /// Verify against the current state, never an old address policy. Runtime
@@ -147,10 +152,11 @@ impl<P: Serialize> Action<P> {
     pub fn verify_account_signature(
         &self,
         account: Option<&crate::ProgrammableAccount>,
+        genesis: &[u8; 32],
     ) -> Result<crate::PolicyAuthorization, SignatureError> {
         use crate::PolicyAuthorization;
         let Some(account) = account else {
-            self.verify_signature()?;
+            self.verify_signature(genesis)?;
             return Ok(PolicyAuthorization::Owner);
         };
         account.policy.validate()?;
@@ -160,7 +166,7 @@ impl<P: Serialize> Action<P> {
         let [0xa7, mode, witness @ ..] = bytes.as_slice() else {
             return Err(SignatureError::Invalid);
         };
-        let message = self.signing_bytes();
+        let message = self.signing_bytes(genesis);
         let threshold = |policy: &crate::ThresholdPolicy| {
             let address = multisig_address(policy.threshold, &policy.members)?;
             verify_multisig(&address.pubkey_bytes()?[1..], witness, &message)
@@ -326,6 +332,9 @@ fn verify_multisig(policy: &[u8], witness: &[u8], message: &[u8]) -> Result<(), 
 mod tests {
     use super::*;
 
+    const G: [u8; 32] = [0xa1; 32];
+    const OTHER: [u8; 32] = [0xb2; 32];
+
     fn test_action() -> Action<u64> {
         Action {
             sender: Address::from_pubkey_bytes(&[9u8; 32]).unwrap(),
@@ -368,7 +377,7 @@ mod tests {
                 sig[..32].copy_from_slice(&r);
                 action.signature = Some(hex::encode(sig));
                 assert!(
-                    action.verify_signature().is_err(),
+                    action.verify_signature(&G).is_err(),
                     "nonce {nonce} R={} must not verify",
                     hex::encode(r)
                 );
@@ -395,12 +404,12 @@ mod tests {
         let reversed: Vec<_> = pks.iter().rev().copied().collect();
         assert_eq!(multisig_address(2, &reversed).unwrap(), action.sender);
 
-        let msg = action.signing_bytes();
+        let msg = action.signing_bytes(&G);
         let sig = |i: usize| (keys[i].1, keys[i].0.sign(&msg).to_bytes());
         let with = |sigs: &[([u8; 32], [u8; 64])]| {
             let mut a = action.clone();
             a.signature = Some(multisig_signature(2, &pks, sigs).unwrap());
-            a.verify_signature()
+            a.verify_signature(&G)
         };
         assert!(with(&[sig(0), sig(2)]).is_ok());
         assert!(with(&[sig(2), sig(1)]).is_ok());
@@ -420,13 +429,26 @@ mod tests {
 
         // A valid 1-of-3 witness over the same members doesn't unlock the 2-of-3 address.
         action.signature = Some(multisig_signature(1, &pks, &[sig(0)]).unwrap());
-        assert!(action.verify_signature().is_err());
+        assert!(action.verify_signature(&G).is_err());
 
         // A member's signature over a different nonce doesn't carry over.
         let mut replay = action.clone();
         replay.signature = Some(multisig_signature(2, &pks, &[sig(0), sig(1)]).unwrap());
         replay.nonce += 1;
-        assert!(replay.verify_signature().is_err());
+        assert!(replay.verify_signature(&G).is_err());
+    }
+
+    /// The same signed action must not verify under another chain's genesis hash.
+    #[test]
+    fn signature_is_bound_to_the_genesis_hash() {
+        use ed25519_dalek::Signer;
+        let (key, pk) = member(1);
+        let mut action = test_action();
+        action.sender = Address::from_pubkey_bytes(&pk).unwrap();
+        action.signature = Some(hex::encode(key.sign(&action.signing_bytes(&G)).to_bytes()));
+        assert!(action.verify_signature(&G).is_ok());
+        assert!(action.verify_signature(&OTHER).is_err());
+        assert!(action.verify_account_signature(None, &OTHER).is_err());
     }
 
     #[test]

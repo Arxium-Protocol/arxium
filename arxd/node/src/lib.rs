@@ -447,7 +447,7 @@ fn sign_fault_action<R: ChainRuntime>(
     let nonce = next_own_nonce(db, mempool, address);
     let mut action = R::build_execution_fault_action(artifact_json, address, nonce)
         .expect("probed Some for this runtime at startup");
-    let signature = key.sign(&action.signing_bytes());
+    let signature = key.sign(&action.signing_bytes(&db.genesis_hash_bytes().ok()?));
     action.signature = Some(hex::encode(signature.to_bytes()));
     Some(action)
 }
@@ -824,7 +824,10 @@ fn spawn_evidence<R: ChainRuntime>(
                 let nonce = next_own_nonce(&db, &mempool, &address);
                 let mut action = R::build_evidence_action(evidence, &address, nonce)
                     .expect("probed Some for this runtime at startup");
-                let signature = key.sign(&action.signing_bytes());
+                let genesis = db
+                    .genesis_hash_bytes()
+                    .expect("genesis hash is written before the node signs");
+                let signature = key.sign(&action.signing_bytes(&genesis));
                 action.signature = Some(hex::encode(signature.to_bytes()));
                 action
             },

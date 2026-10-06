@@ -12,8 +12,9 @@ const vectors = JSON.parse(await readFile(new URL("../fixtures/account-policies.
 const dir = await mkdtemp(join(tmpdir(), "arx-policy-cli-"));
 const run = promisify(execFile), password = "cli-integration-passphrase";
 const server = createServer((request, response) => {
-  assert.equal(request.url, `/accounts/${vectors.sender}`);
   response.setHeader("Content-Type", "application/json");
+  if (request.url === "/genesis-hash") { response.end(JSON.stringify({ genesis_hash: `0x${vectors.genesis_hash}` })); return; }
+  assert.equal(request.url, `/accounts/${vectors.sender}`);
   response.end(JSON.stringify({ nonce: vectors.nonce, programmable: { policy: { owners: { threshold: 2, members: vectors.members.members.map((m: string) => Array.from(fromHex(m))) } } } }));
 });
 await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));

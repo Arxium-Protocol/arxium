@@ -176,7 +176,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         assert!(grant_updates.accounts.0[&alice].identity_hash.is_some());
@@ -201,7 +201,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         assert!(verify_updates.accounts.0[&alice].zk_identity_verified);
@@ -251,7 +251,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap();
         assert!(
@@ -307,7 +307,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap_err();
         assert!(
@@ -345,7 +345,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap_err();
         assert!(err.to_string().contains("malformed zk proof bytes"));
@@ -397,7 +397,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
         .unwrap_err();
         assert!(err.to_string().contains("failed verification"));

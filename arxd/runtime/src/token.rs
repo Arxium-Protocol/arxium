@@ -126,7 +126,7 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0,
+            0, &crate::TEST_GENESIS,
         )
     }
 
