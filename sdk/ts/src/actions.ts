@@ -146,12 +146,13 @@ export function decodePayload(payload: Uint8Array): DecodedPayload {
   if (toHex(encodePayload(decoded)) !== toHex(payload)) throw new Error("payload is not in canonical form");
   return decoded;
 }
-export function signingBytes(sender: string, nonce: number | bigint, payload: Uint8Array): Uint8Array { return new Writer().string(sender).varint(nonce).raw(payload).bytes(); }
-export async function signAction(privateKey: CryptoKey, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return toHex(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, asBuffer(signingBytes(sender, nonce, payload))))); }
+/** Mirrors `Action::signing_bytes`: the chain's 32-byte genesis hash (`GET /genesis-hash`) binds the signature to one chain, so an action signed for chain A is rejected on chain B. */
+export function signingBytes(genesis: Uint8Array, sender: string, nonce: number | bigint, payload: Uint8Array): Uint8Array { if (genesis.length !== 32) throw new Error("genesis hash must be 32 bytes"); return new Writer().raw(genesis).string(sender).varint(nonce).raw(payload).bytes(); }
+export async function signAction(privateKey: CryptoKey, genesis: Uint8Array, sender: string, nonce: number, payload: Uint8Array): Promise<string> { return toHex(new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, asBuffer(signingBytes(genesis, sender, nonce, payload))))); }
 export type SignedAction = { sender: string; nonce: number; signature: string; payload: number[] };
 export function submitBody(sender: string, nonce: number, signature: string, payload: Uint8Array): SignedAction { return { sender, nonce, signature, payload: Array.from(payload) }; }
 
-/** M-of-N sender, mirrors `xc_primitives::multisig_address`. Every member signs with plain `signAction(key, multisigAddress, nonce, payload)`; `multisigSignature` combines exactly `threshold` of them into the action's `signature` field. */
+/** M-of-N sender, mirrors `xc_primitives::multisig_address`. Every member signs with plain `signAction(key, genesis, multisigAddress, nonce, payload)`; `multisigSignature` combines exactly `threshold` of them into the action's `signature` field. */
 export const MAX_MULTISIG_MEMBERS = 16;
 const compareBytes = (a: Uint8Array, b: Uint8Array): number => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] - b[i]; return 0; };
 function multisigPolicy(threshold: number, members: Uint8Array[]): Uint8Array[] { const sorted = [...members].sort(compareBytes); if (!sorted.length || sorted.length > MAX_MULTISIG_MEMBERS) throw new Error("member count must be 1..=16"); if (!Number.isInteger(threshold) || threshold < 1 || threshold > sorted.length) throw new Error("threshold must be 1..=members"); if (sorted.some((m, i) => m.length !== 32 || (i > 0 && compareBytes(sorted[i - 1], m) >= 0))) throw new Error("members must be unique 32-byte keys"); return sorted; }

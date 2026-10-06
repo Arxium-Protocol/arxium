@@ -718,6 +718,7 @@ fn next_sleep(next_tick: &mut Instant, now: Instant, interval: Duration) -> Dura
 
 #[cfg(test)]
 mod tests {
+    const TEST_GENESIS: [u8; 32] = [0xa1; 32];
     use super::*;
     use arxd_runtime::{ActionPayload, ChainBlock, CoreChainRuntime, dispatch};
     use ed25519_dalek::{Signer, SigningKey};
@@ -793,6 +794,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("arxium-test-produce-block-{}", std::process::id()));
         let db = ArxiumDb::open(&dir).expect("open test db");
+        db.write_batch(&xc_storage::GenesisHash(hex::encode(TEST_GENESIS)))
+            .unwrap();
 
         let genesis: ChainBlock = xc_primitives::Block::genesis(0);
         let ExecutionOutcome {
@@ -813,6 +816,7 @@ mod tests {
                     0,
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                     0,
+                    &TEST_GENESIS,
                 )
             },
             &meter::<CoreChainRuntime>(Default::default()),
@@ -855,7 +859,7 @@ mod tests {
                 amount: 400,
             },
         };
-        let signature = alice_key.sign(&transfer.signing_bytes());
+        let signature = alice_key.sign(&transfer.signing_bytes(&TEST_GENESIS));
         transfer.signature = Some(hex::encode(signature.to_bytes()));
 
         // Same nonce twice: the replay is dropped, and the drop is reported
@@ -934,6 +938,7 @@ mod tests {
                     0,
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                     0,
+                    &TEST_GENESIS,
                 )
             },
             &meter::<CoreChainRuntime>(Default::default()),
@@ -994,13 +999,15 @@ mod tests {
                             amount: 1,
                         },
                     };
-                    a.signature = Some(hex::encode(keys[i].sign(&a.signing_bytes()).to_bytes()));
+                    a.signature = Some(hex::encode(
+                        keys[i].sign(&a.signing_bytes(&TEST_GENESIS)).to_bytes(),
+                    ));
                     a
                 })
                 .collect();
             let t = Instant::now();
             for a in &actions {
-                a.verify_signature().unwrap();
+                a.verify_signature(&TEST_GENESIS).unwrap();
             }
             verify += t.elapsed();
             let t = Instant::now();
@@ -1126,6 +1133,7 @@ mod tests {
                             height,
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
                             0,
+                            &TEST_GENESIS,
                         )
                     },
                     <CoreChainRuntime as ChainRuntime>::on_block_sealed,

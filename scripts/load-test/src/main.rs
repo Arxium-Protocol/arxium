@@ -126,7 +126,7 @@ fn key(seed: [u8; 32]) -> Key {
     Key { sk, addr }
 }
 
-fn transfer(k: &Key, nonce: u64, to: &Address, amount: u64) -> String {
+fn transfer(genesis: &[u8; 32], k: &Key, nonce: u64, to: &Address, amount: u64) -> String {
     let mut a = Action {
         sender: k.addr.clone(),
         nonce,
@@ -136,7 +136,7 @@ fn transfer(k: &Key, nonce: u64, to: &Address, amount: u64) -> String {
             amount: amount as _,
         },
     };
-    a.signature = Some(hex::encode(k.sk.sign(&a.signing_bytes()).to_bytes()));
+    a.signature = Some(hex::encode(k.sk.sign(&a.signing_bytes(genesis)).to_bytes()));
     serde_json::to_string(&a).unwrap()
 }
 
@@ -195,6 +195,14 @@ fn main() -> Result<()> {
         println!("{}", funder.addr);
         return Ok(());
     }
+    let genesis: [u8; 32] = hex::decode(
+        get_json(node0, token, "/genesis-hash")?["genesis_hash"]
+            .as_str()
+            .context("genesis-hash response missing genesis_hash")?
+            .trim_start_matches("0x"),
+    )?
+    .try_into()
+    .map_err(|_| anyhow::anyhow!("genesis_hash is not 32 bytes"))?;
     let senders: Vec<Key> = (0..args.senders)
         .map(|i| {
             let mut s = [0u8; 32];
@@ -225,7 +233,7 @@ fn main() -> Result<()> {
                 node0,
                 token,
                 "/actions",
-                Some(&transfer(&funder, nonce, &k.addr, FUND)),
+                Some(&transfer(&genesis, &funder, nonce, &k.addr, FUND)),
             )?;
             anyhow::ensure!(code == 202, "fund rejected {code}: {body}");
             nonce += 1;
@@ -274,7 +282,7 @@ fn main() -> Result<()> {
                         let slot = (i as usize) % mine.len();
                         let idx = mine[slot];
                         let to = &addrs[(idx + 1) % addrs.len()];
-                        let body = transfer(&senders[idx], local[slot], to, 1);
+                        let body = transfer(&genesis, &senders[idx], local[slot], to, 1);
                         let sent = Instant::now();
                         match http(&node, &token, "/actions", Some(&body)) {
                             Ok((202, _)) => {

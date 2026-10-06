@@ -17,30 +17,32 @@ assert.equal(iumToArx(1_250_000_000n), "1.25");
 
 type Fixture = { name: string; input: Record<string, unknown>; sender: string; nonce: number; payload: string; signing_bytes: string; signature: string };
 type MultisigFixture = { threshold: number; member_seeds: string[]; members: string[]; signers: number[]; sender: string; nonce: number; to: string; amount: string; signature: string; asset_ref: string };
-type FixtureDocument = { private_key_seed: string; public_key: string; fixtures: Fixture[]; multisig: MultisigFixture };
+type FixtureDocument = { genesis_hash: string; private_key_seed: string; public_key: string; fixtures: Fixture[]; multisig: MultisigFixture };
 const golden = JSON.parse(readFileSync(new URL("../fixtures/signed-actions.json", import.meta.url), "utf8")) as FixtureDocument;
 const encode = (fixture: Fixture): Uint8Array => actions.encodePayload({ name: fixture.name as actions.DecodedPayload["name"], input: fixture.input });
+const genesis = fromHex(golden.genesis_hash), otherGenesis = fromHex("b2".repeat(32));
 const privateKey = await importSeed(golden.private_key_seed);
 const publicKey = await crypto.subtle.importKey("raw", asBuffer(fromHex(golden.public_key)), "Ed25519", false, ["verify"]);
 for (const fixture of golden.fixtures) {
   const payload = encode(fixture);
-  const signing = actions.signingBytes(fixture.sender, fixture.nonce, payload);
+  const signing = actions.signingBytes(genesis, fixture.sender, fixture.nonce, payload);
   assert.equal(toHex(payload), fixture.payload, `${fixture.name} payload`);
   assert.deepEqual(actions.decodePayload(fromHex(fixture.payload)), { name: fixture.name, input: fixture.input }, `${fixture.name} decodes`);
   assert.equal(toHex(signing), fixture.signing_bytes, `${fixture.name} signing bytes`);
-  assert.equal(await actions.signAction(privateKey, fixture.sender, fixture.nonce, payload), fixture.signature, `${fixture.name} signature`);
+  assert.equal(await actions.signAction(privateKey, genesis, fixture.sender, fixture.nonce, payload), fixture.signature, `${fixture.name} signature`);
   assert.equal(await crypto.subtle.verify("Ed25519", publicKey, asBuffer(fromHex(fixture.signature)), asBuffer(signing)), true, `${fixture.name} signature verifies`);
 }
 {
   const ms = golden.multisig, members = ms.members.map(fromHex), payload = actions.encodeTransfer(ms.to, BigInt(ms.amount));
   assert.equal(await actions.multisigAddress(ms.threshold, [...members].reverse()), ms.sender, "multisig address");
   assert.equal(await deriveAssetRef(ms.sender, "gold"), ms.asset_ref, "multisig issuer asset ref");
-  const sigs = await Promise.all(ms.signers.map(async (i) => [members[i], await actions.signAction(await importSeed(ms.member_seeds[i]), ms.sender, ms.nonce, payload)] as [Uint8Array, string]));
+  const sigs = await Promise.all(ms.signers.map(async (i) => [members[i], await actions.signAction(await importSeed(ms.member_seeds[i]), genesis, ms.sender, ms.nonce, payload)] as [Uint8Array, string]));
   assert.equal(actions.multisigSignature(ms.threshold, members, sigs.reverse()), ms.signature, "multisig witness");
   const signed = actions.submitBody(ms.sender, ms.nonce, ms.signature, payload);
-  assert.equal(await verifySignedAction(signed), true, "multisig verifies");
-  assert.equal(await verifySignedAction({ ...signed, nonce: ms.nonce + 1 }), false, "multisig bound to nonce");
-  assert.equal(await verifySignedAction({ ...signed, signature: actions.multisigSignature(ms.threshold, members, sigs.slice(0, 1)) }), false, "multisig below threshold");
+  assert.equal(await verifySignedAction(signed, genesis), true, "multisig verifies");
+  assert.equal(await verifySignedAction({ ...signed, nonce: ms.nonce + 1 }, genesis), false, "multisig bound to nonce");
+  assert.equal(await verifySignedAction(signed, otherGenesis), false, "multisig bound to the chain");
+  assert.equal(await verifySignedAction({ ...signed, signature: actions.multisigSignature(ms.threshold, members, sigs.slice(0, 1)) }, genesis), false, "multisig below threshold");
 }
 {
   const limits = actions.encodeSetAssetLimits("arxasset1x", 5, null, 86_400n);
@@ -90,7 +92,7 @@ assert.throws(() => decodeAssetRef(ALICE), /invalid asset ref/);
   const pooled = Buffer.from(PKCS8_ED25519_PREFIX + golden.private_key_seed, "hex");
   assert.notEqual(pooled.buffer.byteLength, pooled.length, "test needs a pooled Buffer");
   const seedKey = await unlockKey(await wrapPkcs8(pooled, "pw"), "pw");
-  assert.equal(await actions.signAction(seedKey, golden.fixtures[0].sender, golden.fixtures[0].nonce, fromHex(golden.fixtures[0].payload)), golden.fixtures[0].signature);
+  assert.equal(await actions.signAction(seedKey, genesis, golden.fixtures[0].sender, golden.fixtures[0].nonce, fromHex(golden.fixtures[0].payload)), golden.fixtures[0].signature);
 }
 
 // --- RpcClient calls fetch unbound: browsers and Workers throw "Illegal invocation" otherwise
