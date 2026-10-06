@@ -114,7 +114,8 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         assert_eq!(
@@ -163,7 +164,8 @@ mod tests {
             &[],
             10,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         assert_eq!(

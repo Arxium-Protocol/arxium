@@ -115,7 +115,8 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )?;
         view.apply_accounts(&updates.accounts)?;
         view.apply_governance(&updates.governance);
@@ -451,7 +452,8 @@ mod tests {
             &[],
             8,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         assert_eq!(

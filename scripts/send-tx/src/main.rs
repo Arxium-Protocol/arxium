@@ -290,7 +290,13 @@ fn main() -> Result<()> {
         signature: None,
         payload: action_payload,
     };
-    let (status, body) = http("GET", &args.node, "/genesis-hash", None, args.token.as_deref())?;
+    let (status, body) = http(
+        "GET",
+        &args.node,
+        "/genesis-hash",
+        None,
+        args.token.as_deref(),
+    )?;
     if status != 200 {
         bail!("GET /genesis-hash -> {status}: {body}");
     }

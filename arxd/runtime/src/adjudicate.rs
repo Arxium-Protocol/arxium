@@ -884,7 +884,8 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -918,7 +919,8 @@ mod tests {
             &[],
             0,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1208,7 +1210,8 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
@@ -1248,7 +1251,8 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
@@ -1357,7 +1361,8 @@ mod tests {
             &validators,
             height,
             &bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap();
         // Writes are logged the way `execute_actions` logs them: by folding
@@ -1623,7 +1628,10 @@ mod tests {
             signature: None,
             payload,
         };
-        action.signature = Some(hex::encode(key.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes()));
+        action.signature = Some(hex::encode(
+            key.sign(&action.signing_bytes(&crate::TEST_GENESIS))
+                .to_bytes(),
+        ));
         action
     }
 
@@ -1674,7 +1682,8 @@ mod tests {
                     validators,
                     1,
                     &no_bls_owner,
-                    timestamp, &crate::TEST_GENESIS,
+                    timestamp,
+                    &crate::TEST_GENESIS,
                 )
             },
             <crate::CoreChainRuntime as xc_runtime_api::ChainRuntime>::on_block_sealed,
@@ -1887,7 +1896,8 @@ mod tests {
                 .map(|k| {
                     (
                         k.verifying_key().to_bytes(),
-                        k.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
+                        k.sign(&action.signing_bytes(&crate::TEST_GENESIS))
+                            .to_bytes(),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2277,7 +2287,8 @@ mod tests {
                 &[],
                 height,
                 &no_bls_owner,
-                0, &crate::TEST_GENESIS,
+                0,
+                &crate::TEST_GENESIS,
             )
         };
         let params = xc_primitives::ChainParams::default();
@@ -2407,7 +2418,8 @@ mod tests {
                 &[],
                 0,
                 &no_bls_owner,
-                0, &crate::TEST_GENESIS,
+                0,
+                &crate::TEST_GENESIS,
             )
             .unwrap();
             actions.push(action);

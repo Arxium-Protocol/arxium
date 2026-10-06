@@ -1052,7 +1052,10 @@ fn verify_signatures<P: serde::Serialize + Sync>(
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
     // Below this a thread costs more than the ~100us verify it saves.
     if threads == 1 || actions.len() < 64 {
-        return actions.iter().map(|a| a.verify_signature(genesis)).collect();
+        return actions
+            .iter()
+            .map(|a| a.verify_signature(genesis))
+            .collect();
     }
     let chunk = actions.len().div_ceil(threads);
     std::thread::scope(|scope| {
@@ -1158,7 +1161,9 @@ where
         let presigned = signatures.next().expect("one result per action");
         let account = KvRead::get(&view, &xc_circuit::AccountKey(&action.sender))?;
         let verified = match account.as_ref().and_then(|e| e.programmable.as_ref()) {
-            Some(policy) => action.verify_account_signature(Some(policy), &genesis).map(|_| ()),
+            Some(policy) => action
+                .verify_account_signature(Some(policy), &genesis)
+                .map(|_| ()),
             None => presigned,
         };
         if let Err(err) = verified {
@@ -1767,7 +1772,11 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(outcome.dropped.len(), 1, "foreign-chain signature must not verify");
+        assert_eq!(
+            outcome.dropped.len(),
+            1,
+            "foreign-chain signature must not verify"
+        );
         assert_eq!(outcome.dropped[0].signature, foreign.signature.unwrap());
         assert_eq!(outcome.applied.len(), 1);
     }

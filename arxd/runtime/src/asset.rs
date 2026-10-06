@@ -722,7 +722,8 @@ mod tests {
                 &[],
                 0,
                 &no_bls_owner,
-                0, &crate::TEST_GENESIS,
+                0,
+                &crate::TEST_GENESIS,
             )
         }
 
@@ -1146,7 +1147,8 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            day_start(CLAIM_DAY), &crate::TEST_GENESIS,
+            day_start(CLAIM_DAY),
+            &crate::TEST_GENESIS,
         )
     }
 
@@ -1648,7 +1650,8 @@ mod tests {
                 &[],
                 3,
                 &no_bls_owner,
-                timestamp, &crate::TEST_GENESIS,
+                timestamp,
+                &crate::TEST_GENESIS,
             )
         };
         let err = at(day_start(CLAIM_DAY + 2)).unwrap_err();
@@ -1702,7 +1705,8 @@ mod metadata_uri_tests {
             &[],
             1,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )
         .unwrap_err();
         assert!(err.to_string().contains("byte limit"), "{err}");

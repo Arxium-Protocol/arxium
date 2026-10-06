@@ -815,7 +815,8 @@ mod tests {
                     validators,
                     0,
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
-                    0, &TEST_GENESIS,
+                    0,
+                    &TEST_GENESIS,
                 )
             },
             &meter::<CoreChainRuntime>(Default::default()),
@@ -936,7 +937,8 @@ mod tests {
                     vs,
                     0,
                     &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
-                    0, &TEST_GENESIS,
+                    0,
+                    &TEST_GENESIS,
                 )
             },
             &meter::<CoreChainRuntime>(Default::default()),
@@ -997,7 +999,9 @@ mod tests {
                             amount: 1,
                         },
                     };
-                    a.signature = Some(hex::encode(keys[i].sign(&a.signing_bytes(&TEST_GENESIS)).to_bytes()));
+                    a.signature = Some(hex::encode(
+                        keys[i].sign(&a.signing_bytes(&TEST_GENESIS)).to_bytes(),
+                    ));
                     a
                 })
                 .collect();
@@ -1128,7 +1132,8 @@ mod tests {
                             vals,
                             height,
                             &|_: &xc_bls::BlsPublicKey| std::result::Result::Ok(None),
-                            0, &TEST_GENESIS,
+                            0,
+                            &TEST_GENESIS,
                         )
                     },
                     <CoreChainRuntime as ChainRuntime>::on_block_sealed,

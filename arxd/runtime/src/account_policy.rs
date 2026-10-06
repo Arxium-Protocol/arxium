@@ -245,7 +245,8 @@ mod tests {
             .map(|k| {
                 (
                     k.verifying_key().to_bytes(),
-                    k.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
+                    k.sign(&action.signing_bytes(&crate::TEST_GENESIS))
+                        .to_bytes(),
                 )
             })
             .collect::<Vec<_>>();
@@ -274,7 +275,8 @@ mod tests {
             &[],
             height,
             &no_bls_owner,
-            0, &crate::TEST_GENESIS,
+            0,
+            &crate::TEST_GENESIS,
         )?;
         view.apply_accounts(&updates.accounts)?;
         view.apply_asset_balances(&updates.assets)?;
@@ -293,7 +295,8 @@ mod tests {
     #[test]
     fn threshold_issuer_and_attestor_admin_execute_in_the_real_executor() {
         let db = temp_db();
-        db.write_batch(&xc_storage::GenesisHash(hex::encode(crate::TEST_GENESIS))).unwrap();
+        db.write_batch(&xc_storage::GenesisHash(hex::encode(crate::TEST_GENESIS)))
+            .unwrap();
         let keys = [key(7), key(8), key(9)];
         let issuer = multisig_address(2, &owners(&keys, 2).members).unwrap();
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
@@ -378,7 +381,17 @@ mod tests {
             &[],
             BlockUpdates::default(),
             |a, v, op, ops, validators| {
-                crate::dispatch(a, v, op, ops, validators, 1, &no_bls_owner, 0, &crate::TEST_GENESIS)
+                crate::dispatch(
+                    a,
+                    v,
+                    op,
+                    ops,
+                    validators,
+                    1,
+                    &no_bls_owner,
+                    0,
+                    &crate::TEST_GENESIS,
+                )
             },
             &|a| (crate::metering::action_weight(a), fee_of(a)),
             None,
@@ -406,7 +419,9 @@ mod tests {
             &owners(&keys, 2).members,
             &[(
                 keys[0].verifying_key().to_bytes(),
-                keys[0].sign(&bad.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
+                keys[0]
+                    .sign(&bad.signing_bytes(&crate::TEST_GENESIS))
+                    .to_bytes(),
             )],
         )
         .unwrap();
@@ -481,7 +496,9 @@ mod tests {
                 &owners(&keys, 2).members,
                 &[(
                     keys[0].verifying_key().to_bytes(),
-                    keys[0].sign(&alone.signing_bytes(&crate::TEST_GENESIS)).to_bytes(),
+                    keys[0]
+                        .sign(&alone.signing_bytes(&crate::TEST_GENESIS))
+                        .to_bytes(),
                 )],
             )
             .unwrap();
@@ -720,7 +737,11 @@ mod tests {
             payload: ActionPayload::Transfer { to, amount: 10 },
         };
         let mut witness = session_key.verifying_key().to_bytes().to_vec();
-        witness.extend_from_slice(&session_key.sign(&tx.signing_bytes(&crate::TEST_GENESIS)).to_bytes());
+        witness.extend_from_slice(
+            &session_key
+                .sign(&tx.signing_bytes(&crate::TEST_GENESIS))
+                .to_bytes(),
+        );
         tx.signature = Some(policy_signature(1, &hex::encode(witness)).unwrap());
         run(&mut view, &tx, 2).unwrap();
         assert_eq!(
@@ -742,7 +763,11 @@ mod tests {
                 payload,
             };
             let mut witness = session_key.verifying_key().to_bytes().to_vec();
-            witness.extend_from_slice(&session_key.sign(&action.signing_bytes(&crate::TEST_GENESIS)).to_bytes());
+            witness.extend_from_slice(
+                &session_key
+                    .sign(&action.signing_bytes(&crate::TEST_GENESIS))
+                    .to_bytes(),
+            );
             action.signature = Some(policy_signature(1, &hex::encode(witness)).unwrap());
             action
         };
