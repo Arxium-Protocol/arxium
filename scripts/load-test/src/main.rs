@@ -267,7 +267,6 @@ fn main() -> Result<()> {
             .map(|w| {
                 let (senders, nonces, addrs) = (senders.clone(), nonces.clone(), addrs.clone());
                 let (node, token) = (args.nodes[w % args.nodes.len()].clone(), args.token.clone());
-                let genesis = genesis;
                 let dur = Duration::from_secs(args.step_secs);
                 std::thread::spawn(move || {
                     let mine: Vec<usize> = (w..senders.len()).step_by(workers).collect();
