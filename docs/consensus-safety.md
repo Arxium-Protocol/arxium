@@ -249,8 +249,7 @@ field are the hooks.
 the proposer should not stay banned. A `ReinstateValidator { validator }`
 proposal deletes its `Tombstoned` status row, so it can `JoinValidator`
 again with fresh stake (slashed stake is not returned). It rejects if the
-validator is not tombstoned. Who is slashed in the first place is still open
-(Trello 202).
+validator is not tombstoned. Only the proposer of an upheld `Attack` dispute is ever tombstoned.
 
 **Classify the cause.** `ResolveDispute` carries `cause` and `bounty`.
 Re-execute the disputed block with the canonical binary first.
@@ -258,8 +257,13 @@ Re-execute the disputed block with the canonical binary first.
 challenger gets `bounty` from the treasury. `Attack` (a root no bug
 explains): the proposer is slashed and tombstoned as an equivocator is and
 the challenger gets the percentage reward; an attack verdict carries no
-corrections and no bounty. Signers of the bad root are not penalised yet;
-their precommits stay in the finality certificate as evidence.
+corrections and no bounty. Signers of the bad root are not penalised by
+the protocol, by decision (Trello 202): at least 2/3 of the set signed, and
+the same set votes the resolution, so a rule it enforces on itself binds
+nobody in the one case it is for (collusion). A real attack is answered by
+path B (fork), where the new genesis can leave the signers out of the set;
+their precommits stay in the finality certificate as the public evidence for
+that. A bug is answered by `Bug` (no slash).
 
 **Who and when.** The validator set decides, through the ordinary proposal
 and vote (`voting_period_blocks`). Settlement stays paused for as long as it
