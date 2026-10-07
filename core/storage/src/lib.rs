@@ -2199,24 +2199,45 @@ impl ArxiumDb {
     }
 
     /// Lowest height with an unresolved upheld dispute (`DisputeOpenKey`).
-    /// Keys are zero-padded, so the first one under the prefix is the lowest.
     pub fn lowest_open_dispute(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .lowest_open_dispute_entry()?
+            .map(|(height, _, _)| height))
+    }
+
+    /// The lowest unresolved dispute with what `ResolveDispute` must name: its
+    /// height and header commitment (hex), and the stored record. Keys are
+    /// zero-padded, so the first one under the prefix is the lowest.
+    pub fn lowest_open_dispute_entry(
+        &self,
+    ) -> Result<Option<(u64, String, xc_circuit::OpenDispute)>, StorageError> {
         let prefix = DisputeOpenKey::PREFIX.as_bytes();
         let mut iter = self.db.iterator_cf(
             self.cf(CF_EVIDENCE),
             IteratorMode::From(prefix, Direction::Forward),
         );
-        if let Some(item) = iter.next() {
-            let (key, _) = item?;
-            if let Some(rest) = key.strip_prefix(prefix) {
-                let height = rest.get(..20).and_then(|d| std::str::from_utf8(d).ok());
-                return height
-                    .and_then(|d| d.parse().ok())
-                    .map(Some)
-                    .ok_or(StorageError::CorruptedMeta);
-            }
+        let Some(item) = iter.next() else {
+            return Ok(None);
+        };
+        let (key, value) = item?;
+        let Some(rest) = key.strip_prefix(prefix) else {
+            return Ok(None);
+        };
+        let height = rest
+            .get(..20)
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|d| d.parse().ok());
+        let header = rest
+            .get(21..)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .map(str::to_owned);
+        let record = bincode::serde::decode_from_slice(&value, bincode::config::standard())
+            .map(|(record, _)| record)
+            .ok();
+        match (height, header, record) {
+            (Some(height), Some(header), Some(record)) => Ok(Some((height, header, record))),
+            _ => Err(StorageError::CorruptedMeta),
         }
-        Ok(None)
     }
 
     /// Whether the block at `height` whose header signing bytes hash to

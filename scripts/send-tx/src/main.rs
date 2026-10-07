@@ -10,7 +10,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use xc_primitives::Address;
+use xc_primitives::{Address, DisputeCause, DisputeResolution, GovernanceAction};
 
 /// Signs and submits an action to a running arxd node. Devnet testing only.
 #[derive(Parser)]
@@ -20,9 +20,10 @@ struct Args {
     from: String,
 
     /// "transfer" (default), "join-validator", "leave-validator", "stake", "unstake",
-    /// "register-bls-key", "authorize-operator", "revoke-operator", or
-    /// "sub-account" (prints a validator's stake sub-account address,
-    /// submits nothing)
+    /// "register-bls-key", "authorize-operator", "revoke-operator", the
+    /// governance actions "propose-resolve-dispute", "propose-reinstate",
+    /// "vote" and "execute-proposal", or "sub-account" (prints a validator's
+    /// stake sub-account address, submits nothing)
     #[arg(long, default_value = "transfer")]
     action: String,
 
@@ -61,6 +62,31 @@ struct Args {
     /// Required for "authorize-operator".
     #[arg(long)]
     operator: Option<String>,
+
+    /// "propose-resolve-dispute": disputed block height (`open_dispute_height` on /status).
+    #[arg(long)]
+    height: Option<u64>,
+
+    /// "propose-resolve-dispute": the disputed header's commitment, hex
+    /// (`open_dispute_header` on /status).
+    #[arg(long)]
+    header: Option<String>,
+
+    /// "propose-resolve-dispute": what governance found, "bug" or "attack".
+    #[arg(long)]
+    cause: Option<String>,
+
+    /// "propose-resolve-dispute": IUM paid to the challenger from the treasury on a bug.
+    #[arg(long, default_value_t = 0)]
+    bounty: u128,
+
+    /// "vote" / "execute-proposal": the proposal id.
+    #[arg(long)]
+    proposal: Option<u64>,
+
+    /// "vote": "true" approves, "false" rejects.
+    #[arg(long)]
+    approve: Option<bool>,
 
     /// Override the auto-fetched nonce
     #[arg(long)]
@@ -258,9 +284,58 @@ fn main() -> Result<()> {
             )?,
         },
         "revoke-operator" => ActionPayload::RevokeOperator,
+        "propose-resolve-dispute" => {
+            let header = hex::decode(
+                args.header
+                    .as_deref()
+                    .context("--header is required for propose-resolve-dispute")?
+                    .trim_start_matches("0x"),
+            )
+            .context("--header is not valid hex")?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("--header must be 32 bytes"))?;
+            let cause = match args.cause.as_deref() {
+                Some("bug") => DisputeCause::Bug,
+                Some("attack") => DisputeCause::Attack,
+                _ => bail!("--cause must be \"bug\" or \"attack\""),
+            };
+            ActionPayload::SubmitProposal {
+                action: GovernanceAction::ResolveDispute {
+                    height: args
+                        .height
+                        .context("--height is required for propose-resolve-dispute")?,
+                    header,
+                    resolution: DisputeResolution::Accept,
+                    corrections: Vec::new(),
+                    cause,
+                    bounty: args.bounty,
+                },
+                description: "resolve upheld dispute".to_string(),
+            }
+        }
+        "propose-reinstate" => ActionPayload::SubmitProposal {
+            action: GovernanceAction::ReinstateValidator {
+                validator: resolve_address(
+                    args.validator
+                        .as_deref()
+                        .context("--validator is required for propose-reinstate")?,
+                    &keys,
+                )?,
+            },
+            description: "reinstate validator".to_string(),
+        },
+        "vote" => ActionPayload::VoteProposal {
+            proposal: args.proposal.context("--proposal is required for vote")?,
+            approve: args.approve.context("--approve is required for vote")?,
+        },
+        "execute-proposal" => ActionPayload::ExecuteProposal {
+            proposal: args
+                .proposal
+                .context("--proposal is required for execute-proposal")?,
+        },
         other => {
             bail!(
-                "unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, unstake, register-bls-key, authorize-operator, or revoke-operator"
+                "unknown --action {other:?}, expected transfer, join-validator, leave-validator, stake, unstake, register-bls-key, authorize-operator, revoke-operator, propose-resolve-dispute, propose-reinstate, vote, or execute-proposal"
             )
         }
     };

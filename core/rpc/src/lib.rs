@@ -662,13 +662,18 @@ async fn get_status<P: Payload>(State(state): State<AppState<P>>) -> Result<Resp
 
     // Non-null means an upheld dispute is unresolved and settlement is
     // paused below it: the field an operator's alert rule watches.
-    let open_dispute_height = state.db.lowest_open_dispute().unwrap_or_else(|err| {
+    let open_dispute = state.db.lowest_open_dispute_entry().unwrap_or_else(|err| {
         warn!("failed to read open disputes for /status: {err}");
         None
     });
+    let open_dispute_height = open_dispute.as_ref().map(|(height, _, _)| *height);
 
     Ok(Json(serde_json::json!({
         "open_dispute_height": open_dispute_height,
+        // What a `ResolveDispute` proposal must name, and the chain's own
+        // classification of it (docs/consensus-safety.md §5).
+        "open_dispute_header": open_dispute.as_ref().map(|(_, header, _)| format!("0x{header}")),
+        "open_dispute_cause": open_dispute.as_ref().map(|(_, _, record)| format!("{:?}", record.cause)),
         "chain_name": chain_name,
         // This crate's version — bumped whenever the JSON shape of a block
         // changes, so an HTTP reader (Retracer) can refuse a node whose
@@ -2083,6 +2088,8 @@ mod tests {
             assert_eq!(json["validators_with_bls_key"], 1);
             assert_eq!(json["quorum_reachable"], true);
             assert!(json["open_dispute_height"].is_null());
+            assert!(json["open_dispute_header"].is_null());
+            assert!(json["open_dispute_cause"].is_null());
         });
     }
 

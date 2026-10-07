@@ -216,8 +216,15 @@ by itself.
 
 **Detect.** The node logs `execution dispute upheld` at `error!` level, and
 `/status` carries `open_dispute_height` (null when none). Alert on it being
-non-null. There is no metrics endpoint in `arxd` yet; the log line and this
-field are the hooks.
+non-null. `/status` also carries `open_dispute_header` (the commitment a
+`ResolveDispute` proposal names, with the height) and `open_dispute_cause` (the
+chain's own `Bug`/`Attack` classification). There is no metrics endpoint in
+`arxd` yet; the log line and these fields are the hooks.
+
+Rehearsed end to end on a local network by
+`scripts/two-node-fault-harness.sh` (`FAULT_KIND=resolve-attack` and
+`resolve-bug`), using `send-tx`'s `propose-resolve-dispute`,
+`propose-reinstate`, `vote` and `execute-proposal`.
 
 **Decide, by this criterion, fixed before an incident:**
 
