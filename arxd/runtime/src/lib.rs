@@ -2078,6 +2078,86 @@ mod sdk_golden_fixtures {
                 },
             ),
             fixture(
+                "submitProposal",
+                json!({
+                    "action": {
+                        "kind": "addAttestor",
+                        "attestor": recipient.to_string(),
+                        "name": "Arxium Bank",
+                        "owners": [sender.to_string(), recipient.to_string()],
+                        "threshold": 2,
+                        "evidenceHash": "ab12",
+                        "evidenceUri": "https://example.com/evidence"
+                    },
+                    "description": "add the bank"
+                }),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::SubmitProposal {
+                    action: xc_primitives::GovernanceAction::AddAttestor {
+                        attestor: recipient.clone(),
+                        name: "Arxium Bank".into(),
+                        owners: vec![sender.clone(), recipient.clone()],
+                        threshold: 2,
+                        evidence_hash: "ab12".into(),
+                        evidence_uri: "https://example.com/evidence".into(),
+                    },
+                    description: "add the bank".into(),
+                },
+            ),
+            fixture(
+                "submitProposal",
+                json!({
+                    "action": {"kind": "removeAttestor", "attestor": recipient.to_string()},
+                    "description": "bad actor"
+                }),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::SubmitProposal {
+                    action: xc_primitives::GovernanceAction::RemoveAttestor {
+                        attestor: recipient.clone(),
+                    },
+                    description: "bad actor".into(),
+                },
+            ),
+            fixture(
+                "submitProposal",
+                json!({
+                    "action": {"kind": "unblockAttestor", "attestor": recipient.to_string()},
+                    "description": "key rotated"
+                }),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::SubmitProposal {
+                    action: xc_primitives::GovernanceAction::UnblockAttestor {
+                        attestor: recipient.clone(),
+                    },
+                    description: "key rotated".into(),
+                },
+            ),
+            fixture(
+                "voteProposal",
+                json!({"proposal": "7", "approve": true}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::VoteProposal {
+                    proposal: 7,
+                    approve: true,
+                },
+            ),
+            fixture(
+                "executeProposal",
+                json!({"proposal": "7"}),
+                &sender,
+                &key,
+                nonce,
+                ActionPayload::ExecuteProposal { proposal: 7 },
+            ),
+            fixture(
                 "blockAttestor",
                 json!({}),
                 &sender,

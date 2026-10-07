@@ -54,6 +54,13 @@ try {
   assert.deepEqual(await decoded("apply-attestor", "Arxium Bank", `${vectors.sender},${vectors.sender}`, "2", "ab12", "https://e.example"), { name: "applyAttestor", input: { name: "Arxium Bank", owners: [vectors.sender, vectors.sender], threshold: 2, evidenceHash: "ab12", evidenceUri: "https://e.example" } });
   assert.deepEqual(await decoded("block-attestor"), { name: "blockAttestor", input: {} });
   console.log("CLI apply-attestor / block-attestor payloads passed");
+  const who = vectors.sender;
+  assert.deepEqual(await decoded("propose-add-attestor", who, "Arxium Bank", `${who},${who}`, "2", "ab12", "https://e.example", "add the bank"), { name: "submitProposal", input: { action: { kind: "addAttestor", attestor: who, name: "Arxium Bank", owners: [who, who], threshold: 2, evidenceHash: "ab12", evidenceUri: "https://e.example" }, description: "add the bank" } });
+  assert.deepEqual(await decoded("propose-remove-attestor", who, "bad actor"), { name: "submitProposal", input: { action: { kind: "removeAttestor", attestor: who }, description: "bad actor" } });
+  assert.deepEqual(await decoded("propose-unblock-attestor", who, "key rotated"), { name: "submitProposal", input: { action: { kind: "unblockAttestor", attestor: who }, description: "key rotated" } });
+  assert.deepEqual(await decoded("vote", "7", "yes"), { name: "voteProposal", input: { proposal: "7", approve: true } });
+  assert.deepEqual(await decoded("execute-proposal", "7"), { name: "executeProposal", input: { proposal: "7" } });
+  console.log("CLI governance payloads passed");
 } finally {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await rm(dir, { recursive: true, force: true });
