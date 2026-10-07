@@ -261,6 +261,12 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         db.get_round_certificate(next_height, round - 1)?
     };
 
+    // Fault injection: stamp this block as an older release so a harness can
+    // exercise the Bug classification (`ChainParams::classify_build`).
+    let build_id = env!("CARGO_PKG_VERSION").to_string();
+    #[cfg(feature = "fault-injection")]
+    let build_id = std::env::var("ARXD_FAULT_BUILD_ID").unwrap_or(build_id);
+
     let mut new_block = Block {
         height: next_height,
         parent_hash: parent.hash().to_string(),
@@ -273,7 +279,7 @@ pub fn produce_block_reporting<R: ChainRuntime>(
         state_root,
         round,
         round_certificate,
-        build_id: env!("CARGO_PKG_VERSION").to_string(),
+        build_id,
     };
     if let Some((address, key)) = proposer {
         // Bound to this chain's genesis hash, so the signature can't be

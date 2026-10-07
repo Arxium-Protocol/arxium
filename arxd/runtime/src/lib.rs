@@ -141,7 +141,13 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         let artifact: xc_artifact::EvidenceArtifact = serde_json::from_str(artifact_json).ok()?;
         let outcome = match &artifact.fault {
             xc_artifact::Fault::BlockDivergence { .. } => {
-                adjudicate::adjudicate_block_divergence(&artifact).ok()?
+                match adjudicate::adjudicate_block_divergence(&artifact) {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        tracing::warn!(%err, "local adjudication of block divergence failed");
+                        return None;
+                    }
+                }
             }
             // Neither is an execution fault: both are settled by signature
             // checks alone (`xc_artifact::verify`), with nothing for the
@@ -156,7 +162,10 @@ impl xc_runtime_api::ChainRuntime for CoreChainRuntime {
         };
         match outcome {
             adjudicate::AdjudicationOutcome::Culpable { culpable_pubkey } => Some(culpable_pubkey),
-            adjudicate::AdjudicationOutcome::Disagreement { .. } => None,
+            adjudicate::AdjudicationOutcome::Disagreement { reason } => {
+                tracing::warn!(%reason, "local adjudication found no culprit, not submitting");
+                None
+            }
         }
     }
 

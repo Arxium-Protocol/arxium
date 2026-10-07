@@ -63,7 +63,13 @@ FAULT_KIND="${FAULT_KIND:-divergence}"
 case "$FAULT_KIND" in
     divergence) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT" ;;
     prevote) FAULT_ENV="ARXD_DOUBLE_PREVOTE_AT_HEIGHT" ;;
-    *) echo "FAULT_KIND must be divergence or prevote" >&2; exit 1 ;;
+    # Build-provenance classification of an upheld dispute (Trello 202):
+    # same injected fault, but node 0 stamps its blocks with FAULT_BUILD_ID
+    # and genesis lists canonical_builds [OLD_BUILD, <this binary's version>].
+    dispute-bug) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug ;;
+    dispute-attack) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID=""; EXPECT_CAUSE=Attack ;;
+    dispute-unlisted) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="unlisted-build"; EXPECT_CAUSE=Attack ;;
+    *) echo "FAULT_KIND must be divergence, prevote, dispute-bug, dispute-attack or dispute-unlisted" >&2; exit 1 ;;
 esac
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
@@ -131,7 +137,7 @@ ACCOUNTS='{}'
 # funded every honest evidence-report attempt into the same nonce-0 mempool
 # slot forever and looked identical to a resubmission-storm bug. 100x the
 # fee is comfortably more than a short test run needs.
-ACCOUNT_FUNDING=$((100 * 1000000))
+ACCOUNT_FUNDING=$((1000 * 1000000000))  # the metered fee is now ~5e9 IUM per action
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DIRS[$i]="$ROOT/node-$i"
     mkdir -p "${DIRS[$i]}"
@@ -166,13 +172,19 @@ while (( FAULT_HEIGHT % NUM_VALIDATORS != NODE0_SLOT )); do
 done
 CONFIRM_HEIGHT=$((FAULT_HEIGHT + 6))
 
-jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
+# Default ChainParams from the binary itself, so only canonical_builds is set
+# here (a partial `params` object would not parse).
+CURRENT_BUILD="$("$BIN" --version | awk '{print $2}')"
+PARAMS="$("$BIN" chain-spec --chain local | jq --arg cur "$CURRENT_BUILD" \
+    '.params | .canonical_builds = ["old-build", $cur]')"
+jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" --argjson params "$PARAMS" '{
     genesis_format: "plain",
     height: 0,
     chain_name: "arxium-fault-injection-harness",
     accounts: $accounts,
     validators: $validators,
-    boot_nodes: []
+    boot_nodes: [],
+    params: $params
 }' > "$ROOT/genesis.json"
 
 echo "starting node 0 ($FAULT_KIND fault at height $FAULT_HEIGHT) as ${ADDRS[0]} ..."
@@ -182,6 +194,7 @@ echo "starting node 0 ($FAULT_KIND fault at height $FAULT_HEIGHT) as ${ADDRS[0]}
 # silently depends on whoever's shell started it. Found while building
 # scripts/partition-heal-harness.sh.
 env RUST_LOG="${RUST_LOG:-info}" "$FAULT_ENV=$FAULT_HEIGHT" \
+    ${FAULT_BUILD_ID:+ARXD_FAULT_BUILD_ID=$FAULT_BUILD_ID} \
 "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[0]}" --validator \
     --port "${RPC_PORTS[0]}" --p2p-port "${P2P_PORTS[0]}" --rpc-bind 127.0.0.1 \
     >"$ROOT/node-0.log" 2>&1 &
@@ -239,6 +252,44 @@ fi
 echo "chain reached height $tip"
 
 pass=true
+
+# --- Dispute classification (dispute-* kinds) --------------------------------
+# An upheld dispute slashes no one until governance resolves it, so the
+# checks are: the chain upheld it, classed it by provenance, paused
+# settlement, and left node 0 un-tombstoned and every honest node unhurt.
+if [ -n "${EXPECT_CAUSE:-}" ]; then
+    echo "waiting for an upheld dispute classed $EXPECT_CAUSE (timeout ${CHAIN_TIMEOUT}s)..."
+    deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+    upheld=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        upheld="$(grep -h "execution dispute upheld" "$ROOT"/node-[1-9]*.log 2>/dev/null | head -n 1 || true)"
+        [ -n "$upheld" ] && break
+        sleep 2
+    done
+    if [ -z "$upheld" ]; then
+        echo "  FAIL: no execution dispute was ever upheld"; pass=false
+    elif echo "$upheld" | grep -q "cause.*Some($EXPECT_CAUSE)"; then
+        echo "  ok: dispute upheld, cause $EXPECT_CAUSE"
+    else
+        echo "  FAIL: expected cause $EXPECT_CAUSE, got: $upheld"; pass=false
+    fi
+    rpc() { curl -sf "http://127.0.0.1:$RPC_HONEST/$1" || echo '{}'; }
+    open_h="$(rpc status | jq -r '.open_dispute_height // empty')"
+    if [ -n "$open_h" ]; then echo "  ok: settlement paused below height $open_h"
+    else echo "  FAIL: /status shows no open_dispute_height"; pass=false; fi
+    for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+        status="$(rpc "validators/${ADDRS[$i]}" | jq -r 'if (.status|type)=="string" then .status else (.status|keys[0]) end // "none"')"
+        if [ "$status" = Tombstoned ]; then
+            echo "  FAIL: node $i is Tombstoned before any resolution"; pass=false
+        fi
+    done
+    echo "  ok: nobody tombstoned by the dispute itself"
+    if [ "$pass" = true ]; then
+        echo; echo "PASS — $FAULT_KIND: upheld dispute classed $EXPECT_CAUSE by build provenance."
+        echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"; echo "logs kept in $ROOT"; exit 0
+    fi
+    echo "FAIL $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"; echo "FAIL — see $ROOT"; exit 1
+fi
 
 # Waited on, not read once: the honest fault action lands a few blocks after
 # the dispute, not necessarily by the time the chain passes CONFIRM_HEIGHT.
