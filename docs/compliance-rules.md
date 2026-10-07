@@ -41,8 +41,12 @@ is right and this file is stale — fix the file.
     a vote removes them. Same rules as any other (named, multisig), so a
     genesis attestor must be named honestly, e.g. "Arxium (genesis attestor)".
   - *Applying.* `ApplyAttestor` is sent by the attestor's own multisig address,
-    pays `ChainParams.attestor_apply_bond` (to the treasury, not refunded) and
-    opens an `AddAttestor` vote. The applicant is not a validator. Validators
+    pays `ChainParams.attestor_apply_bond` (to the treasury) and
+    opens an `AddAttestor` vote. The applicant is not a validator. The bond is
+    paid back, the amount it paid, when the vote passes and the attestor
+    registers; a failed or rejected vote keeps it. If governance spent the
+    treasury down meanwhile, the applicant gets what is left and is still
+    registered. Validators
     check the evidence (hash + URI, stored in the proposal) off-chain, then vote.
   - *Names.* 3–64 ASCII characters (letters, digits, space, `. - & ' ( )`), no
     stray spaces. Unique after folding case, spacing, punctuation and the

@@ -276,7 +276,8 @@ pub fn apply_submit<V: KvRead<Error = StorageError>>(
             "epoch_length can't be changed by governance",
         ));
     }
-    open_proposal(view, proposer, action, description, current_height)
+    // A proposer-submitted proposal paid no bond; only an application does.
+    open_proposal(view, proposer, action, description, current_height, 0)
 }
 
 /// What each attestor action needs from state before it is worth a vote, and
@@ -287,6 +288,7 @@ fn open_proposal<V: KvRead<Error = StorageError>>(
     action: GovernanceAction,
     description: &str,
     current_height: u64,
+    bond: u128,
 ) -> Result<(u64, GovernanceUpdates), GovernanceError> {
     let params = chain_params(view)?;
     let mut voting_blocks = params.voting_period_blocks;
@@ -333,6 +335,7 @@ fn open_proposal<V: KvRead<Error = StorageError>>(
         yes_power: 0,
         no_power: 0,
         status: ProposalStatus::Open,
+        bond,
     };
     updates.put(&ProposalKey(id), &proposal)?;
     updates.put(&NextProposalIdKey, &(id + 1))?;
@@ -390,8 +393,34 @@ pub fn apply_attestor_application<V: KvRead<Error = StorageError>>(
         (treasury, treasury_entry),
     ]));
     let description = format!("Attestor application: {name}");
-    let (id, updates) = open_proposal(view, applicant, action, &description, current_height)?;
+    let (id, updates) = open_proposal(view, applicant, action, &description, current_height, bond)?;
     Ok((id, updates, accounts))
+}
+
+/// Pays an application's bond back to its applicant out of the treasury, the
+/// amount it paid, not today's `attestor_apply_bond`. The treasury is shared
+/// and governance can spend it while a vote runs, so if it holds less than
+/// the bond the applicant gets what is there: the attestor is registered
+/// either way, since a vote that passed should not fail on the treasury.
+fn refund_bond<V: KvRead<Error = StorageError>>(
+    view: &V,
+    proposal: &Proposal,
+    accounts: &mut AccountUpdates,
+) -> Result<(), GovernanceError> {
+    if proposal.bond == 0 {
+        return Ok(());
+    }
+    let treasury = treasury_account();
+    let mut from = view.get(&AccountKey(&treasury))?.unwrap_or_default();
+    let refund = proposal.bond.min(from.balance);
+    from.balance -= refund;
+    let mut to = view
+        .get(&AccountKey(&proposal.proposer))?
+        .unwrap_or_default();
+    to.balance = to.balance.saturating_add(refund);
+    accounts.0.insert(treasury, from);
+    accounts.0.insert(proposal.proposer.clone(), to);
+    Ok(())
 }
 
 /// One vote per validator per proposal, weighted by its power in the set in
@@ -503,6 +532,7 @@ pub fn apply_execute<V: KvRead<Error = StorageError>>(
                     attestors.registration = Some(registration);
                     updates.extend(name_row);
                     proposal.status = ProposalStatus::Executed;
+                    refund_bond(view, &proposal, &mut accounts)?;
                 }
             }
             GovernanceAction::RemoveAttestor { attestor } => {
@@ -700,6 +730,7 @@ mod tests {
                     yes_power: 9_000,
                     no_power: 0,
                     status: ProposalStatus::Open,
+                    bond: 0,
                 },
             )
             .unwrap();
@@ -903,6 +934,9 @@ mod tests {
 
         let p = vote_and_execute(&db, id, &[(1, true)], 2, 11);
         assert_eq!(p.status, ProposalStatus::Executed);
+        // The bond comes back when the vote passes.
+        assert_eq!(db.get_account(&applicant).unwrap().unwrap().balance, 150);
+        assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 0);
         let record = db.get_attestor_record(&applicant).unwrap().unwrap();
         assert_eq!(
             (record.name.as_str(), record.threshold),
@@ -924,6 +958,113 @@ mod tests {
             .unwrap_err(),
             GovernanceError::Identity(circuit_identity::IdentityError::NameTaken(_))
         ));
+    }
+
+    /// A funded applicant that has applied; returns its address, the
+    /// proposal id and the account's balance after paying the bond (100).
+    fn applied(db: &ArxiumDb, seed: u8, name: &str) -> (Address, u64) {
+        let (applicant, owners) = attestor_multisig(seed);
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            applicant.clone(),
+            AccountEntry {
+                balance: 150,
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        let (id, up, accounts) =
+            apply_attestor_application(db, &applicant, name, &owners, 2, "00", "u", 1).unwrap();
+        db.write_batch(&up).unwrap();
+        db.write_batch(&accounts).unwrap();
+        assert_eq!(db.get_account(&applicant).unwrap().unwrap().balance, 50);
+        (applicant, id)
+    }
+
+    fn balance(db: &ArxiumDb, who: &Address) -> u128 {
+        db.get_account(who).unwrap().map_or(0, |a| a.balance)
+    }
+
+    #[test]
+    fn a_failed_application_keeps_the_bond() {
+        let db = db();
+        let (applicant, id) = applied(&db, 100, "Doomed Co");
+        // No votes: the window closes and the proposal is rejected.
+        let p = vote_and_execute(&db, id, &[], 0, 11);
+        assert_eq!(p.status, ProposalStatus::Rejected);
+        assert!(db.get_attestor_record(&applicant).unwrap().is_none());
+        assert_eq!(balance(&db, &applicant), 50);
+        assert_eq!(balance(&db, &treasury_account()), 100);
+        // A NO majority is the same.
+        let (applicant, id) = applied(&db, 110, "Refused Co");
+        let p = vote_and_execute(&db, id, &[(1, false)], 2, 11);
+        assert_eq!(p.status, ProposalStatus::Rejected);
+        assert_eq!(balance(&db, &applicant), 50);
+    }
+
+    /// Governance can change the bond while a vote runs; the refund is what
+    /// the applicant paid.
+    #[test]
+    fn the_refund_is_the_amount_paid_not_the_current_param() {
+        let db = db();
+        let (applicant, id) = applied(&db, 120, "Steady Co");
+        db.write_batch(&ChainParamsRow(ChainParams {
+            voting_period_blocks: 10,
+            attestor_apply_bond: 999,
+            ..Default::default()
+        }))
+        .unwrap();
+        let p = vote_and_execute(&db, id, &[(1, true)], 2, 11);
+        assert_eq!(p.status, ProposalStatus::Executed);
+        assert_eq!(balance(&db, &applicant), 150);
+        assert_eq!(balance(&db, &treasury_account()), 0);
+    }
+
+    /// A validator-submitted add paid nothing, so it refunds nothing and
+    /// cannot draw on the treasury.
+    #[test]
+    fn a_validator_submitted_add_refunds_nothing() {
+        let db = db();
+        let treasury = treasury_account();
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            treasury.clone(),
+            AccountEntry {
+                balance: 100,
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        let (attestor, _) = attestor_multisig(130);
+        let (id, up) = apply_submit(&db, &addr(1), add_attestor(130, "Direct Co"), "", 0).unwrap();
+        db.write_batch(&up).unwrap();
+        let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
+        assert_eq!(p.bond, 0);
+        db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
+            .unwrap();
+        let (_, accounts, _, _) = apply_execute(&db, id, 10).unwrap();
+        assert!(accounts.0.is_empty(), "no account is written: {accounts:?}");
+        assert_eq!(balance(&db, &treasury), 100);
+        assert_eq!(balance(&db, &attestor), 0);
+    }
+
+    /// The treasury is shared: if it was spent down while the vote ran, the
+    /// applicant gets what is there and the attestor still registers.
+    #[test]
+    fn a_short_treasury_refunds_what_is_left_and_still_registers() {
+        let db = db();
+        let (applicant, id) = applied(&db, 140, "Late Co");
+        db.write_batch(&AccountUpdates(BTreeMap::from([(
+            treasury_account(),
+            AccountEntry {
+                balance: 30,
+                ..Default::default()
+            },
+        )])))
+        .unwrap();
+        let p = vote_and_execute(&db, id, &[(1, true)], 2, 11);
+        assert_eq!(p.status, ProposalStatus::Executed);
+        assert!(db.get_attestor_record(&applicant).unwrap().is_some());
+        assert_eq!(balance(&db, &applicant), 80);
+        assert_eq!(balance(&db, &treasury_account()), 0);
     }
 
     fn registered(db: &ArxiumDb, seed: u8, name: &str) -> Address {
@@ -1130,6 +1271,7 @@ mod tests {
                     yes_power: TOTAL_VOTING_POWER,
                     no_power: 0,
                     status: ProposalStatus::Open,
+                    bond: 0,
                 },
             )
             .unwrap();
