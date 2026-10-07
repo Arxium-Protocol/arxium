@@ -404,7 +404,10 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// parameters, `Proposal` gained `bond` (refunded to an applicant whose vote passes),
 /// and `Snapshot.attestors` replaces `attestor`/`attestor_admin`.
 /// Devnet reset required.
-pub const SCHEMA_VERSION: u32 = 28;
+/// Bumped 28 -> 29: `Block`/`RawBlock` gained a signed `build_id` (positional
+/// bincode in stored blocks), `ChainParams` gained `canonical_builds`, and the
+/// `evidence:dispute_open:` `OpenDispute` gained `cause`. Devnet reset required.
+pub const SCHEMA_VERSION: u32 = 29;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -2196,24 +2199,45 @@ impl ArxiumDb {
     }
 
     /// Lowest height with an unresolved upheld dispute (`DisputeOpenKey`).
-    /// Keys are zero-padded, so the first one under the prefix is the lowest.
     pub fn lowest_open_dispute(&self) -> Result<Option<u64>, StorageError> {
+        Ok(self
+            .lowest_open_dispute_entry()?
+            .map(|(height, _, _)| height))
+    }
+
+    /// The lowest unresolved dispute with what `ResolveDispute` must name: its
+    /// height and header commitment (hex), and the stored record. Keys are
+    /// zero-padded, so the first one under the prefix is the lowest.
+    pub fn lowest_open_dispute_entry(
+        &self,
+    ) -> Result<Option<(u64, String, xc_circuit::OpenDispute)>, StorageError> {
         let prefix = DisputeOpenKey::PREFIX.as_bytes();
         let mut iter = self.db.iterator_cf(
             self.cf(CF_EVIDENCE),
             IteratorMode::From(prefix, Direction::Forward),
         );
-        if let Some(item) = iter.next() {
-            let (key, _) = item?;
-            if let Some(rest) = key.strip_prefix(prefix) {
-                let height = rest.get(..20).and_then(|d| std::str::from_utf8(d).ok());
-                return height
-                    .and_then(|d| d.parse().ok())
-                    .map(Some)
-                    .ok_or(StorageError::CorruptedMeta);
-            }
+        let Some(item) = iter.next() else {
+            return Ok(None);
+        };
+        let (key, value) = item?;
+        let Some(rest) = key.strip_prefix(prefix) else {
+            return Ok(None);
+        };
+        let height = rest
+            .get(..20)
+            .and_then(|d| std::str::from_utf8(d).ok())
+            .and_then(|d| d.parse().ok());
+        let header = rest
+            .get(21..)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .map(str::to_owned);
+        let record = bincode::serde::decode_from_slice(&value, bincode::config::standard())
+            .map(|(record, _)| record)
+            .ok();
+        match (height, header, record) {
+            (Some(height), Some(header), Some(record)) => Ok(Some((height, header, record))),
+            _ => Err(StorageError::CorruptedMeta),
         }
-        Ok(None)
     }
 
     /// Whether the block at `height` whose header signing bytes hash to
@@ -2537,6 +2561,7 @@ mod explorer_index_tests {
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         }
     }
 
@@ -3792,6 +3817,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(height, &[&updates, &block], true)
             .unwrap();
@@ -3881,6 +3907,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(1, &[&updates, &block], true)
             .unwrap();
@@ -4051,6 +4078,7 @@ mod divergence_recovery_tests {
             state_root,
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         db.write_block_batches(1, &[&gold, &balances, &index, &block], true)
             .unwrap();
@@ -4155,6 +4183,7 @@ mod divergence_recovery_tests {
             height: 6,
             proposer: addr(1),
             disputed: Some([7u8; 32]),
+            cause: None,
             challenger: None,
         })
         .unwrap();

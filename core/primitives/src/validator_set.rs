@@ -301,6 +301,29 @@ pub struct ChainParams {
     /// targeted again, so one validator cannot keep an attestor blocked.
     #[serde(default = "default_attestor_removal_cooldown_blocks")]
     pub attestor_removal_cooldown_blocks: u64,
+    /// Release ids (`Block::build_id`) governance has accepted, oldest first;
+    /// the last is the current one. Empty means not configured: every
+    /// upheld dispute then classifies as a bug.
+    #[serde(default)]
+    pub canonical_builds: Vec<String>,
+}
+
+impl ChainParams {
+    /// What an upheld execution dispute against a block carrying `build_id`
+    /// is, by provenance: a listed build other than the current one is a bug
+    /// (an accepted release produced the root and a later one fixed it); the
+    /// current build replaying differently, or an unlisted build, is an
+    /// attack. Docs: consensus-safety.md §5.
+    pub fn classify_build(&self, build_id: &str) -> DisputeCause {
+        match self.canonical_builds.last() {
+            Some(current)
+                if build_id == current || !self.canonical_builds.iter().any(|b| b == build_id) =>
+            {
+                DisputeCause::Attack
+            }
+            _ => DisputeCause::Bug,
+        }
+    }
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -435,6 +458,7 @@ impl Default for ChainParams {
             attestor_apply_bond: default_attestor_apply_bond(),
             attestor_removal_voting_blocks: default_attestor_removal_voting_blocks(),
             attestor_removal_cooldown_blocks: default_attestor_removal_cooldown_blocks(),
+            canonical_builds: Vec::new(),
         }
     }
 }
@@ -778,5 +802,34 @@ mod tests {
         assert!(ValidatorStatus::Leaving { from_epoch: 6 }.eligible_for(5));
         assert!(!ValidatorStatus::Leaving { from_epoch: 6 }.eligible_for(6));
         assert!(!ValidatorStatus::Tombstoned.eligible_for(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod classify_build_tests {
+    use super::*;
+
+    fn params(builds: &[&str]) -> ChainParams {
+        ChainParams {
+            canonical_builds: builds.iter().map(|b| b.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classification_follows_the_producing_build() {
+        let p = params(&["0.3.0", "0.4.0"]);
+        // An accepted release older than the current one: a bug.
+        assert_eq!(p.classify_build("0.3.0"), DisputeCause::Bug);
+        // The current build replaying differently, or code nobody accepted.
+        assert_eq!(p.classify_build("0.4.0"), DisputeCause::Attack);
+        assert_eq!(p.classify_build("0.4.0-evil"), DisputeCause::Attack);
+        assert_eq!(p.classify_build(""), DisputeCause::Attack);
+    }
+
+    /// No list configured: never classify an attack on no evidence.
+    #[test]
+    fn an_unconfigured_list_classifies_every_dispute_as_a_bug() {
+        assert_eq!(params(&[]).classify_build("0.4.0"), DisputeCause::Bug);
     }
 }

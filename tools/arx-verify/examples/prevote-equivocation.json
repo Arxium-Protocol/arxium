@@ -1,25 +1,25 @@
 {
-  "artifact_version": 5,
-  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
+  "artifact_version": 6,
   "fault": "prevote_equivocation",
-  "voter_pubkey": "0x8ae7e5822ba97ab07877ea318e747499da648b27302414f9d0b9bb7e3646d248be90c9fdaddfdb93485a6e9334f01093",
+  "genesis_hash": "0xa1b2c3d4e5f60718293a4b5c6d7e8f9001122334455667788990aabbccddeeff",
   "height": 5,
-  "prevotes": [
-    {
-      "height": 5,
-      "round": 0,
-      "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-      "signature": "0xb2c759fd5c6b354210e24b26bf7f37cb37d73f58462f0e536a90046cc6ce8edab1b05df2b5473ef3ef0bb82146a692d715e4b5c58d8e0223fa180585e5f07cb5ddb6d0450d6e52ecf42b9d3790c58ebd0706e550a497f28bf6357cbe567a2e0e"
-    },
-    {
-      "height": 5,
-      "round": 0,
-      "block_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "signature": "0xab36cf2d77f52d039749b2407ec8862230b69044f96c3e471cc5b2ced93237a757a031eea56215b31bf003a1881d90e60e540a6ca2b01aa805b103965dd0b20bfa4b44b01d5cca045276ef9b60691a7fdd6a355877c4fa9f548eeb8e3bcd4a9a"
-    }
-  ],
   "human_readable": {
     "block_hash_a": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "block_hash_b": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  }
+  },
+  "prevotes": [
+    {
+      "block_hash": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "height": 5,
+      "round": 0,
+      "signature": "0xb2c759fd5c6b354210e24b26bf7f37cb37d73f58462f0e536a90046cc6ce8edab1b05df2b5473ef3ef0bb82146a692d715e4b5c58d8e0223fa180585e5f07cb5ddb6d0450d6e52ecf42b9d3790c58ebd0706e550a497f28bf6357cbe567a2e0e"
+    },
+    {
+      "block_hash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "height": 5,
+      "round": 0,
+      "signature": "0xab36cf2d77f52d039749b2407ec8862230b69044f96c3e471cc5b2ced93237a757a031eea56215b31bf003a1881d90e60e540a6ca2b01aa805b103965dd0b20bfa4b44b01d5cca045276ef9b60691a7fdd6a355877c4fa9f548eeb8e3bcd4a9a"
+    }
+  ],
+  "voter_pubkey": "0x8ae7e5822ba97ab07877ea318e747499da648b27302414f9d0b9bb7e3646d248be90c9fdaddfdb93485a6e9334f01093"
 }

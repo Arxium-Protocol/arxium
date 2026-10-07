@@ -216,8 +216,15 @@ by itself.
 
 **Detect.** The node logs `execution dispute upheld` at `error!` level, and
 `/status` carries `open_dispute_height` (null when none). Alert on it being
-non-null. There is no metrics endpoint in `arxd` yet; the log line and this
-field are the hooks.
+non-null. `/status` also carries `open_dispute_header` (the commitment a
+`ResolveDispute` proposal names, with the height) and `open_dispute_cause` (the
+chain's own `Bug`/`Attack` classification). There is no metrics endpoint in
+`arxd` yet; the log line and these fields are the hooks.
+
+Rehearsed end to end on a local network by
+`scripts/two-node-fault-harness.sh` (`FAULT_KIND=resolve-attack` and
+`resolve-bug`), using `send-tx`'s `propose-resolve-dispute`,
+`propose-reinstate`, `vote` and `execute-proposal`.
 
 **Decide, by this criterion, fixed before an incident:**
 
@@ -243,6 +250,13 @@ field are the hooks.
      needed there; `Forked` exists to record it if the old chain stays up,
      and takes no corrections.
 
+  Rehearsed (`FAULT_KIND=resolve-forked`): a `Forked` proposal that carries
+  corrections is refused and never mined, and a clean one closes the dispute
+  like `Accept` with no balance change. Steps 1-4 themselves are manual and
+  untested: nothing exports `state_at(height - 1)` as a genesis (`arxd
+  snapshot` writes a RocksDB checkpoint, not a chain spec), so a real rebase
+  needs that export written first.
+
   This keeps most of up to 12h of user activity instead of discarding it.
 
 **Undoing a tombstone.** If the dispute turns out to be a determinism bug,
@@ -265,15 +279,14 @@ path B (fork), where the new genesis can leave the signers out of the set;
 their precommits stay in the finality certificate as the public evidence for
 that. A bug is answered by `Bug` (no slash).
 
-**Planned: chain-enforced classification (design, not built).** Today `cause`
-is whatever the vote says, and "re-execute with the canonical binary first"
-is procedure. The chain can't judge intent, but it can judge provenance. An
+**Chain-enforced classification (arxd 0.4.0, schema 29).** `cause` is not
+whatever the vote says. The chain can't judge intent, but it can judge provenance. An
 upheld dispute means the chain's own replay (the canonical build) disagrees
 with a root that at least 2/3 signed, so the signers ran different code, or
 signed a root they never computed. Provenance tells those apart:
 
-- Each header carries `build_id` (hash of the release that produced it,
-  signed with the header). `ChainParams.canonical_builds` lists the release
+- Each header carries `build_id` (the `arxd` release version that produced
+  it, at most 64 bytes, signed with the header). `ChainParams.canonical_builds` lists the release
   ids governance has accepted, updated at each release (the signed-release
   receipts of A-35 already name them).
 - The chain computes `cause` when it upholds the dispute and stores it in

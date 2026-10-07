@@ -805,6 +805,7 @@ fn spawn_evidence<R: ChainRuntime>(
             state_root: String::new(),
             round: 0,
             round_certificate: None,
+            build_id: String::new(),
         };
         R::build_evidence_action(
             EquivocationEvidence {

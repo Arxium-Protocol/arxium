@@ -156,6 +156,7 @@ fn write_equivocation_artifact<P: Serialize>(
             parent_state_root: block.parent_state_root.clone(),
             state_root: block.state_root.clone(),
             round: block.round,
+            build_id: block.build_id.clone(),
         },
         signature: format!("0x{}", block.signature.clone().unwrap_or_default()),
     };
@@ -235,6 +236,7 @@ fn write_disagreement_artifact<P: Serialize>(
             parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
+            build_id: proposed.build_id.clone(),
         },
         signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
     };
@@ -361,6 +363,7 @@ fn write_block_divergence_artifact<P: Serialize>(
             parent_state_root: proposed.parent_state_root.clone(),
             state_root: proposed.state_root.clone(),
             round: proposed.round,
+            build_id: proposed.build_id.clone(),
         },
         signature: format!("0x{}", proposed.signature.clone().unwrap_or_default()),
     };
@@ -674,6 +677,8 @@ mod tests {
         let addr = Address::from_pubkey_bytes(key.verifying_key().as_bytes()).unwrap();
         let mut block: Block<()> = Block::genesis(timestamp);
         block.height = height;
+        // Non-empty: an artifact that drops it no longer verifies.
+        block.build_id = "test-build".to_string();
         block.sign(&GENESIS, addr, key);
         block
     }
@@ -912,10 +917,14 @@ mod tests {
 
         let artifact: EvidenceArtifact =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(matches!(
-            artifact.fault,
-            Fault::BlockDivergence { height: 5, .. }
-        ));
+        match &artifact.fault {
+            Fault::BlockDivergence {
+                height: 5,
+                block_attestation,
+                ..
+            } => assert_eq!(block_attestation.header.build_id, proposed.build_id),
+            other => panic!("unexpected fault {other:?}"),
+        }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while mempool.lock().unwrap().is_empty() {

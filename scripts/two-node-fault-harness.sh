@@ -61,9 +61,27 @@ NUM_VALIDATORS="${NUM_VALIDATORS:-4}"
 FAULT_HEIGHT="${FAULT_HEIGHT:-5}"
 FAULT_KIND="${FAULT_KIND:-divergence}"
 case "$FAULT_KIND" in
-    divergence) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT" ;;
+    # Node 0 runs the current build, so the chain classes the dispute Attack;
+    # the dispute checks run, then this kind carries on to its own rollback checks.
+    divergence) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; EXPECT_CAUSE=Attack; CONTINUE_AFTER=1 ;;
     prevote) FAULT_ENV="ARXD_DOUBLE_PREVOTE_AT_HEIGHT" ;;
-    *) echo "FAULT_KIND must be divergence or prevote" >&2; exit 1 ;;
+    # Build-provenance classification of an upheld dispute (Trello 202):
+    # same injected fault, but node 0 stamps its blocks with FAULT_BUILD_ID
+    # and genesis lists canonical_builds [OLD_BUILD, <this binary's version>].
+    dispute-bug) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug ;;
+    dispute-attack) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID=""; EXPECT_CAUSE=Attack ;;
+    dispute-unlisted) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="unlisted-build"; EXPECT_CAUSE=Attack ;;
+    # The same, then governance closes the dispute: an honest-validator
+    # ResolveDispute proposal, votes, execution after the voting window, and
+    # for an Attack a ReinstateValidator proposal that lifts the tombstone.
+    resolve-attack) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID=""; EXPECT_CAUSE=Attack; RESOLVE=1 ;;
+    resolve-bug) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug; RESOLVE=1 ;;
+    # Resolution Forked (operators rebased instead of accepting): a Forked
+    # proposal carrying corrections is refused, a clean one closes the dispute
+    # like Accept without touching balances. The halt/export/restart procedure
+    # itself is manual and has no tooling to rehearse (docs/consensus-safety.md §5).
+    resolve-forked) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug; RESOLVE=1; RESOLUTION=forked ;;
+    *) echo "FAULT_KIND must be divergence, prevote, dispute-bug, dispute-attack, dispute-unlisted, resolve-attack, resolve-bug or resolve-forked" >&2; exit 1 ;;
 esac
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
@@ -119,6 +137,11 @@ echo "building arxd with fault-injection (--release; see comment above)..."
 cargo build --release -p arxd --features fault-injection >"$ROOT/build.log" 2>&1 \
     || { echo "build failed, see $ROOT/build.log" >&2; exit 1; }
 BIN="$REPO_ROOT/target/release/arxd"
+if [ -n "${RESOLVE:-}" ]; then
+    cargo build --release -p send-tx >>"$ROOT/build.log" 2>&1 \
+        || { echo "send-tx build failed, see $ROOT/build.log" >&2; exit 1; }
+    SEND_TX="$REPO_ROOT/target/release/send-tx"
+fi
 
 echo "generating $NUM_VALIDATORS node identities and validator keys..."
 VALIDATORS='{}'
@@ -131,7 +154,7 @@ ACCOUNTS='{}'
 # funded every honest evidence-report attempt into the same nonce-0 mempool
 # slot forever and looked identical to a resubmission-storm bug. 100x the
 # fee is comfortably more than a short test run needs.
-ACCOUNT_FUNDING=$((100 * 1000000))
+ACCOUNT_FUNDING=$((1000 * 1000000000))  # the metered fee is now ~5e9 IUM per action
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     DIRS[$i]="$ROOT/node-$i"
     mkdir -p "${DIRS[$i]}"
@@ -166,13 +189,19 @@ while (( FAULT_HEIGHT % NUM_VALIDATORS != NODE0_SLOT )); do
 done
 CONFIRM_HEIGHT=$((FAULT_HEIGHT + 6))
 
-jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" '{
+# Default ChainParams from the binary itself, so only canonical_builds is set
+# here (a partial `params` object would not parse).
+CURRENT_BUILD="$("$BIN" --version | awk '{print $2}')"
+PARAMS="$("$BIN" chain-spec --chain local | jq --arg cur "$CURRENT_BUILD" \
+    '.params | .canonical_builds = ["old-build", $cur] | .voting_period_blocks = 10')"
+jq -n --argjson validators "$VALIDATORS" --argjson accounts "$ACCOUNTS" --argjson params "$PARAMS" '{
     genesis_format: "plain",
     height: 0,
     chain_name: "arxium-fault-injection-harness",
     accounts: $accounts,
     validators: $validators,
-    boot_nodes: []
+    boot_nodes: [],
+    params: $params
 }' > "$ROOT/genesis.json"
 
 echo "starting node 0 ($FAULT_KIND fault at height $FAULT_HEIGHT) as ${ADDRS[0]} ..."
@@ -182,6 +211,7 @@ echo "starting node 0 ($FAULT_KIND fault at height $FAULT_HEIGHT) as ${ADDRS[0]}
 # silently depends on whoever's shell started it. Found while building
 # scripts/partition-heal-harness.sh.
 env RUST_LOG="${RUST_LOG:-info}" "$FAULT_ENV=$FAULT_HEIGHT" \
+    ${FAULT_BUILD_ID:+ARXD_FAULT_BUILD_ID=$FAULT_BUILD_ID} \
 "$BIN" --chain "$ROOT/genesis.json" --base-path "${DIRS[0]}" --validator \
     --port "${RPC_PORTS[0]}" --p2p-port "${P2P_PORTS[0]}" --rpc-bind 127.0.0.1 \
     >"$ROOT/node-0.log" 2>&1 &
@@ -240,12 +270,167 @@ echo "chain reached height $tip"
 
 pass=true
 
+# --- Dispute classification (dispute-* kinds) --------------------------------
+# An upheld dispute slashes no one until governance resolves it, so the
+# checks are: the chain upheld it, classed it by provenance, paused
+# settlement, and left node 0 un-tombstoned and every honest node unhurt.
+if [ -n "${EXPECT_CAUSE:-}" ]; then
+    echo "waiting for an upheld dispute classed $EXPECT_CAUSE (timeout ${CHAIN_TIMEOUT}s)..."
+    deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+    upheld=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        upheld="$(grep -h "execution dispute upheld" "$ROOT"/node-[1-9]*.log 2>/dev/null | head -n 1 || true)"
+        [ -n "$upheld" ] && break
+        sleep 2
+    done
+    if [ -z "$upheld" ]; then
+        echo "  FAIL: no execution dispute was ever upheld"; pass=false
+    elif echo "$upheld" | grep -q "cause.*Some($EXPECT_CAUSE)"; then
+        echo "  ok: dispute upheld, cause $EXPECT_CAUSE"
+    else
+        echo "  FAIL: expected cause $EXPECT_CAUSE, got: $upheld"; pass=false
+    fi
+    rpc() { curl -sf "http://127.0.0.1:$RPC_HONEST/$1" || echo '{}'; }
+    node_status() { rpc "validators/${ADDRS[$1]}" | jq -r 'if (.status|type)=="string" then .status else (.status // {} | keys[0]) end // "none"'; }
+    stake_of_node() { rpc "accounts/${ADDRS[$1]}/stake" | jq -r '.active_amount // 0'; }
+    open_h="$(rpc status | jq -r '.open_dispute_height // empty')"
+    if [ -n "$open_h" ]; then echo "  ok: settlement paused below height $open_h"
+    else echo "  FAIL: /status shows no open_dispute_height"; pass=false; fi
+    for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
+        status="$(rpc "validators/${ADDRS[$i]}" | jq -r 'if (.status|type)=="string" then .status else (.status|keys[0]) end // "none"')"
+        if [ "$status" = Tombstoned ]; then
+            echo "  FAIL: node $i is Tombstoned before any resolution"; pass=false
+        fi
+    done
+    echo "  ok: nobody tombstoned by the dispute itself"
+    chain_cause="$(rpc status | jq -r '.open_dispute_cause // empty')"
+    if [ "$chain_cause" = "$EXPECT_CAUSE" ]; then echo "  ok: /status reports open_dispute_cause $chain_cause"
+    else echo "  FAIL: /status open_dispute_cause '$chain_cause', expected $EXPECT_CAUSE"; pass=false; fi
+
+    if [ -n "${RESOLVE:-}" ] && [ "$pass" = true ]; then
+        # Honest validators 1..n-1 act; node 0 is the accused. Three of four
+        # is 7,500 of 10,000 power, over the 5,000 quorum.
+        HONEST=$(seq 1 $((NUM_VALIDATORS - 1)))
+        tx() { # tx <node index> <send-tx args...>; fails the run if the node refuses it
+            local who=$1; shift
+            "$SEND_TX" --from "$(cat "${DIRS[$who]}/validator.key")" \
+                --node "127.0.0.1:${RPC_PORTS[1]}" "$@" >>"$ROOT/send-tx.log" 2>&1 \
+                || { echo "  FAIL: send-tx $* from node $who was refused, see $ROOT/send-tx.log"; return 1; }
+        }
+        nonce_of() { rpc "accounts/$1" | jq -r '.nonce // 0'; }
+        landed() { # landed <node index> <nonce before>: wait for that sender's action to mine
+            local deadline=$(($(date +%s) + 60))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+                [ "$(nonce_of "${ADDRS[$1]}")" -gt "$2" ] && return 0
+                sleep 1
+            done
+            echo "  FAIL: node $1's action never mined"; return 1
+        }
+        run_proposal() { # run_proposal <proposal id> <propose args...>: propose, all honest vote, wait out the window, execute
+            local id=$1; shift
+            local n0 tip0
+            n0="$(nonce_of "${ADDRS[1]}")"
+            tip0="$(rpc status | jq -r '.tip_height')"
+            tx 1 "$@" && landed 1 "$n0" || return 1
+            for i in $HONEST; do
+                n0="$(nonce_of "${ADDRS[$i]}")"
+                tx "$i" --action vote --proposal "$id" --approve true && landed "$i" "$n0" || return 1
+            done
+            # voting_period_blocks is 10 in genesis; execution needs the window over.
+            local deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+            while [ "$(rpc status | jq -r '.tip_height')" -lt $((tip0 + 14)) ]; do
+                [ "$(date +%s)" -lt "$deadline" ] || { echo "  FAIL: chain stalled waiting out the voting window"; return 1; }
+                sleep 2
+            done
+            n0="$(nonce_of "${ADDRS[2]}")"
+            tx 2 --action execute-proposal --proposal "$id" && landed 2 "$n0"
+        }
+
+        dispute_h="$(rpc status | jq -r '.open_dispute_height')"
+        dispute_header="$(rpc status | jq -r '.open_dispute_header')"
+        stake0_before="$(stake_of_node 0)"
+        echo "resolving the dispute at height $dispute_h as $EXPECT_CAUSE through governance..."
+        if [ "${RESOLUTION:-accept}" = forked ]; then
+            # A forked resolution takes no corrections: the chain must refuse
+            # this one (dropped, no proposal id used), and the clean proposal
+            # below then still gets id 0.
+            n0="$(nonce_of "${ADDRS[1]}")"
+            tx 1 --action propose-resolve-dispute --height "$dispute_h" --header "$dispute_header" \
+                --cause "$(echo "$EXPECT_CAUSE" | tr A-Z a-z)" --resolution forked \
+                --correction "${ADDRS[1]}=5" || pass=false
+            deadline=$(($(date +%s) + 30)); refused=""
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+                refused="$(grep -h "a forked resolution carries no corrections" "$ROOT"/node-[1-9]*.log 2>/dev/null | head -n 1 || true)"
+                [ -n "$refused" ] && break
+                sleep 2
+            done
+            if [ -n "$refused" ] && [ "$(nonce_of "${ADDRS[1]}")" = "$n0" ]; then
+                echo "  ok: Forked with corrections was refused and not mined"
+            else
+                echo "  FAIL: Forked with corrections was not refused as expected"; pass=false
+            fi
+        fi
+        if run_proposal 0 --action propose-resolve-dispute --height "$dispute_h" \
+                --header "$dispute_header" --cause "$(echo "$EXPECT_CAUSE" | tr A-Z a-z)" \
+                --resolution "${RESOLUTION:-accept}"; then
+            deadline=$(($(date +%s) + 60)); open_h="$dispute_h"
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+                open_h="$(rpc status | jq -r '.open_dispute_height // empty')"
+                [ -z "$open_h" ] && break
+                sleep 2
+            done
+            if [ -z "$open_h" ]; then echo "  ok: dispute closed, settlement may resume"
+            else echo "  FAIL: dispute still open at height $open_h after the proposal executed"; pass=false; fi
+
+            status0="$(node_status 0)"
+            stake0_after="$(stake_of_node 0)"
+            if [ "$EXPECT_CAUSE" = Attack ]; then
+                if [ "$status0" = Tombstoned ] && [ "$stake0_after" -lt "$stake0_before" ]; then
+                    echo "  ok: node 0 tombstoned and slashed ($stake0_before -> $stake0_after)"
+                else
+                    echo "  FAIL: Attack verdict left node 0 '$status0', stake $stake0_before -> $stake0_after"; pass=false
+                fi
+                # A tombstone lifted by governance: the determinism-bug escape hatch.
+                echo "reinstating node 0 through governance..."
+                if run_proposal 1 --action propose-reinstate --validator "${ADDRS[0]}"; then
+                    deadline=$(($(date +%s) + 60)); status0="Tombstoned"
+                    while [ "$(date +%s)" -lt "$deadline" ]; do
+                        status0="$(node_status 0)"
+                        [ "$status0" != Tombstoned ] && break
+                        sleep 2
+                    done
+                    if [ "$status0" != Tombstoned ]; then echo "  ok: node 0 reinstated (status now '$status0')"
+                    else echo "  FAIL: node 0 still Tombstoned after the reinstate proposal"; pass=false; fi
+                else
+                    pass=false
+                fi
+            else
+                if [ "$status0" != Tombstoned ] && [ "$stake0_after" -eq "$stake0_before" ]; then
+                    echo "  ok: Bug verdict slashed no one (node 0 '$status0', stake $stake0_after)"
+                else
+                    echo "  FAIL: Bug verdict hit node 0: '$status0', stake $stake0_before -> $stake0_after"; pass=false
+                fi
+            fi
+        else
+            pass=false
+        fi
+    fi
+
+    if [ -z "${CONTINUE_AFTER:-}" ]; then
+        if [ "$pass" = true ]; then
+            echo; echo "PASS — $FAULT_KIND: upheld dispute classed $EXPECT_CAUSE by build provenance${RESOLVE:+, resolved through governance}."
+            echo "PASS $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"; echo "logs kept in $ROOT"; exit 0
+        fi
+        echo "FAIL $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$ROOT/result"; echo "FAIL — see $ROOT"; exit 1
+    fi
+fi
+
 # Waited on, not read once: the honest fault action lands a few blocks after
 # the dispute, not necessarily by the time the chain passes CONFIRM_HEIGHT.
-echo "waiting for node 0 to be tombstoned (timeout ${CHAIN_TIMEOUT}s)..."
-deadline=$(($(date +%s) + CHAIN_TIMEOUT))
 node0_status=""
-while [ "$(date +%s)" -lt "$deadline" ]; do
+deadline=$(($(date +%s) + CHAIN_TIMEOUT))
+[ -z "${CONTINUE_AFTER:-}" ] && echo "waiting for node 0 to be tombstoned (timeout ${CHAIN_TIMEOUT}s)..."
+while [ -z "${CONTINUE_AFTER:-}" ] && [ "$(date +%s)" -lt "$deadline" ]; do
     node0_status="$({ curl -sf "http://127.0.0.1:$RPC_HONEST/validators/${ADDRS[0]}" || echo '{}'; } | jq -r '.status // empty')"
     [ "$node0_status" = "Tombstoned" ] && break
     sleep 2
@@ -256,6 +441,9 @@ tip="$(curl -sf "http://127.0.0.1:$RPC_HONEST/status" | jq -r '.tip_height // 0'
 rpc() { curl -sf "http://127.0.0.1:$RPC_HONEST/$1" || echo '{}'; }
 stake_of() { rpc "accounts/$1/stake" | jq -r '.active_amount // 0'; }
 
+# An upheld dispute (divergence) tombstones no one until governance resolves
+# it; that is asserted above. Only a double-sign tombstones on the spot.
+if [ -z "${CONTINUE_AFTER:-}" ]; then
 echo "checking node 0 was slashed and tombstoned..."
 node0_stake="$(stake_of "${ADDRS[0]}")"
 honest_stake="$(stake_of "${ADDRS[1]}")"
@@ -264,6 +452,7 @@ if [ "$node0_status" = "Tombstoned" ] && [ "$node0_stake" -lt "$honest_stake" ];
 else
     echo "  FAIL: node 0 status '${node0_status:-none}', stake $node0_stake (honest node 1: $honest_stake)"
     pass=false
+fi
 fi
 
 echo "checking no honest validator was slashed..."
@@ -452,8 +641,8 @@ fi
 
 if [ "$pass" = true ]; then
     echo
-    echo "PASS — faulty proposer slashed, no wrongful slash or self-incrimination,"
-    echo "evidence written, kept block not disputed, and"
+    echo "PASS — faulty proposer's dispute upheld and classed Attack (no slash until governance"
+    echo "resolves it), no wrongful slash or self-incrimination, evidence written, kept block not disputed, and"
     echo "the diverged node's automatic rollback and reconvergence all held."
     echo "(Recursion guard not exercised by this scenario — see header comment.)"
     # Kept, not deleted. A passing run's logs are how a pass gets checked
