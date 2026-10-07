@@ -401,7 +401,8 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `RemoveAttestor` and `UnblockAttestor` appended. `AttestorRecord` gained
 /// its multisig, block and cooldown fields, `attestor_name:` rows join the
 /// attestor column family, `ChainParams` gained the three attestor
-/// parameters, and `Snapshot.attestors` replaces `attestor`/`attestor_admin`.
+/// parameters, `Proposal` gained `bond` (refunded to an applicant whose vote passes),
+/// and `Snapshot.attestors` replaces `attestor`/`attestor_admin`.
 /// Devnet reset required.
 pub const SCHEMA_VERSION: u32 = 28;
 

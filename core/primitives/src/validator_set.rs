@@ -288,7 +288,8 @@ pub struct ChainParams {
     pub account_extensions_enabled: bool,
     /// IUM an `ApplyAttestor` pays to `treasury_account()`: the spam floor on
     /// applications, since the proposal it opens costs every validator a look.
-    /// Not refunded, whether or not the vote passes.
+    /// Paid back when the vote passes and the attestor registers; kept if the
+    /// vote fails or the proposal is rejected.
     #[serde(default = "default_attestor_apply_bond")]
     pub attestor_apply_bond: u128,
     /// Voting window for a `RemoveAttestor` proposal. Shorter than
@@ -535,6 +536,13 @@ pub struct Proposal {
     pub yes_power: u32,
     pub no_power: u32,
     pub status: ProposalStatus,
+    /// IUM the proposer paid into the treasury to open this vote
+    /// (`ApplyAttestor`'s bond), paid back if it passes. The amount actually
+    /// paid, not the current `attestor_apply_bond`: governance may change the
+    /// param while the vote is open. Set only by the circuit, never by a
+    /// proposer, so a validator-submitted proposal always carries 0.
+    #[serde(default)]
+    pub bond: u128,
 }
 
 /// Where a validator stands with respect to the active set. Written by the
