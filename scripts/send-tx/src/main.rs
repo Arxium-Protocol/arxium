@@ -76,6 +76,14 @@ struct Args {
     #[arg(long)]
     cause: Option<String>,
 
+    /// "propose-resolve-dispute": "accept" (default) or "forked" (operators rebased; takes no corrections).
+    #[arg(long, default_value = "accept")]
+    resolution: String,
+
+    /// "propose-resolve-dispute": a balance correction `ADDRESS=AMOUNT`, repeatable.
+    #[arg(long)]
+    correction: Vec<String>,
+
     /// "propose-resolve-dispute": IUM paid to the challenger from the treasury on a bug.
     #[arg(long, default_value_t = 0)]
     bounty: u128,
@@ -305,8 +313,21 @@ fn main() -> Result<()> {
                         .height
                         .context("--height is required for propose-resolve-dispute")?,
                     header,
-                    resolution: DisputeResolution::Accept,
-                    corrections: Vec::new(),
+                    resolution: match args.resolution.as_str() {
+                        "accept" => DisputeResolution::Accept,
+                        "forked" => DisputeResolution::Forked,
+                        _ => bail!("--resolution must be \"accept\" or \"forked\""),
+                    },
+                    corrections: args
+                        .correction
+                        .iter()
+                        .map(|c| {
+                            let (who, amount) = c
+                                .split_once('=')
+                                .context("--correction must be ADDRESS=AMOUNT")?;
+                            Ok((resolve_address(who, &keys)?, amount.parse()?))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
                     cause,
                     bounty: args.bounty,
                 },

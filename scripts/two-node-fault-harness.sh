@@ -76,7 +76,12 @@ case "$FAULT_KIND" in
     # for an Attack a ReinstateValidator proposal that lifts the tombstone.
     resolve-attack) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID=""; EXPECT_CAUSE=Attack; RESOLVE=1 ;;
     resolve-bug) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug; RESOLVE=1 ;;
-    *) echo "FAULT_KIND must be divergence, prevote, dispute-bug, dispute-attack, dispute-unlisted, resolve-attack or resolve-bug" >&2; exit 1 ;;
+    # Resolution Forked (operators rebased instead of accepting): a Forked
+    # proposal carrying corrections is refused, a clean one closes the dispute
+    # like Accept without touching balances. The halt/export/restart procedure
+    # itself is manual and has no tooling to rehearse (docs/consensus-safety.md §5).
+    resolve-forked) FAULT_ENV="ARXD_INJECT_FAULT_AT_HEIGHT"; FAULT_BUILD_ID="old-build"; EXPECT_CAUSE=Bug; RESOLVE=1; RESOLUTION=forked ;;
+    *) echo "FAULT_KIND must be divergence, prevote, dispute-bug, dispute-attack, dispute-unlisted, resolve-attack, resolve-bug or resolve-forked" >&2; exit 1 ;;
 esac
 BASE_RPC_PORT=18545
 BASE_P2P_PORT=18601
@@ -345,8 +350,29 @@ if [ -n "${EXPECT_CAUSE:-}" ]; then
         dispute_header="$(rpc status | jq -r '.open_dispute_header')"
         stake0_before="$(stake_of_node 0)"
         echo "resolving the dispute at height $dispute_h as $EXPECT_CAUSE through governance..."
+        if [ "${RESOLUTION:-accept}" = forked ]; then
+            # A forked resolution takes no corrections: the chain must refuse
+            # this one (dropped, no proposal id used), and the clean proposal
+            # below then still gets id 0.
+            n0="$(nonce_of "${ADDRS[1]}")"
+            tx 1 --action propose-resolve-dispute --height "$dispute_h" --header "$dispute_header" \
+                --cause "$(echo "$EXPECT_CAUSE" | tr A-Z a-z)" --resolution forked \
+                --correction "${ADDRS[1]}=5" || pass=false
+            deadline=$(($(date +%s) + 30)); refused=""
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+                refused="$(grep -h "a forked resolution carries no corrections" "$ROOT"/node-[1-9]*.log 2>/dev/null | head -n 1 || true)"
+                [ -n "$refused" ] && break
+                sleep 2
+            done
+            if [ -n "$refused" ] && [ "$(nonce_of "${ADDRS[1]}")" = "$n0" ]; then
+                echo "  ok: Forked with corrections was refused and not mined"
+            else
+                echo "  FAIL: Forked with corrections was not refused as expected"; pass=false
+            fi
+        fi
         if run_proposal 0 --action propose-resolve-dispute --height "$dispute_h" \
-                --header "$dispute_header" --cause "$(echo "$EXPECT_CAUSE" | tr A-Z a-z)"; then
+                --header "$dispute_header" --cause "$(echo "$EXPECT_CAUSE" | tr A-Z a-z)" \
+                --resolution "${RESOLUTION:-accept}"; then
             deadline=$(($(date +%s) + 60)); open_h="$dispute_h"
             while [ "$(date +%s)" -lt "$deadline" ]; do
                 open_h="$(rpc status | jq -r '.open_dispute_height // empty')"

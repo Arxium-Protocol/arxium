@@ -250,6 +250,13 @@ Rehearsed end to end on a local network by
      needed there; `Forked` exists to record it if the old chain stays up,
      and takes no corrections.
 
+  Rehearsed (`FAULT_KIND=resolve-forked`): a `Forked` proposal that carries
+  corrections is refused and never mined, and a clean one closes the dispute
+  like `Accept` with no balance change. Steps 1-4 themselves are manual and
+  untested: nothing exports `state_at(height - 1)` as a genesis (`arxd
+  snapshot` writes a RocksDB checkpoint, not a chain spec), so a real rebase
+  needs that export written first.
+
   This keeps most of up to 12h of user activity instead of discarding it.
 
 **Undoing a tombstone.** If the dispute turns out to be a determinism bug,
