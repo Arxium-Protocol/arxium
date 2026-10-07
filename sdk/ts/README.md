@@ -100,9 +100,13 @@ arx query search arx1address
 arx verify signature
 ```
 
-Supported signed actions are `transfer`, `stake`, `unstake`, `join-validator`, `leave-validator`, `register-bls-key`, `authorize-operator`, `revoke-operator`, `grant-attestation`, `revoke-attestation`, `register-asset`, `issue-asset`, and `transfer-asset`. Amount arguments are raw base-unit integers (IUM for ARX, the asset's smallest unit for an asset).
+Supported signed actions are `transfer`, `stake`, `unstake`, `join-validator`, `leave-validator`, `register-bls-key`, `authorize-operator`, `revoke-operator`, `grant-attestation`, `revoke-attestation`, `register-asset`, `issue-asset`, `transfer-asset`, `apply-attestor`, `block-attestor`, `propose-add-attestor`, `propose-remove-attestor`, `propose-unblock-attestor`, `vote` and `execute-proposal`. Amount arguments are raw base-unit integers (IUM for ARX, the asset's smallest unit for an asset).
 
 ```sh
+arx send apply-attestor "Arxium Bank" <owner>,<owner>,<owner> 2 <evidence-hash> <evidence-uri>   # sender is the 2-of-N multisig; validators vote
+arx send propose-remove-attestor <attestor> "reason"   # validators only; blocks that attestor's grants while the vote runs
+arx send vote <proposal-id> yes   # then, after the window: arx send execute-proposal <proposal-id>
+arx send block-attestor   # attestor emergency stop; only a governance vote lifts it
 arx send register-asset fund-a FUNDA "Fund A" 0 kyc CH,LI   # <asset-id> <symbol> <name> <decimals> [topics] [jurisdictions]
 arx send issue-asset arxasset1... 1000
 arx send transfer-asset arxasset1... arx1recipient 100

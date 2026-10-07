@@ -6,9 +6,10 @@
 //! upgrades an attestation to `zk_identity_verified`.
 //!
 //! Same shape as every circuit: plain arguments, read-only view, typed
-//! errors, returns updates without writing them. The runtime decides *who*
-//! may register an attestor (`AdminRole::Attestor`, a chain-config concern);
-//! this crate decides what an attestor may do once registered.
+//! errors, returns updates without writing them. Attestors are added and
+//! removed only by governance (`circuit-governance` calls the registry
+//! functions here); this crate decides what an attestor may do once
+//! registered, and what a registration must look like.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -16,9 +17,14 @@ use std::sync::OnceLock;
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::CanonicalDeserialize;
 use thiserror::Error;
-use xc_circuit::{AccountKey, AttestorRecordKey, KvRead};
-use xc_primitives::{Address, Asset, AttestorRecord, ClaimTopic};
-use xc_storage::{AccountUpdates, AttestorDeregistration, AttestorRegistration, StorageError};
+use xc_circuit::{AccountKey, AttestorNameKey, AttestorRecordKey, KvRead};
+use xc_primitives::{
+    Address, Asset, AttestorRecord, ClaimTopic, attestor_name_skeleton, validate_attestor_multisig,
+    validate_attestor_name,
+};
+use xc_storage::{
+    AccountUpdates, AttestorDeregistration, AttestorRegistration, GovernanceUpdates, StorageError,
+};
 
 #[derive(Error, Debug)]
 pub enum IdentityError {
@@ -28,6 +34,20 @@ pub enum IdentityError {
     NotAttestor(Address),
     #[error("{0} is already a registered attestor")]
     AlreadyAttestor(Address),
+    #[error("{0} is blocked from granting attestations")]
+    AttestorBlocked(Address),
+    #[error("invalid attestor name: {0}")]
+    InvalidName(&'static str),
+    #[error("attestor name {0:?} is too close to one already registered")]
+    NameTaken(String),
+    #[error("invalid attestor multisig: {0}")]
+    InvalidMultisig(&'static str),
+    #[error("{0} already has a removal vote open")]
+    RemovalPending(Address),
+    #[error(
+        "{attestor} survived a removal vote and cannot be targeted again before height {until}"
+    )]
+    RemovalCooldown { attestor: Address, until: u64 },
     #[error("jurisdiction {0:?} is not a 2-letter uppercase ISO-3166-1 alpha-2 code")]
     InvalidJurisdiction(String),
     #[error("account {0} not found")]
@@ -69,11 +89,9 @@ pub fn validate_jurisdiction_code(code: &str) -> Result<(), IdentityError> {
 pub fn require_attestor<V: KvRead<Error = StorageError>>(
     view: &V,
     who: &Address,
-) -> Result<(), IdentityError> {
-    if view.get(&AttestorRecordKey(who))?.is_none() {
-        return Err(IdentityError::NotAttestor(who.clone()));
-    }
-    Ok(())
+) -> Result<AttestorRecord, IdentityError> {
+    view.get(&AttestorRecordKey(who))?
+        .ok_or_else(|| IdentityError::NotAttestor(who.clone()))
 }
 
 /// Whether `address` holds a live attestation: an `identity_hash` granted by
@@ -99,33 +117,110 @@ pub fn is_attested<V: KvRead<Error = StorageError>>(
     }
 }
 
-/// Rejected if already registered — deregister first to change `name`.
+/// Rejected if already registered, or if the name is invalid or too close to
+/// a registered one (`attestor_name_skeleton`). Returns the record write and
+/// the name row that guards its uniqueness.
 pub fn apply_register_attestor<V: KvRead<Error = StorageError>>(
     view: &V,
     attestor: &Address,
     name: &str,
+    owners: &[Address],
+    threshold: u8,
     current_height: u64,
-) -> Result<AttestorRegistration, IdentityError> {
+) -> Result<(AttestorRegistration, GovernanceUpdates), IdentityError> {
+    validate_attestor_name(name).map_err(IdentityError::InvalidName)?;
+    validate_attestor_multisig(attestor, owners, threshold)
+        .map_err(IdentityError::InvalidMultisig)?;
     if view.get(&AttestorRecordKey(attestor))?.is_some() {
         return Err(IdentityError::AlreadyAttestor(attestor.clone()));
     }
-    Ok(AttestorRegistration {
-        attestor: attestor.clone(),
-        record: AttestorRecord {
-            name: name.to_string(),
-            registered_at: current_height,
+    let skeleton = attestor_name_skeleton(name);
+    if view.get(&AttestorNameKey(&skeleton))?.is_some() {
+        return Err(IdentityError::NameTaken(name.to_string()));
+    }
+    let mut name_row = GovernanceUpdates::default();
+    name_row.put(&AttestorNameKey(&skeleton), attestor)?;
+    Ok((
+        AttestorRegistration {
+            attestor: attestor.clone(),
+            record: AttestorRecord {
+                name: name.to_string(),
+                registered_at: current_height,
+                owners: owners.to_vec(),
+                threshold,
+                ..Default::default()
+            },
         },
-    })
+        name_row,
+    ))
 }
 
 /// Attestations it already granted are untouched — `is_attested` stops
-/// honouring them the moment the record is gone.
+/// honouring them the moment the record is gone. Frees the name.
 pub fn apply_deregister_attestor<V: KvRead<Error = StorageError>>(
     view: &V,
     attestor: &Address,
-) -> Result<AttestorDeregistration, IdentityError> {
-    require_attestor(view, attestor)?;
-    Ok(AttestorDeregistration(attestor.clone()))
+) -> Result<(AttestorDeregistration, GovernanceUpdates), IdentityError> {
+    let record = require_attestor(view, attestor)?;
+    let mut name_row = GovernanceUpdates::default();
+    name_row.delete(&AttestorNameKey(&attestor_name_skeleton(&record.name)));
+    Ok((AttestorDeregistration(attestor.clone()), name_row))
+}
+
+/// Sets or clears the attestor's own emergency block. The runtime lets only
+/// the attestor set it (`BlockAttestor`) and only a vote clear it
+/// (`UnblockAttestor`); this function is just the write.
+pub fn apply_set_self_blocked<V: KvRead<Error = StorageError>>(
+    view: &V,
+    attestor: &Address,
+    blocked: bool,
+) -> Result<GovernanceUpdates, IdentityError> {
+    let mut record = require_attestor(view, attestor)?;
+    record.self_blocked = blocked;
+    let mut updates = GovernanceUpdates::default();
+    updates.put(&AttestorRecordKey(attestor), &record)?;
+    Ok(updates)
+}
+
+/// A removal vote is opening: the attestor cannot grant until it closes.
+/// One at a time per attestor, and not again right after a failed vote.
+pub fn apply_open_removal<V: KvRead<Error = StorageError>>(
+    view: &V,
+    attestor: &Address,
+    current_height: u64,
+) -> Result<GovernanceUpdates, IdentityError> {
+    let mut record = require_attestor(view, attestor)?;
+    if record.removal_pending {
+        return Err(IdentityError::RemovalPending(attestor.clone()));
+    }
+    if current_height < record.removal_cooldown_until {
+        return Err(IdentityError::RemovalCooldown {
+            attestor: attestor.clone(),
+            until: record.removal_cooldown_until,
+        });
+    }
+    record.removal_pending = true;
+    let mut updates = GovernanceUpdates::default();
+    updates.put(&AttestorRecordKey(attestor), &record)?;
+    Ok(updates)
+}
+
+/// A removal vote that did not pass (rejected, or its attestor is already
+/// gone): lifts the block and starts the cooldown. The caller handles a vote
+/// that passed with `apply_deregister_attestor`.
+pub fn apply_close_failed_removal<V: KvRead<Error = StorageError>>(
+    view: &V,
+    attestor: &Address,
+    current_height: u64,
+    cooldown_blocks: u64,
+) -> Result<GovernanceUpdates, IdentityError> {
+    let mut updates = GovernanceUpdates::default();
+    if let Some(mut record) = view.get(&AttestorRecordKey(attestor))? {
+        record.removal_pending = false;
+        record.removal_cooldown_until = current_height.saturating_add(cooldown_blocks);
+        updates.put(&AttestorRecordKey(attestor), &record)?;
+    }
+    Ok(updates)
 }
 
 /// Marks `subject` eligible by setting `AccountEntry.identity_hash`, and
@@ -146,7 +241,11 @@ pub fn apply_grant_attestation<V: KvRead<Error = StorageError>>(
     jurisdiction: Option<&str>,
     current_height: u64,
 ) -> Result<AccountUpdates, IdentityError> {
-    require_attestor(view, attestor)?;
+    // Only new grants are blocked. Revoking, and everything already granted,
+    // is untouched, so a block cannot be used to wipe or strand KYC.
+    if require_attestor(view, attestor)?.blocked() {
+        return Err(IdentityError::AttestorBlocked(attestor.clone()));
+    }
     if let Some(code) = jurisdiction {
         validate_jurisdiction_code(code)?;
     }
@@ -362,9 +461,124 @@ mod tests {
             std::process::id()
         ));
         let db = ArxiumDb::open(&path).unwrap();
-        db.write_batch(&apply_register_attestor(&db, attestor, "test", 0).unwrap())
-            .unwrap();
+        // Seeded directly: the multisig rule is exercised on its own below.
+        db.write_batch(&AttestorRegistration {
+            attestor: attestor.clone(),
+            record: AttestorRecord {
+                name: "test".into(),
+                ..Default::default()
+            },
+        })
+        .unwrap();
         db
+    }
+
+    /// A 2-of-3 attestor address and its owners, distinct per `seed`.
+    fn multisig(seed: u8) -> (Address, Vec<Address>) {
+        let owners: Vec<Address> = (0..3).map(|i| addr(seed + i)).collect();
+        let members: Vec<[u8; 32]> = (0..3).map(|i| [seed + i; 32]).collect();
+        (
+            xc_primitives::multisig_address(2, &members).unwrap(),
+            owners,
+        )
+    }
+
+    fn register(db: &ArxiumDb, seed: u8, name: &str) -> Result<Address, IdentityError> {
+        let (attestor, owners) = multisig(seed);
+        let (registration, name_row) = apply_register_attestor(db, &attestor, name, &owners, 2, 5)?;
+        db.write_batch(&registration).unwrap();
+        db.write_batch(&name_row).unwrap();
+        Ok(attestor)
+    }
+
+    #[test]
+    fn registration_needs_a_multisig_a_clean_name_and_a_free_skeleton() {
+        let db = db_with_attestor(&addr(99));
+        let (attestor, owners) = multisig(10);
+        let try_register = |attestor: &Address, name: &str, owners: &[Address], t| {
+            apply_register_attestor(&db, attestor, name, owners, t, 5).map(|_| ())
+        };
+        assert!(matches!(
+            try_register(&attestor, "Bank", &owners, 1),
+            Err(IdentityError::InvalidMultisig(_))
+        ));
+        assert!(matches!(
+            try_register(&addr(10), "Bank", &owners, 2),
+            Err(IdentityError::InvalidMultisig(_))
+        ));
+        assert!(matches!(
+            try_register(&attestor, "B", &owners, 2),
+            Err(IdentityError::InvalidName(_))
+        ));
+        register(&db, 10, "Arxium Bank").unwrap();
+        let record = KvRead::get(&db, &AttestorRecordKey(&attestor))
+            .unwrap()
+            .unwrap();
+        assert_eq!((record.threshold, record.owners.len()), (2, 3));
+        // A lookalike name is refused; the same attestor twice is refused.
+        assert!(matches!(
+            register(&db, 20, "ARX1UM bank"),
+            Err(IdentityError::NameTaken(_))
+        ));
+        assert!(matches!(
+            register(&db, 10, "Other Name"),
+            Err(IdentityError::AlreadyAttestor(_))
+        ));
+        // Removing it frees the name.
+        let (dereg, name_row) = apply_deregister_attestor(&db, &attestor).unwrap();
+        db.write_batch(&dereg).unwrap();
+        db.write_batch(&name_row).unwrap();
+        register(&db, 20, "ARX1UM bank").unwrap();
+    }
+
+    #[test]
+    fn a_blocked_attestor_cannot_grant_but_can_still_revoke_and_what_it_granted_stays() {
+        let (attestor, alice, bob) = (addr(9), addr(1), addr(2));
+        let db = db_with_attestor(&attestor);
+        db.write_batch(
+            &apply_grant_attestation(&db, &attestor, &alice, "h", &[], None, 1).unwrap(),
+        )
+        .unwrap();
+        for block in [
+            // The attestor's own emergency block.
+            apply_set_self_blocked(&db, &attestor, true).unwrap(),
+            // An open removal vote.
+            apply_open_removal(&db, &attestor, 2).unwrap(),
+        ] {
+            db.write_batch(&block).unwrap();
+        }
+        assert!(matches!(
+            apply_grant_attestation(&db, &attestor, &bob, "h", &[], None, 3).unwrap_err(),
+            IdentityError::AttestorBlocked(_)
+        ));
+        assert!(is_attested(&db, &alice).unwrap());
+        apply_revoke_attestation(&db, &attestor, &alice).unwrap();
+        // Unblocking the self-block alone is not enough: the removal vote is open.
+        db.write_batch(&apply_set_self_blocked(&db, &attestor, false).unwrap())
+            .unwrap();
+        assert!(apply_grant_attestation(&db, &attestor, &bob, "h", &[], None, 3).is_err());
+        db.write_batch(&apply_close_failed_removal(&db, &attestor, 10, 100).unwrap())
+            .unwrap();
+        apply_grant_attestation(&db, &attestor, &bob, "h", &[], None, 11).unwrap();
+    }
+
+    #[test]
+    fn one_removal_vote_at_a_time_and_a_cooldown_after_a_failed_one() {
+        let attestor = addr(9);
+        let db = db_with_attestor(&attestor);
+        db.write_batch(&apply_open_removal(&db, &attestor, 1).unwrap())
+            .unwrap();
+        assert!(matches!(
+            apply_open_removal(&db, &attestor, 2).unwrap_err(),
+            IdentityError::RemovalPending(_)
+        ));
+        db.write_batch(&apply_close_failed_removal(&db, &attestor, 5, 100).unwrap())
+            .unwrap();
+        assert!(matches!(
+            apply_open_removal(&db, &attestor, 104).unwrap_err(),
+            IdentityError::RemovalCooldown { until: 105, .. }
+        ));
+        apply_open_removal(&db, &attestor, 105).unwrap();
     }
 
     #[test]
@@ -477,7 +691,7 @@ mod tests {
         db.write_batch(&grant).unwrap();
         assert!(is_attested(&db, &alice).unwrap());
 
-        let dereg = apply_deregister_attestor(&db, &attestor).unwrap();
+        let (dereg, _) = apply_deregister_attestor(&db, &attestor).unwrap();
         db.write_batch(&dereg).unwrap();
         assert!(!is_attested(&db, &alice).unwrap());
     }

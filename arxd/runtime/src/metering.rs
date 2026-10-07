@@ -50,7 +50,8 @@ fn base_weight(payload: &ActionPayload) -> u64 {
         // Groth16 verify over BLS12-381.
         VerifyIdentityCredential { .. } | VerifyClaimProof { .. } => 5_000,
         GrantAttestation { .. } | RevokeAttestation { .. } => 100,
-        RegisterAttestor { .. } | DeregisterAttestor { .. } => 100,
+        // A bond transfer, an application and its proposal row.
+        ApplyAttestor { .. } | BlockAttestor => 150,
         RegisterAsset { .. } => 150,
         IssueAsset { .. }
         | IssueAssetTo { .. }

@@ -293,25 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn threshold_issuer_and_attestor_admin_execute_in_the_real_executor() {
+    fn threshold_issuer_and_attestor_applicant_execute_in_the_real_executor() {
         let db = temp_db();
         db.write_batch(&xc_storage::GenesisHash(hex::encode(crate::TEST_GENESIS)))
             .unwrap();
         let keys = [key(7), key(8), key(9)];
         let issuer = multisig_address(2, &owners(&keys, 2).members).unwrap();
+        let bond = xc_primitives::ChainParams::default().attestor_apply_bond;
         db.write_batches(&[&AccountUpdates(BTreeMap::from([(
             issuer.clone(),
-            funded(100 * FEE_BUDGET),
+            funded(100 * FEE_BUDGET + bond),
         )]))])
         .unwrap();
-        let mut admins = xc_storage::GovernanceUpdates::default();
-        admins
-            .put(
-                &xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor),
-                &issuer,
-            )
-            .unwrap();
-        db.write_batches(&[&admins]).unwrap();
         let asset = AssetRef::derive(&issuer, "gold").unwrap();
         let receiver = Address::from_pubkey_bytes(&key(10).verifying_key().to_bytes()).unwrap();
         let actions = vec![
@@ -343,10 +336,17 @@ mod tests {
             signed(
                 &issuer,
                 2,
-                ActionPayload::RegisterAttestor {
-                    attestor: receiver.clone(),
+                // The 2-of-3 issuer account applies to become an attestor:
+                // the multisig the chain checks is the one that signs.
+                ActionPayload::ApplyAttestor {
                     name: "Provider".into(),
-                    reason: "appointed".into(),
+                    owners: keys
+                        .iter()
+                        .map(|k| Address::from_pubkey_bytes(&k.verifying_key().to_bytes()).unwrap())
+                        .collect(),
+                    threshold: 2,
+                    evidence_hash: "00".into(),
+                    evidence_uri: "https://example.com/evidence".into(),
                 },
                 &keys,
                 None,

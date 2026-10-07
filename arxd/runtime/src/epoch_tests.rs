@@ -320,6 +320,7 @@ fn the_attestation_gate_is_a_chain_param() {
         record: xc_primitives::AttestorRecord {
             name: "kyc-co".into(),
             registered_at: 0,
+            ..Default::default()
         },
     })
     .unwrap();

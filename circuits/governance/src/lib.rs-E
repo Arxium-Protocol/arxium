@@ -363,15 +363,6 @@ pub fn apply_attestor_application<V: KvRead<Error = StorageError>>(
         evidence_uri: evidence_uri.to_string(),
     };
     validate_action(&action)?;
-    // Refuse a name or address that cannot register before taking a bond.
-    circuit_identity::apply_register_attestor(
-        view,
-        applicant,
-        name,
-        owners,
-        threshold,
-        current_height,
-    )?;
     let bond = chain_params(view)?.attestor_apply_bond;
     let treasury = treasury_account();
     let mut payer = view.get(&AccountKey(applicant))?.unwrap_or_default();
@@ -654,9 +645,6 @@ mod tests {
         .unwrap();
         db.write_batch(&ChainParamsRow(ChainParams {
             voting_period_blocks: 10,
-            attestor_apply_bond: 100,
-            attestor_removal_voting_blocks: 5,
-            attestor_removal_cooldown_blocks: 20,
             ..Default::default()
         }))
         .unwrap();
@@ -704,7 +692,7 @@ mod tests {
             )
             .unwrap();
         db.write_batch(&stored).unwrap();
-        let (up, accounts, _, _) = apply_execute(&db, 0, 15).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 0, 15).unwrap();
         db.write_batch(&up).unwrap();
         db.write_batch(&accounts).unwrap();
         assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 100);
@@ -755,7 +743,7 @@ mod tests {
             GovernanceError::VotingClosed { .. }
         ));
 
-        let (up, accounts, _, _) = apply_execute(&db, 0, 15).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 0, 15).unwrap();
         db.write_batch(&up).unwrap();
         db.write_batch(&accounts).unwrap();
         assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 40);
@@ -776,258 +764,50 @@ mod tests {
         assert_eq!(id, 1);
         db.write_batch(&apply_vote(&db, &addr(1), 1, true, 21).unwrap())
             .unwrap();
-        let (up, accounts, _, _) = apply_execute(&db, 1, 30).unwrap();
+        let (up, accounts, _) = apply_execute(&db, 1, 30).unwrap();
         assert!(accounts.0.is_empty());
         db.write_batch(&up).unwrap();
         let p: Proposal = KvRead::get(&db, &ProposalKey(1)).unwrap().unwrap();
         assert_eq!(p.status, ProposalStatus::Rejected);
     }
 
-    /// A 2-of-3 attestor address and its owners, distinct per `seed`.
-    fn attestor_multisig(seed: u8) -> (Address, Vec<Address>) {
-        let owners: Vec<Address> = (0..3).map(|i| addr(seed + i)).collect();
-        let members: Vec<[u8; 32]> = (0..3).map(|i| [seed + i; 32]).collect();
-        (
-            xc_primitives::multisig_address(2, &members).unwrap(),
-            owners,
-        )
-    }
-
-    fn add_attestor(seed: u8, name: &str) -> GovernanceAction {
-        let (attestor, owners) = attestor_multisig(seed);
-        GovernanceAction::AddAttestor {
-            attestor,
-            name: name.into(),
-            owners,
-            threshold: 2,
-            evidence_hash: "00".into(),
-            evidence_uri: "https://example.com/evidence".into(),
-        }
-    }
-
-    /// Writes a proposal's votes and executes it at `at`, applying every
-    /// write the way the runtime does.
-    fn vote_and_execute(
-        db: &ArxiumDb,
-        id: u64,
-        votes: &[(u8, bool)],
-        voted_at: u64,
-        at: u64,
-    ) -> Proposal {
-        for (who, yes) in votes {
-            db.write_batch(&apply_vote(db, &addr(*who), id, *yes, voted_at).unwrap())
-                .unwrap();
-        }
-        let (up, accounts, _, attestors) = apply_execute(db, id, at).unwrap();
-        db.write_batch(&up).unwrap();
-        db.write_batch(&accounts).unwrap();
-        if let Some(registration) = &attestors.registration {
-            db.write_batch(registration).unwrap();
-        }
-        if let Some(deregistration) = &attestors.deregistration {
-            db.write_batch(deregistration).unwrap();
-        }
-        KvRead::get(db, &ProposalKey(id)).unwrap().unwrap()
-    }
-
     #[test]
     fn quorum_and_majority_are_both_required() {
         let db = db();
-        let action = add_attestor(40, "Quorum Co");
-        let (attestor, _) = attestor_multisig(40);
+        let action = GovernanceAction::SetAdmin {
+            role: "attestor".into(),
+            address: addr(9),
+        };
         // 30% + 10% yes is a majority of votes cast but under the 50% quorum.
         let (id, up) = apply_submit(&db, &addr(2), action.clone(), "", 0).unwrap();
         db.write_batch(&up).unwrap();
-        let p = vote_and_execute(&db, id, &[(2, true), (3, true)], 1, 10);
+        db.write_batch(&apply_vote(&db, &addr(2), id, true, 1).unwrap())
+            .unwrap();
+        db.write_batch(&apply_vote(&db, &addr(3), id, true, 1).unwrap())
+            .unwrap();
+        let (up, _, _) = apply_execute(&db, id, 10).unwrap();
+        db.write_batch(&up).unwrap();
+        let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
         assert_eq!(p.status, ProposalStatus::Rejected);
-        assert!(db.get_attestor_record(&attestor).unwrap().is_none());
+        assert!(
+            KvRead::get(&db, &AdminKey(AdminRole::Attestor))
+                .unwrap()
+                .is_none()
+        );
 
-        // 60% yes vs 40% no passes and registers the attestor.
+        // 60% yes vs 40% no passes and rotates the role.
         let (id, up) = apply_submit(&db, &addr(1), action, "", 10).unwrap();
         db.write_batch(&up).unwrap();
-        let p = vote_and_execute(&db, id, &[(1, true), (2, false), (3, false)], 11, 20);
-        assert_eq!(p.status, ProposalStatus::Executed);
-        assert_eq!(
-            db.get_attestor_record(&attestor).unwrap().unwrap().name,
-            "Quorum Co"
-        );
-        // The listing skips the name-uniqueness rows beside the records.
-        assert_eq!(db.list_attestors().unwrap().len(), 1);
-    }
-
-    /// The applicant is not a validator: it pays the bond and the proposal
-    /// is opened on its behalf, then validators vote.
-    #[test]
-    fn an_application_pays_the_bond_opens_a_vote_and_registers_on_pass() {
-        let db = db();
-        let (applicant, owners) = attestor_multisig(50);
-        let treasury = treasury_account();
-        db.write_batch(&AccountUpdates(BTreeMap::from([(
-            applicant.clone(),
-            AccountEntry {
-                balance: 150,
-                ..Default::default()
-            },
-        )])))
-        .unwrap();
-        let apply = |db: &ArxiumDb, who: &Address, name: &str, h| {
-            apply_attestor_application(db, who, name, &owners, 2, "00", "https://e.example", h)
-        };
-
-        // A name no one may register, and a bond the applicant can't cover.
-        assert!(matches!(
-            apply(&db, &applicant, "Bad!", 1).unwrap_err(),
-            GovernanceError::Identity(circuit_identity::IdentityError::InvalidName(_))
-        ));
-        let (poor, poor_owners) = attestor_multisig(55);
-        assert!(matches!(
-            apply_attestor_application(&db, &poor, "Poor Co", &poor_owners, 2, "00", "u", 1)
-                .unwrap_err(),
-            GovernanceError::CannotPayBond { .. }
-        ));
-        // Owners that don't derive the sender are refused.
-        assert!(matches!(
-            apply_attestor_application(&db, &addr(77), "Not Multi", &owners, 2, "00", "u", 1)
-                .unwrap_err(),
-            GovernanceError::Identity(circuit_identity::IdentityError::InvalidMultisig(_))
-        ));
-
-        let (id, up, accounts) = apply(&db, &applicant, "Regulated Bank", 1).unwrap();
-        db.write_batch(&up).unwrap();
-        db.write_batch(&accounts).unwrap();
-        assert_eq!(db.get_account(&applicant).unwrap().unwrap().balance, 50);
-        assert_eq!(db.get_account(&treasury).unwrap().unwrap().balance, 100);
-        let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
-        assert_eq!(p.proposer, applicant);
-        assert_eq!(p.voting_ends_at, 11);
-
-        let p = vote_and_execute(&db, id, &[(1, true)], 2, 11);
-        assert_eq!(p.status, ProposalStatus::Executed);
-        let record = db.get_attestor_record(&applicant).unwrap().unwrap();
-        assert_eq!(
-            (record.name.as_str(), record.threshold),
-            ("Regulated Bank", 2)
-        );
-        // Registered: a lookalike name can't be proposed any more.
-        let (other, other_owners) = attestor_multisig(60);
-        assert!(matches!(
-            apply_attestor_application(
-                &db,
-                &other,
-                "Regu1ated bank",
-                &other_owners,
-                2,
-                "00",
-                "u",
-                12
-            )
-            .unwrap_err(),
-            GovernanceError::Identity(circuit_identity::IdentityError::NameTaken(_))
-        ));
-    }
-
-    fn registered(db: &ArxiumDb, seed: u8, name: &str) -> Address {
-        let (attestor, _) = attestor_multisig(seed);
-        let (id, up) = apply_submit(db, &addr(1), add_attestor(seed, name), "", 0).unwrap();
-        db.write_batch(&up).unwrap();
-        vote_and_execute(db, id, &[(1, true)], 0, 10);
-        attestor
-    }
-
-    fn can_grant(db: &ArxiumDb, attestor: &Address, height: u64) -> bool {
-        circuit_identity::apply_grant_attestation(db, attestor, &addr(5), "h", &[], None, height)
-            .is_ok()
-    }
-
-    #[test]
-    fn a_removal_vote_blocks_grants_until_it_closes_and_a_failed_one_cools_down() {
-        let db = db();
-        let attestor = registered(&db, 70, "Removal Co");
-        assert!(can_grant(&db, &attestor, 11));
-        let remove = GovernanceAction::RemoveAttestor {
-            attestor: attestor.clone(),
-        };
-
-        // Only validators propose removals.
-        assert!(matches!(
-            apply_submit(&db, &addr(9), remove.clone(), "", 20).unwrap_err(),
-            GovernanceError::NotValidator(_)
-        ));
-        let (id, up) = apply_submit(&db, &addr(1), remove.clone(), "", 20).unwrap();
-        db.write_batch(&up).unwrap();
-        let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
-        assert_eq!(p.voting_ends_at, 25, "removals use the shorter window");
-        assert!(
-            !can_grant(&db, &attestor, 21),
-            "blocked while the vote runs"
-        );
-        // One at a time.
-        assert!(matches!(
-            apply_submit(&db, &addr(2), remove.clone(), "", 21).unwrap_err(),
-            GovernanceError::Identity(circuit_identity::IdentityError::RemovalPending(_))
-        ));
-
-        // Nobody votes, the window passes: the proposal fails, the block lifts.
-        let p = vote_and_execute(&db, id, &[], 0, 25);
-        assert_eq!(p.status, ProposalStatus::Rejected);
-        assert!(can_grant(&db, &attestor, 26));
-        // Cooldown: barred until height 25 + 20.
-        assert!(matches!(
-            apply_submit(&db, &addr(1), remove.clone(), "", 44).unwrap_err(),
-            GovernanceError::Identity(circuit_identity::IdentityError::RemovalCooldown { .. })
-        ));
-        // Something it granted before the second vote.
-        let alice = addr(5);
-        db.write_batch(
-            &circuit_identity::apply_grant_attestation(&db, &attestor, &alice, "h", &[], None, 26)
-                .unwrap(),
-        )
-        .unwrap();
-        let (id, up) = apply_submit(&db, &addr(1), remove, "", 45).unwrap();
-        db.write_batch(&up).unwrap();
-        // This one passes: the attestor is gone, what it granted stops counting.
-
-        let p = vote_and_execute(&db, id, &[(1, true)], 46, 50);
-        assert_eq!(p.status, ProposalStatus::Executed);
-        assert!(db.get_attestor_record(&attestor).unwrap().is_none());
-        assert!(!circuit_identity::is_attested(&db, &alice).unwrap());
-        // The name is free again.
-        let (id, up) = apply_submit(&db, &addr(1), add_attestor(80, "REMOVAL co"), "", 51).unwrap();
+        for (who, yes) in [(1, true), (2, false), (3, false)] {
+            db.write_batch(&apply_vote(&db, &addr(who), id, yes, 11).unwrap())
+                .unwrap();
+        }
+        let (up, _, _) = apply_execute(&db, id, 20).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(
-            vote_and_execute(&db, id, &[(1, true)], 52, 61).status,
-            ProposalStatus::Executed
+            KvRead::get(&db, &AdminKey(AdminRole::Attestor)).unwrap(),
+            Some(addr(9))
         );
-    }
-
-    #[test]
-    fn only_a_vote_lifts_a_self_block() {
-        let db = db();
-        let attestor = registered(&db, 90, "Careful Co");
-        db.write_batch(&circuit_identity::apply_set_self_blocked(&db, &attestor, true).unwrap())
-            .unwrap();
-        assert!(!can_grant(&db, &attestor, 11));
-        let unblock = GovernanceAction::UnblockAttestor {
-            attestor: attestor.clone(),
-        };
-        // Unknown attestors are refused before anyone votes.
-        assert!(matches!(
-            apply_submit(
-                &db,
-                &addr(1),
-                GovernanceAction::UnblockAttestor { attestor: addr(77) },
-                "",
-                11
-            )
-            .unwrap_err(),
-            GovernanceError::UnknownAttestor(_)
-        ));
-        let (id, up) = apply_submit(&db, &addr(1), unblock, "", 11).unwrap();
-        db.write_batch(&up).unwrap();
-        assert!(!can_grant(&db, &attestor, 12), "still blocked while voting");
-        let p = vote_and_execute(&db, id, &[(1, true)], 12, 21);
-        assert_eq!(p.status, ProposalStatus::Executed);
-        assert!(can_grant(&db, &attestor, 22));
     }
 
     #[test]
@@ -1090,7 +870,7 @@ mod tests {
         db.write_batch(&up).unwrap();
         db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
             .unwrap();
-        let (up, _, _, _) = apply_execute(&db, id, 10).unwrap();
+        let (up, _, _) = apply_execute(&db, id, 10).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(chain_params(&db).unwrap(), new_params);
     }
@@ -1134,7 +914,7 @@ mod tests {
             )
             .unwrap();
         db.write_batch(&stored).unwrap();
-        let (up, _, _, _) = apply_execute(&db, 0, 10).unwrap();
+        let (up, _, _) = apply_execute(&db, 0, 10).unwrap();
         db.write_batch(&up).unwrap();
         assert_eq!(proposal(&db, 0).unwrap().status, ProposalStatus::Rejected);
         assert_eq!(chain_params(&db).unwrap(), before);
@@ -1188,7 +968,7 @@ mod tests {
             db.write_batch(&up).unwrap();
             db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
                 .unwrap();
-            let (up, accounts, _, _) = apply_execute(&db, id, 10).unwrap();
+            let (up, accounts, _) = apply_execute(&db, id, 10).unwrap();
             db.write_batch(&up).unwrap();
             db.write_batch(&accounts).unwrap();
             let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
@@ -1223,7 +1003,7 @@ mod tests {
             db.write_batch(&up).unwrap();
             db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
                 .unwrap();
-            let (up, _, _, _) = apply_execute(&db, id, 10).unwrap();
+            let (up, _, _) = apply_execute(&db, id, 10).unwrap();
             db.write_batch(&up).unwrap();
             let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();
             p.status
@@ -1276,7 +1056,7 @@ mod tests {
             db.write_batch(&up).unwrap();
             db.write_batch(&apply_vote(&db, &addr(1), id, true, 1).unwrap())
                 .unwrap();
-            let (up, accounts, slash, _) = apply_execute(&db, id, 10).unwrap();
+            let (up, accounts, slash) = apply_execute(&db, id, 10).unwrap();
             db.write_batch(&up).unwrap();
             db.write_batch(&accounts).unwrap();
             let p: Proposal = KvRead::get(&db, &ProposalKey(id)).unwrap().unwrap();

@@ -33,6 +33,35 @@ pub(crate) fn submit<V: KvRead<Error = StorageError>>(
     })
 }
 
+/// `ApplyAttestor`: `action.sender` is the attestor.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_attestor<V: KvRead<Error = StorageError>>(
+    view: &V,
+    action: &ChainAction,
+    name: &str,
+    owners: &[xc_primitives::Address],
+    threshold: u8,
+    evidence_hash: &str,
+    evidence_uri: &str,
+    current_height: u64,
+) -> anyhow::Result<BlockUpdates> {
+    let (_, governance, accounts) = circuit_governance::apply_attestor_application(
+        view,
+        &action.sender,
+        name,
+        owners,
+        threshold,
+        evidence_hash,
+        evidence_uri,
+        current_height,
+    )?;
+    Ok(BlockUpdates {
+        governance,
+        accounts,
+        ..Default::default()
+    })
+}
+
 pub(crate) fn vote<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
@@ -57,11 +86,13 @@ pub(crate) fn execute<V: KvRead<Error = StorageError>>(
     proposal: u64,
     current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    let (governance, accounts, slash) =
+    let (governance, accounts, slash, attestors) =
         circuit_governance::apply_execute(view, proposal, current_height)?;
     let mut updates = BlockUpdates {
         governance,
         accounts,
+        attestor_registration: attestors.registration,
+        attestor_deregistration: attestors.deregistration,
         ..Default::default()
     };
     // An `Attack` verdict: slash and tombstone the proposer, paying the

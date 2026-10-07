@@ -6,13 +6,15 @@ import { ACCOUNT_POLICY_ACTION, POLICY_VARIANT, encodeAccountPolicy, readAccount
 export const ACTION_VARIANT = {
   transfer: 0, joinValidator: 1, leaveValidator: 2, stake: 3, unstake: 4, registerBlsKey: 6,
   authorizeOperator: 8, revokeOperator: 9, grantAttestation: 10, revokeAttestation: 11,
-  registerAsset: 12, issueAsset: 13, transferAsset: 14, freezeAsset: 18, unfreezeAsset: 19,
-  burnAsset: 20, setHolderFrozen: 21, lockHolderAmount: 22, unlockHolderAmount: 23,
-  issuerForcedTransfer: 24, recoverHolder: 25, issueAssetTo: 26,
-  setAssetLimits: 30, verifyClaimProof: 39, setPrivateClaims: 40,
+  registerAsset: 12, issueAsset: 13, transferAsset: 14, freezeAsset: 16, unfreezeAsset: 17,
+  burnAsset: 18, setHolderFrozen: 19, lockHolderAmount: 20, unlockHolderAmount: 21,
+  issuerForcedTransfer: 22, recoverHolder: 23, issueAssetTo: 24,
+  setAssetLimits: 28, verifyClaimProof: 37, setPrivateClaims: 38,
+  submitProposal: 30, voteProposal: 31, executeProposal: 32,
+  applyAttestor: 41, blockAttestor: 42,
 } as const;
-/** `ActionPayload::Token(TokenAction)` is variant 41; these are `TokenAction`'s own discriminants, written after it. */
-export const TOKEN_ACTION = 41;
+/** `ActionPayload::Token(TokenAction)` is variant 39; these are `TokenAction`'s own discriminants, written after it. */
+export const TOKEN_ACTION = 39;
 export const TOKEN_VARIANT = { createToken: 0, mintToken: 1, transferToken: 2, burnToken: 3, renounceMint: 4 } as const;
 const CLASS = { other: 0, real_estate: 1, equity: 2, bond: 3, stablecoin: 4, commodity: 5, token: 6 } as const;
 const TOPIC = { kyc: 0, aml: 1, accredited: 2, jurisdiction: 3 } as const;
@@ -53,6 +55,25 @@ export function encodeMintToken(tokenRef: string, to: string, amount: bigint): U
 export function encodeTransferToken(tokenRef: string, to: string, amount: bigint): Uint8Array { return token("transferToken").string(tokenRef).string(to).varint(amount).bytes(); }
 export function encodeBurnToken(tokenRef: string, amount: bigint): Uint8Array { return token("burnToken").string(tokenRef).varint(amount).bytes(); }
 export function encodeRenounceMint(tokenRef: string): Uint8Array { return token("renounceMint").string(tokenRef).bytes(); }
+/** Applies to become an attestor. The sender is the attestor: its address must be the `threshold`-of-`owners` multisig (threshold >= 2). Pays the application bond and opens a validator vote. */
+export function encodeApplyAttestor(name: string, owners: string[], threshold: number, evidenceHash: string, evidenceUri: string): Uint8Array { return new Writer().varint(ACTION_VARIANT.applyAttestor).string(name).vec(owners, (w, o) => w.string(o)).u8(threshold).string(evidenceHash).string(evidenceUri).bytes(); }
+/** Emergency stop: the sending attestor can no longer grant new attestations. Only a governance vote lifts it. */
+export function encodeBlockAttestor(): Uint8Array { return new Writer().varint(ACTION_VARIANT.blockAttestor).bytes(); }
+/** `GovernanceAction`'s own discriminants (after `SetChainParams` 0, `TreasurySpend` 1, `ResolveDispute` 2, `ReinstateValidator` 3). Only the attestor actions are encodable here. */
+export const GOVERNANCE_ACTION = { addAttestor: 4, removeAttestor: 5, unblockAttestor: 6 } as const;
+export type GovernanceProposal =
+  | { kind: "addAttestor"; attestor: string; name: string; owners: string[]; threshold: number; evidenceHash: string; evidenceUri: string }
+  | { kind: "removeAttestor" | "unblockAttestor"; attestor: string };
+/** An active validator opens a vote. `addAttestor` needs the attestor's multisig address and its owners; applicants who are not validators use `encodeApplyAttestor`. A removal blocks that attestor's new grants while it runs. */
+export function encodeSubmitProposal(proposal: GovernanceProposal, description: string): Uint8Array {
+  const w = new Writer().varint(ACTION_VARIANT.submitProposal).varint(GOVERNANCE_ACTION[proposal.kind]).string(proposal.attestor);
+  if (proposal.kind === "addAttestor") w.string(proposal.name).vec(proposal.owners, (x, o) => x.string(o)).u8(proposal.threshold).string(proposal.evidenceHash).string(proposal.evidenceUri);
+  return w.string(description).bytes();
+}
+/** Stake-weighted vote. One per validator per proposal. */
+export function encodeVoteProposal(proposal: number | bigint, approve: boolean): Uint8Array { return new Writer().varint(ACTION_VARIANT.voteProposal).varint(BigInt(proposal)).bool(approve).bytes(); }
+/** Anyone may close a proposal once its window has ended; this applies it if it passed and always lifts a removal block. */
+export function encodeExecuteProposal(proposal: number | bigint): Uint8Array { return new Writer().varint(ACTION_VARIANT.executeProposal).varint(BigInt(proposal)).bytes(); }
 export function encodeSetAssetLimits(asset: string, maxHolders: number | null, maxBalancePerHolder: bigint | null = null, maxAttestationAge: bigint | null = null): Uint8Array { return new Writer().varint(ACTION_VARIANT.setAssetLimits).string(asset).option(maxHolders, (w, value) => w.varint(value)).option(maxBalancePerHolder, (w, value) => w.varint(value)).option(maxAttestationAge, (w, value) => w.varint(value)).bytes(); }
 
 /** `{ name, input }` names and shapes match `fixtures/signed-actions.json`: amounts are decimal strings, byte fields are number arrays. */
@@ -85,6 +106,11 @@ export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
     case "setAssetLimits": return encodeSetAssetLimits(input.asset, input.maxHolders, nullableBig(input.maxBalancePerHolder), nullableBig(input.maxAttestationAge));
     case "verifyClaimProof": return encodeVerifyClaimProof(input.asset, Uint8Array.from(input.sub), input.todayDays, Uint8Array.from(input.proof));
     case "setPrivateClaims": return encodeSetPrivateClaims(input.asset, input.enabled);
+    case "submitProposal": return encodeSubmitProposal(input.action, input.description);
+    case "voteProposal": return encodeVoteProposal(BigInt(input.proposal), input.approve);
+    case "executeProposal": return encodeExecuteProposal(BigInt(input.proposal));
+    case "applyAttestor": return encodeApplyAttestor(input.name, input.owners, input.threshold, input.evidenceHash, input.evidenceUri);
+    case "blockAttestor": return encodeBlockAttestor();
     case "createToken": return encodeCreateToken(input.symbol, input.name, input.decimals, BigInt(input.initialSupply), nullableBig(input.maxSupply), input.mintable);
     case "mintToken": return encodeMintToken(input.token, input.to, BigInt(input.amount));
     case "transferToken": return encodeTransferToken(input.token, input.to, BigInt(input.amount));
@@ -94,7 +120,7 @@ export function encodePayload({ name, input }: DecodedPayload): Uint8Array {
   }
 }
 const invert = <K extends string>(table: Record<K, number>): Record<number, K> => Object.fromEntries(Object.entries(table).map(([key, value]) => [value, key])) as Record<number, K>;
-const VARIANT_NAME = invert(ACTION_VARIANT), TOKEN_NAME = invert(TOKEN_VARIANT), CLASS_NAME = invert(CLASS), TOPIC_NAME = invert(TOPIC);
+const VARIANT_NAME = invert(ACTION_VARIANT), TOKEN_NAME = invert(TOKEN_VARIANT), CLASS_NAME = invert(CLASS), TOPIC_NAME = invert(TOPIC), GOVERNANCE_NAME = invert(GOVERNANCE_ACTION);
 const known = <T>(value: T | undefined, what: string): T => { if (value === undefined) throw new Error(`unknown ${what}`); return value; };
 /**
  * Decodes a payload the SDK can encode, then re-encodes it and throws unless the bytes match, so what
@@ -135,6 +161,11 @@ export function decodePayload(payload: Uint8Array): DecodedPayload {
     setAssetLimits: () => ({ asset: str(), maxHolders: r.option((rr) => Number(rr.varint())), maxBalancePerHolder: r.option(amount), maxAttestationAge: r.option(amount) }),
     verifyClaimProof: () => ({ asset: str(), sub: Array.from({ length: 32 }, () => r.u8()), todayDays: Number(r.varint()), proof: bytes() }),
     setPrivateClaims: () => ({ asset: str(), enabled: r.bool() }),
+    submitProposal: () => { const kind = known(GOVERNANCE_NAME[Number(r.varint())], "governance action"), attestor = str(); const action = kind === "addAttestor" ? { kind, attestor, name: str(), owners: r.vec((rr) => rr.string()), threshold: r.u8(), evidenceHash: str(), evidenceUri: str() } : { kind, attestor }; return { action, description: str() }; },
+    voteProposal: () => ({ proposal: amount(), approve: r.bool() }),
+    executeProposal: () => ({ proposal: amount() }),
+    applyAttestor: () => ({ name: str(), owners: r.vec((rr) => rr.string()), threshold: r.u8(), evidenceHash: str(), evidenceUri: str() }),
+    blockAttestor: () => ({}),
     createToken: () => ({ symbol: str(), name: str(), decimals: r.u8(), initialSupply: amount(), maxSupply: r.option(amount), mintable: r.bool() }),
     mintToken: () => ({ token: str(), to: str(), amount: amount() }),
     transferToken: () => ({ token: str(), to: str(), amount: amount() }),

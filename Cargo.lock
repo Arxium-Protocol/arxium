@@ -415,7 +415,7 @@ dependencies = [
 
 [[package]]
 name = "arxd"
-version = "0.1.6"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arxd-node",
@@ -1053,6 +1053,7 @@ dependencies = [
 name = "circuit-governance"
 version = "0.1.0"
 dependencies = [
+ "circuit-identity",
  "thiserror 2.0.19",
  "xc-circuit",
  "xc-primitives",

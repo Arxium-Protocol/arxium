@@ -14,8 +14,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use xc_bls::{BlsPublicKey, BlsSignature};
 use xc_circuit::{
-    AccountAssetsKey, AccountKey, AdminKey, AdminRole, AssetBalanceKey, AssetHolderStateKey,
-    AssetHoldersKey, AssetIndexKey, AssetKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey,
+    AccountAssetsKey, AccountKey, AssetBalanceKey, AssetHolderStateKey, AssetHoldersKey,
+    AssetIndexKey, AssetKey, AttestorNameKey, AttestorRecordKey, BlsKeyKey, BlsPubkeyOwnerKey,
     ChainParamsKey, DisputeOpenKey, DisputedBlockKey, EvidenceMarkerKey, GenesisHashKey, KeySpec,
     KvRead, OperatorIndexKey, OperatorKey, StakeByValidatorKey, StakeKey, ValidatorCandidatesKey,
     ValidatorSetKey, ValidatorStatusKey,
@@ -29,7 +29,7 @@ use xc_primitives::Action;
 use xc_primitives::{
     AccountEntry, Address, Asset, AssetRef, AttestorRecord, Block, ChainParams, Hash32,
     HolderState, Snapshot, StakeAllocation, ValidatorStatus, VotingPower, assign_voting_power,
-    stake_subaccount,
+    attestor_name_skeleton, stake_subaccount,
 };
 
 /// Cap shared by range/history reads, so an explorer client can't force a
@@ -393,7 +393,17 @@ const COLUMN_FAMILIES: [&str; 9] = [
 /// `ActionPayload` lost `ForcedTransfer`, so every later variant moved down
 /// one (positional bincode in stored blocks), and `admin:freeze`/
 /// `admin:recovery` rows are no longer seeded. Devnet reset required.
-pub const SCHEMA_VERSION: u32 = 27;
+/// Bumped 27 -> 28: no admin role is left. `RegisterAttestor`/
+/// `DeregisterAttestor` are deleted (variants 15 and 16, so every later
+/// `ActionPayload` variant moved down two), `ApplyAttestor` and
+/// `BlockAttestor` are appended, and governance `SetAdmin` is deleted
+/// (later `GovernanceAction` variants moved down one) with `AddAttestor`,
+/// `RemoveAttestor` and `UnblockAttestor` appended. `AttestorRecord` gained
+/// its multisig, block and cooldown fields, `attestor_name:` rows join the
+/// attestor column family, `ChainParams` gained the three attestor
+/// parameters, and `Snapshot.attestors` replaces `attestor`/`attestor_admin`.
+/// Devnet reset required.
+pub const SCHEMA_VERSION: u32 = 28;
 
 const SCHEMA_VERSION_KEY: &[u8] = b"meta:schema_version";
 const MERKLE_ROOT_KEY: &[u8] = b"meta:merkle_root";
@@ -627,12 +637,11 @@ pub fn cf_for_key(key: &[u8]) -> &'static str {
         || key.starts_with(b"asset_holder:")
     {
         CF_ASSETS
-    } else if key.starts_with(b"attestor_record:") {
+    } else if key.starts_with(b"attestor_record:") || key.starts_with(b"attestor_name:") {
         CF_ATTESTORS
     } else if key.starts_with(b"evidence:") {
         CF_EVIDENCE
-    } else if key.starts_with(b"admin:")
-        || key.starts_with(b"operator:")
+    } else if key.starts_with(b"operator:")
         || key.starts_with(b"operator_index:")
         || key == b"chain_params"
         || key.starts_with(b"proposal")
@@ -986,9 +995,10 @@ impl ArxiumDb {
         {
             let (key, value) = item?;
             let key_str = std::str::from_utf8(&key).map_err(|_| StorageError::CorruptedMeta)?;
-            let address_str = key_str
-                .strip_prefix("attestor_record:")
-                .ok_or(StorageError::CorruptedMeta)?;
+            // The column family also holds `attestor_name:` uniqueness rows.
+            let Some(address_str) = key_str.strip_prefix("attestor_record:") else {
+                continue;
+            };
             let address = Address::parse(address_str).map_err(|_| StorageError::CorruptedMeta)?;
             let (record, _): (AttestorRecord, _) =
                 bincode::serde::decode_from_slice(&value, config)?;
@@ -2683,8 +2693,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
-            attestor: None,
-            attestor_admin: None,
+            attestors: vec![],
         })
         .unwrap();
 
@@ -2737,8 +2746,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
-            attestor: None,
-            attestor_admin: None,
+            attestors: vec![],
         })
         .unwrap();
 
@@ -2774,8 +2782,7 @@ mod explorer_index_tests {
             accounts: Default::default(),
             validators,
             boot_nodes: vec![],
-            attestor: None,
-            attestor_admin: None,
+            attestors: vec![],
         })
         .unwrap();
 

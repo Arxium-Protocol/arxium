@@ -150,7 +150,7 @@ pub enum ActionPayload {
     RevokeOperator,
     /// Marks `subject` eligible (sets `AccountEntry.identity_hash`) — only
     /// a registered attestor (membership in `CF_ATTESTORS`, managed via
-    /// `RegisterAttestor`/`DeregisterAttestor`) may submit this. Records
+    /// governance votes) may submit this, unless it is blocked. Records
     /// `sender` in `AccountEntry.attested_by` for accountability.
     GrantAttestation {
         subject: Address,
@@ -211,23 +211,6 @@ pub enum ActionPayload {
         to: Address,
         amount: u128,
     },
-    /// Adds `attestor` to the trusted-attestor set (the attestor admin
-    /// only, see `Snapshot.attestor_admin`) — the Trust Spectrum's multi-attestor
-    /// model: more than one regulated KYC provider can hold
-    /// `GrantAttestation`/`RevokeAttestation` rights at once. Rejected if
-    /// `attestor` is already registered.
-    RegisterAttestor {
-        attestor: Address,
-        name: String,
-        reason: String,
-    },
-    /// Removes `attestor` from the trusted-attestor set (attestor admin
-    /// only). Any registered attestor may still revoke attestations that
-    /// `attestor` previously granted — see `identity::require_attestor`.
-    DeregisterAttestor {
-        attestor: Address,
-        reason: String,
-    },
     /// Submits a `Fault::BlockDivergence` (or a prevote/precommit equivocation)
     /// evidence artifact (JSON-serialized `xc_artifact::EvidenceArtifact`)
     /// for on-chain adjudication and slashing — the counterpart to
@@ -262,27 +245,27 @@ pub enum ActionPayload {
         reason: String,
     },
     /// Issuer destroys `amount` of its own balance; `total_supply` follows.
-    /// Variant 20 — appended, so Retracer's mirror and the client codecs must
+    /// Variant 18 — appended, so Retracer's mirror and the client codecs must
     /// add it in this position.
     BurnAsset {
         asset: AssetRef,
         amount: u128,
     },
     /// Issuer takes a holder out of circulation for one asset (or back in) —
-    /// Variant 21.
+    /// Variant 19.
     SetHolderFrozen {
         asset: AssetRef,
         holder: Address,
         frozen: bool,
     },
     /// Issuer locks `amount` of a holder's balance against compliant
-    /// transfers. Variant 22.
+    /// transfers. Variant 20.
     LockHolderAmount {
         asset: AssetRef,
         holder: Address,
         amount: u128,
     },
-    /// Reverses `LockHolderAmount`. Variant 23.
+    /// Reverses `LockHolderAmount`. Variant 21.
     UnlockHolderAmount {
         asset: AssetRef,
         holder: Address,
@@ -296,7 +279,7 @@ pub enum ActionPayload {
     ///
     /// `reason` is mandatory and non-empty, as on `FreezeAsset`/
     /// `UnfreezeAsset`. It is not stored in state — the block that carried
-    /// the action is the durable audit record. Variant 24.
+    /// the action is the durable audit record. Variant 22.
     IssuerForcedTransfer {
         asset: AssetRef,
         from: Address,
@@ -306,14 +289,14 @@ pub enum ActionPayload {
     },
     /// Move everything `lost` holds of an asset to `replacement`, which must
     /// pass the asset's compliance rules. Issuer
-    /// only. Variant 25.
+    /// only. Variant 23.
     RecoverHolder {
         asset: AssetRef,
         lost: Address,
         replacement: Address,
     },
     /// Issuer mints straight into a verified investor's balance. `to` passes the asset's compliance rules; the issuer,
-    /// which never holds the units, is not checked. Variant 26.
+    /// which never holds the units, is not checked. Variant 24.
     IssueAssetTo {
         asset: AssetRef,
         to: Address,
@@ -322,17 +305,17 @@ pub enum ActionPayload {
     /// Issuer permanently gives up the right to mint `asset`: sets
     /// `Asset.issuance_locked` and pins `max_supply` to the current
     /// `total_supply`. A burn after this is final — nothing can refill the
-    /// cap room it frees. Issuer only, one-way, idempotent. Variant 27.
+    /// cap room it frees. Issuer only, one-way, idempotent. Variant 25.
     LockIssuance {
         asset: AssetRef,
     },
     /// Issuer hands every issuer right over `asset` to `new_issuer` — key
-    /// rotation and the compromise remedy. Variant 28.
+    /// rotation and the compromise remedy. Variant 26.
     TransferIssuer {
         asset: AssetRef,
         new_issuer: Address,
     },
-    /// Issuer repoints `metadata_uri` (prospectus, terms). Variant 29.
+    /// Issuer repoints `metadata_uri` (prospectus, terms). Variant 27.
     SetAssetMetadataUri {
         asset: AssetRef,
         metadata_uri: Option<String>,
@@ -341,7 +324,7 @@ pub enum ActionPayload {
     /// per-holder concentration limit, and how stale an attestation may be
     /// (in blocks) before a holder no longer qualifies. `None` clears a
     /// limit. Tightening a cap below the current `holder_count` is allowed —
-    /// it stops new holders, it doesn't evict existing ones. Variant 30.
+    /// it stops new holders, it doesn't evict existing ones. Variant 28.
     SetAssetLimits {
         asset: AssetRef,
         max_holders: Option<u32>,
@@ -350,7 +333,7 @@ pub enum ActionPayload {
     },
     /// `LockHolderAmount` with an expiry: the lock releases itself at
     /// `until_height` without a further issuer action — the on-chain shape of
-    /// a holding period. Variant 31.
+    /// a holding period. Variant 29.
     LockHolderAmountUntil {
         asset: AssetRef,
         holder: Address,
@@ -358,25 +341,25 @@ pub enum ActionPayload {
         until_height: u64,
     },
     /// Opens a governance proposal (`circuit-governance`). Sender must be an
-    /// active validator. `description` is bounded like a `reason`. Variant 32.
+    /// active validator. `description` is bounded like a `reason`. Variant 30.
     SubmitProposal {
         action: GovernanceAction,
         description: String,
     },
-    /// One stake-weighted vote per validator per proposal. Variant 33.
+    /// One stake-weighted vote per validator per proposal. Variant 31.
     VoteProposal {
         proposal: u64,
         approve: bool,
     },
     /// Closes a proposal whose window has ended and applies it if it passed.
-    /// Anyone may send it. Variant 34.
+    /// Anyone may send it. Variant 32.
     ExecuteProposal {
         proposal: u64,
     },
     /// Issuer records the record-date cap table of `asset` on the asset
     /// record (`Asset.snapshot`): every non-issuer holder and its balance as
     /// of this block. The corporate actions below name it by height. One live
-    /// snapshot per asset; a new one replaces the old. Variant 35.
+    /// snapshot per asset; a new one replaces the old. Variant 33.
     SnapshotHolders {
         asset: AssetRef,
     },
@@ -385,7 +368,7 @@ pub enum ActionPayload {
     /// pro rata to their snapshot balance, as compliant transfers of
     /// `payout_asset`. Holders failing the payout asset's compliance are
     /// withheld (their share stays with the issuer); dust from floor rounding
-    /// stays too. `payout_asset == asset` is a stock dividend. Variant 36.
+    /// stays too. `payout_asset == asset` is a stock dividend. Variant 34.
     DistributeToHolders {
         asset: AssetRef,
         snapshot_height: u64,
@@ -397,7 +380,7 @@ pub enum ActionPayload {
     /// proceeds are a `DistributeToHolders` against the same snapshot, sent
     /// first. Freeze `asset` between snapshot and redemption — a holder
     /// whose balance dropped below its snapshot fails the action. Clears
-    /// the snapshot. Variant 37.
+    /// the snapshot. Variant 35.
     RedeemHolders {
         asset: AssetRef,
         snapshot_height: u64,
@@ -406,7 +389,7 @@ pub enum ActionPayload {
     /// holding `b` becomes `b * numerator / denominator`. Growth is minted to
     /// the holder under every issuance rule; shrinkage is forced back to the
     /// issuer's treasury. The treasury itself is not scaled. Clears the
-    /// snapshot. Variant 38.
+    /// snapshot. Variant 36.
     SplitAsset {
         asset: AssetRef,
         snapshot_height: u64,
@@ -419,7 +402,7 @@ pub enum ActionPayload {
     /// sender's `HolderState` so `check_party` accepts them for a while.
     /// `sub` is the per-asset pseudonym the proof commits to; `today_days`
     /// is days since 1900-01-01 for the credential expiry check. Only for
-    /// assets with `private_claims`. Variant 39.
+    /// assets with `private_claims`. Variant 37.
     VerifyClaimProof {
         asset: AssetRef,
         sub: [u8; 32],
@@ -428,17 +411,34 @@ pub enum ActionPayload {
     },
     /// Issuer turns claim proofs on or off for `asset`
     /// (`Asset.private_claims`). Turning it off makes every holder fall back
-    /// to clear-text gating immediately. Variant 40.
+    /// to clear-text gating immediately. Variant 38.
     SetPrivateClaims {
         asset: AssetRef,
         enabled: bool,
     },
-    /// Permissionless crypto tokens (`circuits/token`). Variant 41, and the
+    /// Permissionless crypto tokens (`circuits/token`). Variant 39, and the
     /// first family nested under one variant: new token actions extend
     /// `TokenAction` without moving anything in this enum.
     Token(TokenAction),
-    /// Programmable accounts. Variant 42; nested variants are append-only.
+    /// Programmable accounts. Variant 40; nested variants are append-only.
     AccountPolicy(xc_primitives::AccountPolicyAction),
+    /// Applies to become an attestor. The sender is the attestor: it must be
+    /// the `threshold`-of-`owners` multisig address (threshold >= 2), which
+    /// signing proves it controls. Pays `ChainParams.attestor_apply_bond`
+    /// and opens a governance vote (`AddAttestor`); validators check the
+    /// evidence off-chain and vote. `name` is the real-world name validators
+    /// verified, unique and ASCII-only. Variant 41.
+    ApplyAttestor {
+        name: String,
+        owners: Vec<Address>,
+        threshold: u8,
+        evidence_hash: String,
+        evidence_uri: String,
+    },
+    /// Emergency stop: the sender, a registered attestor, can no longer grant
+    /// new attestations. What it granted stays valid. Only a governance vote
+    /// (`UnblockAttestor`) lifts it, never the attestor's own key. Variant 42.
+    BlockAttestor,
 }
 
 /// `ActionPayload::Token`'s actions. Same rule as the outer enum: variant
@@ -559,7 +559,7 @@ mod tests {
     }
 
     /// `VerifyClaimProof`'s exact bytes, pinned identically in Arx+ Swift's
-    /// `ArxiumCodecTests`: variant 39, the ref as a string, `sub` as 32 raw
+    /// `ArxiumCodecTests`: variant 37, the ref as a string, `sub` as 32 raw
     /// bytes (a fixed array has no length prefix), `today_days` as a varint,
     /// the proof as a length-prefixed byte string.
     #[test]
@@ -577,7 +577,7 @@ mod tests {
         let bytes = bincode::serde::encode_to_vec(&payload, xc_primitives::wire_config()).unwrap();
         assert_eq!(
             hex::encode(bytes),
-            "27436172786173736574316c72776a6b6c676e3634656b76357a67673564366e77613035676c7971\
+            "25436172786173736574316c72776a6b6c676e3634656b76357a67673564366e77613035676c7971\
              6361656e66747138343679706c75733435763332653671716c656a3270\
              0101010101010101010101010101010101010101010101010101010101010101\
              fbd2b4020203"
@@ -605,8 +605,6 @@ mod tests {
             "RegisterAsset",
             "IssueAsset",
             "TransferAsset",
-            "RegisterAttestor",
-            "DeregisterAttestor",
             "SubmitExecutionFault",
             "FreezeAsset",
             "UnfreezeAsset",
@@ -633,6 +631,8 @@ mod tests {
             "SetPrivateClaims",
             "Token",
             "AccountPolicy",
+            "ApplyAttestor",
+            "BlockAttestor",
         ];
         let cfg = bincode::config::standard();
         for (idx, name) in EXPECTED.iter().enumerate() {

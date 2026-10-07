@@ -2037,8 +2037,7 @@ mod tests {
     #[test]
     fn every_end_of_an_attestation_closes_the_private_gate() {
         use circuit_identity::{
-            apply_deregister_attestor, apply_grant_attestation, apply_register_attestor,
-            apply_revoke_attestation,
+            apply_deregister_attestor, apply_grant_attestation, apply_revoke_attestation,
         };
         let db = temp_db();
         let (issuer, holder, attestor) = (addr(1), addr(2), addr(9));
@@ -2050,8 +2049,14 @@ mod tests {
         let (accounts, assets) = apply_issue(&db, &mut asset, &issuer, 0, 100).unwrap();
         db.write_batch(&accounts).unwrap();
         db.write_batch(&assets).unwrap();
-        db.write_batch(&apply_register_attestor(&db, &attestor, "kyc", 0).unwrap())
-            .unwrap();
+        db.write_batch(&xc_storage::AttestorRegistration {
+            attestor: attestor.clone(),
+            record: xc_primitives::AttestorRecord {
+                name: "kyc".into(),
+                ..Default::default()
+            },
+        })
+        .unwrap();
         let grant = |height| {
             db.write_batch(
                 &apply_grant_attestation(&db, &attestor, &holder, "leaf", &[], None, height)
@@ -2091,7 +2096,7 @@ mod tests {
         grant(9);
         db.write_batch(&prove(10).unwrap()).unwrap();
         send(11).expect("re-attested and proved");
-        db.write_batch(&apply_deregister_attestor(&db, &attestor).unwrap())
+        db.write_batch(&apply_deregister_attestor(&db, &attestor).unwrap().0)
             .unwrap();
         assert!(
             matches!(send(11), Err(RwaError::NotCompliant { .. })),

@@ -1149,34 +1149,25 @@ mod tests {
         assert!(matches!(outcome, AdjudicationOutcome::Disagreement { .. }));
     }
 
-    /// Seeds the attestor-admin `AdminKey` directly, the same way `arxd/genesis`
-    /// would via `Snapshot.attestor_admin` — mirrors `xc_storage::GenesisHash`'s pattern for
-    /// a single-key write outside a full genesis batch.
-    struct GovernorSeed(Address);
-    impl xc_storage::BatchWritable for GovernorSeed {
-        fn batch_entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
-            Ok(vec![(
-                xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor).encode(),
-                bincode::serde::encode_to_vec(&self.0, bincode::config::standard())?,
-            )])
-        }
-    }
-
-    /// `RegisterAttestor` under `AuthorizeOperator`/`RevokeOperator`'s old
-    /// company: the governor key (now `AdminKey`) moved into `CF_GOVERNANCE` in the schema-v7
-    /// migration specifically so governance actions like this one stop
-    /// being fail-closed-by-construction and become real `Culpable`
-    /// candidates, same as `Transfer`. A dissenter who claims the wrong
-    /// registered name is named culpable.
+    /// `ApplyAttestor` writes a bond transfer and a governance proposal row,
+    /// all reads and writes of them in the merkleized state, so a block
+    /// carrying one is a real `Culpable` candidate like `Transfer`. A
+    /// dissenter who claims the wrong applicant name is named culpable.
     #[test]
     fn a_dissenter_with_a_wrong_registered_attestor_name_is_named_culpable() {
         let db = temp_db();
-        let governor = xc_primitives::Address::from_pubkey_bytes(&[9u8; 32]).unwrap();
-        let carol = xc_primitives::Address::from_pubkey_bytes(&[3u8; 32]).unwrap();
-        db.write_batch(&GovernorSeed(governor.clone())).unwrap();
+        let owner_keys: Vec<[u8; 32]> = (1..=3u8).map(|b| [b; 32]).collect();
+        let owners: Vec<_> = owner_keys
+            .iter()
+            .map(|k| xc_primitives::Address::from_pubkey_bytes(k).unwrap())
+            .collect();
+        // The applicant is its own sender: the multisig the chain verifies.
+        let governor = xc_primitives::multisig_address(2, &owner_keys).unwrap();
+        let carol = governor.clone();
+        let funds = entry(1_000_000_000_000);
         db.write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
             governor.clone(),
-            entry(1_000_000_000),
+            funds.clone(),
         )])))
         .unwrap();
         let pre_root = db.compute_state_root(&[]).unwrap();
@@ -1185,19 +1176,21 @@ mod tests {
             sender: governor.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::RegisterAttestor {
-                attestor: carol.clone(),
+            payload: crate::ActionPayload::ApplyAttestor {
                 name: "kyc-provider".to_string(),
-                reason: "licensed".to_string(),
+                owners: owners.clone(),
+                threshold: 2,
+                evidence_hash: "00".to_string(),
+                evidence_uri: "https://example.com".to_string(),
             },
         };
         let action_bytes =
             bincode::serde::encode_to_vec(&action, bincode::config::standard()).unwrap();
         // Must match the height `replay` below actually dispatches at (the
         // artifact's `height`), not a stand-in 0 — unlike `Transfer`,
-        // `RegisterAttestor` bakes `current_height` into the record it
-        // writes (`registered_at`), so a mismatched height here would make
-        // this test's own "real" root disagree with what replay computes.
+        // the proposal row bakes `current_height` in (`created_at`), so a
+        // mismatched height here would make this test's own "real" root
+        // disagree with what replay computes.
         let height = 5u64;
 
         // The real result, for the honest (proposer's) side.
@@ -1215,8 +1208,7 @@ mod tests {
         )
         .unwrap();
         db.write_batch(&real_updates.accounts).unwrap();
-        db.write_batch(real_updates.attestor_registration.as_ref().unwrap())
-            .unwrap();
+        db.write_batch(&real_updates.governance).unwrap();
         let real_post_root = db.compute_state_root(&[]).unwrap();
 
         // The dissenter's claimed result: a different registered name for
@@ -1224,22 +1216,21 @@ mod tests {
         // pre-state so it doesn't disturb `db`'s already-committed real one.
         let dissent_db = temp_db();
         dissent_db
-            .write_batch(&GovernorSeed(governor.clone()))
-            .unwrap();
-        dissent_db
             .write_batch(&AccountUpdates(std::collections::BTreeMap::from([(
                 governor.clone(),
-                entry(1_000_000_000),
+                funds,
             )])))
             .unwrap();
         let dissent_action: crate::ChainAction = xc_primitives::Action {
             sender: governor.clone(),
             nonce: 0,
             signature: None,
-            payload: crate::ActionPayload::RegisterAttestor {
-                attestor: carol.clone(),
+            payload: crate::ActionPayload::ApplyAttestor {
                 name: "wrong-name".to_string(),
-                reason: "licensed".to_string(),
+                owners: owners.clone(),
+                threshold: 2,
+                evidence_hash: "00".to_string(),
+                evidence_uri: "https://example.com".to_string(),
             },
         };
         let dissent_view = xc_storage::BlockView::new(&dissent_db);
@@ -1256,19 +1247,25 @@ mod tests {
         )
         .unwrap();
         dissent_db.write_batch(&dissent_updates.accounts).unwrap();
-        dissent_db
-            .write_batch(dissent_updates.attestor_registration.as_ref().unwrap())
-            .unwrap();
+        dissent_db.write_batch(&dissent_updates.governance).unwrap();
         let dissent_post_root = dissent_db.compute_state_root(&[]).unwrap();
 
-        let governor_key = xc_circuit::AdminKey(xc_circuit::AdminRole::Attestor).encode();
-        let governor_account_key = AccountKey(&governor).encode();
-        let attestor_key = AttestorRecordKey(&carol).encode();
-        let proofs = vec![
-            hex_proof(db.prove(&governor_key, &pre_root).unwrap()),
-            hex_proof(db.prove(&governor_account_key, &pre_root).unwrap()),
-            hex_proof(db.prove(&attestor_key, &pre_root).unwrap()),
+        // Every key `ApplyAttestor` reads, present or absent in the pre-state.
+        let skeleton = xc_primitives::attestor_name_skeleton("kyc-provider");
+        let dissent_skeleton = xc_primitives::attestor_name_skeleton("wrong-name");
+        let read_keys = [
+            xc_circuit::ChainParamsKey.encode(),
+            AccountKey(&governor).encode(),
+            AccountKey(&xc_primitives::treasury_account()).encode(),
+            xc_circuit::NextProposalIdKey.encode(),
+            AttestorRecordKey(&carol).encode(),
+            xc_circuit::AttestorNameKey(&skeleton).encode(),
+            xc_circuit::AttestorNameKey(&dissent_skeleton).encode(),
         ];
+        let proofs: Vec<_> = read_keys
+            .iter()
+            .map(|key| hex_proof(db.prove(key, &pre_root).unwrap()))
+            .collect();
 
         let proposer_key = SigningKey::from_bytes(&[7u8; 32]);
         let (voter_sk, voter_pk) = xc_bls::keygen_from_seed(&[11u8; 32]).unwrap();
