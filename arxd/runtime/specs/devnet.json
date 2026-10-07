@@ -44,10 +44,20 @@
     }
   },
   "validators": {
+    "arx15nzggt29xh0raynwrmjkam8afhevscqxn0vh8vcyl48sk355v9rszcavgu": {
+      "stake": 110000000000000,
+      "bls_pubkey": "99b788db916681cf60a9a6d714bdd2877ef46a428f4865af6e52267a9c881e78162730b92c5b330cb4f1dc02f8282d01",
+      "bls_pop": "85964131a447f8a861413c53207721c632b524dc8211004abda9441ffa7cb0f9e8fa60c21fdfcd9a57afdbd3492527940ba77ff7a8a16c009dbbe68928633c98866e7db6416425426b1e956e1483f4a0b7d5a16d3dae258cb807130d685c1c9c"
+    },
     "arx1j45zh2gftdnq2jys57xn5r9jgn62pagwcejdajsgvvkrx9umcmzs7avuhm": {
       "stake": 110000000000000,
       "bls_pubkey": "89f623a9958834044629f7f6a85ad5b6af268ebd1546477a22fd5fdd2b28c2b414460c1d7a4b1abf7e2795f010b52266",
       "bls_pop": "877e640c1f770c47fadf9bd423f094524a4c5cce92356d85833a23f38ed2abab5b995f58df06ddd83988278523951fc80c554f1fcc62e5d8c096c38f6369f3c4b17e6560b406092f26c6e56ec77cd7e2ee31653dd0903e6fe74ee33e2b445474"
+    },
+    "arx1l4egx9ldf0gn8w204djukhwxp2a72wvuwglvh97ltul0vud57jkqq4mr7g": {
+      "stake": 110000000000000,
+      "bls_pubkey": "817bf052dc368bc78b4412af5b9b6aae32708d44e21cfa2e2009346b6f63e1e141abb7c46b349d81f7c8cb957c86b965",
+      "bls_pop": "91cabd4f72befeb59698dda8b5719df1d51ba8b2f889418e6e340f10736e464139bac594859ca3868f4b757ee8589b3214a744b8cf057f075acff4b4774fa26a94b9a52227fe7c1a5fccd8acbf7d445de18fd9ed30ca923a030c131a8ee45e5e"
     },
     "arx1sr70rpddsvsf8mx00znna4mw3hqz5avtsaflfj778mtcye9l58kscq7ssq": {
       "stake": 110000000000000,
@@ -57,6 +67,19 @@
   },
   "boot_nodes": [
     "/ip4/152.228.171.4/tcp/30334/p2p/12D3KooWCu4R4iVt5C2mT1xFHhhWqDP48vbLuLLasFkpWh5zGxec",
-    "/ip4/152.228.171.139/tcp/30334/p2p/12D3KooWRkjhtYyroNjmvUYYPjd5CYaDv2qe9nvK4u1Mb9UcPnHQ"
+    "/ip4/152.228.171.139/tcp/30334/p2p/12D3KooWRkjhtYyroNjmvUYYPjd5CYaDv2qe9nvK4u1Mb9UcPnHQ",
+    "/ip4/15.235.62.103/tcp/30334/p2p/12D3KooWSrUBnV2yorYYzxcg6sM38eZLzuAbdWowp7PduG3f7FT1",
+    "/ip4/15.235.62.104/tcp/30334/p2p/12D3KooWFAhAxfZVhqfKccFJBWcCzC3poRbwoiHmExnShydmBhur"
+  ],
+  "attestors": [
+    {
+      "address": "arx1q9jlzhpuwp7j34ms7qyt0lfrjksnky0jalppjwcltzugu2y65g6d7scz67k",
+      "name": "Arxium (genesis attestor)",
+      "owners": [
+        "arx1qfg4t9mc6e22ka9jzera7w4qnp6lspullwgzl8xgaclduf87re9s05tus7",
+        "arx14q2fajfcj95qwnq0x9q9ppgm7hjuvmmzfgdczjmjkhmsh04a39gqlpn3md"
+      ],
+      "threshold": 2
+    }
   ]
 }
