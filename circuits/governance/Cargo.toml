@@ -9,6 +9,7 @@ thiserror = { workspace = true }
 xc-storage = { workspace = true }
 xc-primitives = { workspace = true }
 xc-circuit = { workspace = true }
+circuit-identity = { workspace = true }
 
 [lints]
 workspace = true

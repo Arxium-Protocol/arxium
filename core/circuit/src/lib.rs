@@ -276,6 +276,18 @@ impl KeySpec for AttestorRecordKey<'_> {
     }
 }
 
+/// The attestor that holds a name, by `attestor_name_skeleton` — what keeps
+/// two attestors from registering names that read alike. `CF_ATTESTORS`,
+/// merkleized with the records it guards.
+pub struct AttestorNameKey<'a>(pub &'a str);
+impl KeySpec for AttestorNameKey<'_> {
+    const CF: &'static str = CF_ATTESTORS;
+    type Value = Address;
+    fn encode(&self) -> Vec<u8> {
+        format!("attestor_name:{}", self.0).into_bytes()
+    }
+}
+
 /// Replay-protection marker for a slashed equivocation/fault at `height` by
 /// `proposer` — `CF_EVIDENCE`, included in `is_state_key`, so the
 /// proof-only adjudicator can read it through `KvRead` like everything else
@@ -431,46 +443,6 @@ impl KeySpec for NextProposalIdKey {
     type Value = u64;
     fn encode(&self) -> Vec<u8> {
         b"proposal_next_id".to_vec()
-    }
-}
-
-/// The chain's privileged roles. Only one: the party that decides who may
-/// act as a KYC provider. Every control over an asset (freeze, forced
-/// transfer, recovery) belongs to that asset's issuer alone. See
-/// `Snapshot::attestor_admin`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdminRole {
-    /// `RegisterAttestor`/`DeregisterAttestor`.
-    Attestor,
-}
-
-impl AdminRole {
-    /// The short form `GovernanceAction::SetAdmin.role` carries.
-    pub fn parse(role: &str) -> Option<Self> {
-        match role {
-            "attestor" => Some(AdminRole::Attestor),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            AdminRole::Attestor => "attestor admin",
-        }
-    }
-}
-
-/// Address holding `AdminRole`, seeded at genesis. Lives in
-/// `CF_GOVERNANCE` (included in `is_state_key`) so the gated actions are
-/// provable to the proof-only adjudicator instead of failing closed.
-pub struct AdminKey(pub AdminRole);
-impl KeySpec for AdminKey {
-    const CF: &'static str = CF_GOVERNANCE;
-    type Value = Address;
-    fn encode(&self) -> Vec<u8> {
-        match self.0 {
-            AdminRole::Attestor => b"admin:attestor".to_vec(),
-        }
     }
 }
 

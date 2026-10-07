@@ -51,6 +51,9 @@ try {
   assert.deepEqual(await decoded("issue-asset", "arxasset1x", "1000"), { name: "issueAsset", input: { asset: "arxasset1x", amount: "1000" } });
   assert.deepEqual(await decoded("transfer-asset", "arxasset1x", vectors.sender, "5"), { name: "transferAsset", input: { asset: "arxasset1x", to: vectors.sender, amount: "5" } });
   console.log("CLI register-asset / issue-asset / transfer-asset payloads passed");
+  assert.deepEqual(await decoded("apply-attestor", "Arxium Bank", `${vectors.sender},${vectors.sender}`, "2", "ab12", "https://e.example"), { name: "applyAttestor", input: { name: "Arxium Bank", owners: [vectors.sender, vectors.sender], threshold: 2, evidenceHash: "ab12", evidenceUri: "https://e.example" } });
+  assert.deepEqual(await decoded("block-attestor"), { name: "blockAttestor", input: {} });
+  console.log("CLI apply-attestor / block-attestor payloads passed");
 } finally {
   await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
   await rm(dir, { recursive: true, force: true });

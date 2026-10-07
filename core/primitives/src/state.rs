@@ -233,7 +233,7 @@ pub struct Asset {
     /// `None` means uncapped. Enforced in `circuit_rwa_asset::apply_issue`.
     pub max_supply: Option<u128>,
     /// Cumulative issued supply, maintained by `apply_issue`/`apply_issue_to`
-    /// and reduced by `apply_burn` (`BurnAsset`, variant 20).
+    /// and reduced by `apply_burn` (`BurnAsset`, variant 18).
     pub total_supply: u128,
     /// Blocks every transfer of this asset while set. Issuance is
     /// deliberately still allowed; freezing is about circulation.
@@ -274,7 +274,7 @@ pub struct Asset {
     /// `circuit-rwa-asset` wherever a balance crosses zero. The issuer's own
     /// treasury balance is not a holder for cap purposes.
     pub holder_count: u32,
-    /// The record-date cap table (`SnapshotHolders`, variant 35) that the
+    /// The record-date cap table (`SnapshotHolders`, variant 33) that the
     /// corporate actions (`DistributeToHolders`/`RedeemHolders`/`SplitAsset`)
     /// pay or scale against. One live snapshot per asset; taking another
     /// replaces it, and the actions that move the balances it describes
@@ -284,7 +284,7 @@ pub struct Asset {
     // give it its own merkleized key if snapshots of thousands of holders
     // start showing up in transfer cost.
     pub snapshot: Option<CapTable>,
-    /// Issuer opt-in (`SetPrivateClaims`, variant 40): a holder may clear
+    /// Issuer opt-in (`SetPrivateClaims`, variant 38): a holder may clear
     /// `required_claims`/`allowed_jurisdictions` with a zk claim proof
     /// (`VerifyClaimProof`, variant 39) instead of clear-text account
     /// fields. Off by default, so existing assets keep today's gating.
@@ -428,10 +428,39 @@ pub struct HolderState {
     pub claim_verified_at: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AttestorRecord {
     pub name: String,
     pub registered_at: u64,
+    /// The multisig's members and threshold, checked against the address at
+    /// registration. Kept so a reader can see who the attestor is.
+    pub owners: Vec<Address>,
+    pub threshold: u8,
+    /// Set by the attestor's own `BlockAttestor`. Only governance clears it.
+    pub self_blocked: bool,
+    /// A `RemoveAttestor` vote is open. Cleared when the proposal is
+    /// executed, whatever the outcome.
+    pub removal_pending: bool,
+    /// A failed removal vote bars a new one before this height.
+    pub removal_cooldown_until: u64,
+}
+
+impl AttestorRecord {
+    /// A blocked attestor may not grant new attestations; everything it
+    /// granted earlier stays valid, and revoking stays open to it.
+    pub fn blocked(&self) -> bool {
+        self.self_blocked || self.removal_pending
+    }
+}
+
+/// One attestor seeded at genesis. Same rules as a voted-in one (named,
+/// multisig), so the genesis attestor is not a special case.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GenesisAttestor {
+    pub address: Address,
+    pub name: String,
+    pub owners: Vec<Address>,
+    pub threshold: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -446,20 +475,11 @@ pub struct Snapshot {
     /// means rely on mDNS or an explicit CLI override.
     #[serde(default)]
     pub boot_nodes: Vec<String>,
-    /// The sole address allowed to grant/revoke `identity_hash` attestations
-    /// (`ActionPayload::GrantAttestation`/`RevokeAttestation`). Fixed at
-    /// genesis rather than governed — see the compliance-integration plan's
-    /// Stage 1 note that a governance mechanism is deferred. `Option` and
-    /// `#[serde(default)]` so existing specs without compliance features
-    /// still parse; a chain with no attestor simply can't grant attestations.
+    /// Attestors registered at genesis: the only way one exists before the
+    /// first vote, and they stay until a vote removes them. Empty means no
+    /// one can grant attestations until a proposal adds one.
     #[serde(default)]
-    pub attestor: Option<Address>,
-    /// Address allowed to submit `RegisterAttestor`/`DeregisterAttestor` —
-    /// separate from `attestor` above because deciding *who* may act as a
-    /// KYC provider shouldn't require the same key to also perform KYC.
-    /// `Option`/`#[serde(default)]` for the same reason as `attestor`.
-    #[serde(default)]
-    pub attestor_admin: Option<Address>,
+    pub attestors: Vec<GenesisAttestor>,
     /// Epoch length, attestation gate, minimum set — see `ChainParams`.
     /// Defaults so specs written before it existed still parse.
     #[serde(default)]
@@ -521,6 +541,16 @@ impl Snapshot {
                     pop.len()
                 ),
                 _ => {}
+            }
+        }
+        let mut skeletons = std::collections::BTreeSet::new();
+        for a in &self.attestors {
+            crate::validate_attestor_name(&a.name)
+                .map_err(|e| anyhow::anyhow!("{e}: {:?}", a.name))?;
+            crate::validate_attestor_multisig(&a.address, &a.owners, a.threshold)
+                .map_err(|e| anyhow::anyhow!("genesis attestor {:?}: {e}", a.name))?;
+            if !skeletons.insert(crate::attestor_name_skeleton(&a.name)) {
+                anyhow::bail!("genesis attestor name {:?} collides with another", a.name);
             }
         }
         for (address, entry) in &self.accounts {

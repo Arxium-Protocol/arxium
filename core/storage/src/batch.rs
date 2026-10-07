@@ -124,24 +124,23 @@ impl BatchWritable for Snapshot {
             ChainParamsKey.encode(),
             bincode::serde::encode_to_vec(&self.params, config)?,
         ));
-        if let Some(attestor) = &self.attestor {
-            // Seeds the multi-attestor registry with this chain-spec's
-            // legacy single attestor field, so a spec written before the
-            // Trust Spectrum registry existed still grants a working
-            // attestor at genesis instead of silently having none.
+        for seed in &self.attestors {
             let record = AttestorRecord {
-                name: "genesis".to_string(),
+                name: seed.name.clone(),
                 registered_at: self.height,
+                owners: seed.owners.clone(),
+                threshold: seed.threshold,
+                self_blocked: false,
+                removal_pending: false,
+                removal_cooldown_until: 0,
             };
             entries.push((
-                AttestorRecordKey(attestor).encode(),
+                AttestorRecordKey(&seed.address).encode(),
                 bincode::serde::encode_to_vec(&record, config)?,
             ));
-        }
-        if let Some(admin) = &self.attestor_admin {
             entries.push((
-                AdminKey(AdminRole::Attestor).encode(),
-                bincode::serde::encode_to_vec(admin, config)?,
+                AttestorNameKey(&attestor_name_skeleton(&seed.name)).encode(),
+                bincode::serde::encode_to_vec(&seed.address, config)?,
             ));
         }
         Ok(entries)
@@ -1043,6 +1042,7 @@ mod effects_tests {
                 record: AttestorRecord {
                     name: "att".into(),
                     registered_at: 7,
+                    ..Default::default()
                 },
             }],
             &[AttestorDeregistration(a.clone())],

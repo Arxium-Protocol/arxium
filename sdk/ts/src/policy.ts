@@ -1,7 +1,7 @@
 import { Reader, Writer, asBuffer, fromHex, toHex } from "./bincode.js";
 import { multisigAddress, multisigSignature, signAction, verifyMultisig } from "./actions.js";
 
-export const ACCOUNT_POLICY_ACTION = 42;
+export const ACCOUNT_POLICY_ACTION = 40;
 export const POLICY_VARIANT = { setAccountPolicy: 0, rotateAccountMembers: 1, addSessionKey: 2, revokeSessionKey: 3, startAccountRecovery: 4, cancelAccountRecovery: 5, executeAccountRecovery: 6 } as const;
 export type ThresholdPolicy = { threshold: number; members: string[] };
 export type SpendAsset = "native" | { asset: string };

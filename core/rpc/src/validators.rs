@@ -13,6 +13,27 @@ pub(super) struct AttestorResponse {
     attestor: String,
     name: String,
     registered_at: u64,
+    owners: Vec<String>,
+    threshold: u8,
+    /// Cannot grant new attestations: self-blocked or a removal vote is open.
+    blocked: bool,
+    self_blocked: bool,
+    removal_pending: bool,
+}
+
+impl AttestorResponse {
+    fn new(attestor: &Address, record: xc_primitives::AttestorRecord) -> Self {
+        Self {
+            attestor: attestor.to_string(),
+            blocked: record.blocked(),
+            name: record.name,
+            registered_at: record.registered_at,
+            owners: record.owners.iter().map(ToString::to_string).collect(),
+            threshold: record.threshold,
+            self_blocked: record.self_blocked,
+            removal_pending: record.removal_pending,
+        }
+    }
 }
 
 /// Every attestor currently in the trust-spectrum registry.
@@ -24,11 +45,7 @@ pub(super) async fn get_attestors<P: Payload>(
             .db
             .list_attestors()?
             .into_iter()
-            .map(|(attestor, record)| AttestorResponse {
-                attestor: attestor.to_string(),
-                name: record.name,
-                registered_at: record.registered_at,
-            })
+            .map(|(attestor, record)| AttestorResponse::new(&attestor, record))
             .collect(),
     ))
 }
@@ -43,11 +60,7 @@ pub(super) async fn get_attestor<P: Payload>(
         .db
         .get_attestor_record(&address)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(AttestorResponse {
-        attestor: address.to_string(),
-        name: record.name,
-        registered_at: record.registered_at,
-    }))
+    Ok(Json(AttestorResponse::new(&address, record)))
 }
 
 #[derive(serde::Deserialize)]

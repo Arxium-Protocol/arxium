@@ -6,6 +6,7 @@ use std::path::PathBuf;
 mod action;
 mod address;
 mod asset_ref;
+mod attestor;
 mod block;
 mod consensus;
 mod hash32;
@@ -19,6 +20,10 @@ pub use action::{
 };
 pub use address::{Address, AddressError};
 pub use asset_ref::{AssetRef, AssetRefError};
+pub use attestor::{
+    MAX_ATTESTOR_NAME_LEN, MIN_ATTESTOR_NAME_LEN, MIN_ATTESTOR_THRESHOLD, attestor_name_skeleton,
+    validate_attestor_multisig, validate_attestor_name,
+};
 pub use block::{Block, RawBlock};
 pub use consensus::{
     MAX_FUTURE_DRIFT_SECS, RoundCertificate, eligible_proposer, expected_proposer,
@@ -28,8 +33,8 @@ pub use hash32::{Hash32, Hash32Error};
 pub use policy::*;
 pub use state::{
     AccountEntry, Asset, AssetClass, AssetMetadata, AttestorRecord, CapTable, ClaimTopic,
-    CountryCode, HolderState, Snapshot, StakeAllocation, Unbonding, ValidatorEntry,
-    reward_pool_account, stake_subaccount, treasury_account,
+    CountryCode, GenesisAttestor, HolderState, Snapshot, StakeAllocation, Unbonding,
+    ValidatorEntry, reward_pool_account, stake_subaccount, treasury_account,
 };
 pub use validator_set::{
     ChainParams, DEFAULT_ACTION_FEE, DEFAULT_MIN_VALIDATOR_STAKE, DEFAULT_REWARD_PER_BLOCK,

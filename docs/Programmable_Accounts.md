@@ -3,8 +3,8 @@
 ## Milestone coverage and release status
 
 - **M1:** immutable threshold issuer/admin roles run through the real executor.
-  `account_policy::tests::threshold_issuer_and_attestor_admin_execute_in_the_real_executor`
-  registers and issues an asset, registers an attestor, performs an issuer
+  `account_policy::tests::threshold_issuer_and_attestor_applicant_execute_in_the_real_executor`
+  registers and issues an asset, applies as an attestor, performs an issuer
   forced transfer, and freezes the asset. Threshold signatures are
   verified before role dispatch. The SDK/CLI, Console, API assembler and mobile
   codecs provide building, individual signing and assembly.

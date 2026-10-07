@@ -1,66 +1,21 @@
 // Copyright (c) 2026 Arxium Protocol AG
 // SPDX-License-Identifier: Apache-2.0
 
-use xc_circuit::{AdminKey, AdminRole, KvRead};
+use xc_circuit::KvRead;
 use xc_executor::BlockUpdates;
 use xc_primitives::{Address, ClaimTopic};
 use xc_storage::StorageError;
 
 use crate::ChainAction;
 
-/// Authorization check for the privileged roles — `action.sender` must be
-/// the genesis-seeded holder of `role` (`AdminKey`, see
-/// `Snapshot.{attestor,freeze,recovery}_admin`). One address per role; for
-/// on-chain M-of-N, that address is a multisig one
-/// (`xc_primitives::multisig_address`) and the threshold is enforced by
-/// `Action::verify_signature` before this runs. Stays in the runtime: which address holds a role is chain
-/// configuration, not identity logic.
-pub(crate) fn require_admin<V: KvRead<Error = StorageError>>(
+/// `BlockAttestor`: the sender, a registered attestor, stops its own new
+/// grants. There is no inverse here: lifting it takes a vote.
+pub(crate) fn block_attestor<V: KvRead<Error = StorageError>>(
     view: &V,
     action: &ChainAction,
-    role: AdminRole,
-) -> anyhow::Result<()> {
-    let admin = view
-        .get(&AdminKey(role))?
-        .ok_or_else(|| anyhow::anyhow!("chain has no {} configured", role.name()))?;
-    if action.sender != admin {
-        anyhow::bail!("{} is not the {}", action.sender, role.name());
-    }
-    Ok(())
-}
-
-/// `AdminRole::Attestor`-gated. The registry itself lives in `circuit-identity`.
-pub(crate) fn register_attestor<V: KvRead<Error = StorageError>>(
-    view: &V,
-    action: &ChainAction,
-    attestor: &Address,
-    name: &str,
-    reason: &str,
-    current_height: u64,
 ) -> anyhow::Result<BlockUpdates> {
-    crate::asset::check_reason(reason, "registering an attestor")?;
-    require_admin(view, action, AdminRole::Attestor)?;
     Ok(BlockUpdates {
-        attestor_registration: Some(circuit_identity::apply_register_attestor(
-            view,
-            attestor,
-            name,
-            current_height,
-        )?),
-        ..Default::default()
-    })
-}
-
-pub(crate) fn deregister_attestor<V: KvRead<Error = StorageError>>(
-    view: &V,
-    action: &ChainAction,
-    attestor: &Address,
-    reason: &str,
-) -> anyhow::Result<BlockUpdates> {
-    crate::asset::check_reason(reason, "deregistering an attestor")?;
-    require_admin(view, action, AdminRole::Attestor)?;
-    Ok(BlockUpdates {
-        attestor_deregistration: Some(circuit_identity::apply_deregister_attestor(view, attestor)?),
+        governance: circuit_identity::apply_set_self_blocked(view, &action.sender, true)?,
         ..Default::default()
     })
 }
@@ -152,7 +107,7 @@ mod tests {
             &AttestorRecordKey(&attestor),
             &AttestorRecord {
                 name: "test".to_string(),
-                registered_at: 0,
+                ..Default::default()
             },
         )
         .unwrap();

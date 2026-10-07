@@ -845,8 +845,7 @@ mod tests {
             accounts,
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
-            attestor: None,
-            attestor_admin: None,
+            attestors: vec![],
         })
         .unwrap();
 
@@ -976,8 +975,7 @@ mod tests {
             accounts,
             validators: BTreeMap::new(),
             boot_nodes: Vec::new(),
-            attestor: None,
-            attestor_admin: None,
+            attestors: vec![],
         })
         .unwrap();
 

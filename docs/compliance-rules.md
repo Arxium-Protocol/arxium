@@ -27,17 +27,45 @@ is right and this file is stale — fix the file.
   `required_claims`, `allowed_jurisdictions`, `max_attestation_age`,
   `max_holders`, `max_balance_per_holder`, `max_supply`, plus the
   `frozen` / `issuance_locked` switches.
-- **Roles.** One chain-wide admin address seeded at genesis: the attestor
-  admin, which decides who may act as a KYC provider. Every control over an
-  asset — freeze, forced transfer, recovery — belongs to that asset's issuer
-  and no one else. Either may be a multisig address (up to 16 ed25519 members,
-  threshold 1..=N; `xc_primitives::multisig_address`, SDK `multisigAddress`),
-  in which case every action from it must carry exactly `threshold` member
-  signatures — checked on chain in `Action::verify_signature`.
-  Attestors are a registry, many at once. `arxd/runtime/src/identity.rs`
-  (`require_admin`), `asset.rs` (`require_issuer`).
+- **Roles.** The protocol has no admin role. Every control over an asset —
+  freeze, forced transfer, recovery — belongs to that asset's issuer and no one
+  else. Who may act as a KYC provider is decided by a validator vote only (see
+  *Attestors* below). Any sender may be a multisig address (up to 16 ed25519
+  members, threshold 1..=N; `xc_primitives::multisig_address`, SDK
+  `multisigAddress`), in which case every action from it must carry exactly
+  `threshold` member signatures — checked on chain in
+  `Action::verify_signature`. `asset.rs` (`require_issuer`).
+- **Attestors.** A registry, many at once, added and removed only by
+  governance (`AddAttestor` / `RemoveAttestor` proposals, `circuits/governance`).
+  - *Genesis.* `Snapshot.attestors` seeds the first attestor(s); they stay until
+    a vote removes them. Same rules as any other (named, multisig), so a
+    genesis attestor must be named honestly, e.g. "Arxium (genesis attestor)".
+  - *Applying.* `ApplyAttestor` is sent by the attestor's own multisig address,
+    pays `ChainParams.attestor_apply_bond` (to the treasury, not refunded) and
+    opens an `AddAttestor` vote. The applicant is not a validator. Validators
+    check the evidence (hash + URI, stored in the proposal) off-chain, then vote.
+  - *Names.* 3–64 ASCII characters (letters, digits, space, `. - & ' ( )`), no
+    stray spaces. Unique after folding case, spacing, punctuation and the
+    lookalikes `0 1 5 i` (`attestor_name_skeleton`): "ARX1UM bank" cannot
+    register next to "Arxium Bank". A name is a claim, not proof; validators
+    must check it.
+  - *Multisig.* Mandatory: the attestor address must be the
+    `threshold`-of-`owners` multisig with threshold >= 2 and unique owners; the
+    chain derives it, since an address is only a hash.
+  - *Removal.* Validators only. While the vote is open (`attestor_removal_voting_blocks`,
+    shorter than a normal vote) the attestor cannot grant new attestations;
+    what it granted stays valid and revoking stays open. If the vote passes
+    everything it granted stops counting. One removal vote per attestor at a
+    time; the block always lifts when the proposal is executed (passed, failed
+    or expired — anyone may execute, so expiry only matters until someone
+    does); a failed vote starts `attestor_removal_cooldown_blocks` before it can
+    be targeted again.
+  - *Self-block.* `BlockAttestor`: an attestor stops its own new grants in an
+    emergency. Only an `UnblockAttestor` vote lifts it, never the attestor's key.
+  `circuits/identity` (`apply_register_attestor` and friends),
+  `circuits/governance`, `arxd/runtime/src/{identity,governance}.rs`.
 - **Reasons.** Every privileged action (forced transfers, freeze/unfreeze,
-  attestor register/deregister) carries a free-text `reason`, non-blank and
+  and attestor proposals) carries a free-text `reason`, non-blank and
   ≤ 512 bytes. It is not written to state; the block carrying the action is
   the audit record. `asset::check_reason`.
 
@@ -45,8 +73,11 @@ is right and this file is stale — fix the file.
 
 | Action | Allowed sender | Enforced in |
 |---|---|---|
-| `RegisterAttestor` / `DeregisterAttestor` | attestor admin | `runtime::identity::require_admin(Attestor)` |
-| `GrantAttestation` / `RevokeAttestation` | any *registered* attestor | `circuit_identity::require_attestor` |
+| `SubmitProposal(AddAttestor / RemoveAttestor / UnblockAttestor)` | an active validator | `circuit_governance::apply_submit` |
+| `ApplyAttestor` | the applicant's own 2-of-N multisig (pays the bond) | `circuit_governance::apply_attestor_application` |
+| `BlockAttestor` | a registered attestor, for itself | `runtime::identity::block_attestor` |
+| `GrantAttestation` | any registered attestor that is not blocked | `circuit_identity::require_attestor` + `blocked()` |
+| `RevokeAttestation` | any *registered* attestor | `circuit_identity::require_attestor` |
 | `VerifyCredential` (ZK) | the account itself | `circuit_identity::apply_verify_credential` |
 | `RegisterAsset` | anyone (becomes issuer) | `runtime::asset::register_asset` |
 | `IssueAsset`, `IssueAssetTo`, `BurnAsset`, `LockIssuance`, `TransferIssuer`, `SetAssetMetadataUri`, `SetAssetLimits` | issuer | `runtime::asset::require_issuer` |
@@ -59,11 +90,13 @@ Authorization errors (all `arxd/runtime`):
 
 | Error | Meaning |
 |---|---|
-| `{sender} is not the {role}` | sender is not the seeded admin for that role |
-| `chain has no {role} configured` | genesis seeded no address for the role; the action can never succeed on this chain |
 | `only the issuer ({issuer}) of {asset} may do this, got {sender}` | issuer-only action from someone else |
 | `{addr} is not a registered attestor` | grant/revoke from an unregistered address, or deregistering one |
-| `{addr} is already a registered attestor` | deregister first to change its name |
+| `{addr} is already a registered attestor` | the applicant or proposed attestor already exists |
+| `{addr} is blocked from granting attestations` | self-blocked, or a removal vote is open |
+| `invalid attestor name: …` / `attestor name {n} is too close to one already registered` | name rules |
+| `invalid attestor multisig: …` | owners/threshold do not derive the address, or threshold < 2 |
+| `{addr} already has a removal vote open` / `… cannot be targeted again before height {h}` | one removal vote at a time; cooldown after a failed one |
 | `{what} needs a non-empty reason` / `reason is N bytes, over the 512-byte limit` | missing/oversized audit reason |
 | `unknown asset {asset}` | no such `arxasset1…`; never an implicit create |
 | `{validator} has no attestation from a registered attestor, and this chain requires one to validate` | `JoinValidator` on an attestation-required chain |

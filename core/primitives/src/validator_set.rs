@@ -286,6 +286,20 @@ pub struct ChainParams {
     /// voted SetChainParams after the session/recovery audit.
     #[serde(default)]
     pub account_extensions_enabled: bool,
+    /// IUM an `ApplyAttestor` pays to `treasury_account()`: the spam floor on
+    /// applications, since the proposal it opens costs every validator a look.
+    /// Not refunded, whether or not the vote passes.
+    #[serde(default = "default_attestor_apply_bond")]
+    pub attestor_apply_bond: u128,
+    /// Voting window for a `RemoveAttestor` proposal. Shorter than
+    /// `voting_period_blocks`: a removal is the emergency path, and the
+    /// attestor cannot grant while it runs.
+    #[serde(default = "default_attestor_removal_voting_blocks")]
+    pub attestor_removal_voting_blocks: u64,
+    /// Blocks after a failed removal vote before the same attestor can be
+    /// targeted again, so one validator cannot keep an attestor blocked.
+    #[serde(default = "default_attestor_removal_cooldown_blocks")]
+    pub attestor_removal_cooldown_blocks: u64,
 }
 
 fn default_block_interval_secs() -> u64 {
@@ -379,6 +393,19 @@ pub const DEFAULT_TOKEN_CREATE_FEE: u128 = 100 * 1_000_000_000;
 fn default_token_create_fee() -> u128 {
     DEFAULT_TOKEN_CREATE_FEE
 }
+/// Same as the token-create fee: the spam floor for opening a vote.
+// ponytail: placeholder until the governance-parameters decision card lands.
+fn default_attestor_apply_bond() -> u128 {
+    DEFAULT_TOKEN_CREATE_FEE
+}
+/// 1 day at 2s slots.
+fn default_attestor_removal_voting_blocks() -> u64 {
+    24 * 60 * 60 / 2
+}
+/// 3 days at 2s slots.
+fn default_attestor_removal_cooldown_blocks() -> u64 {
+    3 * 24 * 60 * 60 / 2
+}
 
 impl Default for ChainParams {
     fn default() -> Self {
@@ -404,6 +431,9 @@ impl Default for ChainParams {
             challenger_reward_bps: default_challenger_reward_bps(),
             token_create_fee: default_token_create_fee(),
             account_extensions_enabled: false,
+            attestor_apply_bond: default_attestor_apply_bond(),
+            attestor_removal_voting_blocks: default_attestor_removal_voting_blocks(),
+            attestor_removal_cooldown_blocks: default_attestor_removal_cooldown_blocks(),
         }
     }
 }
@@ -415,11 +445,6 @@ pub enum GovernanceAction {
     /// so the proposal text is exactly the state that results — a supervisor
     /// reads one record, not a diff against something that may have moved.
     SetChainParams(ChainParams),
-    /// Rotate a genesis-seeded admin role (`AdminKey`). `role` is the
-    /// `AdminRole` name (`"attestor"`) — a
-    /// string so this crate needn't depend on `xc-circuit`, which defines
-    /// the enum and depends on this crate.
-    SetAdmin { role: String, address: Address },
     /// Pay `amount` IUM out of `treasury_account()` to `to`.
     TreasurySpend { to: Address, amount: u128 },
     /// Close an upheld dispute so settlement resumes past it. `header` is
@@ -444,6 +469,27 @@ pub enum GovernanceAction {
     /// later shown to be a determinism bug (Trello 202). Rejected if the
     /// validator is not tombstoned. Slashed stake is not returned.
     ReinstateValidator { validator: Address },
+    /// Registers `attestor` as a KYC provider. The only way in besides the
+    /// genesis seed: there is no admin role. `attestor` must be the
+    /// `threshold`-of-`owners` multisig address (threshold >= 2), which the
+    /// chain checks because an address is only a hash. `evidence_hash` and
+    /// `evidence_uri` are what validators checked off-chain before voting;
+    /// the chain stores them only inside this proposal.
+    AddAttestor {
+        attestor: Address,
+        name: String,
+        owners: Vec<Address>,
+        threshold: u8,
+        evidence_hash: String,
+        evidence_uri: String,
+    },
+    /// Removes `attestor`. While the vote is open the attestor cannot grant
+    /// new attestations; on passing, everything it granted stops counting.
+    RemoveAttestor { attestor: Address },
+    /// Lifts an attestor's emergency self-block (`BlockAttestor`). Only a
+    /// vote can: the attestor's own key never can, since the key may be the
+    /// thing that was compromised.
+    UnblockAttestor { attestor: Address },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

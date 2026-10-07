@@ -745,6 +745,7 @@ mod tests {
                 record: xc_primitives::AttestorRecord {
                     name: "test".into(),
                     registered_at: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
@@ -802,6 +803,7 @@ mod tests {
                 record: xc_primitives::AttestorRecord {
                     name: "issuer".into(),
                     registered_at: 0,
+                    ..Default::default()
                 },
             })
             .unwrap();
