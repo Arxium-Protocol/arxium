@@ -1,4 +1,4 @@
-# @arxium-protocol/sdk
+# @arxiumlabs/sdk
 
 TypeScript SDK and `arx` CLI for the Arxium network. It has zero runtime dependencies and requires Node 20 or later. The SDK uses WebCrypto Ed25519 and also runs in browsers and Workers.
 
@@ -7,8 +7,8 @@ Builder docs (endpoints, API keys, faucet, quickstart, RWA walkthrough): https:/
 ## Install
 
 ```sh
-npm install @arxium-protocol/sdk      # library
-npm install -g @arxium-protocol/sdk   # arx CLI
+npm install @arxiumlabs/sdk      # library
+npm install -g @arxiumlabs/sdk   # arx CLI
 ```
 
 ## Releasing
@@ -23,7 +23,7 @@ cd sdk/ts && npm test
 ## SDK quickstart
 
 ```ts
-import { ArxiumRpc, encodeTransfer, arxToIum } from "@arxium-protocol/sdk";
+import { ArxiumRpc, encodeTransfer, arxToIum } from "@arxiumlabs/sdk";
 
 const rpc = new ArxiumRpc({ rpc: "https://node.example", token: process.env.ARX_TOKEN });
 const payload = encodeTransfer("arx1...", arxToIum("1.5"));
