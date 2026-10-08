@@ -20,7 +20,7 @@
     }
   },
   "bin": {
-    "arx": "./dist/cli.js"
+    "arx": "dist/cli.js"
   },
   "files": [
     "dist",
