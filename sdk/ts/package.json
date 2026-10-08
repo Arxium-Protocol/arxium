@@ -4,9 +4,14 @@
   "description": "Arxium TypeScript SDK and arx CLI",
   "type": "module",
   "private": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arxium-Protocol/arxium.git",
+    "directory": "sdk/ts"
+  },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com",
-    "access": "restricted"
+    "access": "public"
   },
   "exports": {
     ".": {
