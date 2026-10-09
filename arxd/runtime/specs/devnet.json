@@ -9,6 +9,7 @@
     "max_validator_set": 100,
     "reward_per_block": 4300000000,
     "unbonding_blocks": 1800,
+    "voting_period_blocks": 302400,
     "token_create_fee": 100000000
   },
   "accounts": {
