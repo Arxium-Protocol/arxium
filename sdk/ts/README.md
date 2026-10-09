@@ -1,29 +1,29 @@
-# @arxium-protocol/sdk
+# @arxiumlabs/sdk
 
-TypeScript SDK and `arx` CLI for the private Arxium network. It has zero runtime dependencies and requires Node 20 or later. The SDK uses WebCrypto Ed25519 and also runs in browsers and Workers.
+TypeScript SDK and `arx` CLI for the Arxium network. It has zero runtime dependencies and requires Node 20 or later. The SDK uses WebCrypto Ed25519 and also runs in browsers and Workers.
+
+Builder docs (endpoints, API keys, faucet, quickstart, RWA walkthrough): https://arxium.network/docs
 
 ## Install
 
-Until mainnet the package isn't on any registry. Consumers commit the packed tarball and depend on it as a file:
+```sh
+npm install @arxiumlabs/sdk      # library
+npm install -g @arxiumlabs/sdk   # arx CLI
+```
+
+## Releasing
+
+Bump `version` here, run the release checks, then push a `sdk-vX.Y.Z` tag. `.github/workflows/sdk.yml` publishes to npm through trusted publishing (no token) with provenance.
 
 ```sh
-# release checks (what .github/workflows/sdk.yml runs)
 cd Arxium && cargo test -p arxd-runtime writes_typescript_signed_action_fixtures && git diff --exit-code sdk/ts/fixtures
 cd sdk/ts && npm test
-# pack into the consumer, e.g. Console
-npm pack --pack-destination ../../../Console/vendor
 ```
-
-```json
-"@arxium-protocol/sdk": "file:vendor/arxium-protocol-sdk-0.1.0.tgz"
-```
-
-For a new version: bump `version` here, pack, update the file name in the consumer's `package.json`, run `npm install`, and delete the old tarball.
 
 ## SDK quickstart
 
 ```ts
-import { ArxiumRpc, encodeTransfer, arxToIum } from "@arxium-protocol/sdk";
+import { ArxiumRpc, encodeTransfer, arxToIum } from "@arxiumlabs/sdk";
 
 const rpc = new ArxiumRpc({ rpc: "https://node.example", token: process.env.ARX_TOKEN });
 const payload = encodeTransfer("arx1...", arxToIum("1.5"));
