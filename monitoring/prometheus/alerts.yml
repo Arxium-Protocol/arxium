@@ -39,11 +39,14 @@ groups:
             the finality quorum. Register the missing validator keys.
 
       - alert: ArxiumBlocksRejected
-        expr: increase(arxium_blocks_rejected_total[10m]) > 0
+        # A late round-0 block after a round timeout, or a block gossiped while
+        # a node is a few blocks behind, is rejected by design (a handful per
+        # day per node), so only a sustained rate is worth a warning.
+        expr: increase(arxium_blocks_rejected_total[1h]) > 3
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} block(s) rejected in the last 10 minutes"
+          summary: "{{ $value | printf \"%.0f\" }} block(s) rejected in the last hour"
 
       - alert: ArxiumProductionErrors
         expr: increase(arxium_block_production_errors_total[10m]) > 0
