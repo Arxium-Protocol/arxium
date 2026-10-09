@@ -445,20 +445,11 @@ tests:
 
   - interval: 1m
     input_series:
-      - series: 'arxium_blocks_rejected_total'
-        values: '0x20 1x10'
       - series: 'arxium_block_production_errors_total'
         values: '0x20 1x10'
       - series: 'arxium_network_outbound_dropped_total{channel="blocks"}'
         values: '0x20 1x10'
     alert_rule_test:
-      - eval_time: 25m
-        alertname: ArxiumBlocksRejected
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-            exp_annotations:
-              summary: "1 block(s) rejected in the last 10 minutes"
       - eval_time: 25m
         alertname: ArxiumProductionErrors
         exp_alerts:
@@ -474,10 +465,23 @@ tests:
               channel: blocks
             exp_annotations:
               summary: "1 outbound blocks message(s) dropped in the last 10 minutes"
-      # Ten minutes after the last step the window no longer holds it.
-      - eval_time: 32m
+
+  # Routine rejects (a few per day) stay quiet; a burst pages.
+  - interval: 1m
+    input_series:
+      - series: 'arxium_blocks_rejected_total{instance="quiet"}'
+        values: '0x20 1x20 2x20'
+      - series: 'arxium_blocks_rejected_total{instance="burst"}'
+        values: '0x20 10x40'
+    alert_rule_test:
+      - eval_time: 50m
         alertname: ArxiumBlocksRejected
-        exp_alerts: []
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: burst
+            exp_annotations:
+              summary: "10 block(s) rejected in the last hour"
 
   # Signed-vote protection. `floor` refusals are routine catch-up after a
   # restart and must not page; `conflict` and `write_failed` must.
